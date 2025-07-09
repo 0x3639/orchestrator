@@ -95,8 +95,7 @@ func (eN *evmNetwork) Start() error {
 		return err
 	}
 
-	go eN.SubscribeToEvents()
-	// todo defer unsub?
+	go eN.SyncEvents()
 
 	go eN.ProcessEvents()
 	return nil
@@ -111,11 +110,11 @@ func (eN *evmNetwork) EvmRpc() *rpc.EvmRpc {
 }
 
 func (eN *evmNetwork) Sync() error {
-	eN.logger.Info("In sync evm")
+	//eN.logger.Info("In sync evm")
 	if updateHeight, err := eN.eventsStore().GetLastUpdateHeight(); err != nil {
 		return err
 	} else {
-		eN.logger.Info("updateHeight: ", updateHeight)
+		//eN.logger.Info("updateHeight: ", updateHeight)
 		for {
 			latestBlock, rpcErr := eN.EvmRpc().BlockNumber()
 			if rpcErr != nil {
@@ -125,34 +124,36 @@ func (eN *evmNetwork) Sync() error {
 
 			if updateHeight > latestBlock {
 				// todo this can happen if we have a fork
-				return errors.Errorf("sync evm problem for network: %s, chainId: %d", eN.NetworkName(), eN.ChainId())
+				return errors.Errorf("Sync updateHeight %d greater than network latest block: %d, networkName: %s, chainId: %d",
+					updateHeight, latestBlock, eN.NetworkName(), eN.ChainId())
 			}
 
 			end := false
 			filterQuerySize := eN.rpcManager.Evm(eN.ChainId()).FilterQuerySize()
 
 			distance := latestBlock - updateHeight
-			if distance < eN.ConfirmationsToFinality() {
+			if distance < eN.ConfirmationsToFinality() || distance < filterQuerySize {
 				filterQuerySize = distance
 				end = true
-			} else if distance < filterQuerySize {
-				filterQuerySize = distance
 			}
 			// eN.logger.Infof("distance: %d, left: %d, right: %d, filterQuerySize: %d\n", distance, updateHeight, updateHeight+filterQuerySize, filterQuerySize)
 
-			if logs, err := eN.EvmRpc().FilterLogs(updateHeight, updateHeight+filterQuerySize); err != nil {
-				return err
-			} else {
+			if logs, errFilter := eN.EvmRpc().FilterLogs(updateHeight, updateHeight+filterQuerySize); errFilter != nil {
+				return errFilter
+			} else if len(logs) > 0 {
+				eN.logger.Info("Found %d logs: ", len(logs))
 				for _, log := range logs {
+					live := latestBlock-log.BlockNumber < eN.ConfirmationsToFinality()
+
 					// if we have confirmations then we are live, otherwise we are not
-					if err := eN.InterpretLog(log, latestBlock-log.BlockNumber < eN.ConfirmationsToFinality()); err != nil {
+					if err := eN.InterpretLog(log, live); err != nil {
 						eN.logger.Error(err)
 						continue
 					}
 				}
 			}
 
-			updateHeight += filterQuerySize
+			updateHeight += filterQuerySize + 1
 			if err := eN.eventsStore().SetLastUpdateHeight(updateHeight); err != nil {
 				return err
 			}
@@ -165,7 +166,8 @@ func (eN *evmNetwork) Sync() error {
 }
 
 func (eN *evmNetwork) InterpretLog(log etypes.Log, live bool) error {
-	eN.logger.Infof("InterpretLog - tx: %s and log topic: %s - live: %v", log.TxHash.String(), log.Topics[0].Hex(), live)
+	eN.logger.Infof("InterpretLog - tx: %s, log topic: %s, block: %d, live: %v",
+		log.TxHash.String(), log.Topics[0].Hex(), log.BlockNumber, live)
 
 	switch log.Topics[0].Hex() {
 	case common.UnwrapSigHash.Hex():
@@ -550,44 +552,14 @@ func (eN *evmNetwork) FillEvmParamsRpc() error {
 	return nil
 }
 
-func (eN *evmNetwork) SubscribeToEvents() {
-	eN.logger.Infof("SubscribeToEvents for network with chainId: %d", eN.ChainId())
-	logSub, logChan, err := eN.EvmRpc().SubscribeToLogs()
-	if err != nil {
-		eN.logger.Error(err)
-		eN.stopChan <- syscall.SIGINT
-		return
-	}
-
-	go func() {
-		for {
-			time.Sleep(3 * time.Minute)
-			if logSub != nil {
-				logSub.Unsubscribe()
-			}
-			errSync := eN.Sync()
-			if errSync != nil {
-				eN.logger.Debug(errSync)
-				continue
-			}
-			if logSub, logChan, err = eN.EvmRpc().SubscribeToLogs(); err != nil {
-				eN.logger.Error(err)
-				eN.stopChan <- syscall.SIGINT
-			}
-		}
-	}()
-
+func (eN *evmNetwork) SyncEvents() {
 	for {
-		select {
-		case subErr := <-logSub.Err():
-			if subErr != nil {
-				eN.logger.Error(subErr)
-				eN.stopChan <- syscall.SIGINT
-			}
-		case newLog := <-logChan:
-			if errInterpret := eN.InterpretLog(newLog, true); errInterpret != nil {
-				eN.logger.Debug(errInterpret)
-			}
+		time.Sleep(eN.EstimatedBlockTime() + 2*time.Second)
+
+		errSync := eN.Sync()
+		if errSync != nil {
+			eN.logger.Debug(errSync)
+			continue
 		}
 	}
 }
