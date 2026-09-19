@@ -48,7 +48,7 @@ Everything lives in `~/.orchestrator/config.json`. On first start the orchestrat
 
 | Field | Default | Meaning |
 | --- | --- | --- |
-| `DataPath` | `~/.orchestrator` | **Leave at the default.** The orchestrator always reads `~/.orchestrator/config.json` of the running user at startup; there is no flag to point it elsewhere, despite what one log message suggests. A different `DataPath` inside that file only changes where the producer key is read from and where the file is rewritten to, while `events/`, `queues/` and `logs/` stay under `~/.orchestrator` and `TssConfig.BaseDir` is independent. The directory is created `0700`, an existing wider mode is tightened, and it must be owned by the running user. |
+| `DataPath` | `~/.orchestrator` | **Leave at the default.** The orchestrator always reads `~/.orchestrator/config.json` of the running user at startup; there is no flag to point it elsewhere, despite what one log message suggests. A different `DataPath` inside that file only changes where the producer key is read from, where the instance lock file is placed and where the file is rewritten to, while `events/`, `queues/` and `logs/` stay under `~/.orchestrator` and `TssConfig.BaseDir` is independent. The directory is created `0700`, an existing wider mode is tightened, and it must be owned by the running user. |
 | `GlobalState` | `0` | Persisted node state. Managed by the orchestrator; do not edit. See [States](operations/states.md). |
 | `EvmAddress` | derived | The signer's EVM address, derived from the producer key. Written for information. |
 | `ProducerKeyFileName` | `producer` | Name of the encrypted key file inside `DataPath`. |
