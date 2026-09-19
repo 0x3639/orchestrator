@@ -16,7 +16,6 @@ import (
 	"orchestrator/db/manager"
 	"orchestrator/rpc"
 	"os"
-	"reflect"
 	"strings"
 	"syscall"
 
@@ -165,6 +164,14 @@ func (eN *evmNetwork) Sync() error {
 }
 
 func (eN *evmNetwork) InterpretLog(log etypes.Log, live bool) error {
+	if log.Removed {
+		// The subscription re-sends logs from blocks that were reorged out
+		// with Removed set. The canonical copy, if any, arrives separately;
+		// the queued copy is dropped by ProcessEvents once the canonical
+		// header no longer matches its block hash.
+		eN.logger.Infof("InterpretLog - ignoring removed log tx: %s logIndex: %d block: %d", log.TxHash.String(), log.Index, log.BlockNumber)
+		return nil
+	}
 	eN.logger.Infof("InterpretLog - tx: %s and log topic: %s - live: %v", log.TxHash.String(), log.Topics[0].Hex(), live)
 
 	switch log.Topics[0].Hex() {
@@ -520,11 +527,10 @@ func (eN *evmNetwork) InterpretLog(log etypes.Log, live bool) error {
 			common.AdministratorLogger.Infof("SetConfirmationsToFinality %d", confirmations.Arg0)
 		}
 	}
-	if err := eN.eventsStore().SetLastUpdateHeight(log.BlockNumber); err != nil {
-		return err
-	}
-	eN.logger.Infof("Set last blockNumber as: %d", log.BlockNumber)
-
+	// The sync cursor is advanced only by Sync, after a whole block range has
+	// been processed. Writing it here for every log, including live
+	// subscription logs, used to rewind the cursor behind ranges Sync had
+	// already covered, which re-fetched and re-enqueued the same events.
 	return nil
 }
 
@@ -592,141 +598,119 @@ func (eN *evmNetwork) SubscribeToEvents() {
 	}
 }
 
-func (eN *evmNetwork) ProcessEvents() {
-	// this means we should dequeue
-	dequeue := false
-	// this means we dequeued an item
-	dequeued := false
-	for {
-		var peekedInterface interface{}
-		var errQueue error
+const (
+	processEventsBaseBackoff = 5 * time.Second
+	processEventsMaxBackoff  = 2 * time.Minute
+	processEventsWarnEvery   = 10
+)
 
-		if dequeue {
-			peekedInterface, errQueue = eN.unconfirmedQueue.DequeueBlock()
-			if errQueue != nil {
-				eN.logger.Error(errQueue)
-				eN.stopChan <- syscall.SIGINT
-				return
-			}
-			dequeue = false
-			dequeued = true
-		} else {
-			peekedInterface, errQueue = eN.unconfirmedQueue.PeekBlock()
-			if errQueue != nil {
-				eN.logger.Error(errQueue)
-				eN.stopChan <- syscall.SIGINT
-				return
-			}
-			dequeued = false
+// ProcessEvents drains the persistent queue of live unwrap events in order.
+// The head event is only removed once the chain has given a definitive
+// answer: confirmed (persisted to the events store) or rejected (reverted
+// or reorged out). Transient failures, above all RPC errors from an
+// overloaded EVM node, keep the event queued and retry with backoff.
+//
+// Dropping an event on a transient error is never acceptable here. Each
+// signer builds its TSS signing pool from its local events store, and the
+// ceremony only forms a party between signers whose pools are identical, so
+// a single lost event on one node can stall unwrap signing for everyone.
+func (eN *evmNetwork) ProcessEvents() {
+	backoff := processEventsBaseBackoff
+	attempts := 0
+
+	for {
+		peeked, errQueue := eN.unconfirmedQueue.PeekBlock()
+		if errQueue != nil {
+			eN.logger.Error(errQueue)
+			eN.stopChan <- syscall.SIGINT
+			return
 		}
-		var y bool
-		frontEvent, y := peekedInterface.(*events.UnwrapRequestEvm)
-		if !y {
+		frontEvent, ok := peeked.(*events.UnwrapRequestEvm)
+		if !ok {
 			eN.logger.Info("Dequeued object is not events.UnwrapRequestEvm")
-			if dequeued == false {
-				dequeue = true
+			if !eN.dropQueuedEvent() {
+				return
 			}
 			continue
 		}
 		eN.logger.Debugf("Processing evm event with tx hash %s and logIndex: %d", frontEvent.TransactionHash.String(), frontEvent.LogIndex)
 
-		var txReceipt *etypes.Receipt
-		txReceipt, err := eN.EvmRpc().TransactionReceipt(frontEvent.TransactionHash)
-		if err != nil {
-			eN.logger.Debug(err)
-			if dequeued == false {
-				dequeue = true
-			}
-			continue
-		} else if txReceipt.Status != etypes.ReceiptStatusSuccessful {
-			eN.logger.Infof("txReceipt for tx hash %s not successful\n", txReceipt.TxHash.String())
-			if dequeued == false {
-				dequeue = true
-			}
-			continue
-		}
+		decision := confirmQueuedEvent(eN.EvmRpc(), frontEvent, eN.EvmParams.ConfirmationsToFinality(), eN.EvmParams.EstimatedBlockTime())
 
-		for {
-			time.Sleep(2 * time.Second)
-			currentBlockHeight, err := eN.EvmRpc().BlockNumber()
-			if err != nil {
-				eN.logger.Debug(err)
+		switch decision.outcome {
+		case outcomeRetry:
+			if decision.err != nil {
+				attempts++
+				eN.logger.Warnf("Event %s/%d not confirmable yet (%s): %v; attempt %d, retrying in %s, queue size %d",
+					frontEvent.TransactionHash.String(), frontEvent.LogIndex, decision.reason, decision.err, attempts, backoff, eN.unconfirmedQueue.Size())
+				if attempts%processEventsWarnEvery == 0 {
+					eN.logger.Errorf("Event %s/%d has failed confirmation %d times in a row; the unconfirmed queue is blocked until the EVM node answers",
+						frontEvent.TransactionHash.String(), frontEvent.LogIndex, attempts)
+				}
+				time.Sleep(backoff)
+				backoff *= 2
+				if backoff > processEventsMaxBackoff {
+					backoff = processEventsMaxBackoff
+				}
 				continue
 			}
-			if currentBlockHeight < txReceipt.BlockNumber.Uint64() {
-				eN.logger.Errorf("blockNumber on evm with chain id: %d is less than the transaction block number, we are probably still syncing", eN.ChainId())
-				// we stop the binary so it restarts and wait for the node to sync
+			// A known wait, e.g. for more confirmations, is not a failure.
+			attempts = 0
+			backoff = processEventsBaseBackoff
+			wait := decision.retryAfter
+			if wait <= 0 {
+				wait = processEventsBaseBackoff
+			} else if wait > processEventsMaxBackoff {
+				wait = processEventsMaxBackoff
+			}
+			eN.logger.Debugf("Event %s/%d: %s, checking again in %s", frontEvent.TransactionHash.String(), frontEvent.LogIndex, decision.reason, wait)
+			time.Sleep(wait)
+			continue
+
+		case outcomeDiscard:
+			attempts = 0
+			backoff = processEventsBaseBackoff
+			eN.logger.Warnf("Discarding event %s/%d: %s", frontEvent.TransactionHash.String(), frontEvent.LogIndex, decision.reason)
+			if !eN.dropQueuedEvent() {
+				return
+			}
+			continue
+
+		case outcomeConfirmed:
+			attempts = 0
+			backoff = processEventsBaseBackoff
+			eN.logger.Infof("Event with hash: %s and logIndex: %d is confirmed", frontEvent.TransactionHash.String(), frontEvent.LogIndex)
+
+			added, err := eN.eventsStore().AddUnwrapRequestIfMissing(*frontEvent)
+			if err != nil {
+				eN.logger.Error(err)
 				eN.stopChan <- syscall.SIGINT
 				return
 			}
-
-			confirmations := currentBlockHeight - txReceipt.BlockNumber.Uint64()
-			if confirmations < eN.EvmParams.ConfirmationsToFinality() {
-				// we need to wait confirmationsRequired blocks * estimated time per block
-				confirmationsRequired := eN.EvmParams.ConfirmationsToFinality() - confirmations
-				timeToWait := time.Duration(confirmationsRequired) * eN.EvmParams.EstimatedBlockTime()
-				time.Sleep(timeToWait)
-				continue
+			if added {
+				eN.logger.Infof("Added event hash: %s logIndex: %d to persistent storage", frontEvent.TransactionHash.String(), frontEvent.LogIndex)
+			} else {
+				// The same event reaches the queue more than once (subscription
+				// plus periodic Sync). The existing record may already carry a
+				// signature or a sent status and must not be reset.
+				eN.logger.Infof("Event hash: %s logIndex: %d already in persistent storage, keeping the existing record", frontEvent.TransactionHash.String(), frontEvent.LogIndex)
 			}
-			break
-		}
-
-		txReceipt, err = eN.EvmRpc().TransactionReceipt(frontEvent.TransactionHash)
-		if err != nil {
-			eN.logger.Debug(err)
-			if dequeued == false {
-				dequeue = true
-			}
-			continue
-		} else if txReceipt.Status != etypes.ReceiptStatusSuccessful {
-			eN.logger.Infof("txReceipt for tx hash %s not successful\n", txReceipt.TxHash.String())
-			if dequeued == false {
-				dequeue = true
-			}
-			continue
-		}
-
-		if !reflect.DeepEqual(txReceipt.BlockHash.Bytes(), frontEvent.BlockHash.Bytes()) {
-			eN.logger.Info("Transaction %s has a different block hash %s, expected %s", frontEvent.TransactionHash.String(), txReceipt.BlockHash.String(), frontEvent.BlockHash.String())
-			if dequeued == false {
-				dequeue = true
-			}
-			continue
-		}
-
-		// We double-check that this transaction exists
-		tx, _, err := eN.EvmRpc().TransactionByHash(frontEvent.TransactionHash)
-		if err != nil {
-			eN.logger.Debug(err)
-			if dequeued == false {
-				dequeue = true
-			}
-			continue
-		} else if tx == nil {
-			eN.logger.Infof("Transaction %s does not exist or has not executed successfully", frontEvent.TransactionHash.String())
-			if dequeued == false {
-				dequeue = true
-			}
-			continue
-		}
-
-		eN.logger.Infof("Event with hash: %s and logIndex: %d is confirmed", frontEvent.TransactionHash.String(), frontEvent.LogIndex)
-
-		if err := eN.eventsStore().AddUnwrapRequest(*frontEvent); err != nil {
-			eN.logger.Error(errQueue)
-			eN.stopChan <- syscall.SIGINT
-			return
-		}
-		eN.logger.Infof("Added event hash: %s logIndex: %d to persistent storage", frontEvent.TransactionHash.String(), frontEvent.LogIndex)
-		if !dequeued {
-			_, errQueue = eN.unconfirmedQueue.DequeueBlock()
-			if errQueue != nil {
-				eN.logger.Error(errQueue)
-				eN.stopChan <- syscall.SIGINT
+			if !eN.dropQueuedEvent() {
 				return
 			}
 		}
 	}
+}
+
+// dropQueuedEvent removes the head of the unconfirmed queue. It returns
+// false when the queue is unusable and the node has been told to stop.
+func (eN *evmNetwork) dropQueuedEvent() bool {
+	if _, err := eN.unconfirmedQueue.DequeueBlock(); err != nil {
+		eN.logger.Error(err)
+		eN.stopChan <- syscall.SIGINT
+		return false
+	}
+	return true
 }
 
 func (eN *evmNetwork) Stop() {

@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"orchestrator/common"
 	oconfig "orchestrator/common/config"
+	"orchestrator/common/events"
 	"orchestrator/db/manager"
 	"orchestrator/health"
 	"orchestrator/network"
@@ -37,6 +38,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/prometheus/tsdb/fileutil"
 	"github.com/zenon-network/go-zenon/common/types"
+	"github.com/zenon-network/go-zenon/vm/constants"
 	"github.com/zenon-network/go-zenon/vm/embedded/definition"
 	"github.com/zenon-network/go-zenon/vm/embedded/implementation"
 	"github.com/zenon-network/go-zenon/wallet"
@@ -1130,6 +1132,7 @@ func (node *Node) processSignaturesUnwrap() (error, bool) {
 	if err != nil {
 		return err, true
 	}
+	requests = node.reconcileUnsignedUnwrapRequests(requests)
 	if len(requests) == 0 {
 		return nil, false
 	}
@@ -1191,7 +1194,7 @@ func (node *Node) processSignaturesUnwrap() (error, bool) {
 			continue
 		}
 
-		if err = node.networksManager.AddEvmUnwrapRequest(*requests[msgsIndexes[sig.Msg]]); err != nil {
+		if err = node.networksManager.SetEvmUnwrapRequestSignature(requests[msgsIndexes[sig.Msg]]); err != nil {
 			node.logger.Debug(err.Error())
 			continue
 		}
@@ -1199,6 +1202,39 @@ func (node *Node) processSignaturesUnwrap() (error, bool) {
 		node.logger.Debugf("\n%d. sig: %s, recoveryID: %s, FinalSig: %s \n", msgsIndexes[sig.Msg], sig.Signature, sig.RecoveryID, requests[msgsIndexes[sig.Msg]].Signature)
 	}
 	return nil, true
+}
+
+// reconcileUnsignedUnwrapRequests removes from the signing pool every event
+// that Zenon already knows about, marking it as sent locally. Such events
+// exist when this node missed the ceremony that signed them (offline, lost
+// the event, or the record was reset), and left in the pool they make this
+// node propose a different message set than its peers. The TSS ceremony
+// only forms a party between signers with an identical set, so one stale
+// entry here stalls unwrap signing for the whole bridge until operators
+// wipe and resync the events store.
+func (node *Node) reconcileUnsignedUnwrapRequests(requests []*events.UnwrapRequestEvm) []*events.UnwrapRequestEvm {
+	remaining := make([]*events.UnwrapRequestEvm, 0, len(requests))
+	reconciled := 0
+	for _, req := range requests {
+		rpcReq, err := node.networksManager.GetEvmUnwrapRequestByHashAndLogFromRPC(types.Hash(req.TransactionHash), req.LogIndex)
+		if rpcReq != nil {
+			if err := node.networksManager.SetEvmUnwrapRequestAsSent(req); err != nil {
+				node.logger.Warnf("reconcile: event %s/%d exists on Zenon but could not be marked as sent: %v", req.TransactionHash.String(), req.LogIndex, err)
+				continue
+			}
+			reconciled++
+			continue
+		}
+		if err != nil && err.Error() != constants.ErrDataNonExistent.Error() {
+			// Zenon RPC failure: keep the event in the pool rather than guess.
+			node.logger.Warnf("reconcile: cannot query Zenon for event %s/%d: %v", req.TransactionHash.String(), req.LogIndex, err)
+		}
+		remaining = append(remaining, req)
+	}
+	if reconciled > 0 {
+		node.logger.Infof("reconcile: %d unsigned unwrap events already exist on Zenon and were marked as sent; %d remain to sign", reconciled, len(remaining))
+	}
+	return remaining
 }
 
 // Send signatures methods

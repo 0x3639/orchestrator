@@ -352,6 +352,12 @@ func (r *EvmRpc) BlockNumber() (uint64, error) {
 	return r.rpcClient.BlockNumber(context.Background())
 }
 
+// HeaderByNumber returns the canonical header at the given height, used to
+// decide whether an observed block was reorged out.
+func (r *EvmRpc) HeaderByNumber(number uint64) (*etypes.Header, error) {
+	return r.rpcClient.HeaderByNumber(context.Background(), new(big.Int).SetUint64(number))
+}
+
 func (r *EvmRpc) BlockByHash(hash ecommon.Hash) (*etypes.Block, error) {
 	return r.rpcClient.BlockByHash(context.Background(), hash)
 }

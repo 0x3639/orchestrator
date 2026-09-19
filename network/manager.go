@@ -642,6 +642,20 @@ func (m *NetworksManager) SetEvmUnwrapRequestAsSent(event *events.UnwrapRequestE
 	return nil
 }
 
+// SetEvmUnwrapRequestSignature stores only the signature on an existing
+// record, leaving its redeem status untouched. Writing the whole event back
+// after a ceremony could undo a status change made meanwhile by the sender.
+func (m *NetworksManager) SetEvmUnwrapRequestSignature(event *events.UnwrapRequestEvm) error {
+	for _, network := range m.evmNetworks {
+		if network.ChainId() == event.ChainId {
+			if err := network.SetUnwrapRequestSignature(event.TransactionHash, event.LogIndex, event.Signature); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 func (m *NetworksManager) AddEvmUnwrapRequest(event events.UnwrapRequestEvm) error {
 	for _, network := range m.evmNetworks {
 		if network.ChainId() == event.ChainId {

@@ -32,6 +32,17 @@ func (es *evmStorage) AddUnwrapRequest(event events.UnwrapRequestEvm) error {
 	return nil
 }
 
+func (es *evmStorage) AddUnwrapRequestIfMissing(event events.UnwrapRequestEvm) (bool, error) {
+	existing, err := es.GetUnwrapRequestByHashAndLog(event.TransactionHash, event.LogIndex)
+	if err != nil {
+		return false, err
+	}
+	if existing != nil {
+		return false, nil
+	}
+	return true, es.AddUnwrapRequest(event)
+}
+
 func (es *evmStorage) UpdateUnwrapRequestBlockNumber(event events.UnwrapRequestEvm) error {
 	localEvent, err := es.GetUnwrapRequestByHashAndLog(event.TransactionHash, event.LogIndex)
 	if err != nil {
@@ -191,6 +202,13 @@ func (es *evmStorage) GetUnsignedUnwrapRequests() ([]*events.UnwrapRequestEvm, e
 			return nil, err
 		}
 		if len(event.Signature) > 0 {
+			continue
+		}
+		// An unsigned record that is no longer unredeemed is already known to
+		// Zenon (reconciled from the chain), so it must not enter the signing
+		// pool: every signer has to build the identical pool for the TSS
+		// ceremony to form a party.
+		if event.RedeemStatus != common.UnredeemedStatus {
 			continue
 		}
 
