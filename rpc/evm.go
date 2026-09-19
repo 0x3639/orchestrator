@@ -50,7 +50,7 @@ func NewEvmRpcClient(networkConfig config.BaseNetworkConfig, networkName string,
 	for {
 		newRpcClient, err = ethclient.Dial(currentUrl)
 		if err != nil {
-			logger.Infof("Error when dialing %s, got: %s\n", currentUrl, err)
+			logger.Infof("Error when dialing %s, got: %s\n", config.RedactURL(currentUrl), config.RedactErrorForURL(err, currentUrl))
 		} else {
 			break
 		}
