@@ -40,10 +40,18 @@ type EvmRpc struct {
 	logChan chan etypes.Log
 	logger  *zap.SugaredLogger
 
-	// secondary holds clients for configured URLs other than the connected
-	// one, used only for canonical-block agreement checks.
-	secondaryMu sync.Mutex
-	secondary   map[string]*ethclient.Client
+	// secondary holds one entry per configured URL other than the connected
+	// one, used only for canonical-block agreement checks. Entries are
+	// created under secondaryMu; dialling and calls happen under the entry's
+	// own lock so URLs proceed concurrently and Stop can drain them.
+	secondaryMu      sync.Mutex
+	secondary        map[string]*secondaryClient
+	secondaryStopped bool
+}
+
+type secondaryClient struct {
+	mu     sync.Mutex
+	client *ethclient.Client
 }
 
 func NewEvmRpcClient(networkConfig config.BaseNetworkConfig, networkName string, address ecommon.Address) (*EvmRpc, error) {
@@ -71,6 +79,7 @@ func NewEvmRpcClient(networkConfig config.BaseNetworkConfig, networkName string,
 		}
 	}
 	newUrls.Clear()
+	warnAgreementConfiguration(logger, networkName, newUrls.Urls)
 
 	newBridgeContract, err := bridge.NewBridge(address, newRpcClient)
 	if err != nil {
@@ -96,6 +105,25 @@ func NewEvmRpcClient(networkConfig config.BaseNetworkConfig, networkName string,
 }
 
 /// Utils
+
+// warnAgreementConfiguration tells the operator when canonical-block
+// agreement cannot be independent: a single URL, or the same URL listed
+// twice, is one provider's word.
+func warnAgreementConfiguration(logger *zap.SugaredLogger, networkName string, urls []string) {
+	seen := make(map[string]bool, len(urls))
+	distinct := 0
+	for _, url := range urls {
+		if seen[url] {
+			logger.Warnf("network %s lists the same EVM endpoint more than once; duplicates add no independent agreement", networkName)
+			continue
+		}
+		seen[url] = true
+		distinct++
+	}
+	if distinct < 2 {
+		logger.Warnf("network %s has a single EVM endpoint; canonical-block agreement relies on that one provider, configure two or more independent endpoints for reorg and backfill safety", networkName)
+	}
+}
 
 func (r *EvmRpc) Bridge() *bridge.Bridge {
 	return r.bridgeContract
@@ -482,46 +510,61 @@ func agreeCanonicalHash(number uint64, results []headerResult) (ecommon.Hash, er
 
 // headerFromSecondary asks a non-connected configured endpoint for a header,
 // dialling it on first use and keeping the client for later checks. A
-// failing client is dropped so the next check re-dials.
+// failing client is dropped so the next check re-dials. After Stop no new
+// client is created.
 func (r *EvmRpc) headerFromSecondary(url string, number uint64) (*etypes.Header, error) {
-	ctx, cancel := callContext(evmCallTimeout)
-	defer cancel()
-
 	r.secondaryMu.Lock()
-	client, ok := r.secondary[url]
+	if r.secondaryStopped {
+		r.secondaryMu.Unlock()
+		return nil, errors.New("evm rpc stopped")
+	}
+	entry, ok := r.secondary[url]
 	if !ok {
-		var err error
-		client, err = ethclient.DialContext(ctx, url)
-		if err != nil {
-			r.secondaryMu.Unlock()
-			return nil, err
-		}
 		if r.secondary == nil {
-			r.secondary = make(map[string]*ethclient.Client)
+			r.secondary = make(map[string]*secondaryClient)
 		}
-		r.secondary[url] = client
+		entry = &secondaryClient{}
+		r.secondary[url] = entry
 	}
 	r.secondaryMu.Unlock()
 
-	header, err := client.HeaderByNumber(ctx, new(big.Int).SetUint64(number))
-	if err != nil {
-		r.secondaryMu.Lock()
-		if r.secondary[url] == client {
-			delete(r.secondary, url)
+	entry.mu.Lock()
+	defer entry.mu.Unlock()
+	ctx, cancel := callContext(evmCallTimeout)
+	defer cancel()
+	if entry.client == nil {
+		client, err := ethclient.DialContext(ctx, url)
+		if err != nil {
+			return nil, err
 		}
-		r.secondaryMu.Unlock()
-		client.Close()
+		entry.client = client
+	}
+	header, err := entry.client.HeaderByNumber(ctx, new(big.Int).SetUint64(number))
+	if err != nil {
+		entry.client.Close()
+		entry.client = nil
 		return nil, err
 	}
 	return header, nil
 }
 
+// closeSecondaryClients marks the rpc as stopped so no new secondary client
+// is created, then closes every existing one, waiting for in-flight calls.
 func (r *EvmRpc) closeSecondaryClients() {
 	r.secondaryMu.Lock()
-	defer r.secondaryMu.Unlock()
-	for url, client := range r.secondary {
-		client.Close()
-		delete(r.secondary, url)
+	r.secondaryStopped = true
+	entries := make([]*secondaryClient, 0, len(r.secondary))
+	for _, entry := range r.secondary {
+		entries = append(entries, entry)
+	}
+	r.secondaryMu.Unlock()
+	for _, entry := range entries {
+		entry.mu.Lock()
+		if entry.client != nil {
+			entry.client.Close()
+			entry.client = nil
+		}
+		entry.mu.Unlock()
 	}
 }
 

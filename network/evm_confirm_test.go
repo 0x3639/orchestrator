@@ -284,3 +284,18 @@ func TestClassifyEvent(t *testing.T) {
 		t.Fatal("endpoint failure must surface as an error")
 	}
 }
+
+func TestClassifyEventDoesNotNeedBlockLogsForReorg(t *testing.T) {
+	header := canonicalHeader(100)
+	ev := testEvent(100, header)
+	replacement := canonicalHeader(100)
+	replacement.Extra = []byte("fork")
+	chain := healthyChain(ev, header)
+	chain.header = replacement
+	chain.logsErr = errors.New("block-hash log queries unsupported")
+
+	v, err := classifyEvent(chain, ev, testContract)
+	if err != nil || v != verdictReorged {
+		t.Fatalf("agreed different block is a reorg regardless of log availability, got %s err=%v", v, err)
+	}
+}

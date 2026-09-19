@@ -46,39 +46,38 @@ type evmNetwork struct {
 	// events without wiping and resyncing from the deployment height.
 	backfillBlocks uint64
 
-	// evidenceCache remembers the agreed canonical hash and block logs per
-	// height for the duration of one Sync pass so a block with several
-	// unwrap logs is checked once. It is never used for deletions.
-	evidenceMu    sync.Mutex
-	evidenceCache map[uint64]blockEvidence
+	// canonicalCache remembers the agreed canonical hash per height for the
+	// duration of one Sync pass so a block with several unwrap logs costs
+	// one agreement check. It is never used for deletions.
+	canonicalMu    sync.Mutex
+	canonicalCache map[uint64]ecommon.Hash
 }
 
-// classifyCached is classifyEvent with the chain evidence memoised for the
-// current Sync pass.
-func (eN *evmNetwork) classifyCached(ev *events.UnwrapRequestEvm) (eventVerdict, error) {
-	eN.evidenceMu.Lock()
-	evidence, ok := eN.evidenceCache[ev.BlockNumber]
-	eN.evidenceMu.Unlock()
-	if !ok || (evidence.hash == ev.BlockHash && evidence.logs == nil) {
-		var err error
-		evidence, err = fetchBlockEvidence(eN.EvmRpc(), ev)
-		if err != nil {
-			return verdictInconclusive, err
-		}
-		eN.evidenceMu.Lock()
-		if eN.evidenceCache == nil {
-			eN.evidenceCache = make(map[uint64]blockEvidence)
-		}
-		eN.evidenceCache[ev.BlockNumber] = evidence
-		eN.evidenceMu.Unlock()
+// agreedHashCached is EvmRpc.CanonicalHash memoised for the current Sync pass.
+func (eN *evmNetwork) agreedHashCached(number uint64) (ecommon.Hash, error) {
+	eN.canonicalMu.Lock()
+	hash, ok := eN.canonicalCache[number]
+	eN.canonicalMu.Unlock()
+	if ok {
+		return hash, nil
 	}
-	return classifyWithEvidence(ev, evidence, *eN.ContractAddress()), nil
+	hash, err := eN.EvmRpc().CanonicalHash(number)
+	if err != nil {
+		return ecommon.Hash{}, err
+	}
+	eN.canonicalMu.Lock()
+	if eN.canonicalCache == nil {
+		eN.canonicalCache = make(map[uint64]ecommon.Hash)
+	}
+	eN.canonicalCache[number] = hash
+	eN.canonicalMu.Unlock()
+	return hash, nil
 }
 
-func (eN *evmNetwork) resetEvidenceCache() {
-	eN.evidenceMu.Lock()
-	eN.evidenceCache = make(map[uint64]blockEvidence)
-	eN.evidenceMu.Unlock()
+func (eN *evmNetwork) resetCanonicalCache() {
+	eN.canonicalMu.Lock()
+	eN.canonicalCache = make(map[uint64]ecommon.Hash)
+	eN.canonicalMu.Unlock()
 }
 
 func NewEvmNetwork(network *definition.NetworkInfo, dbManager *manager.Manager, rpcManager *rpc.Manager, state *common.GlobalState, stop chan os.Signal) (*evmNetwork, error) {
@@ -257,7 +256,7 @@ func (eN *evmNetwork) pruneNonCanonicalUnsigned(fromBlock uint64) error {
 
 func (eN *evmNetwork) Sync() error {
 	eN.logger.Info("In sync evm")
-	eN.resetEvidenceCache()
+	eN.resetCanonicalCache()
 	if updateHeight, err := eN.eventsStore().GetLastUpdateHeight(); err != nil {
 		return err
 	} else {
@@ -419,15 +418,22 @@ func (eN *evmNetwork) InterpretLog(log etypes.Log, live bool) error {
 				}
 				eN.logger.Info("Successfully enqueued event")
 			} else {
-				// Historical logs bypass the unconfirmed queue, so they get the
-				// same canonical check here: a backend on a minority fork must
-				// not be able to plant a fork-only record on this signer.
-				verdict, err := eN.classifyCached(ev)
+				// Historical logs bypass the unconfirmed queue, so a backend on
+				// a minority fork must not be able to plant a fork-only record.
+				// The range log itself is the presence evidence: it is stored
+				// when every endpoint agrees its block is canonical, skipped
+				// when every endpoint agrees on a different block (an orphan
+				// log), and the range is retried when endpoints disagree or
+				// fail. This never pins on a provider that cannot serve
+				// block-hash log queries.
+				canonical, err := eN.agreedHashCached(ev.BlockNumber)
 				if err != nil {
 					return fmt.Errorf("cannot validate historical unwrap %s/%d against the canonical chain: %w", ev.TransactionHash.String(), ev.LogIndex, err)
 				}
-				if verdict != verdictPresent {
-					return fmt.Errorf("historical unwrap %s/%d in block %d (%s) not confirmed by the agreed canonical chain: %s", ev.TransactionHash.String(), ev.LogIndex, ev.BlockNumber, ev.BlockHash.Hex(), verdict)
+				if canonical != ev.BlockHash {
+					eN.logger.Warnf("Skipping historical unwrap %s/%d from block %d (%s): every endpoint agrees the canonical block is %s",
+						ev.TransactionHash.String(), ev.LogIndex, ev.BlockNumber, ev.BlockHash.Hex(), canonical.Hex())
+					continue
 				}
 				// Present already when the znn sync or a previous pass stored it;
 				// UpdateUnwrapRequestBlockNumber inserts when missing and otherwise

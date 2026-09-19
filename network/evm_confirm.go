@@ -195,49 +195,24 @@ func (v eventVerdict) String() string {
 	return "inconclusive"
 }
 
-// blockEvidence is what the chain reports for one height: the agreed
-// canonical hash and, when it matches the observed block, that block's
-// bridge logs.
-type blockEvidence struct {
-	hash ecommon.Hash
-	logs []etypes.Log
-}
-
-// fetchBlockEvidence collects the evidence for ev's height. Block logs are
-// only fetched when the canonical hash is the block the event was seen in.
-func fetchBlockEvidence(chain evmChainReader, ev *events.UnwrapRequestEvm) (blockEvidence, error) {
-	hash, err := chain.CanonicalHash(ev.BlockNumber)
-	if err != nil {
-		return blockEvidence{}, err
-	}
-	evidence := blockEvidence{hash: hash}
-	if hash == ev.BlockHash {
-		logs, err := chain.FilterBlockLogs(hash)
-		if err != nil {
-			return blockEvidence{}, err
-		}
-		evidence.logs = logs
-	}
-	return evidence, nil
-}
-
-func classifyWithEvidence(ev *events.UnwrapRequestEvm, evidence blockEvidence, contract ecommon.Address) eventVerdict {
-	if evidence.hash != ev.BlockHash {
-		return verdictReorged
-	}
-	if blockContainsEvent(evidence.logs, ev, contract) {
-		return verdictPresent
-	}
-	return verdictInconclusive
-}
-
-// classifyEvent checks an event against the canonical chain with fresh
-// calls. It is used to validate historical logs before storing them and,
-// with no caching, to decide deletions during a backfill.
+// classifyEvent checks a stored event against the canonical chain with
+// fresh calls. It decides deletions during a backfill: only an agreed
+// different block is a reorg; a canonical block whose logs do not show the
+// event is inconclusive.
 func classifyEvent(chain evmChainReader, ev *events.UnwrapRequestEvm, contract ecommon.Address) (eventVerdict, error) {
-	evidence, err := fetchBlockEvidence(chain, ev)
+	hash, err := chain.CanonicalHash(ev.BlockNumber)
 	if err != nil {
 		return verdictInconclusive, err
 	}
-	return classifyWithEvidence(ev, evidence, contract), nil
+	if hash != ev.BlockHash {
+		return verdictReorged, nil
+	}
+	logs, err := chain.FilterBlockLogs(hash)
+	if err != nil {
+		return verdictInconclusive, err
+	}
+	if blockContainsEvent(logs, ev, contract) {
+		return verdictPresent, nil
+	}
+	return verdictInconclusive, nil
 }
