@@ -1135,9 +1135,16 @@ func (node *Node) processSignaturesUnwrap() (error, bool) {
 	if err != nil {
 		return err, true
 	}
-	requests, err = node.reconcileUnsignedUnwrapRequests(requests)
+	requests, complete, err := node.reconcileUnsignedUnwrapRequests(requests)
 	if err != nil {
 		return err, true
+	}
+	if !complete {
+		// Signers with more stale records than the lookup budget would build
+		// a different pool than up-to-date signers; the reconciled statuses
+		// are persisted, so the next ceremony continues from there.
+		node.logger.Info("unwrap reconciliation incomplete for this ceremony, skipping signing until the backlog is worked off")
+		return nil, false
 	}
 	if len(requests) == 0 {
 		return nil, false
@@ -1224,25 +1231,27 @@ const reconcileLookupsPerPool = 4
 // wipe and resync the events store.
 //
 // Requests are visited in storage order. The walk stops once enough remain
-// to fill the ceremony pool, or after a bounded number of Zenon lookups, so
-// a large backlog of already-registered records is worked off a slice per
-// ceremony instead of in one pass. Every signer applies the same rule to
-// the same ordered records and the same Zenon state, so a partial pool is
-// still the same pool on every node. Any Zenon RPC failure aborts the
-// ceremony for this node: guessing would produce a pool its peers do not
-// share.
-func (node *Node) reconcileUnsignedUnwrapRequests(requests []*events.UnwrapRequestEvm) ([]*events.UnwrapRequestEvm, error) {
+// to fill the ceremony pool. It also stops after a bounded number of Zenon
+// lookups; in that case the result is reported as incomplete and the caller
+// skips signing, because a signer with a larger stale backlog than the
+// budget would otherwise select a different pool than its peers. Reconciled
+// statuses are persisted either way, so successive ceremonies work the
+// backlog off. Any Zenon RPC failure aborts the ceremony for this node:
+// guessing would produce a pool its peers do not share.
+func (node *Node) reconcileUnsignedUnwrapRequests(requests []*events.UnwrapRequestEvm) ([]*events.UnwrapRequestEvm, bool, error) {
 	poolSize := common.SignCeremonyPoolSize
 	lookupCap := reconcileLookupsPerPool * poolSize
 	remaining := make([]*events.UnwrapRequestEvm, 0, poolSize)
 	reconciled := 0
 	lookups := 0
+	complete := true
 	for _, req := range requests {
 		if len(remaining) >= poolSize {
 			break
 		}
 		if lookups >= lookupCap {
-			node.logger.Warnf("reconcile: stopped after %d Zenon lookups with %d records selected; the rest is worked off in later ceremonies", lookups, len(remaining))
+			node.logger.Warnf("reconcile: stopped after %d Zenon lookups with %d records selected; %d reconciled this pass, the rest is worked off in later ceremonies", lookups, len(remaining), reconciled)
+			complete = false
 			break
 		}
 		lookups++
@@ -1252,7 +1261,7 @@ func (node *Node) reconcileUnsignedUnwrapRequests(requests []*events.UnwrapReque
 				remaining = append(remaining, req)
 				continue
 			}
-			return nil, fmt.Errorf("reconcile: cannot query Zenon for event %s/%d: %w", req.TransactionHash.String(), req.LogIndex, err)
+			return nil, false, fmt.Errorf("reconcile: cannot query Zenon for event %s/%d: %w", req.TransactionHash.String(), req.LogIndex, err)
 		}
 		if rpcReq == nil {
 			remaining = append(remaining, req)
@@ -1265,14 +1274,14 @@ func (node *Node) reconcileUnsignedUnwrapRequests(requests []*events.UnwrapReque
 			status = common.RedeemedStatus
 		}
 		if err := node.networksManager.SetEvmUnwrapRequestStatus(req, status); err != nil {
-			return nil, fmt.Errorf("reconcile: event %s/%d exists on Zenon but its local status could not be updated: %w", req.TransactionHash.String(), req.LogIndex, err)
+			return nil, false, fmt.Errorf("reconcile: event %s/%d exists on Zenon but its local status could not be updated: %w", req.TransactionHash.String(), req.LogIndex, err)
 		}
 		reconciled++
 	}
 	if reconciled > 0 {
 		node.logger.Infof("reconcile: %d unsigned unwrap events already exist on Zenon and were excluded from the pool; %d selected to sign", reconciled, len(remaining))
 	}
-	return remaining, nil
+	return remaining, complete, nil
 }
 
 // Send signatures methods

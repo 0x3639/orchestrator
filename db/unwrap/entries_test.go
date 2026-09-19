@@ -154,25 +154,57 @@ func TestConcurrentMutationsDoNotLoseWrites(t *testing.T) {
 	}
 }
 
-func TestDeleteUnwrapRequest(t *testing.T) {
+func TestDeleteUnwrapRequestIfUnsigned(t *testing.T) {
 	store := newTestStorage(t)
 	ev := sampleEvent("0x0d", 0)
+	ev.BlockHash = ecommon.HexToHash("0xb10c")
 	if _, err := store.AddUnwrapRequestIfMissing(ev); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.DeleteUnwrapRequest(ev.TransactionHash, 0); err != nil {
+
+	// Wrong block hash: the record was refreshed to another block meanwhile.
+	deleted, err := store.DeleteUnwrapRequestIfUnsigned(ev.TransactionHash, 0, ecommon.HexToHash("0xdead"))
+	if err != nil || deleted {
+		t.Fatalf("mismatched block must not delete, got deleted=%v err=%v", deleted, err)
+	}
+
+	// Signed meanwhile: keep.
+	if err := store.SetUnwrapRequestSignature(ev.TransactionHash, 0, "sig"); err != nil {
 		t.Fatal(err)
+	}
+	deleted, err = store.DeleteUnwrapRequestIfUnsigned(ev.TransactionHash, 0, ev.BlockHash)
+	if err != nil || deleted {
+		t.Fatalf("signed record must not delete, got deleted=%v err=%v", deleted, err)
+	}
+	if err := store.SetUnsentUnwrapRequestAsUnsigned(ev.TransactionHash, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	// Marked by the Zenon listener meanwhile: keep.
+	if err := store.SetUnwrapRequestStatus(ev.TransactionHash, 0, common.PendingRedeemStatus); err != nil {
+		t.Fatal(err)
+	}
+	deleted, err = store.DeleteUnwrapRequestIfUnsigned(ev.TransactionHash, 0, ev.BlockHash)
+	if err != nil || deleted {
+		t.Fatalf("pending record must not delete, got deleted=%v err=%v", deleted, err)
+	}
+	if err := store.SetUnwrapRequestStatus(ev.TransactionHash, 0, common.UnredeemedStatus); err != nil {
+		t.Fatal(err)
+	}
+
+	// Still unsigned, unredeemed and same block: delete.
+	deleted, err = store.DeleteUnwrapRequestIfUnsigned(ev.TransactionHash, 0, ev.BlockHash)
+	if err != nil || !deleted {
+		t.Fatalf("expected delete, got deleted=%v err=%v", deleted, err)
 	}
 	got, err := store.GetUnwrapRequestByHashAndLog(ev.TransactionHash, 0)
-	if err != nil {
-		t.Fatal(err)
+	if err != nil || got != nil {
+		t.Fatalf("record should be gone, got %+v err=%v", got, err)
 	}
-	if got != nil {
-		t.Fatalf("record should be gone, got %+v", got)
-	}
-	unsigned, err := store.GetUnsignedUnwrapRequests()
-	if err != nil || len(unsigned) != 0 {
-		t.Fatalf("deleted record must not be listed, got %d err=%v", len(unsigned), err)
+	// Deleting again is a no-op.
+	deleted, err = store.DeleteUnwrapRequestIfUnsigned(ev.TransactionHash, 0, ev.BlockHash)
+	if err != nil || deleted {
+		t.Fatalf("missing record must report not deleted, got deleted=%v err=%v", deleted, err)
 	}
 }
 

@@ -19,7 +19,9 @@ import (
 	"orchestrator/common/bridge"
 	"orchestrator/common/config"
 	"orchestrator/common/storage"
+	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -33,9 +35,15 @@ type EvmRpc struct {
 	filterQuery     ethereum.FilterQuery
 	filterQuerySize uint64
 
+	subMu   sync.Mutex
 	logSub  ethereum.Subscription
 	logChan chan etypes.Log
 	logger  *zap.SugaredLogger
+
+	// secondary holds clients for configured URLs other than the connected
+	// one, used only for canonical-block agreement checks.
+	secondaryMu sync.Mutex
+	secondary   map[string]*ethclient.Client
 }
 
 func NewEvmRpcClient(networkConfig config.BaseNetworkConfig, networkName string, address ecommon.Address) (*EvmRpc, error) {
@@ -102,8 +110,15 @@ func (r *EvmRpc) FilterQuerySize() uint64 {
 }
 
 func (r *EvmRpc) Stop() {
+	r.subMu.Lock()
+	sub := r.logSub
+	r.logSub = nil
+	r.subMu.Unlock()
+	if sub != nil {
+		sub.Unsubscribe()
+	}
 	r.rpcClient.Close()
-	r.logSub.Unsubscribe()
+	r.closeSecondaryClients()
 }
 
 // todo return an error?
@@ -133,13 +148,15 @@ func (r *EvmRpc) IsSynced() bool {
 /// Subscribe
 
 func (r *EvmRpc) SubscribeToLogs() (ethereum.Subscription, chan etypes.Log, error) {
-	var err error
-	r.logSub, err = r.rpcClient.SubscribeFilterLogs(context.Background(), r.filterQuery, r.logChan)
+	sub, err := r.rpcClient.SubscribeFilterLogs(context.Background(), r.filterQuery, r.logChan)
 	if err != nil {
 		r.logger.Errorf("Error after subscribe: %s", err.Error())
 		return nil, nil, err
 	}
-	return r.logSub, r.logChan, nil
+	r.subMu.Lock()
+	r.logSub = sub
+	r.subMu.Unlock()
+	return sub, r.logChan, nil
 }
 
 /// Transactions
@@ -384,65 +401,128 @@ func (r *EvmRpc) HeaderByNumber(number uint64) (*etypes.Header, error) {
 	return r.rpcClient.HeaderByNumber(ctx, new(big.Int).SetUint64(number))
 }
 
+// headerResult is one endpoint's answer for a block header.
+type headerResult struct {
+	endpoint int
+	hash     ecommon.Hash
+	err      error
+}
+
 // CanonicalHash returns the hash of the canonical block at number as agreed
-// by every reachable configured endpoint. The connected endpoint is asked
-// through the existing client; every other configured URL is dialled for
-// the one call. Endpoints that disagree, which happens when a load-balanced
-// provider is split across forks or a backend lags, yield an error so the
-// caller treats the answer as unknown rather than acting on one backend's
-// view. With a single configured URL this is that endpoint's answer.
+// by every configured endpoint. The connected endpoint is asked through the
+// existing client; every other configured URL is asked through a retained
+// secondary client. All endpoints are queried concurrently under one
+// deadline. The answer is only definitive when every endpoint responds and
+// all responses match; a missing or disagreeing endpoint yields an error,
+// so a split or partially unreachable provider can never justify dropping
+// an event. With a single configured URL this is that endpoint's answer.
 func (r *EvmRpc) CanonicalHash(number uint64) (ecommon.Hash, error) {
-	agreed := make(map[ecommon.Hash][]int)
+	urls := r.Urls.Urls
+	results := make([]headerResult, len(urls))
+	var wg sync.WaitGroup
+	for idx, url := range urls {
+		wg.Add(1)
+		go func(idx int, url string) {
+			defer wg.Done()
+			var (
+				header *etypes.Header
+				err    error
+			)
+			if uint32(idx) == r.Urls.CurrentUrlIndex {
+				header, err = r.HeaderByNumber(number)
+			} else {
+				header, err = r.headerFromSecondary(url, number)
+			}
+			res := headerResult{endpoint: idx, err: err}
+			if err == nil {
+				if header == nil {
+					res.err = fmt.Errorf("no header for block %d", number)
+				} else {
+					res.hash = header.Hash()
+				}
+			}
+			results[idx] = res
+		}(idx, url)
+	}
+	wg.Wait()
+	return agreeCanonicalHash(number, results)
+}
+
+// agreeCanonicalHash reduces per-endpoint answers to one hash, or an error
+// when any endpoint failed or the answers differ.
+func agreeCanonicalHash(number uint64, results []headerResult) (ecommon.Hash, error) {
+	if len(results) == 0 {
+		return ecommon.Hash{}, errors.New("no EVM endpoints configured")
+	}
 	var failures []string
-	for idx, url := range r.Urls.Urls {
-		var (
-			header *etypes.Header
-			err    error
-		)
-		if uint32(idx) == r.Urls.CurrentUrlIndex {
-			header, err = r.HeaderByNumber(number)
-		} else {
-			header, err = headerFromUrl(url, number)
-		}
-		if err != nil {
-			failures = append(failures, fmt.Sprintf("endpoint #%d: %v", idx, err))
+	byHash := make(map[ecommon.Hash][]int)
+	for _, res := range results {
+		if res.err != nil {
+			failures = append(failures, fmt.Sprintf("endpoint #%d: %v", res.endpoint, res.err))
 			continue
 		}
-		if header == nil {
-			failures = append(failures, fmt.Sprintf("endpoint #%d: no header for block %d", idx, number))
-			continue
-		}
-		hash := header.Hash()
-		agreed[hash] = append(agreed[hash], idx)
+		byHash[res.hash] = append(byHash[res.hash], res.endpoint)
 	}
-	if len(agreed) == 0 {
-		return ecommon.Hash{}, fmt.Errorf("no configured endpoint returned block %d: %s", number, strings.Join(failures, "; "))
+	if len(failures) > 0 {
+		return ecommon.Hash{}, fmt.Errorf("canonical block %d inconclusive, %d of %d endpoints did not answer: %s", number, len(failures), len(results), strings.Join(failures, "; "))
 	}
-	if len(agreed) > 1 {
-		views := make([]string, 0, len(agreed))
-		for hash, idxs := range agreed {
+	if len(byHash) > 1 {
+		views := make([]string, 0, len(byHash))
+		for hash, idxs := range byHash {
 			views = append(views, fmt.Sprintf("%s from endpoints %v", hash.Hex(), idxs))
 		}
+		sort.Strings(views)
 		return ecommon.Hash{}, fmt.Errorf("configured endpoints disagree on canonical block %d: %s", number, strings.Join(views, "; "))
 	}
-	for hash := range agreed {
-		if len(failures) > 0 {
-			r.logger.Debugf("CanonicalHash(%d): %d endpoint(s) unreachable: %s", number, len(failures), strings.Join(failures, "; "))
-		}
+	for hash := range byHash {
 		return hash, nil
 	}
 	return ecommon.Hash{}, errors.New("unreachable")
 }
 
-func headerFromUrl(url string, number uint64) (*etypes.Header, error) {
+// headerFromSecondary asks a non-connected configured endpoint for a header,
+// dialling it on first use and keeping the client for later checks. A
+// failing client is dropped so the next check re-dials.
+func (r *EvmRpc) headerFromSecondary(url string, number uint64) (*etypes.Header, error) {
 	ctx, cancel := callContext(evmCallTimeout)
 	defer cancel()
-	client, err := ethclient.DialContext(ctx, url)
+
+	r.secondaryMu.Lock()
+	client, ok := r.secondary[url]
+	if !ok {
+		var err error
+		client, err = ethclient.DialContext(ctx, url)
+		if err != nil {
+			r.secondaryMu.Unlock()
+			return nil, err
+		}
+		if r.secondary == nil {
+			r.secondary = make(map[string]*ethclient.Client)
+		}
+		r.secondary[url] = client
+	}
+	r.secondaryMu.Unlock()
+
+	header, err := client.HeaderByNumber(ctx, new(big.Int).SetUint64(number))
 	if err != nil {
+		r.secondaryMu.Lock()
+		if r.secondary[url] == client {
+			delete(r.secondary, url)
+		}
+		r.secondaryMu.Unlock()
+		client.Close()
 		return nil, err
 	}
-	defer client.Close()
-	return client.HeaderByNumber(ctx, new(big.Int).SetUint64(number))
+	return header, nil
+}
+
+func (r *EvmRpc) closeSecondaryClients() {
+	r.secondaryMu.Lock()
+	defer r.secondaryMu.Unlock()
+	for url, client := range r.secondary {
+		client.Close()
+		delete(r.secondary, url)
+	}
 }
 
 func (r *EvmRpc) BlockByHash(hash ecommon.Hash) (*etypes.Block, error) {

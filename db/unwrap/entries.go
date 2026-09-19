@@ -52,14 +52,26 @@ func (es *evmStorage) AddUnwrapRequestIfMissing(event events.UnwrapRequestEvm) (
 	return true, es.putUnwrapRequest(event)
 }
 
-func (es *evmStorage) DeleteUnwrapRequest(txHash ecommon.Hash, logIndex uint32) error {
+func (es *evmStorage) DeleteUnwrapRequestIfUnsigned(txHash ecommon.Hash, logIndex uint32, blockHash ecommon.Hash) (bool, error) {
 	es.mu.Lock()
 	defer es.mu.Unlock()
+	current, err := es.GetUnwrapRequestByHashAndLog(txHash, logIndex)
+	if err != nil {
+		return false, err
+	}
+	if current == nil {
+		return false, nil
+	}
+	// The record may have been signed, marked by the Zenon listener, or
+	// refreshed to another block since the caller inspected it.
+	if current.Signature != "" || current.RedeemStatus != common.UnredeemedStatus || current.BlockHash != blockHash {
+		return false, nil
+	}
 	if err := es.DB.Delete(getUnwrapRequestKey(txHash, logIndex)); err != nil {
 		es.SendSigInt()
-		return err
+		return false, err
 	}
-	return nil
+	return true, nil
 }
 
 func (es *evmStorage) UpdateUnwrapRequestBlockNumber(event events.UnwrapRequestEvm) error {

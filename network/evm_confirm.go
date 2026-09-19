@@ -169,21 +169,75 @@ func blockContainsEvent(logs []etypes.Log, ev *events.UnwrapRequestEvm, contract
 	return false
 }
 
-// eventIsCanonical reports whether a stored event's block is the agreed
-// canonical block at its height and still carries the event's log. It is
-// used to validate historical logs before they are stored and to prune
-// records that came from a fork.
-func eventIsCanonical(chain evmChainReader, ev *events.UnwrapRequestEvm, contract ecommon.Address) (bool, error) {
-	canonical, err := chain.CanonicalHash(ev.BlockNumber)
+// eventVerdict is the result of checking a stored or historical event
+// against the agreed canonical chain.
+type eventVerdict int
+
+const (
+	// verdictInconclusive means the canonical block matches the event's
+	// block but the connected endpoint did not show the event's log. That
+	// is a provider defect or pruning, not evidence the event is bogus.
+	verdictInconclusive eventVerdict = iota
+	// verdictPresent means the event's block is canonical and carries its log.
+	verdictPresent
+	// verdictReorged means every endpoint agrees the canonical block at the
+	// event's height is a different block.
+	verdictReorged
+)
+
+func (v eventVerdict) String() string {
+	switch v {
+	case verdictPresent:
+		return "present"
+	case verdictReorged:
+		return "reorged"
+	}
+	return "inconclusive"
+}
+
+// blockEvidence is what the chain reports for one height: the agreed
+// canonical hash and, when it matches the observed block, that block's
+// bridge logs.
+type blockEvidence struct {
+	hash ecommon.Hash
+	logs []etypes.Log
+}
+
+// fetchBlockEvidence collects the evidence for ev's height. Block logs are
+// only fetched when the canonical hash is the block the event was seen in.
+func fetchBlockEvidence(chain evmChainReader, ev *events.UnwrapRequestEvm) (blockEvidence, error) {
+	hash, err := chain.CanonicalHash(ev.BlockNumber)
 	if err != nil {
-		return false, err
+		return blockEvidence{}, err
 	}
-	if canonical != ev.BlockHash {
-		return false, nil
+	evidence := blockEvidence{hash: hash}
+	if hash == ev.BlockHash {
+		logs, err := chain.FilterBlockLogs(hash)
+		if err != nil {
+			return blockEvidence{}, err
+		}
+		evidence.logs = logs
 	}
-	logs, err := chain.FilterBlockLogs(ev.BlockHash)
+	return evidence, nil
+}
+
+func classifyWithEvidence(ev *events.UnwrapRequestEvm, evidence blockEvidence, contract ecommon.Address) eventVerdict {
+	if evidence.hash != ev.BlockHash {
+		return verdictReorged
+	}
+	if blockContainsEvent(evidence.logs, ev, contract) {
+		return verdictPresent
+	}
+	return verdictInconclusive
+}
+
+// classifyEvent checks an event against the canonical chain with fresh
+// calls. It is used to validate historical logs before storing them and,
+// with no caching, to decide deletions during a backfill.
+func classifyEvent(chain evmChainReader, ev *events.UnwrapRequestEvm, contract ecommon.Address) (eventVerdict, error) {
+	evidence, err := fetchBlockEvidence(chain, ev)
 	if err != nil {
-		return false, err
+		return verdictInconclusive, err
 	}
-	return blockContainsEvent(logs, ev, contract), nil
+	return classifyWithEvidence(ev, evidence, contract), nil
 }

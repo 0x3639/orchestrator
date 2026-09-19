@@ -250,33 +250,37 @@ func TestConfirmQueuedEventDiscardsReorgedBlock(t *testing.T) {
 	}
 }
 
-func TestEventIsCanonical(t *testing.T) {
+func TestClassifyEvent(t *testing.T) {
 	header := canonicalHeader(100)
 	ev := testEvent(100, header)
 	chain := healthyChain(ev, header)
 
-	ok, err := eventIsCanonical(chain, ev, testContract)
-	if err != nil || !ok {
-		t.Fatalf("expected canonical, got ok=%v err=%v", ok, err)
+	v, err := classifyEvent(chain, ev, testContract)
+	if err != nil || v != verdictPresent {
+		t.Fatalf("expected present, got %s err=%v", v, err)
 	}
 
+	// Canonical block matches but the endpoint returns no log: inconclusive,
+	// never grounds for deletion.
 	chain.logs = nil
-	ok, err = eventIsCanonical(chain, ev, testContract)
-	if err != nil || ok {
-		t.Fatalf("block without the log must not be canonical for the event, got ok=%v err=%v", ok, err)
+	v, err = classifyEvent(chain, ev, testContract)
+	if err != nil || v != verdictInconclusive {
+		t.Fatalf("empty logs must be inconclusive, got %s err=%v", v, err)
 	}
 
+	// Every endpoint agrees on a different block: reorged.
 	replacement := canonicalHeader(100)
 	replacement.Extra = []byte("fork")
 	chain = healthyChain(ev, header)
 	chain.header = replacement
-	ok, err = eventIsCanonical(chain, ev, testContract)
-	if err != nil || ok {
-		t.Fatalf("reorged block must not be canonical, got ok=%v err=%v", ok, err)
+	v, err = classifyEvent(chain, ev, testContract)
+	if err != nil || v != verdictReorged {
+		t.Fatalf("expected reorged, got %s err=%v", v, err)
 	}
 
-	chain.headerErr = errors.New("endpoints disagree")
-	if _, err := eventIsCanonical(chain, ev, testContract); err == nil {
-		t.Fatal("endpoint disagreement must surface as an error, not a verdict")
+	// Endpoint disagreement or failure is an error, not a verdict.
+	chain.headerErr = errors.New("canonical block 100 inconclusive, 1 of 3 endpoints did not answer")
+	if _, err := classifyEvent(chain, ev, testContract); err == nil {
+		t.Fatal("endpoint failure must surface as an error")
 	}
 }
