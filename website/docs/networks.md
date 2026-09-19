@@ -51,7 +51,14 @@ The cost of the cap in CU per second is `RpcRequestsPerSecond × CU per call`, s
 Tuning:
 
 - **Provider rejects on frequency**: lower `RpcRequestsPerSecond`.
-- **Provider times out or rejects on size**: lower `FilterQuerySize` to `1000`. The retry loop handles the occasional timeout, but a range that always times out never completes.
+- **Provider rejects the window width or result size**: the sync narrows its `eth_getLogs` window automatically. When the provider's message names the width it accepts, as Alchemy's does, the window drops straight to it; otherwise it halves on each rejection down to 8 blocks. It widens again after 50 consecutive successes, and logs each change. `FilterQuerySize` is the ceiling it starts from.
+- **Provider times out**: lower `FilterQuerySize`. A range that always times out never completes.
+
+:::caution Free provider plans cannot do the initial scan
+Measured in September 2026: **Alchemy's** free tier limits `eth_getLogs` to a 10-block window, and **dRPC's** free plan rejects windows wider than roughly 100 blocks (its message quotes 10,000) and often cannot route queries far behind the head at all. The sync narrows its window and keeps going, but a first scan of Ethereum from the bridge's deployment block at 10-block windows is close to a million queries, days at any sane request rate.
+
+For the initial scan, in order of preference: copy `~/.orchestrator/events` from a healthy signer (all signers hold the same event set, and the copy carries the sync cursor, so only the tail needs scanning); run your own full node; or use a provider whose free tier allows wide historical windows, such as Infura's 10,000 blocks, for the scan alone. Once the cursor is near the head, the 3-minute catch-ups cover a handful of blocks and any of these plans serves them.
+:::
 - **Several networks or URLs share one API key**: the caps add up per endpoint. Set each low enough that the sum fits the account.
 
 ## What the endpoint must support

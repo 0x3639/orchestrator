@@ -17,6 +17,9 @@ Log lines you will meet, what they mean, and what to do.
 | `network Ethereum has a single EVM endpoint` | Canonical-block agreement relies on one provider | Add a second independent endpoint. |
 | `EVM RPC requests are not rate limited` | `RpcRequestsPerSecond` missing from this network | Add it; see [EVM networks](../networks.md). |
 | `Sync … failed at block N (attempt k/12), retrying in …` | Provider rejected or timed out a query | Normal under throttling. Persistent: lower the rate or `FilterQuerySize`. |
+| `provider rejected an eth_getLogs window of W blocks (…); narrowing to N blocks` | The provider's plan allows narrower log queries than `FilterQuerySize` | None; the sync adapts. If it narrows all the way to 8, the provider is unsuitable for a full scan; see [EVM networks](../networks.md). |
+| `N consecutive ranges succeeded, widening the eth_getLogs window to W blocks` | Probing back toward `FilterQuerySize` | None; informational. |
+| `Can't route your request to suitable provider` | A load-balanced provider has no backend for this query, typically deep history on a free plan | Retries automatically; persistent means the provider lacks the history. Use a full-history endpoint. |
 | `… giving up until the next refresh` | 12 consecutive failures on one range | Sync resumes in 3 minutes from the same cursor. Check provider health. |
 | `head N is below the range end M` | A lagging backend behind the endpoint | Retries automatically; persistent means the provider is inconsistent. |
 | `canonical block N inconclusive, k of m endpoints did not answer` | An agreement endpoint is down | Fix that endpoint; nothing is decided until all answer. |

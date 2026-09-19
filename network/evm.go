@@ -46,6 +46,9 @@ type evmNetwork struct {
 	// events without wiping and resyncing from the deployment height.
 	backfillBlocks uint64
 
+	// queryRange tunes the eth_getLogs window to what the provider accepts.
+	queryRange *queryRangeAdapter
+
 	// canonicalCache remembers the agreed canonical hash per height for the
 	// duration of one Sync pass so a block with several unwrap logs costs
 	// one agreement check. It is never used for deletions.
@@ -327,9 +330,12 @@ func (eN *evmNetwork) Sync() error {
 			return errors.Errorf("sync evm problem for network: %s, chainId: %d", eN.NetworkName(), eN.ChainId())
 		}
 
+		if eN.queryRange == nil {
+			eN.queryRange = newQueryRangeAdapter(eN.rpcManager.Evm(eN.ChainId()).FilterQuerySize())
+		}
 		if !rangeFrozen {
 			distance := latestBlock - updateHeight
-			filterQuerySize := eN.rpcManager.Evm(eN.ChainId()).FilterQuerySize()
+			filterQuerySize := eN.queryRange.size()
 			rangeIsTip = false
 			if distance < eN.ConfirmationsToFinality() || distance == 0 {
 				// The range reaches the head. A zero distance still queries
@@ -362,6 +368,24 @@ func (eN *evmNetwork) Sync() error {
 
 		logs, err := eN.EvmRpc().FilterLogs(updateHeight, rangeEnd)
 		if err != nil {
+			if isRangeLimitError(err) && filterQuerySize > 1 {
+				// The provider rejected the window's width or result size.
+				// Narrow the window, to the width the message suggests when
+				// it gives one, and retry at once; this is not a transient
+				// failure, so it does not spend the retry budget. The reduced
+				// width is kept for the following ranges.
+				hint, _ := suggestedRange(err)
+				newSize, _ := eN.queryRange.shrink(hint)
+				if newSize < filterQuerySize {
+					eN.logger.Warnf("Sync for chainId %d: provider rejected an eth_getLogs window of %d blocks (%v); narrowing to %d blocks",
+						eN.ChainId(), filterQuerySize, err, newSize)
+					rangeFrozen = false
+					if !eN.sleep(time.Second) {
+						return errors.New("sync interrupted by shutdown")
+					}
+					continue
+				}
+			}
 			if err := retryRange(fmt.Sprintf("eth_getLogs for blocks [%d, %d]", updateHeight, rangeEnd), err); err != nil {
 				return err
 			}
@@ -391,6 +415,9 @@ func (eN *evmNetwork) Sync() error {
 		attempts = 0
 		backoff = syncRetryBaseBackoff
 		rangeFrozen = false
+		if newSize, grew := eN.queryRange.noteSuccess(); grew {
+			eN.logger.Infof("Sync for chainId %d: %d consecutive ranges succeeded, widening the eth_getLogs window to %d blocks", eN.ChainId(), growAfterRanges, newSize)
+		}
 
 		updateHeight += filterQuerySize
 		if err := eN.eventsStore().SetLastUpdateHeight(updateHeight); err != nil {
