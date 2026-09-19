@@ -24,6 +24,7 @@ func NewNodeManager(ctx *cli.Context) (*Manager, error) {
 	if err != nil {
 		return nil, err
 	}
+	nodeConfig.EvmBackfillBlocks = ctx.GlobalUint64(EvmBackfillBlocksFlag.Name)
 
 	logger, err := common.CreateLogger()
 	if err != nil {

@@ -17,6 +17,14 @@ type EvmStorage interface {
 	AddUnwrapRequest(events.UnwrapRequestEvm) error
 	UpdateUnwrapRequestBlockNumber(events.UnwrapRequestEvm) error
 	GetUnwrapRequestByHashAndLog(ecommon.Hash, uint32) (*events.UnwrapRequestEvm, error)
+	// AddUnwrapRequestIfMissing stores the event only when no record exists
+	// for its hash and log index, so a duplicate delivery can never reset a
+	// signed or sent record. It reports whether a record was added.
+	AddUnwrapRequestIfMissing(events.UnwrapRequestEvm) (bool, error)
+	// DeleteUnwrapRequestIfUnsigned removes the record only if, re-read under
+	// the storage lock, it still has no signature, is still unredeemed and
+	// still refers to the given block hash. It reports whether it deleted.
+	DeleteUnwrapRequestIfUnsigned(txHash ecommon.Hash, logIndex uint32, blockHash ecommon.Hash) (bool, error)
 	SetUnwrapRequestStatus(ecommon.Hash, uint32, uint32) error
 	SetUnwrapRequestSignature(ecommon.Hash, uint32, string) error
 	GetUnwrapRequestsByStatus(uint32) ([]*events.UnwrapRequestEvm, error)
