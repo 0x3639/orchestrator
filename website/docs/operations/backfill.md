@@ -21,7 +21,7 @@ The flag is never persisted. It applies once per process start, so leaving it in
 
 1. **Stop the signer** and back up `~/.orchestrator/events` and `~/.orchestrator/queues`.
 2. **Verify the endpoints.** Two or more independent, full-history providers per network, all healthy and agreeing. Backfill refuses to delete on any disagreement and fails the range on any unreachable endpoint, so a flaky provider makes it stall rather than repair. See [EVM networks](../networks.md).
-3. **Choose `N`** so that `cursor − N` precedes the earliest event the signer may have missed, plus a margin of one confirmation window. Blocks per day: Ethereum about 7,200, BSC about 28,800. A week on Ethereum is `50000`.
+3. **Choose `N`** so that `cursor − N` precedes the earliest event the signer may have missed, plus a margin of one confirmation window. Derive blocks per day from `estimatedBlockTime` in [`getStatus`](../health-api.md) rather than from memory: `86400 / estimatedBlockTime`. Ethereum's 12-second blocks give about 7,200 per day, so a week is `50000`. BSC has shortened its block interval several times (3 s, then 1.5 s, 0.75 s and 0.45 s), so a day there is currently near 200,000 blocks; check the reported value.
 4. **Start once with the flag**:
    ```bash
    orchestrator --evm.backfill-blocks 50000

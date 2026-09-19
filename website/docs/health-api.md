@@ -25,7 +25,7 @@ Responses are `{"result": ..., "error": ""}` or `{"result": null, "error": "<mes
 | `405` | Not a `POST` |
 | `415` | Content type is not `application/json` |
 | `413` | Body over 4 KiB |
-| `400` | Malformed JSON, more than one JSON value, or parameters supplied |
+| `400` | Malformed JSON, more than one JSON value, or a non-empty `params` array |
 | `404` | Unknown method |
 | `429` | Rate limited, see below |
 | `500` | The method itself failed; `error` says why |
@@ -63,7 +63,7 @@ Cached for `CachedResponseDelay` seconds.
 }
 ```
 
-`unwrapsHash` and `wrapsHash` are digests of the ordered set of events this signer still has to sign. **Compare them across signers**: matching hashes mean the signers will form a ceremony; differing hashes mean at least one signer holds a different set. See [Signing stalls](operations/signing-stalls.md).
+`unwrapsHash` and `wrapsHash` are digests of the identities (transaction hash and log index, or wrap id) of **every** event this signer still has to sign, in order. **Compare them across signers.** Differing hashes mean at least one signer holds a different set and will not join the others' ceremony. Matching hashes rule that out but do not guarantee a ceremony: the signers must also agree on the group membership in `LocalPubKeys` and be able to reach each other. See [Signing stalls](operations/signing-stalls.md).
 
 `latestUpdateHeight` is the EVM sync cursor. It should track the chain head within a few minutes; a stalled value means sync is failing, see [First sync](operations/first-sync.md).
 

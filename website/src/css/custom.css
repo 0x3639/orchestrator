@@ -64,8 +64,31 @@
   --ifm-h3-font-size: 1.5rem;
   --ifm-line-height-base: 1.75;
   --ifm-navbar-background-color: var(--background);
-  --ifm-footer-background-color: hsl(0 0% 7%);
   --ifm-toc-border-color: var(--border);
+
+  /* Infima emphasis scale on the neutral ramp so menus, search and dropdowns
+     stay semantic in both themes. */
+  --ifm-color-emphasis-0: hsl(0 0% 100%);
+  --ifm-color-emphasis-100: hsl(0 0% 96%);
+  --ifm-color-emphasis-200: hsl(0 0% 92%);
+  --ifm-color-emphasis-400: hsl(0 0% 80%);
+  --ifm-color-emphasis-500: hsl(0 0% 65%);
+  --ifm-color-emphasis-600: var(--muted-foreground);
+  --ifm-color-emphasis-700: hsl(0 0% 35%);
+  --ifm-color-emphasis-800: hsl(0 0% 25%);
+  --ifm-color-emphasis-900: var(--foreground);
+  --ifm-color-emphasis-1000: hsl(0 0% 8%);
+  --ifm-color-content-secondary: var(--muted-foreground);
+  --ifm-dropdown-background-color: var(--card);
+  --ifm-menu-color: var(--foreground);
+
+  /* Theme-aware shadow scale from the design system's elevation tokens. */
+  --elevation-1: 0 1px 2px 0 hsl(0 0% 0% / 0.05);
+  --elevation-3: 0 4px 12px -2px hsl(0 0% 0% / 0.10);
+  --elevation-4: 0 12px 24px -6px hsl(0 0% 0% / 0.13);
+  --ifm-global-shadow-lw: var(--elevation-1);
+  --ifm-global-shadow-md: var(--elevation-3);
+  --ifm-global-shadow-tl: var(--elevation-4);
   --ifm-table-border-color: var(--border);
   --ifm-table-stripe-background: var(--muted);
   --docusaurus-highlighted-code-line-bg: var(--accent);
@@ -102,6 +125,46 @@
   --ifm-menu-color-background-active: var(--accent);
   --ifm-color-emphasis-300: var(--border);
   --docusaurus-highlighted-code-line-bg: var(--accent);
+
+  --ifm-color-emphasis-0: hsl(0 0% 8%);
+  --ifm-color-emphasis-100: hsl(0 0% 12%);
+  --ifm-color-emphasis-200: hsl(0 0% 16%);
+  --ifm-color-emphasis-400: hsl(0 0% 30%);
+  --ifm-color-emphasis-500: hsl(0 0% 45%);
+  --ifm-color-emphasis-600: var(--muted-foreground);
+  --ifm-color-emphasis-700: hsl(0 0% 78%);
+  --ifm-color-emphasis-800: hsl(0 0% 88%);
+  --ifm-color-emphasis-900: var(--foreground);
+  --ifm-color-emphasis-1000: hsl(0 0% 100%);
+  --ifm-color-content-secondary: var(--muted-foreground);
+  --ifm-dropdown-background-color: hsl(0 0% 14%);
+  --ifm-menu-color: var(--foreground);
+
+  --elevation-1: 0 1px 2px 0 hsl(0 0% 0% / 0.45), inset 0 1px 0 0 hsl(0 0% 100% / 0.03);
+  --elevation-3: 0 8px 18px -4px hsl(0 0% 0% / 0.60), inset 0 1px 0 0 hsl(0 0% 100% / 0.05);
+  --elevation-4: 0 14px 32px -8px hsl(0 0% 0% / 0.65), inset 0 1px 0 0 hsl(0 0% 100% / 0.05);
+  --ifm-global-shadow-lw: var(--elevation-1);
+  --ifm-global-shadow-md: var(--elevation-3);
+  --ifm-global-shadow-tl: var(--elevation-4);
+}
+
+/* The footer is always the near-black surface, in both themes; Infima's
+   .footer--dark tokens would otherwise paint it blue-grey. */
+.footer--dark {
+  --ifm-footer-background-color: hsl(0 0% 7%);
+  --ifm-footer-color: hsl(0 0% 65%);
+  --ifm-footer-link-color: hsl(0 0% 78%);
+  --ifm-footer-link-hover-color: var(--zenon-green);
+  --ifm-footer-title-color: hsl(0 0% 98%);
+  border-top: 1px solid hsl(0 0% 18%);
+}
+
+.footer__title {
+  font-family: var(--font-mono);
+  font-size: 0.6875rem;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: var(--ledger-tracking);
 }
 
 html {
@@ -109,8 +172,9 @@ html {
   text-rendering: optimizeLegibility;
 }
 
+/* Space Grotesk ships up to 700; the design system's "extrabold" h1 maps to it. */
 h1 {
-  font-weight: 800;
+  font-weight: 700;
   letter-spacing: -0.01em;
 }
 
@@ -173,7 +237,8 @@ table thead th {
   color: var(--foreground);
 }
 
-/* Cards: --card surface, hairline border, tight radius, theme-aware shadow. */
+/* Cards: --card surface, hairline border, --radius-xl (10px, per the design
+   system's card spec), theme-aware shadow. */
 .card {
   background: var(--card);
   border: 1px solid var(--border);
@@ -213,7 +278,7 @@ table thead th {
 
 .hero--orchestrator .hero__title {
   font-size: 2.75rem;
-  font-weight: 800;
+  font-weight: 700;
   letter-spacing: -0.01em;
   margin-bottom: 0.5rem;
 }

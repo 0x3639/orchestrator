@@ -50,8 +50,7 @@ jobs:
       - name: Generate checksums
         run: |
           cd build
-          echo $(sha256sum *)
-          echo $(sha256sum *) >> SHA256CHECKSUMS.txt
+          sha256sum * | tee SHA256CHECKSUMS.txt
       - name: Set version
         run: |
           ORCHESTRATOR=$(cat metadata/version.go | grep Version | awk -F '"' '{print $2}')

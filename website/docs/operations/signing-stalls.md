@@ -9,7 +9,7 @@ title: Signing stalls
 
 ## Why signers stall
 
-A TSS signing ceremony is identified by a hash of **the exact set of messages** being signed plus the signer keys. Every signer builds that set locally: the first 50 unsigned unwrap events in its own `events/` store, in key order. Signers whose sets differ compute different ceremony ids, join different rooms, and no room reaches the two-thirds threshold. Nothing signs, and nothing changes the sets, so it stays that way.
+A TSS signing ceremony is identified by a hash of **the exact set of messages** being signed plus the signer keys. Every signer builds that set locally: the first unsigned unwrap events in its own `events/` store, in key order, up to the ceremony pool size. The pool size is 50 by default and can be changed by the bridge administrator through bridge metadata. Signers whose sets differ compute different ceremony ids, join different rooms, and no room reaches the two-thirds threshold. Nothing signs, and nothing changes the sets, so it stays that way.
 
 Wiping the stores forced every signer to rebuild its set from the same chain history, so the sets converged. It also re-signed all of history, 50 events per ceremony, each rejected by Zenon as already existing, which is where the provider load came from.
 
@@ -42,4 +42,4 @@ Then:
 
 ## What reconciliation costs
 
-Before each ceremony a signer looks up its unsigned events on the local Zenon node, in order, until it has enough to fill the pool, with at most 200 lookups per ceremony. A signer with a large stale backlog works it off over successive windows and skips signing until its lookups complete, so that it never proposes a pool its peers do not share. If the Zenon RPC fails mid-way the signer sits out that ceremony rather than guess.
+Before each ceremony a signer looks up its unsigned events on the local Zenon node, in order, until it has enough to fill the pool, with at most four times the pool size in lookups per ceremony (200 at the default pool size). A signer with a large stale backlog works it off over successive windows and skips signing until its lookups complete, so that it never proposes a pool its peers do not share. If the Zenon RPC fails mid-way the signer sits out that ceremony rather than guess.

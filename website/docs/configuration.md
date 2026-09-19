@@ -48,7 +48,7 @@ Everything lives in `~/.orchestrator/config.json`. On first start the orchestrat
 
 | Field | Default | Meaning |
 | --- | --- | --- |
-| `DataPath` | `~/.orchestrator` | Directory for `config.json`, the producer key file, `events/`, `queues/`, `tss/` and `logs/`. Created `0700`; an existing wider mode is tightened. Must be owned by the user running the orchestrator. |
+| `DataPath` | `~/.orchestrator` | Directory for `config.json` and the producer key file. Created `0700`; an existing wider mode is tightened. Must be owned by the user running the orchestrator. **Only those two files follow this setting**: `events/`, `queues/` and `logs/` are always created under `~/.orchestrator` of the running user, and `TssConfig.BaseDir` defaults to `~/.orchestrator/tss` independently. Leave `DataPath` at its default unless you also move `BaseDir` and accept the split. |
 | `GlobalState` | `0` | Persisted node state. Managed by the orchestrator; do not edit. See [States](operations/states.md). |
 | `EvmAddress` | derived | The signer's EVM address, derived from the producer key. Written for information. |
 | `ProducerKeyFileName` | `producer` | Name of the encrypted key file inside `DataPath`. |
@@ -58,7 +58,9 @@ Everything lives in `~/.orchestrator/config.json`. On first start the orchestrat
 
 ## Networks
 
-`Networks` is a map from network name to settings. `Zenon` is required. Every other entry must match a network registered on the Zenon bridge contract by name.
+`Networks` is a map from network name to settings. `Zenon` is required. At startup the orchestrator reads the networks registered on the Zenon bridge contract and requires an entry here **for each of them**, by name; startup fails if one is missing. Entries for names the bridge does not register are ignored.
+
+The file is loaded on top of the built-in defaults, which already contain `BSC`, `Ethereum` and `Supernova` entries pointing at localhost. Leaving a network out of your file therefore does not remove it; the default entry remains and is rewritten into the file. The example above shows only the entries you should edit.
 
 | Field | Default | Meaning |
 | --- | --- | --- |
@@ -88,7 +90,7 @@ Network entries are replaced wholesale when the file is read, so an entry withou
 | `Address` | `127.0.0.1` | Interface the health RPC listens on. Loopback keeps the unauthenticated endpoint off the network. Set `0.0.0.0` only behind a proxy. |
 | `Port` | `55000` | Health RPC port. |
 | `CachedResponseDelay` | `25` | Seconds a `getStatus` result is cached. |
-| `ResponsesPerSecond`, `Burst` | `2`, `2` | Aggregate rate cap across all clients. |
-| `PerClientResponsesPerSecond`, `PerClientBurst` | `2`, `2` | Cap per client IP. `0` disables per-client limiting. |
+| `ResponsesPerSecond`, `Burst` | `2`, `2` | Aggregate rate cap across all clients. Both must be positive; `0` rejects every request. |
+| `PerClientResponsesPerSecond`, `PerClientBurst` | `2`, `2` | Cap per client IP. `PerClientResponsesPerSecond: 0` disables per-client limiting; a positive rate with `PerClientBurst: 0` rejects every request. |
 
 See [Health API](health-api.md) for what the endpoint serves.

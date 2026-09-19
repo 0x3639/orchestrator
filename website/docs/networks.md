@@ -17,11 +17,11 @@ For historical sync every endpoint must serve full history: headers at any heigh
 
 ## Rate limits
 
-`RpcRequestsPerSecond` and `RpcBurst` cap requests **per endpoint** with a token bucket. The cap covers every call the orchestrator makes to that endpoint: the sync's `eth_getLogs` and head reads, receipts and headers during event confirmation, canonical-block checks, and the bridge contract reads. It does not cover the log subscription, which is server-pushed.
+`RpcRequestsPerSecond` and `RpcBurst` cap requests **per endpoint** with a token bucket. The cap covers every read the orchestrator makes to that endpoint: the sync's `eth_getLogs` and head reads, receipts and headers during event confirmation, canonical-block checks, and the bridge contract reads. It does not cover the log subscription, which is server-pushed, or the rare transaction sends.
 
 ### Sizing against a free tier
 
-A typical free provider budget, in compute units (CU):
+The limits below are quoted from one free-tier provider's published terms as of September 2026, in that provider's compute units (CU). Providers differ and change their terms; check yours and redo the arithmetic.
 
 | Limit | Value |
 | --- | --- |

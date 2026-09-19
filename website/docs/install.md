@@ -12,11 +12,16 @@ The orchestrator runs on Linux only. The data directory helper refuses macOS and
 Every push to `master` publishes `orchestrator-linux-amd64.zip` and `orchestrator-linux-arm64.zip` with a `SHA256CHECKSUMS.txt` to the GitHub release for the current version. Pushes to `dev` produce the same binaries as a workflow artifact for testing, never as a release.
 
 ```bash
+sha256sum orchestrator-linux-amd64.zip
+cat SHA256CHECKSUMS.txt        # compare the digest for your file by eye
 unzip orchestrator-linux-amd64.zip
-sha256sum -c SHA256CHECKSUMS.txt
 chmod +x orchestrator-linux-amd64
 sudo install -m 0755 orchestrator-linux-amd64 /usr/local/bin/orchestrator
 ```
+
+:::note
+Releases up to `v0.0.9a` write both digests on one line of `SHA256CHECKSUMS.txt`, which `sha256sum -c` rejects. Compare the digest by hand for those. Builds from `dev` onward write one digest per line and `sha256sum -c SHA256CHECKSUMS.txt` works.
+:::
 
 ## Build from source
 
