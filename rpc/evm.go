@@ -7,6 +7,7 @@ import (
 	"github.com/ethereum/go-ethereum/accounts/abi"
 	"github.com/ethereum/go-ethereum/accounts/abi/bind"
 	ecommon "github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/common/hexutil"
 	etypes "github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/ethclient"
 	"github.com/pkg/errors"
@@ -536,6 +537,29 @@ type headerResult struct {
 	err      error
 }
 
+// blockHashByNumber returns the hash the endpoint reports for the canonical
+// block at number, via eth_getBlockByNumber. The hash is taken verbatim from
+// the response and never recomputed from header fields: Header.Hash() in the
+// pinned go-ethereum predates header fields added by later network upgrades
+// (Pectra's requestsHash), so a locally computed hash is wrong for every
+// block after such an upgrade and would make canonical blocks look reorged.
+func blockHashByNumber(ctx context.Context, client *ethclient.Client, number uint64) (ecommon.Hash, error) {
+	var raw struct {
+		Hash   *ecommon.Hash `json:"hash"`
+		Number *hexutil.Big  `json:"number"`
+	}
+	if err := client.Client().CallContext(ctx, &raw, "eth_getBlockByNumber", hexutil.EncodeUint64(number), false); err != nil {
+		return ecommon.Hash{}, err
+	}
+	if raw.Hash == nil {
+		return ecommon.Hash{}, fmt.Errorf("block %d not available from this endpoint", number)
+	}
+	if raw.Number != nil && raw.Number.ToInt().Uint64() != number {
+		return ecommon.Hash{}, fmt.Errorf("endpoint returned block %s for a request for block %d", raw.Number.ToInt(), number)
+	}
+	return *raw.Hash, nil
+}
+
 // CanonicalHash returns the hash of the canonical block at number as agreed
 // by every configured endpoint. The connected endpoint is asked through the
 // existing client; every other configured URL is asked through a retained
@@ -553,27 +577,29 @@ func (r *EvmRpc) CanonicalHash(number uint64) (ecommon.Hash, error) {
 		go func(idx int, url string) {
 			defer wg.Done()
 			var (
-				header *etypes.Header
-				err    error
+				hash ecommon.Hash
+				err  error
 			)
 			if uint32(idx) == r.Urls.CurrentUrlIndex {
-				header, err = r.HeaderByNumber(number)
+				hash, err = r.blockHash(number)
 			} else {
-				header, err = r.headerFromSecondary(url, number)
+				hash, err = r.blockHashFromSecondary(url, number)
 			}
-			res := headerResult{endpoint: idx, err: err}
-			if err == nil {
-				if header == nil {
-					res.err = fmt.Errorf("no header for block %d", number)
-				} else {
-					res.hash = header.Hash()
-				}
-			}
-			results[idx] = res
+			results[idx] = headerResult{endpoint: idx, hash: hash, err: err}
 		}(idx, url)
 	}
 	wg.Wait()
 	return agreeCanonicalHash(number, results)
+}
+
+// blockHash asks the connected endpoint for the canonical block hash at number.
+func (r *EvmRpc) blockHash(number uint64) (ecommon.Hash, error) {
+	ctx, cancel := callContext(evmCallTimeout)
+	defer cancel()
+	if err := r.throttle(ctx); err != nil {
+		return ecommon.Hash{}, err
+	}
+	return blockHashByNumber(ctx, r.rpcClient, number)
 }
 
 // agreeCanonicalHash reduces per-endpoint answers to one hash, or an error
@@ -608,15 +634,15 @@ func agreeCanonicalHash(number uint64, results []headerResult) (ecommon.Hash, er
 	return ecommon.Hash{}, errors.New("unreachable")
 }
 
-// headerFromSecondary asks a non-connected configured endpoint for a header,
-// dialling it on first use and keeping the client for later checks. A
-// failing client is dropped so the next check re-dials. After Stop no new
-// client is created.
-func (r *EvmRpc) headerFromSecondary(url string, number uint64) (*etypes.Header, error) {
+// blockHashFromSecondary asks a non-connected configured endpoint for the
+// canonical block hash at number, dialling it on first use and keeping the
+// client for later checks. A failing client is dropped so the next check
+// re-dials. After Stop no new client is created.
+func (r *EvmRpc) blockHashFromSecondary(url string, number uint64) (ecommon.Hash, error) {
 	r.secondaryMu.Lock()
 	if r.secondaryStopped {
 		r.secondaryMu.Unlock()
-		return nil, errors.New("evm rpc stopped")
+		return ecommon.Hash{}, errors.New("evm rpc stopped")
 	}
 	entry, ok := r.secondary[url]
 	if !ok {
@@ -636,7 +662,7 @@ func (r *EvmRpc) headerFromSecondary(url string, number uint64) (*etypes.Header,
 	stopped := r.secondaryStopped
 	r.secondaryMu.Unlock()
 	if stopped {
-		return nil, errors.New("evm rpc stopped")
+		return ecommon.Hash{}, errors.New("evm rpc stopped")
 	}
 	ctx, cancel := callContext(evmCallTimeout)
 	defer cancel()
@@ -645,23 +671,23 @@ func (r *EvmRpc) headerFromSecondary(url string, number uint64) (*etypes.Header,
 			entry.limiter = rate.NewLimiter(r.limit, r.burst)
 		}
 		if err := entry.limiter.Wait(ctx); err != nil {
-			return nil, err
+			return ecommon.Hash{}, err
 		}
 	}
 	if entry.client == nil {
 		client, err := ethclient.DialContext(ctx, url)
 		if err != nil {
-			return nil, err
+			return ecommon.Hash{}, err
 		}
 		entry.client = client
 	}
-	header, err := entry.client.HeaderByNumber(ctx, new(big.Int).SetUint64(number))
+	hash, err := blockHashByNumber(ctx, entry.client, number)
 	if err != nil {
 		entry.client.Close()
 		entry.client = nil
-		return nil, err
+		return ecommon.Hash{}, err
 	}
-	return header, nil
+	return hash, nil
 }
 
 // closeSecondaryClients marks the rpc as stopped so no new secondary client
