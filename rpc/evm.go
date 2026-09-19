@@ -530,6 +530,14 @@ func (r *EvmRpc) headerFromSecondary(url string, number uint64) (*etypes.Header,
 
 	entry.mu.Lock()
 	defer entry.mu.Unlock()
+	// Stop may have closed this entry between the check above and taking
+	// its lock; never dial a client that nothing will close.
+	r.secondaryMu.Lock()
+	stopped := r.secondaryStopped
+	r.secondaryMu.Unlock()
+	if stopped {
+		return nil, errors.New("evm rpc stopped")
+	}
 	ctx, cancel := callContext(evmCallTimeout)
 	defer cancel()
 	if entry.client == nil {

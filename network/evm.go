@@ -53,12 +53,17 @@ type evmNetwork struct {
 	canonicalCache map[uint64]ecommon.Hash
 }
 
-// agreedHashCached is EvmRpc.CanonicalHash memoised for the current Sync pass.
-func (eN *evmNetwork) agreedHashCached(number uint64) (ecommon.Hash, error) {
+// agreedHashForLog returns the endpoint-agreed canonical hash at number,
+// memoised for the current Sync pass. A cached hash is only reused when it
+// matches the observed block; a mismatch is re-checked with a fresh
+// agreement call, so a stale cache entry can never be the reason a
+// legitimate log is skipped. Adjacent Sync ranges share their boundary
+// block, and the canonical view can change between them.
+func (eN *evmNetwork) agreedHashForLog(number uint64, observed ecommon.Hash) (ecommon.Hash, error) {
 	eN.canonicalMu.Lock()
 	hash, ok := eN.canonicalCache[number]
 	eN.canonicalMu.Unlock()
-	if ok {
+	if ok && hash == observed {
 		return hash, nil
 	}
 	hash, err := eN.EvmRpc().CanonicalHash(number)
@@ -426,7 +431,7 @@ func (eN *evmNetwork) InterpretLog(log etypes.Log, live bool) error {
 				// log), and the range is retried when endpoints disagree or
 				// fail. This never pins on a provider that cannot serve
 				// block-hash log queries.
-				canonical, err := eN.agreedHashCached(ev.BlockNumber)
+				canonical, err := eN.agreedHashForLog(ev.BlockNumber, ev.BlockHash)
 				if err != nil {
 					return fmt.Errorf("cannot validate historical unwrap %s/%d against the canonical chain: %w", ev.TransactionHash.String(), ev.LogIndex, err)
 				}
