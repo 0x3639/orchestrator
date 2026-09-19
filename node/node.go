@@ -1210,6 +1210,10 @@ func (node *Node) processSignaturesUnwrap() (error, bool) {
 	return nil, true
 }
 
+// reconcileLookupsPerPool bounds Zenon lookups per ceremony to this multiple
+// of the pool size.
+const reconcileLookupsPerPool = 4
+
 // reconcileUnsignedUnwrapRequests removes from the signing pool every event
 // that Zenon already knows about, recording its Zenon status locally. Such
 // events exist when this node missed the ceremony that signed them (offline,
@@ -1219,17 +1223,29 @@ func (node *Node) processSignaturesUnwrap() (error, bool) {
 // stale entry here keeps this node out of every ceremony until operators
 // wipe and resync the events store.
 //
-// Requests are visited in storage order and the walk stops once enough
-// remain to fill the ceremony pool, so the cost is bounded by the pool size
-// rather than the backlog. Any Zenon RPC failure aborts the ceremony for
-// this node: guessing would produce a pool its peers do not share.
+// Requests are visited in storage order. The walk stops once enough remain
+// to fill the ceremony pool, or after a bounded number of Zenon lookups, so
+// a large backlog of already-registered records is worked off a slice per
+// ceremony instead of in one pass. Every signer applies the same rule to
+// the same ordered records and the same Zenon state, so a partial pool is
+// still the same pool on every node. Any Zenon RPC failure aborts the
+// ceremony for this node: guessing would produce a pool its peers do not
+// share.
 func (node *Node) reconcileUnsignedUnwrapRequests(requests []*events.UnwrapRequestEvm) ([]*events.UnwrapRequestEvm, error) {
-	remaining := make([]*events.UnwrapRequestEvm, 0, common.SignCeremonyPoolSize)
+	poolSize := common.SignCeremonyPoolSize
+	lookupCap := reconcileLookupsPerPool * poolSize
+	remaining := make([]*events.UnwrapRequestEvm, 0, poolSize)
 	reconciled := 0
+	lookups := 0
 	for _, req := range requests {
-		if len(remaining) >= common.SignCeremonyPoolSize {
+		if len(remaining) >= poolSize {
 			break
 		}
+		if lookups >= lookupCap {
+			node.logger.Warnf("reconcile: stopped after %d Zenon lookups with %d records selected; the rest is worked off in later ceremonies", lookups, len(remaining))
+			break
+		}
+		lookups++
 		rpcReq, err := node.networksManager.GetEvmUnwrapRequestByHashAndLogFromRPC(types.Hash(req.TransactionHash), req.LogIndex)
 		if err != nil {
 			if err.Error() == constants.ErrDataNonExistent.Error() {

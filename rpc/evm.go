@@ -2,6 +2,7 @@ package rpc
 
 import (
 	"context"
+	"fmt"
 	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/accounts/abi"
 	ecommon "github.com/ethereum/go-ethereum/common"
@@ -18,6 +19,7 @@ import (
 	"orchestrator/common/bridge"
 	"orchestrator/common/config"
 	"orchestrator/common/storage"
+	"strings"
 	"time"
 )
 
@@ -374,12 +376,73 @@ func (r *EvmRpc) BlockNumber() (uint64, error) {
 	return r.rpcClient.BlockNumber(ctx)
 }
 
-// HeaderByNumber returns the canonical header at the given height, used to
-// decide whether an observed block was reorged out.
+// HeaderByNumber returns the canonical header at the given height from the
+// currently connected endpoint.
 func (r *EvmRpc) HeaderByNumber(number uint64) (*etypes.Header, error) {
 	ctx, cancel := callContext(evmCallTimeout)
 	defer cancel()
 	return r.rpcClient.HeaderByNumber(ctx, new(big.Int).SetUint64(number))
+}
+
+// CanonicalHash returns the hash of the canonical block at number as agreed
+// by every reachable configured endpoint. The connected endpoint is asked
+// through the existing client; every other configured URL is dialled for
+// the one call. Endpoints that disagree, which happens when a load-balanced
+// provider is split across forks or a backend lags, yield an error so the
+// caller treats the answer as unknown rather than acting on one backend's
+// view. With a single configured URL this is that endpoint's answer.
+func (r *EvmRpc) CanonicalHash(number uint64) (ecommon.Hash, error) {
+	agreed := make(map[ecommon.Hash][]int)
+	var failures []string
+	for idx, url := range r.Urls.Urls {
+		var (
+			header *etypes.Header
+			err    error
+		)
+		if uint32(idx) == r.Urls.CurrentUrlIndex {
+			header, err = r.HeaderByNumber(number)
+		} else {
+			header, err = headerFromUrl(url, number)
+		}
+		if err != nil {
+			failures = append(failures, fmt.Sprintf("endpoint #%d: %v", idx, err))
+			continue
+		}
+		if header == nil {
+			failures = append(failures, fmt.Sprintf("endpoint #%d: no header for block %d", idx, number))
+			continue
+		}
+		hash := header.Hash()
+		agreed[hash] = append(agreed[hash], idx)
+	}
+	if len(agreed) == 0 {
+		return ecommon.Hash{}, fmt.Errorf("no configured endpoint returned block %d: %s", number, strings.Join(failures, "; "))
+	}
+	if len(agreed) > 1 {
+		views := make([]string, 0, len(agreed))
+		for hash, idxs := range agreed {
+			views = append(views, fmt.Sprintf("%s from endpoints %v", hash.Hex(), idxs))
+		}
+		return ecommon.Hash{}, fmt.Errorf("configured endpoints disagree on canonical block %d: %s", number, strings.Join(views, "; "))
+	}
+	for hash := range agreed {
+		if len(failures) > 0 {
+			r.logger.Debugf("CanonicalHash(%d): %d endpoint(s) unreachable: %s", number, len(failures), strings.Join(failures, "; "))
+		}
+		return hash, nil
+	}
+	return ecommon.Hash{}, errors.New("unreachable")
+}
+
+func headerFromUrl(url string, number uint64) (*etypes.Header, error) {
+	ctx, cancel := callContext(evmCallTimeout)
+	defer cancel()
+	client, err := ethclient.DialContext(ctx, url)
+	if err != nil {
+		return nil, err
+	}
+	defer client.Close()
+	return client.HeaderByNumber(ctx, new(big.Int).SetUint64(number))
 }
 
 func (r *EvmRpc) BlockByHash(hash ecommon.Hash) (*etypes.Block, error) {

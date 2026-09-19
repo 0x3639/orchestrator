@@ -153,3 +153,37 @@ func TestConcurrentMutationsDoNotLoseWrites(t *testing.T) {
 		t.Fatalf("block number refresh was lost: %d", got.BlockNumber)
 	}
 }
+
+func TestDeleteUnwrapRequest(t *testing.T) {
+	store := newTestStorage(t)
+	ev := sampleEvent("0x0d", 0)
+	if _, err := store.AddUnwrapRequestIfMissing(ev); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.DeleteUnwrapRequest(ev.TransactionHash, 0); err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.GetUnwrapRequestByHashAndLog(ev.TransactionHash, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != nil {
+		t.Fatalf("record should be gone, got %+v", got)
+	}
+	unsigned, err := store.GetUnsignedUnwrapRequests()
+	if err != nil || len(unsigned) != 0 {
+		t.Fatalf("deleted record must not be listed, got %d err=%v", len(unsigned), err)
+	}
+}
+
+func TestSendSigIntNeverBlocks(t *testing.T) {
+	stop := make(chan os.Signal, 1)
+	store := NewEvmStorage(zdb.NewMemDB(), stop, 1)
+	store.SendSigInt()
+	store.SendSigInt() // channel full: must not block
+	if len(stop) != 1 {
+		t.Fatalf("expected one pending signal, got %d", len(stop))
+	}
+	close(stop)
+	store.SendSigInt() // closed: must not panic
+}

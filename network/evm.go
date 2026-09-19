@@ -45,6 +45,46 @@ type evmNetwork struct {
 	// blocks once at startup so an operator can repair a node that lost
 	// events without wiping and resyncing from the deployment height.
 	backfillBlocks uint64
+
+	// canonicalCache remembers agreed canonical hashes for the duration of
+	// one Sync pass so a block with several unwrap logs is checked once.
+	canonicalMu    sync.Mutex
+	canonicalCache map[uint64]ecommon.Hash
+}
+
+// eventIsCanonicalCached is eventIsCanonical with the canonical hash lookup
+// memoised for the current Sync pass.
+func (eN *evmNetwork) eventIsCanonicalCached(ev *events.UnwrapRequestEvm) (bool, error) {
+	eN.canonicalMu.Lock()
+	hash, ok := eN.canonicalCache[ev.BlockNumber]
+	eN.canonicalMu.Unlock()
+	if !ok {
+		var err error
+		hash, err = eN.EvmRpc().CanonicalHash(ev.BlockNumber)
+		if err != nil {
+			return false, err
+		}
+		eN.canonicalMu.Lock()
+		if eN.canonicalCache == nil {
+			eN.canonicalCache = make(map[uint64]ecommon.Hash)
+		}
+		eN.canonicalCache[ev.BlockNumber] = hash
+		eN.canonicalMu.Unlock()
+	}
+	if hash != ev.BlockHash {
+		return false, nil
+	}
+	logs, err := eN.EvmRpc().FilterBlockLogs(ev.BlockHash)
+	if err != nil {
+		return false, err
+	}
+	return blockContainsEvent(logs, ev, *eN.ContractAddress()), nil
+}
+
+func (eN *evmNetwork) resetCanonicalCache() {
+	eN.canonicalMu.Lock()
+	eN.canonicalCache = make(map[uint64]ecommon.Hash)
+	eN.canonicalMu.Unlock()
 }
 
 func NewEvmNetwork(network *definition.NetworkInfo, dbManager *manager.Manager, rpcManager *rpc.Manager, state *common.GlobalState, stop chan os.Signal) (*evmNetwork, error) {
@@ -141,8 +181,11 @@ func (eN *evmNetwork) Start() error {
 			target = lastUpdateHeight - eN.backfillBlocks
 		}
 		if target < lastUpdateHeight {
-			eN.logger.Warnf("Backfill requested: rewinding sync cursor for chainId %d from %d to %d (%d blocks); already stored events are kept as-is",
+			eN.logger.Warnf("Backfill requested: rewinding sync cursor for chainId %d from %d to %d (%d blocks); signed and sent records are kept, unsigned records not on the canonical chain are removed",
 				eN.ChainId(), lastUpdateHeight, target, lastUpdateHeight-target)
+			if err := eN.pruneNonCanonicalUnsigned(target); err != nil {
+				return err
+			}
 			if err := eN.dbManager.EvmStorage(eN.ChainId()).SetLastUpdateHeight(target); err != nil {
 				return err
 			}
@@ -169,8 +212,44 @@ func (eN *evmNetwork) EvmRpc() *rpc.EvmRpc {
 	return eN.rpcManager.Evm(eN.ChainId())
 }
 
+// pruneNonCanonicalUnsigned deletes unsigned, unredeemed records at or above
+// fromBlock whose block is no longer the agreed canonical block or no longer
+// carries their log. Such records can only have come from a forked or
+// inconsistent backend; reconciliation cannot remove them because Zenon
+// never had them, and left in place they keep this signer's pool different
+// from its peers. Signed or sent records are never touched.
+func (eN *evmNetwork) pruneNonCanonicalUnsigned(fromBlock uint64) error {
+	eN.resetCanonicalCache()
+	unsigned, err := eN.eventsStore().GetUnsignedUnwrapRequests()
+	if err != nil {
+		return err
+	}
+	removed := 0
+	for _, ev := range unsigned {
+		if ev.BlockNumber < fromBlock {
+			continue
+		}
+		canonical, err := eN.eventIsCanonicalCached(ev)
+		if err != nil {
+			return fmt.Errorf("backfill: cannot validate stored unwrap %s/%d: %w", ev.TransactionHash.String(), ev.LogIndex, err)
+		}
+		if canonical {
+			continue
+		}
+		eN.logger.Warnf("Backfill: removing unsigned unwrap %s/%d stored from block %d (%s) which is not on the agreed canonical chain",
+			ev.TransactionHash.String(), ev.LogIndex, ev.BlockNumber, ev.BlockHash.Hex())
+		if err := eN.eventsStore().DeleteUnwrapRequest(ev.TransactionHash, ev.LogIndex); err != nil {
+			return err
+		}
+		removed++
+	}
+	eN.logger.Infof("Backfill: checked %d unsigned unwrap records from block %d, removed %d", len(unsigned), fromBlock, removed)
+	return nil
+}
+
 func (eN *evmNetwork) Sync() error {
 	eN.logger.Info("In sync evm")
+	eN.resetCanonicalCache()
 	if updateHeight, err := eN.eventsStore().GetLastUpdateHeight(); err != nil {
 		return err
 	} else {
@@ -332,6 +411,16 @@ func (eN *evmNetwork) InterpretLog(log etypes.Log, live bool) error {
 				}
 				eN.logger.Info("Successfully enqueued event")
 			} else {
+				// Historical logs bypass the unconfirmed queue, so they get the
+				// same canonical check here: a backend on a minority fork must
+				// not be able to plant a fork-only record on this signer.
+				canonical, err := eN.eventIsCanonicalCached(ev)
+				if err != nil {
+					return fmt.Errorf("cannot validate historical unwrap %s/%d against the canonical chain: %w", ev.TransactionHash.String(), ev.LogIndex, err)
+				}
+				if !canonical {
+					return fmt.Errorf("historical unwrap %s/%d in block %d (%s) is not on the agreed canonical chain", ev.TransactionHash.String(), ev.LogIndex, ev.BlockNumber, ev.BlockHash.Hex())
+				}
 				// Present already when the znn sync or a previous pass stored it;
 				// UpdateUnwrapRequestBlockNumber inserts when missing and otherwise
 				// only refreshes the block fields, never the signature or status.
@@ -614,46 +703,56 @@ func (eN *evmNetwork) FillEvmParamsRpc() error {
 	return nil
 }
 
+const subscriptionRefreshInterval = 3 * time.Minute
+
+// SubscribeToEvents owns the live log subscription. One loop consumes it,
+// refreshes it every subscriptionRefreshInterval after a catch-up Sync, and
+// re-establishes it with backoff when the provider drops it. A failed Sync
+// is logged and retried at the next refresh; it never leaves the node
+// without a subscription.
 func (eN *evmNetwork) SubscribeToEvents() {
 	eN.logger.Infof("SubscribeToEvents for network with chainId: %d", eN.ChainId())
-	logSub, logChan, err := eN.EvmRpc().SubscribeToLogs()
-	if err != nil {
-		eN.logger.Error(err)
-		eN.stopChan <- syscall.SIGINT
-		return
-	}
-
-	go func() {
-		for {
-			if !eN.sleep(3 * time.Minute) {
-				return
-			}
-			if logSub != nil {
-				logSub.Unsubscribe()
-			}
-			errSync := eN.Sync()
-			if errSync != nil {
-				eN.logger.Debug(errSync)
-				continue
-			}
-			if logSub, logChan, err = eN.EvmRpc().SubscribeToLogs(); err != nil {
-				eN.logger.Error(err)
-				eN.requestStop()
-			}
-		}
-	}()
+	resubscribeBackoff := processEventsBaseBackoff
 
 	for {
-		select {
-		case subErr := <-logSub.Err():
-			if subErr != nil {
-				eN.logger.Error(subErr)
-				eN.stopChan <- syscall.SIGINT
+		logSub, logChan, err := eN.EvmRpc().SubscribeToLogs()
+		if err != nil {
+			eN.logger.Errorf("cannot subscribe to logs for chainId %d: %v; retrying in %s", eN.ChainId(), err, resubscribeBackoff)
+			if !eN.sleep(resubscribeBackoff) {
+				return
 			}
-		case newLog := <-logChan:
-			if errInterpret := eN.InterpretLog(newLog, true); errInterpret != nil {
-				eN.logger.Debug(errInterpret)
+			resubscribeBackoff *= 2
+			if resubscribeBackoff > processEventsMaxBackoff {
+				resubscribeBackoff = processEventsMaxBackoff
 			}
+			continue
+		}
+		resubscribeBackoff = processEventsBaseBackoff
+
+		refresh := time.NewTimer(subscriptionRefreshInterval)
+	consume:
+		for {
+			select {
+			case <-eN.done:
+				refresh.Stop()
+				logSub.Unsubscribe()
+				return
+			case subErr := <-logSub.Err():
+				eN.logger.Errorf("log subscription for chainId %d ended: %v; catching up and resubscribing", eN.ChainId(), subErr)
+				break consume
+			case newLog := <-logChan:
+				if errInterpret := eN.InterpretLog(newLog, true); errInterpret != nil {
+					eN.logger.Debug(errInterpret)
+				}
+			case <-refresh.C:
+				break consume
+			}
+		}
+		refresh.Stop()
+		logSub.Unsubscribe()
+
+		if errSync := eN.Sync(); errSync != nil {
+			eN.logger.Errorf("Sync for chainId %d failed and will be retried at the next refresh; the sync cursor did not advance: %v", eN.ChainId(), errSync)
 		}
 	}
 }
@@ -685,6 +784,7 @@ func (eN *evmNetwork) ProcessEvents() {
 	attempts := 0
 	discardVotes := 0
 	var discardFor string
+	var discardHash ecommon.Hash
 
 	for {
 		peeked, errQueue := eN.unconfirmedQueue.PeekBlock()
@@ -747,17 +847,24 @@ func (eN *evmNetwork) ProcessEvents() {
 		case outcomeDiscard:
 			attempts = 0
 			backoff = processEventsBaseBackoff
+			// Consecutive votes must name the same replacement block; a
+			// different answer restarts the count.
+			if decision.canonicalHash != discardHash {
+				discardHash = decision.canonicalHash
+				discardVotes = 0
+			}
 			discardVotes++
 			if discardVotes < discardAgreement {
-				eN.logger.Warnf("Event %s looks reorged out (%s); confirmation %d/%d, re-checking in %s",
-					key, decision.reason, discardVotes, discardAgreement, discardRecheckDelay)
+				eN.logger.Warnf("Event %s looks reorged out (%s); agreement %d/%d on canonical %s, re-checking in %s",
+					key, decision.reason, discardVotes, discardAgreement, discardHash.Hex(), discardRecheckDelay)
 				if !eN.sleep(discardRecheckDelay) {
 					return
 				}
 				continue
 			}
-			eN.logger.Warnf("Discarding event %s after %d consecutive checks: %s", key, discardVotes, decision.reason)
+			eN.logger.Warnf("Discarding event %s after %d consecutive agreeing checks: %s", key, discardVotes, decision.reason)
 			discardVotes = 0
+			discardHash = ecommon.Hash{}
 			if !eN.dropQueuedEvent() {
 				return
 			}

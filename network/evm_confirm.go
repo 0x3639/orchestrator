@@ -18,7 +18,10 @@ import (
 // a live node.
 type evmChainReader interface {
 	BlockNumber() (uint64, error)
-	HeaderByNumber(number uint64) (*etypes.Header, error)
+	// CanonicalHash is the hash of the canonical block at the given height
+	// as agreed by every reachable configured endpoint; it errors when they
+	// disagree, so a split provider never produces a definitive answer.
+	CanonicalHash(number uint64) (ecommon.Hash, error)
 	TransactionReceipt(txHash ecommon.Hash) (*etypes.Receipt, error)
 	// FilterBlockLogs returns the bridge contract's logs in the given block.
 	FilterBlockLogs(blockHash ecommon.Hash) ([]etypes.Log, error)
@@ -33,10 +36,10 @@ const (
 	outcomeRetry confirmOutcome = iota
 	// outcomeConfirmed means the event is final and must be persisted.
 	outcomeConfirmed
-	// outcomeDiscard means the chain reports that the block the event was
-	// observed in is no longer canonical. Because a load-balanced provider
-	// can answer from a lagging or forked backend, the caller only acts on
-	// this after several consecutive agreeing attempts.
+	// outcomeDiscard means every configured endpoint agrees that the block
+	// the event was observed in is no longer canonical. The caller still
+	// requires several consecutive attempts to agree on the same
+	// replacement block before dropping the event.
 	outcomeDiscard
 )
 
@@ -62,21 +65,20 @@ type confirmDecision struct {
 	retryAfter time.Duration
 	// err is set for transient failures such as RPC errors.
 	err error
+	// canonicalHash is the replacement block's hash on a discard decision,
+	// so the caller can require consecutive attempts to agree on it.
+	canonicalHash ecommon.Hash
 }
 
 func retryDecision(reason string, err error, after time.Duration) confirmDecision {
 	return confirmDecision{outcome: outcomeRetry, reason: reason, err: err, retryAfter: after}
 }
 
-func discardDecision(reason string) confirmDecision {
-	return confirmDecision{outcome: outcomeDiscard, reason: reason}
-}
-
 // confirmQueuedEvent decides whether the unwrap event at the head of the
 // unconfirmed queue is final, must wait, or was reorged out.
 //
-// The only definitive rejection is a canonical header at the event's height
-// whose hash differs from the block the event was observed in. A reverted
+// The only definitive rejection is an agreed canonical hash at the event's
+// height that differs from the block the event was observed in. A reverted
 // receipt or a receipt from another block is never trusted on its own: the
 // event's log was observed in a specific block, so if that block is still
 // canonical a contradicting receipt can only come from an inconsistent or
@@ -114,20 +116,22 @@ func confirmQueuedEvent(chain evmChainReader, ev *events.UnwrapRequestEvm, contr
 }
 
 // resolveAgainstCanonicalBlock handles every case where the receipt does
-// not vouch for the event. If the block the event was observed in is no
-// longer canonical, the event was reorged out. If it is still canonical the
-// block's own logs are the source of truth: the event is confirmed when its
-// log is there and otherwise waits for a consistent backend.
+// not vouch for the event. If every endpoint agrees the block the event was
+// observed in is no longer canonical, the event was reorged out. If it is
+// still canonical the block's own logs are the source of truth: the event
+// is confirmed when its log is there and otherwise waits for a consistent
+// backend. Endpoint disagreement is never definitive.
 func resolveAgainstCanonicalBlock(chain evmChainReader, ev *events.UnwrapRequestEvm, contract ecommon.Address, context string) confirmDecision {
-	header, err := chain.HeaderByNumber(ev.BlockNumber)
+	canonical, err := chain.CanonicalHash(ev.BlockNumber)
 	if err != nil {
-		return retryDecision(context+"; cannot read canonical header", err, 0)
+		return retryDecision(context+"; canonical block not agreed by configured endpoints", err, 0)
 	}
-	if header == nil {
-		return retryDecision(context+"; canonical header not available", errors.New("nil header"), 0)
-	}
-	if header.Hash() != ev.BlockHash {
-		return discardDecision(fmt.Sprintf("%s; block %d was reorged out (canonical %s, observed %s)", context, ev.BlockNumber, header.Hash().Hex(), ev.BlockHash.Hex()))
+	if canonical != ev.BlockHash {
+		return confirmDecision{
+			outcome:       outcomeDiscard,
+			reason:        fmt.Sprintf("%s; block %d was reorged out (canonical %s, observed %s)", context, ev.BlockNumber, canonical.Hex(), ev.BlockHash.Hex()),
+			canonicalHash: canonical,
+		}
 	}
 
 	logs, err := chain.FilterBlockLogs(ev.BlockHash)
@@ -163,4 +167,23 @@ func blockContainsEvent(logs []etypes.Log, ev *events.UnwrapRequestEvm, contract
 		}
 	}
 	return false
+}
+
+// eventIsCanonical reports whether a stored event's block is the agreed
+// canonical block at its height and still carries the event's log. It is
+// used to validate historical logs before they are stored and to prune
+// records that came from a fork.
+func eventIsCanonical(chain evmChainReader, ev *events.UnwrapRequestEvm, contract ecommon.Address) (bool, error) {
+	canonical, err := chain.CanonicalHash(ev.BlockNumber)
+	if err != nil {
+		return false, err
+	}
+	if canonical != ev.BlockHash {
+		return false, nil
+	}
+	logs, err := chain.FilterBlockLogs(ev.BlockHash)
+	if err != nil {
+		return false, err
+	}
+	return blockContainsEvent(logs, ev, contract), nil
 }

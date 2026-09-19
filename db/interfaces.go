@@ -21,6 +21,9 @@ type EvmStorage interface {
 	// for its hash and log index, so a duplicate delivery can never reset a
 	// signed or sent record. It reports whether a record was added.
 	AddUnwrapRequestIfMissing(events.UnwrapRequestEvm) (bool, error)
+	// DeleteUnwrapRequest removes a record that was found not to exist on the
+	// canonical chain. Only unsigned, unredeemed records should ever be deleted.
+	DeleteUnwrapRequest(ecommon.Hash, uint32) error
 	SetUnwrapRequestStatus(ecommon.Hash, uint32, uint32) error
 	SetUnwrapRequestSignature(ecommon.Hash, uint32, string) error
 	GetUnwrapRequestsByStatus(uint32) ([]*events.UnwrapRequestEvm, error)

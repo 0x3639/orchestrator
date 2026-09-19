@@ -26,8 +26,14 @@ type fakeChain struct {
 }
 
 func (f *fakeChain) BlockNumber() (uint64, error) { return f.head, f.headErr }
-func (f *fakeChain) HeaderByNumber(uint64) (*etypes.Header, error) {
-	return f.header, f.headerErr
+func (f *fakeChain) CanonicalHash(uint64) (ecommon.Hash, error) {
+	if f.headerErr != nil {
+		return ecommon.Hash{}, f.headerErr
+	}
+	if f.header == nil {
+		return ecommon.Hash{}, errors.New("no header")
+	}
+	return f.header.Hash(), nil
 }
 func (f *fakeChain) TransactionReceipt(ecommon.Hash) (*etypes.Receipt, error) {
 	return f.receipt, f.receiptErr
@@ -100,6 +106,12 @@ func TestConfirmQueuedEventRetriesOnTransportErrors(t *testing.T) {
 			c := healthyChain(ev, header)
 			c.receiptErr = ethereum.NotFound
 			c.headerErr = boom
+			return c
+		}(),
+		"endpoints disagree on canonical block": func() *fakeChain {
+			c := healthyChain(ev, header)
+			c.receiptErr = ethereum.NotFound
+			c.headerErr = errors.New("configured endpoints disagree on canonical block 100")
 			return c
 		}(),
 		"block logs error": func() *fakeChain {
@@ -213,8 +225,12 @@ func TestConfirmQueuedEventDiscardsReorgedBlock(t *testing.T) {
 	chain := healthyChain(ev, observed)
 	chain.receiptErr = ethereum.NotFound
 	chain.header = replacement
-	if d := decide(chain, ev); d.outcome != outcomeDiscard {
+	d := decide(chain, ev)
+	if d.outcome != outcomeDiscard {
 		t.Fatalf("expected discard for missing receipt after reorg, got %s (%s)", d.outcome, d.reason)
+	}
+	if d.canonicalHash != replacement.Hash() {
+		t.Fatalf("discard must report the replacement block, got %s", d.canonicalHash.Hex())
 	}
 
 	// Receipt present but in a different block, and the observed block is gone.
@@ -231,5 +247,36 @@ func TestConfirmQueuedEventDiscardsReorgedBlock(t *testing.T) {
 	chain.receipt.BlockHash = replacement.Hash()
 	if d := decide(chain, ev); d.outcome != outcomeConfirmed {
 		t.Fatalf("expected confirmed via block logs, got %s (%s)", d.outcome, d.reason)
+	}
+}
+
+func TestEventIsCanonical(t *testing.T) {
+	header := canonicalHeader(100)
+	ev := testEvent(100, header)
+	chain := healthyChain(ev, header)
+
+	ok, err := eventIsCanonical(chain, ev, testContract)
+	if err != nil || !ok {
+		t.Fatalf("expected canonical, got ok=%v err=%v", ok, err)
+	}
+
+	chain.logs = nil
+	ok, err = eventIsCanonical(chain, ev, testContract)
+	if err != nil || ok {
+		t.Fatalf("block without the log must not be canonical for the event, got ok=%v err=%v", ok, err)
+	}
+
+	replacement := canonicalHeader(100)
+	replacement.Extra = []byte("fork")
+	chain = healthyChain(ev, header)
+	chain.header = replacement
+	ok, err = eventIsCanonical(chain, ev, testContract)
+	if err != nil || ok {
+		t.Fatalf("reorged block must not be canonical, got ok=%v err=%v", ok, err)
+	}
+
+	chain.headerErr = errors.New("endpoints disagree")
+	if _, err := eventIsCanonical(chain, ev, testContract); err == nil {
+		t.Fatal("endpoint disagreement must surface as an error, not a verdict")
 	}
 }

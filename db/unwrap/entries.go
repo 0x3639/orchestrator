@@ -52,6 +52,16 @@ func (es *evmStorage) AddUnwrapRequestIfMissing(event events.UnwrapRequestEvm) (
 	return true, es.putUnwrapRequest(event)
 }
 
+func (es *evmStorage) DeleteUnwrapRequest(txHash ecommon.Hash, logIndex uint32) error {
+	es.mu.Lock()
+	defer es.mu.Unlock()
+	if err := es.DB.Delete(getUnwrapRequestKey(txHash, logIndex)); err != nil {
+		es.SendSigInt()
+		return err
+	}
+	return nil
+}
+
 func (es *evmStorage) UpdateUnwrapRequestBlockNumber(event events.UnwrapRequestEvm) error {
 	es.mu.Lock()
 	defer es.mu.Unlock()
