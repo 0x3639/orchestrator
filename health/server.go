@@ -4,9 +4,11 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"golang.org/x/crypto/sha3"
-	"golang.org/x/time/rate"
+	"io"
+	"mime"
+	"net"
 	"net/http"
 	"orchestrator/common"
 	"orchestrator/common/config"
@@ -16,6 +18,23 @@ import (
 	"orchestrator/tss"
 	"runtime"
 	"sort"
+	"strconv"
+	"time"
+
+	"golang.org/x/crypto/sha3"
+	"golang.org/x/time/rate"
+)
+
+const (
+	// Health requests are tiny JSON objects such as {"method":"getStatus","params":[]}.
+	// Anything larger is rejected before it is decoded.
+	maxRequestBodyBytes = 4 * 1024
+	maxHeaderBytes      = 8 * 1024
+
+	readHeaderTimeout = 5 * time.Second
+	readTimeout       = 10 * time.Second
+	writeTimeout      = 15 * time.Second
+	idleTimeout       = 30 * time.Second
 )
 
 // HealthRPCHandler struct
@@ -25,19 +44,51 @@ type Handler struct {
 	dbManager       *manager.Manager
 	tssManager      *tss.TssManager
 	identity        Identity
-	limiter         *rate.Limiter
-	StatusCache     *StatusResults
+	// limiter is the aggregate safety cap shared by every caller.
+	limiter *rate.Limiter
+	// clientLimiters holds the per-source limits; nil disables per-client limiting.
+	clientLimiters *clientLimiters
+	StatusCache    *StatusResults
 }
 
 func NewHealthRpcHandler(networksManager *network.NetworksManager, dbManager *manager.Manager, state *common.GlobalState, healthConfig config.HealthRpcConfig) (*Handler, error) {
-	return &Handler{
+	handler := &Handler{
 		state:           state,
 		networksManager: networksManager,
 		dbManager:       dbManager,
 		tssManager:      nil,
 		limiter:         rate.NewLimiter(rate.Limit(healthConfig.ResponsesPerSecond), healthConfig.Burst),
 		StatusCache:     NewCachedStatusResults(healthConfig.CachedResponseDelay),
-	}, nil
+	}
+	if healthConfig.PerClientResponsesPerSecond > 0 {
+		handler.clientLimiters = newClientLimiters(rate.Limit(healthConfig.PerClientResponsesPerSecond), healthConfig.PerClientBurst)
+	}
+	return handler, nil
+}
+
+// ListenAddress returns the host:port the health server should bind to.
+// An empty Address falls back to loopback so the signer is never exposed on
+// every interface by accident.
+func ListenAddress(healthConfig config.HealthRpcConfig) string {
+	address := healthConfig.Address
+	if address == "" {
+		address = config.DefaultHealthRpcAddress
+	}
+	return net.JoinHostPort(address, strconv.Itoa(healthConfig.Port))
+}
+
+// NewServer builds an http.Server with strict connection deadlines so slow or
+// idle clients cannot pin sockets and goroutines indefinitely.
+func NewServer(addr string, handler http.Handler) *http.Server {
+	return &http.Server{
+		Addr:              addr,
+		Handler:           handler,
+		ReadHeaderTimeout: readHeaderTimeout,
+		ReadTimeout:       readTimeout,
+		WriteTimeout:      writeTimeout,
+		IdleTimeout:       idleTimeout,
+		MaxHeaderBytes:    maxHeaderBytes,
+	}
 }
 
 func (s *Handler) SetTssManager(tssManager *tss.TssManager) {
@@ -202,45 +253,67 @@ func (s *Handler) GetIdentity(params []interface{}) (interface{}, error) {
 	return s.identity, nil
 }
 
-// Handler method
+// ServeHTTP validates the request shape before charging the rate limiter so
+// that malformed or trivial requests cannot consume the budget reserved for
+// legitimate monitoring probes.
 func (s *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		writeError(w, http.StatusMethodNotAllowed, "only POST requests are supported")
+		return
+	}
+	if !hasJSONContentType(r) {
+		writeError(w, http.StatusUnsupportedMediaType, "Content-Type must be application/json")
+		return
+	}
+	if r.ContentLength > maxRequestBodyBytes {
+		writeError(w, http.StatusRequestEntityTooLarge, fmt.Sprintf("request body must not exceed %d bytes", maxRequestBodyBytes))
+		return
+	}
+
+	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodyBytes)
+	decoder := json.NewDecoder(r.Body)
+
 	var req Request
-	var res Response
-
-	if !s.limiter.Allow() {
-		res.Error = fmt.Sprintf("Too many requests per second. Maximum ")
-		w.WriteHeader(http.StatusTooManyRequests)
-		json.NewEncoder(w).Encode(res)
+	if err := decoder.Decode(&req); err != nil {
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			writeError(w, http.StatusRequestEntityTooLarge, fmt.Sprintf("request body must not exceed %d bytes", maxRequestBodyBytes))
+			return
+		}
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("Invalid request: %v", err))
+		return
+	}
+	// Exactly one JSON value is allowed per request.
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		writeError(w, http.StatusBadRequest, "Invalid request: body must contain exactly one JSON value")
 		return
 	}
 
-	// Decode request
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		res.Error = fmt.Sprintf("Invalid request: %v", err)
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(res)
-		return
-	}
-
-	// Call the appropriate method
-	var result interface{}
-	var err error
-
+	var method func([]interface{}) (interface{}, error)
 	switch req.Method {
 	case "getStatus":
-		result, err = s.GetStatus(req.Params)
+		method = s.GetStatus
 	case "getBuildInfo":
-		result, err = s.GetBuildInfo(req.Params)
+		method = s.GetBuildInfo
 	case "getIdentity":
-		result, err = s.GetIdentity(req.Params)
+		method = s.GetIdentity
 	default:
-		res.Error = fmt.Sprintf("Method %s not found", req.Method)
-		w.WriteHeader(http.StatusNotFound)
-		json.NewEncoder(w).Encode(res)
+		writeError(w, http.StatusNotFound, fmt.Sprintf("Method %s not found", req.Method))
 		return
 	}
 
-	// Set response
+	// Only well-formed requests for known methods are charged against the quota.
+	if !s.allow(r) {
+		writeError(w, http.StatusTooManyRequests, "Too many requests, retry later")
+		return
+	}
+
+	result, err := method(req.Params)
+
+	var res Response
 	if err != nil {
 		res.Error = err.Error()
 		w.WriteHeader(http.StatusInternalServerError)
@@ -248,7 +321,37 @@ func (s *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		res.Result = result
 		w.WriteHeader(http.StatusOK)
 	}
-
-	// Encode response
 	json.NewEncoder(w).Encode(res)
+}
+
+// allow charges the per-client bucket first so a throttled source does not
+// drain the shared budget, then the aggregate cap.
+func (s *Handler) allow(r *http.Request) bool {
+	if s.clientLimiters != nil && !s.clientLimiters.allow(clientKey(r)) {
+		return false
+	}
+	return s.limiter.Allow()
+}
+
+// clientKey identifies the request source by the transport-level remote IP.
+// Forwarding headers are deliberately ignored because they are client-controlled.
+func clientKey(r *http.Request) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
+}
+
+func hasJSONContentType(r *http.Request) bool {
+	mediaType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	if err != nil {
+		return false
+	}
+	return mediaType == "application/json"
+}
+
+func writeError(w http.ResponseWriter, status int, message string) {
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(Response{Error: message})
 }

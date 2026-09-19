@@ -6,7 +6,6 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
-	"fmt"
 	wallet2 "github.com/MoonBaZZe/znn-sdk-go/wallet"
 	zcommon "github.com/zenon-network/go-zenon/common"
 	"io"
@@ -93,7 +92,11 @@ func NewNode(config *oconfig.Config, logger *zap.Logger) (*Node, error) {
 		return nil, errInit
 	}
 
-	newKeyStore, err := wallet2.ReadKeyFile(config.ProducerKeyFileName, config.ProducerKeyFilePassphrase, path.Join(config.DataPath, config.ProducerKeyFileName))
+	producerKeyPath := path.Join(config.DataPath, config.ProducerKeyFileName)
+	if err = oconfig.VerifyOwnedPath(producerKeyPath); err != nil {
+		return nil, err
+	}
+	newKeyStore, err := wallet2.ReadKeyFile(config.ProducerKeyFileName, config.ProducerKeyFilePassphrase, producerKeyPath)
 	if err != nil {
 		return nil, err
 	}
@@ -143,11 +146,7 @@ func NewNode(config *oconfig.Config, logger *zap.Logger) (*Node, error) {
 		return nil, err
 	}
 
-	addr := fmt.Sprintf(":%d", node.config.HealthConfig.Port)
-	node.healthRpcServer = &http.Server{
-		Addr:    addr,
-		Handler: healthHandler,
-	}
+	node.healthRpcServer = health.NewServer(health.ListenAddress(node.config.HealthConfig), healthHandler)
 
 	return node, nil
 }
@@ -265,7 +264,7 @@ func (node *Node) Start() error {
 	node.healthRpcServer.Handler.(*health.Handler).SetIdentity(identity)
 
 	go func() {
-		node.logger.Infof("Starting health rpc server on port: %d\n", node.config.HealthConfig.Port)
+		node.logger.Infof("Starting health rpc server on %s", node.healthRpcServer.Addr)
 		if errListen := node.healthRpcServer.ListenAndServe(); errListen != nil && !errors.Is(errListen, http.ErrServerClosed) {
 			node.logger.Fatalf("ListenAndServe(): %v", errListen)
 		}
@@ -1607,7 +1606,7 @@ func (node *Node) openDataDir() error {
 		return nil
 	}
 
-	if err := os.MkdirAll(node.config.DataPath, 0700); err != nil {
+	if err := oconfig.EnsureDataDir(node.config.DataPath); err != nil {
 		return err
 	}
 	node.logger.Info("successfully ensured DataPath exists", zap.String("data-path", node.config.DataPath))
