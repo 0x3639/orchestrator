@@ -4,6 +4,7 @@ import (
 	"net/url"
 	"orchestrator/common"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -37,8 +38,8 @@ func RegisterSecretURL(raw string) {
 		return
 	}
 	redacted := RedactURL(raw)
-	common.LogRedactor.Register(raw, redacted)
-	common.LogRedactor.Register(parsed.String(), redacted)
+	registerURLForm(raw, redacted)
+	registerURLForm(parsed.String(), redacted)
 	if parsed.User != nil {
 		if password, ok := parsed.User.Password(); ok {
 			// net/http renders credentials as user:***@host in url.Error by
@@ -47,7 +48,7 @@ func RegisterSecretURL(raw string) {
 			// asterisks as %2A.
 			canonical := parsed.String()
 			masked := strings.Replace(canonical, parsed.User.String()+"@", parsed.User.Username()+":***@", 1)
-			common.LogRedactor.Register(masked, redacted)
+			registerURLForm(masked, redacted)
 			if len(password) >= minRegisteredComponentLen {
 				common.LogRedactor.Register(password, common.RedactedPlaceholder)
 			}
@@ -57,7 +58,7 @@ func RegisterSecretURL(raw string) {
 		}
 		stripped := *parsed
 		stripped.User = nil
-		common.LogRedactor.Register(stripped.String(), redacted)
+		registerURLForm(stripped.String(), redacted)
 	}
 	if parsed.Path != "" && parsed.Path != "/" && len(parsed.Path) >= minRegisteredComponentLen {
 		common.LogRedactor.Register(parsed.Path, "/"+common.RedactedPlaceholder)
@@ -91,6 +92,19 @@ func RegisterSecretURL(raw string) {
 				common.LogRedactor.Register(value, common.RedactedPlaceholder)
 			}
 		}
+	}
+}
+
+// registerURLForm registers one whole-URL rendering and, when it differs,
+// the form fmt's %q verb produces for it. url.Error quotes the URL with %q,
+// so a decoded username containing a quote, backslash or control byte is
+// escaped again before it reaches the log.
+func registerURLForm(form, redacted string) {
+	common.LogRedactor.Register(form, redacted)
+	quoted := strconv.Quote(form)
+	quoted = quoted[1 : len(quoted)-1]
+	if quoted != form {
+		common.LogRedactor.Register(quoted, redacted)
 	}
 }
 

@@ -323,6 +323,27 @@ func TestRegisterSecretURLMatchesNetHTTPMaskedForm(t *testing.T) {
 		t.Fatalf("net/http masked form not matched: %s", got)
 	}
 
+	// url.Error applies %q to the URL, so a username that decodes to a quote
+	// is escaped again; the quoted rendering must be matched too.
+	common.LogRedactor.Reset()
+	quotedRaw := `https://a%22b:pw@rpc.example.com/x?k=abc#tok`
+	RegisterSecretURL(quotedRaw)
+	qp, err := url.Parse(quotedRaw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	qMasked := strings.Replace(qp.String(), qp.User.String()+"@", qp.User.Username()+":***@", 1)
+	realErr := (&url.Error{Op: "Post", URL: qMasked, Err: errors.New("connection refused")}).Error()
+	if !strings.Contains(realErr, `a\"b`) {
+		t.Fatalf("test setup: expected %%q-escaped username in %q", realErr)
+	}
+	got = common.LogRedactor.Redact(realErr)
+	for _, leak := range []string{`a\"b`, `a"b`, "/x?", "k=abc", "#tok"} {
+		if strings.Contains(got, leak) {
+			t.Fatalf("quoted url.Error leaked %q: %s", leak, got)
+		}
+	}
+
 	// A short fragment must not scrub the same word elsewhere.
 	common.LogRedactor.Reset()
 	RegisterSecretURL("https://rpc.example.com/rpc#production")
