@@ -3,6 +3,7 @@ package config
 import (
 	"encoding/json"
 	"errors"
+	"net/url"
 	"orchestrator/common"
 	"os"
 	"path/filepath"
@@ -288,6 +289,45 @@ func TestRegisterSecretURLHandlesClientRenderedForms(t *testing.T) {
 				t.Fatalf("form %q leaked %q: %s", form, sentinel, got)
 			}
 		}
+	}
+}
+
+func TestRegisterSecretURLMatchesNetHTTPMaskedForm(t *testing.T) {
+	common.LogRedactor.Reset()
+	t.Cleanup(common.LogRedactor.Reset)
+
+	// Every component is below the per-component thresholds, so only the
+	// whole-URL forms can catch it. Use the URL exactly as net/http renders
+	// it in url.Error: the password replaced by a literal ***.
+	raw := "https://api:pw@rpc.example.com/x?k=abc#tok"
+	RegisterSecretURL(raw)
+
+	rendered := `Post "https://api:***@rpc.example.com/x?k=abc#tok": dial tcp: connection refused`
+	got := common.LogRedactor.Redact(rendered)
+	for _, leak := range []string{"api:", "/x?", "k=abc", "#tok", "%2A"} {
+		if strings.Contains(got, leak) {
+			t.Fatalf("masked form leaked %q: %s", leak, got)
+		}
+	}
+	if !strings.Contains(got, "rpc.example.com") {
+		t.Fatalf("host should survive: %s", got)
+	}
+
+	// The exact string net/http produces for a real request must be caught.
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	netHTTPForm := strings.Replace(parsed.String(), parsed.User.String()+"@", parsed.User.Username()+":***@", 1)
+	if got := common.LogRedactor.Redact(netHTTPForm); strings.Contains(got, "api:***") {
+		t.Fatalf("net/http masked form not matched: %s", got)
+	}
+
+	// A short fragment must not scrub the same word elsewhere.
+	common.LogRedactor.Reset()
+	RegisterSecretURL("https://rpc.example.com/rpc#production")
+	if got := common.LogRedactor.Redact("switching to production mode #production"); got != "switching to production mode #<redacted>" {
+		t.Fatalf("fragment over-redaction: %q", got)
 	}
 }
 

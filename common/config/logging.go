@@ -41,10 +41,13 @@ func RegisterSecretURL(raw string) {
 	common.LogRedactor.Register(parsed.String(), redacted)
 	if parsed.User != nil {
 		if password, ok := parsed.User.Password(); ok {
-			// net/http renders credentials as user:***@host in url.Error.
-			masked := *parsed
-			masked.User = url.UserPassword(parsed.User.Username(), "***")
-			common.LogRedactor.Register(masked.String(), redacted)
+			// net/http renders credentials as user:***@host in url.Error by
+			// string-replacing the userinfo, so mirror that exactly rather
+			// than going through url.UserPassword, which would escape the
+			// asterisks as %2A.
+			canonical := parsed.String()
+			masked := strings.Replace(canonical, parsed.User.String()+"@", parsed.User.Username()+":***@", 1)
+			common.LogRedactor.Register(masked, redacted)
 			if len(password) >= minRegisteredComponentLen {
 				common.LogRedactor.Register(password, common.RedactedPlaceholder)
 			}
@@ -62,7 +65,16 @@ func RegisterSecretURL(raw string) {
 			common.LogRedactor.Register(escaped, "/"+common.RedactedPlaceholder)
 		}
 	}
-	if len(parsed.Fragment) >= minRegisteredComponentLen {
+	// Fragments are registered with their leading '#' so a short fragment
+	// such as "production" cannot scrub ordinary words elsewhere in the log;
+	// only key-length fragments are registered bare.
+	if fragment := parsed.EscapedFragment(); len(fragment) >= minRegisteredComponentLen {
+		common.LogRedactor.Register("#"+fragment, "#"+common.RedactedPlaceholder)
+		if fragment != parsed.Fragment {
+			common.LogRedactor.Register("#"+parsed.Fragment, "#"+common.RedactedPlaceholder)
+		}
+	}
+	if len(parsed.Fragment) >= minRegisteredTokenLen {
 		common.LogRedactor.Register(parsed.Fragment, common.RedactedPlaceholder)
 	}
 	for _, segment := range strings.Split(parsed.Path, "/") {
