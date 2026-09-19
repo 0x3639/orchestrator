@@ -264,15 +264,17 @@ func (rC *znnNetwork) InterpretSendBlockData(sendBlock *api.AccountBlock, live b
 
 		rC.logger.Debugf("redeem for tx: %s and log index: %d", param.TransactionHash.String(), param.LogIndex)
 		if rpcEvent, rpcErr := rC.GetUnwrapTokenRequestByHashAndLog(param.TransactionHash, param.LogIndex); rpcErr != nil {
-			if rpcErr.Error() == constants.ErrDataNonExistent.Error() {
-				rC.logger.Info("there is a redeem attempt for a non existing unwrap event")
-				rC.logger.Debug(rpcErr)
+			if bridgeObjectGone(rpcErr) {
+				rC.logger.Infof("skipping redeem of unwrap %s/%d: the bridge no longer has it or its network (%v)", param.TransactionHash.String(), param.LogIndex, rpcErr)
 				break
 			}
 			return rpcErr
 		} else if rpcEvent == nil {
 			// someone is trying to redeem a non existent event
 			rC.logger.Info("there is a redeem attempt for a non existing unwrap event")
+			break
+		} else if !rC.dbManager.HasEvmStorage(rpcEvent.ChainId) {
+			rC.logger.Infof("skipping redeem of unwrap %s/%d: chainId %d is not a configured network on this node", param.TransactionHash.String(), param.LogIndex, rpcEvent.ChainId)
 			break
 		} else {
 			if localEvent, err := rC.dbManager.EvmStorage(rpcEvent.ChainId).GetUnwrapRequestByHashAndLog(ecommon.Hash(rpcEvent.TransactionHash), rpcEvent.LogIndex); err != nil {
@@ -304,9 +306,12 @@ func (rC *znnNetwork) InterpretSendBlockData(sendBlock *api.AccountBlock, live b
 			param.NetworkClass, param.ChainId, param.TransactionHash, param.LogIndex, param.ToAddress.String(), param.TokenAddress, param.Amount.String(), param.Signature)
 
 		if rpcZnnEvent, rpcZnnErr := rC.GetUnwrapTokenRequestByHashAndLog(param.TransactionHash, param.LogIndex); rpcZnnErr != nil {
-			if rpcZnnErr.Error() == constants.ErrDataNonExistent.Error() {
-				rC.logger.Debugf("UnwrapTokenRequest not found: Hash: %s, LogIndex: %d, ChainId: %d\n",
-					param.TransactionHash.String(), param.LogIndex, param.ChainId)
+			if bridgeObjectGone(rpcZnnErr) {
+				// A request the bridge no longer recognises, typically because
+				// its network was removed from the bridge
+				// after the request was made. Nothing can be done with it.
+				rC.logger.Infof("skipping unwrap request %s/%d for chainId %d: the bridge no longer has it or its network (%v)",
+					param.TransactionHash.String(), param.LogIndex, param.ChainId, rpcZnnErr)
 				break
 			}
 			rC.logger.Debugf("get for tx %s and log :%d rpc error: %s", param.TransactionHash.String(), param.LogIndex, rpcZnnErr.Error())
@@ -314,6 +319,12 @@ func (rC *znnNetwork) InterpretSendBlockData(sendBlock *api.AccountBlock, live b
 		} else if rpcZnnEvent == nil {
 			// We don't care if it the rpc does not return it, it means the tx returned an error
 			rC.logger.Infof("unwrap event non existent: %s", param.TransactionHash.String())
+			break
+		} else if !rC.rpcManager.HasEvmNetwork(param.ChainId) || !rC.dbManager.HasEvmStorage(param.ChainId) {
+			// The bridge still knows the request but this node has no client
+			// or store for its chain; looking either up would stop the node.
+			rC.logger.Infof("skipping unwrap request %s/%d: chainId %d is not a configured network on this node",
+				param.TransactionHash.String(), param.LogIndex, param.ChainId)
 			break
 		} else {
 			if tx, rpcEvmErr := rC.rpcManager.Evm(param.ChainId).TransactionReceipt(ecommon.Hash(param.TransactionHash)); rpcEvmErr != nil {
@@ -464,14 +475,17 @@ func (rC *znnNetwork) InterpretSendBlockData(sendBlock *api.AccountBlock, live b
 
 		common.AdministratorLogger.Infof("RevokeUnwrapRequestMethodName TxHash: %s, LogIndex: %d", param.TransactionHash.String(), param.LogIndex)
 		if rpcEvent, rpcErr := rC.GetUnwrapTokenRequestByHashAndLog(param.TransactionHash, param.LogIndex); rpcErr != nil {
-			if rpcErr.Error() == constants.ErrDataNonExistent.Error() {
-				rC.logger.Debug(rpcErr)
+			if bridgeObjectGone(rpcErr) {
+				rC.logger.Infof("skipping revoke of unwrap %s/%d: the bridge no longer has it or its network (%v)", param.TransactionHash.String(), param.LogIndex, rpcErr)
 				break
 			}
 			return rpcErr
 		} else if rpcEvent == nil {
 			// someone is trying to redeem a non existent event
 			rC.logger.Info("event non existent")
+			break
+		} else if !rC.dbManager.HasEvmStorage(rpcEvent.ChainId) {
+			rC.logger.Infof("skipping revoke of unwrap %s/%d: chainId %d is not a configured network on this node", param.TransactionHash.String(), param.LogIndex, rpcEvent.ChainId)
 			break
 		} else {
 			// if the event was revoked we also set it locally
