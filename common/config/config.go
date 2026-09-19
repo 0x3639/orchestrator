@@ -26,8 +26,17 @@ const (
 )
 
 type BaseNetworkConfig struct {
-	Urls            []string
+	Urls []string
+	// FilterQuerySize is how many blocks one eth_getLogs query spans while
+	// syncing. Smaller ranges mean more, cheaper queries.
 	FilterQuerySize uint64
+	// RpcRequestsPerSecond caps how many JSON-RPC requests the orchestrator
+	// sends to this network's endpoints, per endpoint. It applies to sync,
+	// event confirmation and canonical-block checks alike. 0 means no cap.
+	RpcRequestsPerSecond float64
+	// RpcBurst is how many requests may be sent at once before the rate cap
+	// applies. 0 with a non-zero rate means a burst of 1.
+	RpcBurst int
 }
 
 type TssManagerConfig struct {

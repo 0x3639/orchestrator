@@ -259,61 +259,161 @@ func (eN *evmNetwork) pruneNonCanonicalUnsigned(fromBlock uint64) error {
 	return nil
 }
 
+const (
+	// syncRetryBaseBackoff and syncRetryMaxBackoff pace retries of a single
+	// range when the provider rejects or times out a query, which is what a
+	// rate-limited endpoint does during the initial sync. Retrying in place
+	// keeps the pass going instead of abandoning it until the next refresh.
+	syncRetryBaseBackoff = 2 * time.Second
+	syncRetryMaxBackoff  = 2 * time.Minute
+	// syncMaxRangeAttempts bounds retries of one range before the pass gives
+	// up; the next refresh resumes from the same cursor.
+	syncMaxRangeAttempts = 12
+	// syncProgressEvery is how many ranges to process between progress lines.
+	syncProgressEvery = 25
+)
+
 func (eN *evmNetwork) Sync() error {
 	eN.logger.Info("In sync evm")
 	eN.resetCanonicalCache()
-	if updateHeight, err := eN.eventsStore().GetLastUpdateHeight(); err != nil {
+	updateHeight, err := eN.eventsStore().GetLastUpdateHeight()
+	if err != nil {
 		return err
-	} else {
-		eN.logger.Info("updateHeight: ", updateHeight)
-		for {
-			latestBlock, rpcErr := eN.EvmRpc().BlockNumber()
-			if rpcErr != nil {
-				eN.logger.Debug(rpcErr)
-				return rpcErr
+	}
+	eN.logger.Info("updateHeight: ", updateHeight)
+
+	startHeight := updateHeight
+	startedAt := time.Now()
+	ranges := 0
+	attempts := 0
+	backoff := syncRetryBaseBackoff
+	// rangeEnd is fixed when a range is first attempted and kept across
+	// retries, so a query the provider rejected is retried as-is rather
+	// than growing toward a newer head.
+	var rangeEnd uint64
+	rangeFrozen := false
+	rangeIsTip := false
+
+	// retryRange pauses before the same range is attempted again. It
+	// returns an error once the attempt budget is spent or the node stops.
+	retryRange := func(what string, cause error) error {
+		attempts++
+		if attempts >= syncMaxRangeAttempts {
+			return fmt.Errorf("sync for chainId %d: %s failed %d times at block %d, giving up until the next refresh: %w", eN.ChainId(), what, attempts, updateHeight, cause)
+		}
+		eN.logger.Warnf("Sync for chainId %d: %s failed at block %d (attempt %d/%d), retrying in %s: %v",
+			eN.ChainId(), what, updateHeight, attempts, syncMaxRangeAttempts, backoff, cause)
+		if !eN.sleep(backoff) {
+			return errors.New("sync interrupted by shutdown")
+		}
+		backoff *= 2
+		if backoff > syncRetryMaxBackoff {
+			backoff = syncRetryMaxBackoff
+		}
+		return nil
+	}
+
+	for {
+		latestBlock, rpcErr := eN.EvmRpc().BlockNumber()
+		if rpcErr != nil {
+			if err := retryRange("reading chain head", rpcErr); err != nil {
+				return err
 			}
+			continue
+		}
 
-			if updateHeight > latestBlock {
-				// todo this can happen if we have a fork
-				return errors.Errorf("sync evm problem for network: %s, chainId: %d", eN.NetworkName(), eN.ChainId())
-			}
+		if updateHeight > latestBlock {
+			// todo this can happen if we have a fork
+			return errors.Errorf("sync evm problem for network: %s, chainId: %d", eN.NetworkName(), eN.ChainId())
+		}
 
-			end := false
-			filterQuerySize := eN.rpcManager.Evm(eN.ChainId()).FilterQuerySize()
-
+		if !rangeFrozen {
 			distance := latestBlock - updateHeight
-			if distance < eN.ConfirmationsToFinality() {
+			filterQuerySize := eN.rpcManager.Evm(eN.ChainId()).FilterQuerySize()
+			rangeIsTip = false
+			if distance < eN.ConfirmationsToFinality() || distance == 0 {
+				// The range reaches the head. A zero distance still queries
+				// the cursor block once: on first start the cursor is the
+				// deployment height, which has not been scanned yet, and the
+				// query is idempotent otherwise. rangeIsTip ends the pass so
+				// it cannot spin on the same block.
 				filterQuerySize = distance
-				end = true
+				rangeIsTip = true
 			} else if distance < filterQuerySize {
 				filterQuerySize = distance
 			}
-			// eN.logger.Infof("distance: %d, left: %d, right: %d, filterQuerySize: %d\n", distance, updateHeight, updateHeight+filterQuerySize, filterQuerySize)
-
-			if logs, err := eN.EvmRpc().FilterLogs(updateHeight, updateHeight+filterQuerySize); err != nil {
+			rangeEnd = updateHeight + filterQuerySize
+			rangeFrozen = true
+		}
+		if latestBlock < rangeEnd {
+			// The head retreated below the frozen range end (a lagging
+			// backend behind a load balancer). A provider that clamps the
+			// query would report success for blocks it has not seen, and the
+			// cursor would then pass them for good. Wait for the head.
+			if err := retryRange(fmt.Sprintf("head %d is below the range end %d", latestBlock, rangeEnd), errors.New("provider head behind range")); err != nil {
 				return err
-			} else {
-				for _, log := range logs {
-					// if we have confirmations then we are live, otherwise we are not
-					if err := eN.InterpretLog(log, latestBlock-log.BlockNumber < eN.ConfirmationsToFinality()); err != nil {
-						// Do not advance the cursor past a range with an unprocessed
-						// log; the next Sync retries the same range. Skipping it
-						// would silently lose the event on this signer only.
-						eN.logger.Errorf("Sync: failed to interpret log tx %s logIndex %d in block %d, range [%d, %d] will be retried: %v",
-							log.TxHash.String(), log.Index, log.BlockNumber, updateHeight, updateHeight+filterQuerySize, err)
-						return err
-					}
+			}
+			continue
+		}
+		filterQuerySize := rangeEnd - updateHeight
+		// Only stop when the covered range still reaches the current head;
+		// if the head moved on during retries there is more to fetch.
+		end := rangeIsTip && latestBlock == rangeEnd
+
+		logs, err := eN.EvmRpc().FilterLogs(updateHeight, rangeEnd)
+		if err != nil {
+			if err := retryRange(fmt.Sprintf("eth_getLogs for blocks [%d, %d]", updateHeight, rangeEnd), err); err != nil {
+				return err
+			}
+			continue
+		}
+		interpretFailed := false
+		for _, log := range logs {
+			// if we have confirmations then we are live, otherwise we are not
+			if err := eN.InterpretLog(log, latestBlock-log.BlockNumber < eN.ConfirmationsToFinality()); err != nil {
+				// Do not advance the cursor past a range with an unprocessed
+				// log; the same range is retried. Skipping it would silently
+				// lose the event on this signer only.
+				eN.logger.Errorf("Sync: failed to interpret log tx %s logIndex %d in block %d, range [%d, %d] will be retried: %v",
+					log.TxHash.String(), log.Index, log.BlockNumber, updateHeight, updateHeight+filterQuerySize, err)
+				if err := retryRange("interpreting logs", err); err != nil {
+					return err
 				}
-			}
-
-			updateHeight += filterQuerySize
-			if err := eN.eventsStore().SetLastUpdateHeight(updateHeight); err != nil {
-				return err
-			}
-			if end {
+				interpretFailed = true
 				break
 			}
 		}
+		if interpretFailed {
+			continue
+		}
+
+		// The range succeeded: reset the retry budget and unfreeze for the next one.
+		attempts = 0
+		backoff = syncRetryBaseBackoff
+		rangeFrozen = false
+
+		updateHeight += filterQuerySize
+		if err := eN.eventsStore().SetLastUpdateHeight(updateHeight); err != nil {
+			return err
+		}
+		ranges++
+		if ranges%syncProgressEvery == 0 {
+			done := updateHeight - startHeight
+			total := latestBlock - startHeight
+			pct := float64(0)
+			if total > 0 {
+				pct = 100 * float64(done) / float64(total)
+			}
+			eN.logger.Infof("Sync progress for chainId %d: block %d of %d (%.1f%%), %d ranges in %s",
+				eN.ChainId(), updateHeight, latestBlock, pct, ranges, time.Since(startedAt).Round(time.Second))
+		}
+		if end {
+			break
+		}
+	}
+	if ranges >= syncProgressEvery {
+		eN.logger.Infof("Sync complete for chainId %d: blocks %d to %d in %d ranges, %s",
+			eN.ChainId(), startHeight, updateHeight, ranges, time.Since(startedAt).Round(time.Second))
 	}
 	return nil
 }

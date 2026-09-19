@@ -143,8 +143,10 @@ const redactedPlaceholder = common.RedactedPlaceholder
 
 // NetworkSummary is the loggable view of a network configuration.
 type NetworkSummary struct {
-	Urls            []string
-	FilterQuerySize uint64
+	Urls                 []string
+	FilterQuerySize      uint64
+	RpcRequestsPerSecond float64
+	RpcBurst             int
 }
 
 // HealthSummary is the loggable view of the health RPC configuration.
@@ -188,7 +190,7 @@ func (c Config) LoggableSummary() Summary {
 	for name, network := range c.Networks {
 		urls := RedactURLs(network.Urls)
 		sort.Strings(urls)
-		networks[name] = NetworkSummary{Urls: urls, FilterQuerySize: network.FilterQuerySize}
+		networks[name] = NetworkSummary{Urls: urls, FilterQuerySize: network.FilterQuerySize, RpcRequestsPerSecond: network.RpcRequestsPerSecond, RpcBurst: network.RpcBurst}
 	}
 
 	return Summary{
