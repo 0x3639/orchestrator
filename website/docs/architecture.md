@@ -26,9 +26,9 @@ Every transfer is a two-step, **request then redeem**. The request records the u
 
 ## The orchestrator's role
 
-Each orchestrator node runs alongside a Pillar and holds one share of a threshold-signature (TSS) key. The TSS group can sign; it cannot move funds on its own, because the contracts only act on a valid group signature for a transfer that they can themselves verify.
+Each orchestrator node runs alongside a Pillar and holds one share of a threshold-signature (TSS) key. The contracts verify the group signature and their own local rules; they cannot see the other chain. Verifying that a transfer has a genuine source-side cause is the orchestrators' job, done twice: before signing, and again during the redeem delay, when every signer checks each registered redeem against the source network and halts the bridge if the cause is missing. See [Security model](security-model.md).
 
-There is no extra consensus round between orchestrators. Each node independently watches every network, waits for the transfer to reach that network's finality threshold, and then proposes it for signing in the next ceremony. A ceremony succeeds when a super-majority (more than two thirds) of the group proposes the identical set of transfers. That successful signature **is** the off-chain consensus on which transfers are valid.
+There is no extra consensus round between orchestrators. Each node independently watches every network, waits for the transfer to reach that network's finality threshold, and then proposes it for signing in the next ceremony. A ceremony succeeds when at least two thirds of the group, rounded up (`ceil(2N/3)` of `N` signers), propose the identical set of transfers. That successful signature **is** the off-chain consensus on which transfers are valid.
 
 Two consequences shape everything else in this guide:
 
@@ -41,16 +41,16 @@ Signing alternates between the two directions on a fixed schedule measured in mo
 
 ## Networks and finality
 
-Only EVM networks are bridged today: Ethereum-compatible execution, secp256k1 ECDSA signatures and the Ethereum JSON-RPC API. Each network has a network class and chain id, and a finality threshold in blocks below which the orchestrator will not sign:
+Only EVM networks are bridged today: Ethereum-compatible execution, secp256k1 ECDSA signatures and the Ethereum JSON-RPC API. Each network is identified by a network class and chain id:
 
-| Network | Class | Chain id | Finality |
+| Network | Class | Chain id | Consensus finality, for background |
 | --- | --- | --- | --- |
-| Network of Momentum | 1 | 1 | 6 momentums |
+| Network of Momentum | 1 | 1 | about 6 momentums |
 | Ethereum | 2 | 1 | 1 epoch, about 6.4 minutes |
 | BNB Smart Chain | 2 | 56 | fast finality, seconds |
 
-The exact number of confirmations for each EVM network is a bridge parameter, `confirmationsToFinality`, reported per network by the [health API](health-api.md).
+The last column is what each chain's own consensus considers final. The thresholds the orchestrator actually waits for are bridge parameters: `confirmationsToFinality` from `getOrchestratorInfo` for wrap requests on NoM, and each EVM bridge contract's `confirmationsToFinality` block count for unwrap events, reported per network by the [health API](health-api.md). See [Bridge parameters](bridge-parameters.md).
 
 ---
 
-*Adapted from the HyperCore-Team documentation for the NoM multi-chain infrastructure, [hypercore-team.github.io](https://hypercore-team.github.io/), and ZIP:sumamu-0001. GPL v3.*
+*Adapted from the HyperCore Team's [NoM multi-chain infrastructure documentation](https://hypercore-team.github.io/) (MIT licence, copyright 2023 HyperCore Team; see [Attribution](attribution.md)), which describes [ZIP:sumamu-0001](https://forum.zenon.org/t/zip-sumamu-0001-final/1327). Source pages: [Architecture overview](https://hypercore-team.github.io/intro/architecture.html), [Participants](https://hypercore-team.github.io/intro/participants.html), [Decentralized bridge](https://hypercore-team.github.io/decentralized_bridge/intro.html).*

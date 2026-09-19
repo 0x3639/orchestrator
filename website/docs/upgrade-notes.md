@@ -31,7 +31,11 @@ The rest of this guide describes the orchestrator as it behaves in the 0x3639 bu
 - Duplicate event deliveries cannot reset a signed or sent record; the sync cursor only moves forward.
 - The signing pool is reconciled against Zenon before each ceremony, so a signer that fell out of sync usually recovers by itself within a few ceremony windows, and a rebuilt event store does not re-sign history.
 - Historical unwrap logs are validated against the endpoint-agreed canonical block before being stored.
-- Bridge-contract reads share the per-endpoint request cap and carry a deadline.
+- Every EVM read, including the bridge-contract reads, shares the per-endpoint request cap and carries a 30-second deadline (2 minutes for `eth_getLogs`).
+- The health listener has header, read, write and idle deadlines.
+- `config.json` must be a regular file, not a symlink, and at most 1 MiB; anything else is refused at startup.
+- A dropped log subscription is re-established in process with backoff instead of stopping the node.
+- `FilterQuerySize: 0` falls back to `2000` with a warning instead of querying the same block forever.
 - The `SHA256CHECKSUMS.txt` release asset has one digest per line; releases up to v0.0.9a wrote both on one line.
 
 ### Release builds

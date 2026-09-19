@@ -36,7 +36,7 @@ It also watches for transfers that should not exist and, with the other signers,
 
 ## About this guide
 
-This guide documents the orchestrator build maintained by 0x3639. It describes the software as it behaves in that build. Differences from the upstream HyperCore-Team release are listed in one place, the [Upgrade notes](upgrade-notes.md), so that the rest of the guide can be read without a history lesson.
+This guide documents the orchestrator build maintained by 0x3639 and describes the software as it behaves in that build. Version history, and what to do when moving a running signer between versions, is kept on one page, [Upgrade notes](upgrade-notes.md). Adapted material is credited on the page that uses it and on the [Attribution](attribution.md) page.
 
 ## Read next
 

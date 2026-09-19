@@ -9,7 +9,7 @@ title: Signing stalls
 
 ## How a ceremony forms
 
-A TSS signing ceremony is identified by a hash of **the exact set of messages** being signed plus the signer keys. Every signer builds that set locally: the first unsigned unwrap events in its own `events/` store, in key order, up to the ceremony pool size (50 by default, adjustable by the bridge administrator through [bridge metadata](../bridge-parameters.md)). Signers whose sets are identical join the same ceremony; a ceremony succeeds when more than two thirds of the group join it.
+A TSS signing ceremony is identified by a hash of **the exact set of messages** being signed plus the signer keys. Every signer builds that set locally: the first unsigned unwrap events in its own `events/` store, in key order, up to the ceremony pool size (50 by default, adjustable by the bridge administrator through [bridge metadata](../bridge-parameters.md)). Signers whose sets are identical join the same ceremony; a ceremony succeeds when at least two thirds of the group, rounded up (`ceil(2N/3)` of `N` signers), join it.
 
 A signer whose set differs from its peers', even by one event, computes a different ceremony id and stays out. If the group fragments into sets that none reaches the threshold, nothing signs.
 
@@ -35,7 +35,7 @@ Collect from **every** signer at the same time:
 
 Then:
 
-- **`unwrapsHash` differs between signers** and `latestUpdateHeight` values are all near the head: the event sets diverged. Identify the signer whose count is off. If its count is higher, reconciliation clears stale extras at the next ceremony. If lower, it is missing events: run a [backfill](backfill.md) on that signer.
+- **`unwrapsHash` differs between signers** and `latestUpdateHeight` values are all near the head: the event sets diverged. Identify the signer whose count is off. If its count is higher and the extras are events Zenon already has, reconciliation clears them at the next ceremony; if the extras are records nobody else holds (from a forked backend), only a [backfill](backfill.md) removes them. If its count is lower, it is missing events: run a backfill on that signer.
 - **`latestUpdateHeight` is far behind on one signer**: that signer's sync is failing. See [First sync](first-sync.md) for the log lines and [Troubleshooting](troubleshooting.md).
 - **`LocalPubKeys` differ**: a configuration-level split that no store repair fixes. The signers disagree about who is in the group; that is resolved by the next key generation.
 - **All hashes match but nothing signs**: the problem is the ceremony itself, not the sets. Check TSS peer connectivity on port `55055` and `peersLen` in `getStatus`.

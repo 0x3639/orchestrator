@@ -14,7 +14,7 @@ Every wrap and unwrap is two actions:
 1. **Request** signals the user's intent and locks or burns the source-side assets.
 2. **Redeem** delivers the assets on the destination once a valid orchestrator signature exists.
 
-After a redeem is registered there is a window during which the assets remain unredeemable. During that window every orchestrator checks that the matching source-side transaction exists. If it does not, the orchestrators halt the bridge.
+Registering a redeem on the destination does not deliver the assets immediately: there is a delay during which they remain unredeemable. During that delay every orchestrator checks that the registration has a matching request on the source network. The check runs in both directions, for redeems registered on an EVM contract (`RegisteredRedeem`) and for unwrap requests registered on NoM. If the source-side cause does not exist, the orchestrators halt the bridge.
 
 ## Time challenges
 
@@ -22,11 +22,11 @@ Sensitive administrative actions, such as changing the TSS public key, adding a 
 
 ## Distributed halting
 
-The orchestrators halt the bridge on their own when any of them observes a redeem on a destination network with no corresponding request on the source network. The signer enters `EmergencyState`, the group signs a halt message in a ceremony, and one signer submits it on each network. Halting needs the same super-majority as any other signature.
+The orchestrators halt the bridge on their own when any of them observes a redeem registration on a destination network with no corresponding request on the source network. The signer enters `EmergencyState`, the group signs halt messages for every network in a ceremony, and a selected signer submits each one. Halting needs the same threshold as any other signature.
 
-On EVM networks the halt is an ordinary transaction sent from **this signer's EVM address**, which is derived from the producer key and shown as `evmAddress` in the [health API](health-api.md). That address must hold enough of the network's gas token to send a transaction, or the signer cannot participate in a halt. Check the balance as part of routine monitoring.
+On EVM networks the halt is an ordinary transaction sent from the submitting signer's **own EVM address**, which is derived from the producer key and shown as `evmAddress` in the [health API](health-api.md). Submission rotates between signers, so a signer whose address holds no gas cannot submit when it is selected and the halt waits for the next one. Keep the address funded on every bridged EVM network and include its balance in monitoring.
 
-Only the administrator and the orchestrators can halt. Lifting a halt is an administrator action and takes effect only after the bridge's minimum unhalt duration.
+The administrator can halt any network unilaterally; ordinary signers halt only through the threshold-signed emergency ceremony. Lifting a halt is an administrator action and takes effect only after the bridge's minimum unhalt duration.
 
 ## Administrator and guardians
 
@@ -46,4 +46,4 @@ If your monitoring detects a security event, contact the other Pillar operators 
 
 ---
 
-*Adapted from the HyperCore-Team documentation for the NoM multi-chain infrastructure, [hypercore-team.github.io](https://hypercore-team.github.io/). GPL v3.*
+*Adapted from the HyperCore Team's [NoM multi-chain infrastructure documentation](https://hypercore-team.github.io/) (MIT licence, copyright 2023 HyperCore Team; see [Attribution](attribution.md)), which describes [ZIP:sumamu-0001](https://forum.zenon.org/t/zip-sumamu-0001-final/1327). Source pages: [Security](https://hypercore-team.github.io/security.html), [Participants](https://hypercore-team.github.io/intro/participants.html).*

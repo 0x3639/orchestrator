@@ -26,6 +26,7 @@ const sidebars = {
       ],
     },
     'upgrade-notes',
+    'attribution',
   ],
 };
 

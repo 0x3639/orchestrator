@@ -35,7 +35,7 @@ Ownership is checked by exact user id. Running as root against a directory owned
 
 ## The signer's EVM address
 
-The producer key also derives this signer's EVM private key. Its address is written to `config.json` as `EvmAddress` and reported by the [health API](health-api.md). The signer sends bridge halt transactions on EVM networks from this address, so it **must hold gas** on every bridged EVM network. A signer with an empty address cannot take part in a halt. Fund it after the first start and include its balance in monitoring; see [Security model](security-model.md).
+The producer key also derives this signer's EVM private key. Its address is written to `config.json` as `EvmAddress` and reported by the [health API](health-api.md). When this signer is selected to submit a bridge halt on an EVM network, the transaction is sent from this address, so it **must hold gas** on every bridged EVM network. A signer whose balance is empty cannot submit when selected, which delays the halt until another signer is chosen. Fund it after the first start and include its balance in monitoring; see [Security model](security-model.md).
 
 ## Back up the TSS share
 

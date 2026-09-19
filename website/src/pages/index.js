@@ -20,7 +20,7 @@ const features = [
   {
     eyebrow: 'Signing',
     title: 'Keep signers converged',
-    body: 'Why unwrap signing stalls, how nodes self-heal, and the bounded backfill that replaces wiping the events store.',
+    body: 'Why unwrap signing stalls, how nodes self-heal, and the bounded backfill repair for a signer that has lost events.',
     to: '/docs/operations/signing-stalls',
     label: 'Signing stalls runbook',
   },

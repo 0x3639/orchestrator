@@ -19,9 +19,7 @@ chmod +x orchestrator-linux-amd64
 sudo install -m 0755 orchestrator-linux-amd64 /usr/local/bin/orchestrator
 ```
 
-:::note
-Releases up to `v0.0.9a` write both digests on one line of `SHA256CHECKSUMS.txt`, which `sha256sum -c` rejects. Compare the digest by hand for those. Builds from `dev` onward write one digest per line and `sha256sum -c SHA256CHECKSUMS.txt` works.
-:::
+The checksum file lists one digest per line, so `sha256sum -c SHA256CHECKSUMS.txt` also works.
 
 ## Build from source
 
