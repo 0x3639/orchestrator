@@ -49,6 +49,9 @@ function toPlainMarkdown(body, docId, siteUrl) {
     return `](${siteUrl}/${DOCS_ROUTE}/${resolved}/${hash ?? ''})`;
   });
   return linked
+    // MDX imports and React components have no text form; drop them.
+    .replace(/^import .*$/gm, '')
+    .replace(/^<[A-Z][\w.]*[^>]*\/>$/gm, '')
     .replace(/^:::(\w+)(?:\s+(.*))?$/gm, (m, kind, title) => `**${title || kind[0].toUpperCase() + kind.slice(1)}.**`)
     .replace(/^:::$/gm, '')
     .replace(/\n{3,}/g, '\n\n')

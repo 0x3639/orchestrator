@@ -4,6 +4,8 @@ title: Overview
 description: "What the Zenon bridge orchestrator is, the two jobs a signer does, how a node is wired, and where to start."
 ---
 
+import SignerWiring from '@site/src/components/SignerWiring';
+
 # Overview
 
 The orchestrator is the signer node of the Zenon bridge. Each participating Pillar operator runs one. Together the orchestrators hold a threshold-signature (TSS) key, and the bridge contracts on Zenon and on each EVM network release assets only against that group's signature. [How the bridge works](architecture.md) explains the design; this guide covers running a node.
@@ -17,17 +19,7 @@ It also watches for transfers that should not exist and, with the other signers,
 
 ## How a signer is wired
 
-```
-                 ┌───────────────┐        ┌──────────────────┐
-  Zenon node ◄──►│               │◄──────►│ EVM endpoint(s)  │
-  (ws://:35998)  │  orchestrator │        │ per network      │
-                 │               │        └──────────────────┘
-                 │  ~/.orchestrator/
-                 │    config.json   producer   events/   queues/   tss/
-                 └──────┬────────┘
-                        │ :55055 libp2p (TSS peers)
-                        │ :55000 health RPC (loopback)
-```
+<SignerWiring />
 
 - **`config.json`** holds every setting. The orchestrator rewrites it on each start with mode `0600`.
 - **`producer`** is the encrypted Zenon producer key file. Its passphrase unlocks the key that identifies this signer and derives its EVM address.
