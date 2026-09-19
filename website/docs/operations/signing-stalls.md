@@ -5,25 +5,25 @@ title: Signing stalls
 
 # Signing stalls
 
-**Symptom.** Unwraps (EVM to Zenon) stop being signed. `getStatus` shows `unwrapsToSign` above zero on every signer, the bridge is not halted, and nothing moves. Historically the fix was to delete `events/` and `queues/` on each signer and resync from the deployment block. This page explains why that worked, why it is no longer needed, and what to do instead.
+**Symptom.** Unwraps (EVM to Zenon) stop being signed. `getStatus` shows `unwrapsToSign` above zero on every signer, the bridge is not halted, and nothing moves.
 
-## Why signers stall
+## How a ceremony forms
 
-A TSS signing ceremony is identified by a hash of **the exact set of messages** being signed plus the signer keys. Every signer builds that set locally: the first unsigned unwrap events in its own `events/` store, in key order, up to the ceremony pool size. The pool size is 50 by default and can be changed by the bridge administrator through bridge metadata. Signers whose sets differ compute different ceremony ids, join different rooms, and no room reaches the two-thirds threshold. Nothing signs, and nothing changes the sets, so it stays that way.
+A TSS signing ceremony is identified by a hash of **the exact set of messages** being signed plus the signer keys. Every signer builds that set locally: the first unsigned unwrap events in its own `events/` store, in key order, up to the ceremony pool size (50 by default, adjustable by the bridge administrator through [bridge metadata](../bridge-parameters.md)). Signers whose sets are identical join the same ceremony; a ceremony succeeds when more than two thirds of the group join it.
 
-Wiping the stores forced every signer to rebuild its set from the same chain history, so the sets converged. It also re-signed all of history, 50 events per ceremony, each rejected by Zenon as already existing, which is where the provider load came from.
+A signer whose set differs from its peers', even by one event, computes a different ceremony id and stays out. If the group fragments into sets that none reaches the threshold, nothing signs.
 
-## How the fork keeps sets converged
+## How signers keep their sets converged
 
-| Divergence path in the old code | Fix |
-| --- | --- |
-| A queued event was dropped after two RPC failures, so an overloaded provider lost events on some signers | Events are only dropped when every endpoint agrees the block was reorged out, confirmed across three checks 30 s apart. Transport errors retry with backoff. |
-| Duplicate deliveries reset a signed record to unsigned | Adding a record is idempotent; the ceremony writes only the signature. |
-| The sync cursor was rewound by live subscription logs, re-fetching and re-queueing ranges | Only the sync loop advances the cursor, and only forward. |
-| An event this signer missed the ceremony for stayed in its pool forever | Before each ceremony the pool is reconciled against Zenon; events Zenon already has are marked with Zenon's status and excluded. |
-| Historical logs from a forked backend were stored as-is | Historical logs are stored only when all endpoints agree their block is canonical. |
+The orchestrator treats its local event set as something that must match its peers', and guards it in five ways:
 
-A signer that missed a ceremony now **self-heals** at its next window through reconciliation. A signer that lost an event before the upgrade needs a [backfill](backfill.md).
+- **Events are never dropped on transport errors.** A queued unwrap event is discarded only when every configured endpoint agrees the block it was seen in was reorged out, confirmed across three checks 30 seconds apart. RPC errors, missing receipts and lagging backends retry with backoff instead.
+- **Stored records are never reset by duplicates.** The same event arrives more than once (subscription and periodic sync); adding it is idempotent, and a ceremony writes only the signature.
+- **The sync cursor only moves forward**, and only after a whole block range has been processed. A failed range is retried; it is never skipped.
+- **Historical events are validated** against the canonical block, agreed by every endpoint, before they are stored.
+- **The pool is reconciled against Zenon before each ceremony.** Events Zenon already knows about, because other signers reached the threshold without this one, are marked with Zenon's status and excluded. A signer that missed a ceremony therefore rejoins at its next window without intervention.
+
+What these guards cannot fix is a signer that has genuinely lost events from its store, or holds records from a fork. For that, [backfill](backfill.md) re-scans a bounded range.
 
 ## Diagnosing a stall
 
@@ -35,7 +35,7 @@ Collect from **every** signer at the same time:
 
 Then:
 
-- **`unwrapsHash` differs between signers** and `latestUpdateHeight` values are all near the head: the event sets diverged. Identify the signer whose count is off. If its count is higher, reconciliation will clear stale extras at the next ceremony. If lower, it is missing events: run a [backfill](backfill.md) on that signer.
+- **`unwrapsHash` differs between signers** and `latestUpdateHeight` values are all near the head: the event sets diverged. Identify the signer whose count is off. If its count is higher, reconciliation clears stale extras at the next ceremony. If lower, it is missing events: run a [backfill](backfill.md) on that signer.
 - **`latestUpdateHeight` is far behind on one signer**: that signer's sync is failing. See [First sync](first-sync.md) for the log lines and [Troubleshooting](troubleshooting.md).
 - **`LocalPubKeys` differ**: a configuration-level split that no store repair fixes. The signers disagree about who is in the group; that is resolved by the next key generation.
 - **All hashes match but nothing signs**: the problem is the ceremony itself, not the sets. Check TSS peer connectivity on port `55055` and `peersLen` in `getStatus`.

@@ -65,6 +65,24 @@ WantedBy=multi-user.target
 
 The orchestrator exits with a stop signal on several unrecoverable conditions and expects to be restarted, so `Restart=always` is required.
 
+## Ports
+
+| Port | Protocol | Purpose |
+| --- | --- | --- |
+| `55055` | TCP, libp2p | TSS peer traffic. Must be reachable by the other signers; open it in the firewall. |
+| `55000` | TCP, HTTP | [Health API](health-api.md). Loopback only by default. |
+
+Check that nothing else holds the peer port before the first start:
+
+```bash
+ss -nlp | grep 55055
+```
+
+## After the first start
+
+1. Fund the signer's EVM address, shown by `getIdentity` in the [health API](health-api.md), with gas on every bridged EVM network. It pays for halt transactions.
+2. Once the first key generation has completed, back up `~/.orchestrator/tss`. See [Producer key and passphrase](secrets.md).
+
 ## Command-line flags
 
 | Flag | Purpose |

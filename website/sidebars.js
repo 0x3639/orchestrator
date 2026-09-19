@@ -4,11 +4,14 @@
 const sidebars = {
   docs: [
     'intro',
+    'architecture',
+    'security-model',
     'install',
     'configuration',
     'secrets',
     'networks',
     'health-api',
+    'bridge-parameters',
     {
       type: 'category',
       label: 'Operations',

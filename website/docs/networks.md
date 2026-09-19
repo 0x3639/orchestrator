@@ -15,6 +15,10 @@ List two providers operated by different parties. The first reachable one become
 
 For historical sync every endpoint must serve full history: headers at any height and complete `eth_getLogs` results. A provider that returns an empty result for pruned ranges cannot be detected and would silently skip events.
 
+## Prefer your own node
+
+The strongest configuration is a full node you run yourself for each bridged network, listed first, with a second independent endpoint for agreement. Your own node gives an exact view of chain state, detects reorganisations directly, and cannot be censored or rate-limited by a third party. Remote providers, whether centralised (Infura, Alchemy, QuickNode and the like) or decentralised (Ankr, Pocket), are appropriate as the second endpoint and as a fallback, and they are what the [rate limits](#rate-limits) below are for.
+
 ## Rate limits
 
 `RpcRequestsPerSecond` and `RpcBurst` cap requests **per endpoint** with a token bucket. The cap covers every read the orchestrator makes to that endpoint: the sync's `eth_getLogs` and head reads, receipts and headers during event confirmation, canonical-block checks, and the bridge contract reads. It does not cover the log subscription, which is server-pushed, or the rare transaction sends.

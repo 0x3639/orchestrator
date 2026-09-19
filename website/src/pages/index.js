@@ -6,7 +6,7 @@ const features = [
   {
     eyebrow: 'Setup',
     title: 'Install and configure',
-    body: 'Build from source or use a release binary, then write a config.json that keeps the health endpoint private and the producer passphrase out of backups.',
+    body: 'Build from source or use a release binary, write a config.json, fund the signer address and back up the key share.',
     to: '/docs/install',
     label: 'Start here',
   },

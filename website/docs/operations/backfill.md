@@ -5,7 +5,7 @@ title: Backfill
 
 # Backfill
 
-`--evm.backfill-blocks N` is the bounded repair for a signer that is missing events or holding records from a fork. It replaces deleting `events/` and `queues/` in all but emergency cases.
+`--evm.backfill-blocks N` is the bounded repair for a signer that is missing events or holding records from a fork. It re-scans a chosen range instead of the whole chain, keeps every record it can vouch for, and is the procedure to reach for before the [emergency reset](emergency-reset.md).
 
 ## What it does
 
