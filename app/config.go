@@ -2,7 +2,6 @@ package app
 
 import (
 	"encoding/json"
-	"fmt"
 	"orchestrator/common"
 	"orchestrator/common/config"
 	"orchestrator/node"
@@ -23,8 +22,7 @@ func MakeConfig() (*config.Config, error) {
 		return nil, err
 	}
 
-	// 3: Load the producer passphrase from a runtime source; it is never
-	// serialized with the rest of the configuration.
+	// 3: Resolve the producer passphrase (env, passphrase file, config.json, prompt).
 	if err := config.LoadProducerPassphrase(&cfg, true); err != nil {
 		return nil, err
 	}
@@ -65,28 +63,5 @@ func readConfigFromFile(cfg *config.Config) error {
 		common.GlobalLogger.Errorf("Config malformed: please check; error: %v", err)
 		return err
 	}
-	if hasLegacyPassphrase(jsonConf) {
-		return fmt.Errorf("%s contains %s, which is no longer read from disk; remove it from the file and provide the passphrase through %s or ProducerKeyFilePassphraseFile",
-			configPath, config.LegacyPassphraseConfigKey, config.ProducerPassphraseEnv)
-	}
 	return nil
-}
-
-// hasLegacyPassphrase reports whether the raw config still carries a
-// plaintext passphrase so operators are told to migrate instead of silently
-// starting without it.
-func hasLegacyPassphrase(jsonConf []byte) bool {
-	var raw map[string]json.RawMessage
-	if err := json.Unmarshal(jsonConf, &raw); err != nil {
-		return false
-	}
-	value, ok := raw[config.LegacyPassphraseConfigKey]
-	if !ok {
-		return false
-	}
-	var passphrase string
-	if err := json.Unmarshal(value, &passphrase); err != nil {
-		return true
-	}
-	return passphrase != ""
 }

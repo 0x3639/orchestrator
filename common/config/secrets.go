@@ -3,6 +3,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"orchestrator/common"
 	"os"
 	"strings"
 	"syscall"
@@ -14,20 +15,16 @@ import (
 // producer key file passphrase.
 const ProducerPassphraseEnv = "ORCHESTRATOR_PRODUCER_PASSPHRASE"
 
-// LegacyPassphraseConfigKey is the config.json key that used to hold the
-// passphrase in plaintext. It is no longer read.
-const LegacyPassphraseConfigKey = "ProducerKeyFilePassphrase"
-
 // ErrPassphraseMissing is returned when no passphrase source is available.
 var ErrPassphraseMissing = fmt.Errorf(
-	"producer key passphrase not provided: set %s, point ProducerKeyFilePassphraseFile in config.json at an owner-only file, or run interactively to be prompted",
+	"producer key passphrase not provided: set %s, point ProducerKeyFilePassphraseFile in config.json at an owner-only file, set ProducerKeyFilePassphrase in config.json, or run interactively to be prompted",
 	ProducerPassphraseEnv,
 )
 
-// LoadProducerPassphrase populates cfg.ProducerKeyFilePassphrase from, in
-// order: the environment, the configured passphrase file, and finally an
-// interactive terminal prompt when allowPrompt is set. The passphrase never
-// touches the serialized configuration.
+// LoadProducerPassphrase resolves cfg.ProducerKeyFilePassphrase from, in
+// order: the environment, the configured passphrase file, the value already
+// present in the configuration (config.json), and finally an interactive
+// terminal prompt when allowPrompt is set.
 func LoadProducerPassphrase(cfg *Config, allowPrompt bool) error {
 	if value, ok := os.LookupEnv(ProducerPassphraseEnv); ok && value != "" {
 		cfg.ProducerKeyFilePassphrase = value
@@ -40,6 +37,11 @@ func LoadProducerPassphrase(cfg *Config, allowPrompt bool) error {
 			return err
 		}
 		cfg.ProducerKeyFilePassphrase = value
+		return nil
+	}
+
+	if cfg.ProducerKeyFilePassphrase != "" {
+		common.GlobalLogger.Warnf("producer key passphrase is stored in %s; consider moving it to %s or ProducerKeyFilePassphraseFile", cfg.ConfigPath(), ProducerPassphraseEnv)
 		return nil
 	}
 

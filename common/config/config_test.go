@@ -32,26 +32,18 @@ func sampleConfig(t *testing.T) Config {
 	}
 }
 
-func TestPassphraseIsNeverSerialized(t *testing.T) {
+func TestPassphraseRoundTripsThroughConfigFile(t *testing.T) {
 	cfg := sampleConfig(t)
 	out, err := json.Marshal(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(string(out), sentinelPassphrase) {
-		t.Fatalf("serialized config leaks the passphrase: %s", out)
-	}
-	if strings.Contains(string(out), `"`+LegacyPassphraseConfigKey+`":`) {
-		t.Fatalf("serialized config still carries %s", LegacyPassphraseConfigKey)
-	}
-
-	// Legacy files that still contain the key must not populate the field.
 	var loaded Config
-	if err := json.Unmarshal([]byte(`{"ProducerKeyFilePassphrase":"`+sentinelPassphrase+`"}`), &loaded); err != nil {
+	if err := json.Unmarshal(out, &loaded); err != nil {
 		t.Fatal(err)
 	}
-	if loaded.ProducerKeyFilePassphrase != "" {
-		t.Fatal("passphrase must not be read from config.json")
+	if loaded.ProducerKeyFilePassphrase != sentinelPassphrase {
+		t.Fatalf("passphrase from config.json must be honoured, got %q", loaded.ProducerKeyFilePassphrase)
 	}
 }
 
@@ -115,14 +107,6 @@ func TestWriteConfigUsesOwnerOnlyPermissions(t *testing.T) {
 	}
 	assertMode()
 
-	raw, err := os.ReadFile(configPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if strings.Contains(string(raw), sentinelPassphrase) {
-		t.Fatalf("config.json on disk contains the passphrase: %s", raw)
-	}
-
 	// A pre-existing world-readable file is tightened on rewrite.
 	if err := os.Chmod(configPath, 0644); err != nil {
 		t.Fatal(err)
@@ -165,6 +149,27 @@ func TestLoadProducerPassphraseFromFile(t *testing.T) {
 	cfg = Config{ProducerKeyFilePassphraseFile: path}
 	if err := LoadProducerPassphrase(&cfg, false); err == nil {
 		t.Fatal("expected error for world-readable passphrase file")
+	}
+}
+
+func TestLoadProducerPassphraseFromConfig(t *testing.T) {
+	t.Setenv(ProducerPassphraseEnv, "")
+	cfg := Config{DataPath: t.TempDir(), ProducerKeyFilePassphrase: sentinelPassphrase}
+	if err := LoadProducerPassphrase(&cfg, false); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.ProducerKeyFilePassphrase != sentinelPassphrase {
+		t.Fatalf("got %q", cfg.ProducerKeyFilePassphrase)
+	}
+
+	// Environment and passphrase file override the config.json value.
+	t.Setenv(ProducerPassphraseEnv, "from-env")
+	cfg = Config{ProducerKeyFilePassphrase: sentinelPassphrase}
+	if err := LoadProducerPassphrase(&cfg, false); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.ProducerKeyFilePassphrase != "from-env" {
+		t.Fatalf("env should override config.json, got %q", cfg.ProducerKeyFilePassphrase)
 	}
 }
 

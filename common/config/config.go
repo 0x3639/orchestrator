@@ -68,9 +68,11 @@ type Config struct {
 	HealthConfig HealthRpcConfig
 
 	ProducerKeyFileName string
-	// ProducerKeyFilePassphrase is populated at runtime by LoadProducerPassphrase
-	// and is never serialized, so it cannot land in config.json or in logs.
-	ProducerKeyFilePassphrase string `json:"-"`
+	// ProducerKeyFilePassphrase may be set in config.json (which is kept at
+	// mode 0600 inside a 0700 data directory). ORCHESTRATOR_PRODUCER_PASSPHRASE
+	// and ProducerKeyFilePassphraseFile take precedence when present so the
+	// value can be moved out of the file. It is never logged.
+	ProducerKeyFilePassphrase string
 	// ProducerKeyFilePassphraseFile optionally points to an owner-only file
 	// holding the passphrase. It should live outside DataPath and its backups.
 	ProducerKeyFilePassphraseFile string
