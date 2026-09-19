@@ -287,6 +287,12 @@ func (eN *evmNetwork) Sync() error {
 	ranges := 0
 	attempts := 0
 	backoff := syncRetryBaseBackoff
+	// rangeEnd is fixed when a range is first attempted and kept across
+	// retries, so a query the provider rejected is retried as-is rather
+	// than growing toward a newer head.
+	var rangeEnd uint64
+	rangeFrozen := false
+	rangeIsTip := false
 
 	// retryRange pauses before the same range is attempted again. It
 	// returns an error once the attempt budget is spent or the node stops.
@@ -321,20 +327,31 @@ func (eN *evmNetwork) Sync() error {
 			return errors.Errorf("sync evm problem for network: %s, chainId: %d", eN.NetworkName(), eN.ChainId())
 		}
 
-		end := false
-		filterQuerySize := eN.rpcManager.Evm(eN.ChainId()).FilterQuerySize()
-
-		distance := latestBlock - updateHeight
-		if distance < eN.ConfirmationsToFinality() {
-			filterQuerySize = distance
-			end = true
-		} else if distance < filterQuerySize {
-			filterQuerySize = distance
+		if !rangeFrozen {
+			distance := latestBlock - updateHeight
+			if distance == 0 {
+				// The cursor block was included in the previous range
+				// (ranges are inclusive and share their boundary block);
+				// there is nothing new to fetch.
+				break
+			}
+			filterQuerySize := eN.rpcManager.Evm(eN.ChainId()).FilterQuerySize()
+			rangeIsTip = false
+			if distance < eN.ConfirmationsToFinality() {
+				filterQuerySize = distance
+				rangeIsTip = true
+			} else if distance < filterQuerySize {
+				filterQuerySize = distance
+			}
+			rangeEnd = updateHeight + filterQuerySize
+			rangeFrozen = true
 		}
+		filterQuerySize := rangeEnd - updateHeight
+		end := rangeIsTip
 
-		logs, err := eN.EvmRpc().FilterLogs(updateHeight, updateHeight+filterQuerySize)
+		logs, err := eN.EvmRpc().FilterLogs(updateHeight, rangeEnd)
 		if err != nil {
-			if err := retryRange(fmt.Sprintf("eth_getLogs for blocks [%d, %d]", updateHeight, updateHeight+filterQuerySize), err); err != nil {
+			if err := retryRange(fmt.Sprintf("eth_getLogs for blocks [%d, %d]", updateHeight, rangeEnd), err); err != nil {
 				return err
 			}
 			continue
@@ -359,9 +376,10 @@ func (eN *evmNetwork) Sync() error {
 			continue
 		}
 
-		// The range succeeded: reset the retry budget for the next one.
+		// The range succeeded: reset the retry budget and unfreeze for the next one.
 		attempts = 0
 		backoff = syncRetryBaseBackoff
+		rangeFrozen = false
 
 		updateHeight += filterQuerySize
 		if err := eN.eventsStore().SetLastUpdateHeight(updateHeight); err != nil {

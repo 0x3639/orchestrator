@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/accounts/abi"
+	"github.com/ethereum/go-ethereum/accounts/abi/bind"
 	ecommon "github.com/ethereum/go-ethereum/common"
 	etypes "github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/ethclient"
@@ -89,6 +90,17 @@ func NewEvmRpcClient(networkConfig config.BaseNetworkConfig, networkName string,
 	newUrls.Clear()
 	warnAgreementConfiguration(logger, networkName, newUrls.Urls)
 
+	if networkConfig.RpcRequestsPerSecond < 0 {
+		return nil, fmt.Errorf("network %s: RpcRequestsPerSecond must be 0 (uncapped) or positive, got %v", networkName, networkConfig.RpcRequestsPerSecond)
+	}
+	if networkConfig.RpcBurst < 0 {
+		return nil, fmt.Errorf("network %s: RpcBurst must be 0 or positive, got %d", networkName, networkConfig.RpcBurst)
+	}
+	filterQuerySize := networkConfig.FilterQuerySize
+	if filterQuerySize == 0 {
+		filterQuerySize = defaultFilterQuerySize
+		logger.Warnf("network %s: FilterQuerySize is 0, using %d", networkName, filterQuerySize)
+	}
 	limit, burst := rateSettings(networkConfig)
 	var limiter *rate.Limiter
 	if limit > 0 {
@@ -115,7 +127,7 @@ func NewEvmRpcClient(networkConfig config.BaseNetworkConfig, networkName string,
 		bridgeContract:  newBridgeContract,
 		bridgeAddress:   address,
 		filterQuery:     newFilterQuery,
-		filterQuerySize: networkConfig.FilterQuerySize,
+		filterQuerySize: filterQuerySize,
 		logChan:         make(chan etypes.Log, 20000),
 		logger:          logger,
 		limiter:         limiter,
@@ -413,6 +425,9 @@ const (
 	// stalled websocket; a bounded deadline turns a hung call into a retry.
 	evmCallTimeout       = 30 * time.Second
 	evmFilterLogsTimeout = 2 * time.Minute
+	// defaultFilterQuerySize is used when the config leaves the range width
+	// at 0, which would otherwise make Sync query the same block forever.
+	defaultFilterQuerySize = 2000
 )
 
 func callContext(timeout time.Duration) (context.Context, context.CancelFunc) {
@@ -677,35 +692,85 @@ func (r *EvmRpc) BlockByHash(hash ecommon.Hash) (*etypes.Block, error) {
 	return r.rpcClient.BlockByHash(ctx, hash)
 }
 
+// contractCallOpts acquires a request permit and returns CallOpts carrying
+// a deadline for a generated contract read. Contract reads go to the same
+// provider as every other call and must count against the same cap.
+func (r *EvmRpc) contractCallOpts() (*bind.CallOpts, context.CancelFunc, error) {
+	ctx, cancel := callContext(evmCallTimeout)
+	if err := r.throttle(ctx); err != nil {
+		cancel()
+		return nil, nil, err
+	}
+	return &bind.CallOpts{Context: ctx}, cancel, nil
+}
+
 func (r *EvmRpc) GetCurrentTss() (ecommon.Address, error) {
-	return r.bridgeContract.Tss(nil)
+	opts, cancel, err := r.contractCallOpts()
+	if err != nil {
+		return ecommon.Address{}, err
+	}
+	defer cancel()
+	return r.bridgeContract.Tss(opts)
 }
 
 func (r *EvmRpc) IsHalted() (bool, error) {
-	return r.bridgeContract.IsHalted(nil)
+	opts, cancel, err := r.contractCallOpts()
+	if err != nil {
+		return false, err
+	}
+	defer cancel()
+	return r.bridgeContract.IsHalted(opts)
 }
 
 func (r *EvmRpc) GetActionNonce() (*big.Int, error) {
-	return r.bridgeContract.ActionsNonce(nil)
+	opts, cancel, err := r.contractCallOpts()
+	if err != nil {
+		return nil, err
+	}
+	defer cancel()
+	return r.bridgeContract.ActionsNonce(opts)
 }
 
 func (r *EvmRpc) EstimatedBlockTime() (uint64, error) {
-	return r.bridgeContract.EstimatedBlockTime(nil)
+	opts, cancel, err := r.contractCallOpts()
+	if err != nil {
+		return 0, err
+	}
+	defer cancel()
+	return r.bridgeContract.EstimatedBlockTime(opts)
 }
 
 func (r *EvmRpc) ConfirmationsToFinality() (uint64, error) {
-	return r.bridgeContract.ConfirmationsToFinality(nil)
+	opts, cancel, err := r.contractCallOpts()
+	if err != nil {
+		return 0, err
+	}
+	defer cancel()
+	return r.bridgeContract.ConfirmationsToFinality(opts)
 }
 
 func (r *EvmRpc) RedeemsInfo(hash types.Hash) (struct {
 	BlockNumber *big.Int
 	ParamsHash  [32]byte
 }, error) {
-	return r.bridgeContract.RedeemsInfo(nil, big.NewInt(0).SetBytes(hash.Bytes()))
+	opts, cancel, err := r.contractCallOpts()
+	if err != nil {
+		return struct {
+			BlockNumber *big.Int
+			ParamsHash  [32]byte
+		}{}, err
+	}
+	defer cancel()
+	return r.bridgeContract.RedeemsInfo(opts, big.NewInt(0).SetBytes(hash.Bytes()))
 }
 
 func (r *EvmRpc) ContractDeploymentHeight() (uint64, error) {
-	ans, err := r.bridgeContract.ContractDeploymentHeight(nil)
+	opts, cancel, err := r.contractCallOpts()
+	if err != nil {
+		return 0, err
+	}
+	defer cancel()
+	ans, err := r.bridgeContract.ContractDeploymentHeight(opts)
 	if err != nil {
 		return 0, err
 	}

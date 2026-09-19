@@ -57,3 +57,19 @@ func TestThrottlePacesRequests(t *testing.T) {
 		t.Fatal("cancelled context should return an error instead of waiting")
 	}
 }
+
+func TestRateSettingsRejectsNegativeInConstructor(t *testing.T) {
+	// NewEvmRpcClient validates before dialling; rateSettings itself treats
+	// negative as uncapped so the constructor is the only gate.
+	if l, _ := rateSettings(config.BaseNetworkConfig{RpcRequestsPerSecond: -1}); l != 0 {
+		t.Fatalf("negative rate must not produce a limiter, got %v", l)
+	}
+	_, err := NewEvmRpcClient(config.BaseNetworkConfig{Urls: []string{"http://127.0.0.1:1"}, RpcRequestsPerSecond: -1}, "test", [20]byte{})
+	if err == nil {
+		t.Fatal("negative RpcRequestsPerSecond must be rejected")
+	}
+	_, err = NewEvmRpcClient(config.BaseNetworkConfig{Urls: []string{"http://127.0.0.1:1"}, RpcBurst: -1}, "test", [20]byte{})
+	if err == nil {
+		t.Fatal("negative RpcBurst must be rejected")
+	}
+}
