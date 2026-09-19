@@ -154,6 +154,14 @@ func originalLogIndex(ev *events.UnwrapRequestEvm) uint32 {
 }
 
 func blockContainsEvent(logs []etypes.Log, ev *events.UnwrapRequestEvm, contract ecommon.Address) bool {
+	_, found := findUnwrapLog(logs, ev, contract)
+	return found
+}
+
+// findUnwrapLog selects by the block-wide log index and event identity.
+// Filtering a block's logs does not renumber their Index fields, so a log's
+// position in the returned slice is not its on-chain index.
+func findUnwrapLog(logs []etypes.Log, ev *events.UnwrapRequestEvm, contract ecommon.Address) (etypes.Log, bool) {
 	want := originalLogIndex(ev)
 	for _, log := range logs {
 		if log.Removed || log.Address != contract || len(log.Topics) == 0 {
@@ -162,11 +170,11 @@ func blockContainsEvent(logs []etypes.Log, ev *events.UnwrapRequestEvm, contract
 		if log.Topics[0] != common.UnwrapSigHash {
 			continue
 		}
-		if log.TxHash == ev.TransactionHash && uint32(log.Index) == want && log.BlockHash == ev.BlockHash {
-			return true
+		if log.TxHash == ev.TransactionHash && uint64(log.Index) == uint64(want) && log.BlockHash == ev.BlockHash {
+			return log, true
 		}
 	}
-	return false
+	return etypes.Log{}, false
 }
 
 // eventVerdict is the result of checking a stored or historical event
