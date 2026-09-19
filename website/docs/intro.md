@@ -5,20 +5,14 @@ title: Overview
 
 # Overview
 
-The orchestrator is the signer node of the Zenon bridge. A set of pillar operators each run one, and together they form a threshold-signature (TSS) group that signs two kinds of transfer:
+The orchestrator is the signer node of the Zenon bridge. Each participating Pillar operator runs one. Together the orchestrators hold a threshold-signature (TSS) key, and the bridge contracts on Zenon and on each EVM network release assets only against that group's signature. [How the bridge works](architecture.md) explains the design; this guide covers running a node.
 
-- **Wraps**, Zenon to an EVM chain. The orchestrator watches Zenon for wrap requests, signs them as a group, and one member submits the signature.
-- **Unwraps**, an EVM chain back to Zenon. The orchestrator watches the bridge contract on each EVM network for `Unwrapped` events, waits for finality, signs them as a group, and one member submits the request to Zenon.
+An orchestrator does two jobs:
 
-This site documents the **0x3639 fork** of the orchestrator, which carries operational fixes on top of the upstream HyperCore-Team code:
+- **Signs wraps**, Zenon to an EVM chain. It watches Zenon for wrap requests, signs them with the group, and one member submits the signature.
+- **Signs unwraps**, an EVM chain back to Zenon. It watches the bridge contract on each EVM network for `Unwrapped` events, waits for finality, signs them with the group, and one member submits the request to Zenon.
 
-| Area | What changed | Where to read |
-| --- | --- | --- |
-| Health RPC | Binds to loopback by default, enforces request shape, rate-limits per client | [Health API](health-api.md) |
-| Secrets | Producer passphrase can live outside `config.json`; files are owner-only | [Producer key and passphrase](secrets.md) |
-| Logging | Startup config is allowlisted; RPC URLs and credentials are redacted at the log sink | [Upgrade notes](upgrade-notes.md) |
-| Sync | Per-endpoint request cap, retry-in-place, progress logging | [First sync](operations/first-sync.md) |
-| Signing | Signers keep their unwrap event sets converged; bounded backfill replaces the hard reset | [Signing stalls](operations/signing-stalls.md) |
+It also watches for transfers that should not exist and, with the other signers, halts the bridge when it finds one. See [Security model](security-model.md).
 
 ## How a signer is wired
 
@@ -38,10 +32,14 @@ This site documents the **0x3639 fork** of the orchestrator, which carries opera
 - **`producer`** is the encrypted Zenon producer key file. Its passphrase unlocks the key that identifies this signer and derives its EVM address.
 - **`events/`** is a LevelDB store per network with the wrap and unwrap records this signer knows about, and the sync cursor.
 - **`queues/`** is a persistent queue of live unwrap events awaiting finality.
-- **`tss/`** holds the TSS key shares from the last key generation.
+- **`tss/`** holds this signer's share of the group key. Back it up; see [Install](install.md).
+
+## About this guide
+
+This guide documents the orchestrator build maintained by 0x3639 and describes the software as it behaves in that build. Version history, and what to do when moving a running signer between versions, is kept on one page, [Upgrade notes](upgrade-notes.md). Adapted material is credited on the page that uses it and on the [Attribution](attribution.md) page.
 
 ## Read next
 
 1. [Install](install.md), then [Configuration](configuration.md).
 2. [Producer key and passphrase](secrets.md) before the first start.
-3. [EVM networks](networks.md) to size your provider settings before the first sync.
+3. [EVM networks](networks.md) to choose endpoints and size provider limits before the first sync.

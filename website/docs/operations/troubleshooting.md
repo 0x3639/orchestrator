@@ -12,7 +12,7 @@ Log lines you will meet, what they mean, and what to do.
 | `producer key passphrase not provided` | No passphrase source found | Set `ORCHESTRATOR_PRODUCER_PASSPHRASE` or `ProducerKeyFilePassphraseFile`. See [secrets](../secrets.md). |
 | `… is owned by uid X but the orchestrator runs as uid Y` | Ownership check failed on the data dir, config, key or passphrase file | Fix ownership, or run as the owning user. |
 | `passphrase file … must not be readable by group or others` | Passphrase file mode too wide | `chmod 0600` it. |
-| `data directory … had mode 0755; restricted it to 0700` | Legacy permissions tightened | None; informational. |
+| `data directory … had mode 0755; restricted it to 0700` | The data directory was wider than owner-only and has been tightened | None; informational. |
 | `network Ethereum has a single EVM endpoint` | Canonical-block agreement relies on one provider | Add a second independent endpoint. |
 | `EVM RPC requests are not rate limited` | `RpcRequestsPerSecond` missing from this network | Add it; see [EVM networks](../networks.md). |
 | `Sync … failed at block N (attempt k/12), retrying in …` | Provider rejected or timed out a query | Normal under throttling. Persistent: lower the rate or `FilterQuerySize`. |

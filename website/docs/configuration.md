@@ -66,11 +66,11 @@ The file is loaded on top of the built-in defaults, which already contain `BSC` 
 | --- | --- | --- |
 | `Urls` | required | Endpoints, tried in order at startup. For EVM networks, list two or more independent providers; see [EVM networks](networks.md). |
 | `FilterQuerySize` | `2000` | Blocks per `eth_getLogs` query during sync. `0` falls back to `2000`. |
-| `RpcRequestsPerSecond` | `0` (uncapped) | Request cap per endpoint. New configs default to `3`. |
-| `RpcBurst` | `0` | Requests allowed at once before the cap applies. New configs default to `5`. |
+| `RpcRequestsPerSecond` | `0` (uncapped) | Request cap per endpoint. A freshly generated file contains `3`. |
+| `RpcBurst` | `0` | Requests allowed at once before the cap applies. A freshly generated file contains `5`. |
 
-:::caution Existing configs are not capped automatically
-Network entries are replaced wholesale when the file is read, so an entry without `RpcRequestsPerSecond` is uncapped even though new files default to `3`. Add the field to each EVM network to opt in.
+:::caution An entry without the field is uncapped
+Network entries are read wholesale, so an entry that omits `RpcRequestsPerSecond` runs uncapped regardless of what a freshly generated file would contain. Put the field in every EVM network entry you write.
 :::
 
 ## TssConfig
