@@ -1,6 +1,7 @@
 ---
 sidebar_position: 2
 title: First sync
+description: "What happens during an orchestrator's first sync of an EVM network, how long it takes, how rate limits and retries behave, and the log lines to expect."
 ---
 
 # First sync

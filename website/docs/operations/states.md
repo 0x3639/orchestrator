@@ -1,6 +1,7 @@
 ---
 sidebar_position: 1
 title: Node states
+description: "The orchestrator's node states, their numeric values, what triggers each one and what the signer does in it."
 ---
 
 # Node states

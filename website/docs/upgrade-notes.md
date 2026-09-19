@@ -1,6 +1,7 @@
 ---
 sidebar_position: 9
 title: Upgrade notes
+description: "Changelog for the 0x3639 orchestrator build: breaking changes, new configuration, behaviour changes and an upgrade checklist for running signers."
 ---
 
 # Upgrade notes

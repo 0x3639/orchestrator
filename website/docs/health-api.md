@@ -1,6 +1,7 @@
 ---
 sidebar_position: 6
 title: Health API
+description: "The orchestrator's health RPC: request format, status codes, getStatus, getBuildInfo and getIdentity, rate limits, and how to expose it safely."
 ---
 
 # Health API

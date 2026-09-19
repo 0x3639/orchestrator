@@ -1,6 +1,7 @@
 ---
 sidebar_position: 5
 title: Emergency reset
+description: "Rebuilding a signer's event stores from chain history as a last resort, and what to expect afterwards."
 ---
 
 # Emergency reset

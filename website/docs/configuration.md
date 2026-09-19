@@ -1,6 +1,7 @@
 ---
 sidebar_position: 3
 title: Configuration
+description: "Reference for every field in the orchestrator's config.json: data path, networks, TSS, health RPC, producer key, with defaults and caveats."
 ---
 
 # Configuration

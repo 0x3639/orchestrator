@@ -1,6 +1,7 @@
 ---
 sidebar_position: 5
 title: EVM networks
+description: "Choosing EVM endpoints for a signer: why two independent providers matter, running your own node, and sizing request rate caps against provider limits."
 ---
 
 # EVM networks

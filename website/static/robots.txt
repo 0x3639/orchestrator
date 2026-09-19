@@ -1,0 +1,9 @@
+# Operator documentation for the Zenon bridge orchestrator.
+# Everything here is public and intended to be indexed, by search engines and
+# by language-model crawlers alike. A plain-text index of the site for
+# language models is at /orchestrator/llms.txt.
+
+User-agent: *
+Allow: /
+
+Sitemap: https://www.0x3639.com/orchestrator/sitemap.xml

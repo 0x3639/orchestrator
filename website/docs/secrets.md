@@ -1,6 +1,7 @@
 ---
 sidebar_position: 4
 title: Producer key and passphrase
+description: "How the orchestrator resolves the producer key passphrase, the file permission and ownership rules it enforces, the signer's EVM address, and what to back up."
 ---
 
 # Producer key and passphrase

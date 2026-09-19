@@ -226,14 +226,27 @@ table thead th {
   filter: brightness(0.95);
 }
 
-.button--secondary {
+/* Secondary action: quiet outline. Infima's own secondary button is tuned
+   for light backgrounds and hides its label on dark; set its variables so
+   the label is always the foreground colour in both themes. */
+.button.button--secondary {
+  --ifm-button-background-color: transparent;
+  --ifm-button-border-color: var(--border);
+  --ifm-button-color: var(--foreground);
   background: transparent;
   border: 1px solid var(--border);
+  /* Infima's .button.button--secondary hard-codes gray-900 for the label,
+     which is near-black on the dark theme; match its specificity. */
   color: var(--foreground);
 }
 
-.button--secondary:hover {
+.button.button--secondary:hover,
+.button.button--secondary:focus-visible {
+  --ifm-button-background-color: var(--accent);
+  --ifm-button-border-color: var(--ifm-color-primary);
+  --ifm-button-color: var(--foreground);
   background: var(--accent);
+  border-color: var(--ifm-color-primary);
   color: var(--foreground);
 }
 

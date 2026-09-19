@@ -20,6 +20,8 @@ const config = {
   organizationName: '0x3639',
   projectName: 'orchestrator',
 
+  trailingSlash: true,
+
   onBrokenLinks: 'throw',
   onBrokenAnchors: 'throw',
   markdown: {
@@ -38,6 +40,27 @@ const config = {
     {
       href: 'https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Space+Grotesk:wght@300;400;500;600;700&display=swap',
       type: 'text/css',
+    },
+  ],
+
+  // Machine-readable copies of the guide for language models: /llms.txt,
+  // /llms-full.txt and a .md beside every page. See plugins/llms-txt.js.
+  plugins: ['./plugins/llms-txt.js'],
+
+  headTags: [
+    {
+      tagName: 'script',
+      attributes: {type: 'application/ld+json'},
+      innerHTML: JSON.stringify({
+        '@context': 'https://schema.org',
+        '@type': 'WebSite',
+        name: 'Orchestrator operator guide',
+        url: 'https://www.0x3639.com/orchestrator/',
+        description: 'Operator guide for the Zenon TSS bridge orchestrator: install, configure, secure and operate a signer.',
+        inLanguage: 'en',
+        publisher: {'@type': 'Organization', name: '0x3639', url: 'https://www.0x3639.com/'},
+        about: {'@type': 'SoftwareApplication', name: 'Zenon bridge orchestrator', applicationCategory: 'Blockchain infrastructure', operatingSystem: 'Linux', url: 'https://github.com/0x3639/orchestrator'},
+      }),
     },
   ],
 
@@ -62,6 +85,18 @@ const config = {
   themeConfig:
     /** @type {import('@docusaurus/preset-classic').ThemeConfig} */
     ({
+      // Default social card and site-wide meta. Docs pages add their own
+      // description from front matter; Docusaurus emits og:* and canonical.
+      image: 'img/og-image.png',
+      metadata: [
+        {name: 'description', content: 'Operator guide for the Zenon TSS bridge orchestrator: install, configure, secure and operate a signer, and recover it without a hard reset.'},
+        {name: 'keywords', content: 'Zenon, Network of Momentum, bridge, orchestrator, TSS, threshold signature, Pillar, wZNN, EVM, operator guide'},
+        {name: 'twitter:card', content: 'summary_large_image'},
+        {property: 'og:type', content: 'website'},
+        {property: 'og:site_name', content: 'Orchestrator operator guide'},
+        {property: 'og:locale', content: 'en_US'},
+        {name: 'robots', content: 'index, follow, max-image-preview:large'},
+      ],
       colorMode: {
         defaultMode: 'dark',
         respectPrefersColorScheme: true,
