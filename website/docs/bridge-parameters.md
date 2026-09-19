@@ -1,6 +1,7 @@
 ---
 sidebar_position: 8
 title: Bridge parameters
+description: "The bridge contract parameters the orchestrator reads from Zenon and each EVM contract, and the behaviour each one drives."
 ---
 
 # Bridge parameters

@@ -1,6 +1,7 @@
 ---
 sidebar_position: 2
 title: Install
+description: "Install the orchestrator from a release binary or source, run it as a systemd service, open its ports, fund the signer address and back up the TSS share."
 ---
 
 # Install

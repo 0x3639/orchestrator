@@ -1,6 +1,7 @@
 ---
 sidebar_position: 6
 title: Troubleshooting
+description: "Orchestrator log lines, what each one means and the action to take, plus how to compare signers and collect logs."
 ---
 
 # Troubleshooting

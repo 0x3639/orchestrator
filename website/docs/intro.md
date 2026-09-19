@@ -1,6 +1,7 @@
 ---
 sidebar_position: 1
 title: Overview
+description: "What the Zenon bridge orchestrator is, the two jobs a signer does, how a node is wired, and where to start."
 ---
 
 # Overview

@@ -1,6 +1,7 @@
 ---
 sidebar_position: 10
 title: Attribution
+description: "Sources and licences for material adapted into this guide, including the HyperCore Team documentation under the MIT licence."
 ---
 
 # Attribution

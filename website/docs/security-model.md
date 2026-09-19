@@ -1,6 +1,7 @@
 ---
 sidebar_position: 3
 title: Security model
+description: "The bridge's security model for operators: request and redeem, time challenges, distributed halting, administrator and guardians, and what to monitor."
 ---
 
 # Security model

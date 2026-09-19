@@ -1,6 +1,7 @@
 ---
 sidebar_position: 2
 title: How the bridge works
+description: "How the Zenon bridge moves assets between NoM and EVM networks: lock-and-release, request-then-redeem, TSS super-majority signing, ceremony windows and finality."
 ---
 
 # How the bridge works

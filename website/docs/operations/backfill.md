@@ -1,6 +1,7 @@
 ---
 sidebar_position: 4
 title: Backfill
+description: "Runbook for the one-shot backfill flag that re-scans a bounded block range to repair a signer that is missing events or holding fork-only records."
 ---
 
 # Backfill

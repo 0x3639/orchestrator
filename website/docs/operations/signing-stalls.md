@@ -1,6 +1,7 @@
 ---
 sidebar_position: 3
 title: Signing stalls
+description: "Why unwrap signing stalls when signers' event sets diverge, how the orchestrator keeps them converged, and how to diagnose a stalled bridge."
 ---
 
 # Signing stalls
