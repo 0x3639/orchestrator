@@ -18,6 +18,7 @@ import (
 	"orchestrator/common/bridge"
 	"orchestrator/common/config"
 	"orchestrator/common/storage"
+	"time"
 )
 
 type EvmRpc struct {
@@ -311,6 +312,17 @@ func (r *EvmRpc) GetHaltTxEvm(sender ecommon.Address, signature []byte, contract
 
 /// Rpc Calls
 
+const (
+	// Calls made while confirming queued events must not hang forever on a
+	// stalled websocket; a bounded deadline turns a hung call into a retry.
+	evmCallTimeout       = 30 * time.Second
+	evmFilterLogsTimeout = 2 * time.Minute
+)
+
+func callContext(timeout time.Duration) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), timeout)
+}
+
 func (r *EvmRpc) FilterLogs(left, right uint64) ([]etypes.Log, error) {
 	r.filterQuery.FromBlock = big.NewInt(0).SetUint64(left)
 	r.filterQuery.ToBlock = big.NewInt(0).SetUint64(right)
@@ -318,18 +330,26 @@ func (r *EvmRpc) FilterLogs(left, right uint64) ([]etypes.Log, error) {
 		r.filterQuery.FromBlock = nil
 		r.filterQuery.ToBlock = nil
 	}()
-	return r.rpcClient.FilterLogs(context.Background(), r.filterQuery)
+	ctx, cancel := callContext(evmFilterLogsTimeout)
+	defer cancel()
+	return r.rpcClient.FilterLogs(ctx, r.filterQuery)
 }
 
+// FilterBlockLogs returns the bridge contract's logs in the given block.
 func (r *EvmRpc) FilterBlockLogs(blockHash ecommon.Hash) ([]etypes.Log, error) {
 	newFilterQuery := ethereum.FilterQuery{
 		BlockHash: &blockHash,
+		Addresses: r.filterQuery.Addresses,
 	}
-	return r.rpcClient.FilterLogs(context.Background(), newFilterQuery)
+	ctx, cancel := callContext(evmCallTimeout)
+	defer cancel()
+	return r.rpcClient.FilterLogs(ctx, newFilterQuery)
 }
 
 func (r *EvmRpc) TransactionReceipt(txHash ecommon.Hash) (*etypes.Receipt, error) {
-	return r.rpcClient.TransactionReceipt(context.Background(), txHash)
+	ctx, cancel := callContext(evmCallTimeout)
+	defer cancel()
+	return r.rpcClient.TransactionReceipt(ctx, txHash)
 }
 
 func (r *EvmRpc) EstimateGas(msg ethereum.CallMsg) (uint64, error) {
@@ -349,13 +369,17 @@ func (r *EvmRpc) BalanceAt(address ecommon.Address, blockNumber uint64) (*big.In
 }
 
 func (r *EvmRpc) BlockNumber() (uint64, error) {
-	return r.rpcClient.BlockNumber(context.Background())
+	ctx, cancel := callContext(evmCallTimeout)
+	defer cancel()
+	return r.rpcClient.BlockNumber(ctx)
 }
 
 // HeaderByNumber returns the canonical header at the given height, used to
 // decide whether an observed block was reorged out.
 func (r *EvmRpc) HeaderByNumber(number uint64) (*etypes.Header, error) {
-	return r.rpcClient.HeaderByNumber(context.Background(), new(big.Int).SetUint64(number))
+	ctx, cancel := callContext(evmCallTimeout)
+	defer cancel()
+	return r.rpcClient.HeaderByNumber(ctx, new(big.Int).SetUint64(number))
 }
 
 func (r *EvmRpc) BlockByHash(hash ecommon.Hash) (*etypes.Block, error) {

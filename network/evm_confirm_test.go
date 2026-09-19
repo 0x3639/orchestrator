@@ -10,6 +10,7 @@ import (
 	ecommon "github.com/ethereum/go-ethereum/common"
 	etypes "github.com/ethereum/go-ethereum/core/types"
 
+	"orchestrator/common"
 	"orchestrator/common/events"
 )
 
@@ -20,8 +21,8 @@ type fakeChain struct {
 	receiptErr error
 	header     *etypes.Header
 	headerErr  error
-	tx         *etypes.Transaction
-	txErr      error
+	logs       []etypes.Log
+	logsErr    error
 }
 
 func (f *fakeChain) BlockNumber() (uint64, error) { return f.head, f.headErr }
@@ -31,14 +32,16 @@ func (f *fakeChain) HeaderByNumber(uint64) (*etypes.Header, error) {
 func (f *fakeChain) TransactionReceipt(ecommon.Hash) (*etypes.Receipt, error) {
 	return f.receipt, f.receiptErr
 }
-func (f *fakeChain) TransactionByHash(ecommon.Hash) (*etypes.Transaction, bool, error) {
-	return f.tx, false, f.txErr
+func (f *fakeChain) FilterBlockLogs(ecommon.Hash) ([]etypes.Log, error) {
+	return f.logs, f.logsErr
 }
 
 const (
 	testConfirmations = 12
 	testBlockTime     = 10 * time.Second
 )
+
+var testContract = ecommon.HexToAddress("0x00000000000000000000000000000000000000b1")
 
 func canonicalHeader(number uint64) *etypes.Header {
 	return &etypes.Header{Number: new(big.Int).SetUint64(number), Difficulty: big.NewInt(1)}
@@ -54,20 +57,33 @@ func testEvent(number uint64, header *etypes.Header) *events.UnwrapRequestEvm {
 	}
 }
 
+func eventLog(ev *events.UnwrapRequestEvm) etypes.Log {
+	return etypes.Log{
+		Address:   testContract,
+		Topics:    []ecommon.Hash{common.UnwrapSigHash},
+		TxHash:    ev.TransactionHash,
+		Index:     uint(originalLogIndex(ev)),
+		BlockHash: ev.BlockHash,
+	}
+}
+
 func healthyChain(ev *events.UnwrapRequestEvm, header *etypes.Header) *fakeChain {
 	return &fakeChain{
 		head:    ev.BlockNumber + testConfirmations + 5,
 		receipt: &etypes.Receipt{Status: etypes.ReceiptStatusSuccessful, BlockNumber: new(big.Int).SetUint64(ev.BlockNumber), BlockHash: header.Hash()},
 		header:  header,
-		tx:      etypes.NewTransaction(0, ecommon.Address{}, big.NewInt(0), 0, big.NewInt(0), nil),
+		logs:    []etypes.Log{eventLog(ev)},
 	}
+}
+
+func decide(chain evmChainReader, ev *events.UnwrapRequestEvm) confirmDecision {
+	return confirmQueuedEvent(chain, ev, testContract, testConfirmations, testBlockTime)
 }
 
 func TestConfirmQueuedEventConfirmsFinalEvent(t *testing.T) {
 	header := canonicalHeader(100)
 	ev := testEvent(100, header)
-	d := confirmQueuedEvent(healthyChain(ev, header), ev, testConfirmations, testBlockTime)
-	if d.outcome != outcomeConfirmed {
+	if d := decide(healthyChain(ev, header), ev); d.outcome != outcomeConfirmed {
 		t.Fatalf("expected confirmed, got %s (%s)", d.outcome, d.reason)
 	}
 }
@@ -80,17 +96,22 @@ func TestConfirmQueuedEventRetriesOnTransportErrors(t *testing.T) {
 	cases := map[string]*fakeChain{
 		"head error":    {headErr: boom},
 		"receipt error": func() *fakeChain { c := healthyChain(ev, header); c.receiptErr = boom; return c }(),
-		"tx error":      func() *fakeChain { c := healthyChain(ev, header); c.txErr = boom; return c }(),
 		"header error": func() *fakeChain {
 			c := healthyChain(ev, header)
 			c.receiptErr = ethereum.NotFound
 			c.headerErr = boom
 			return c
 		}(),
-		"provider head behind receipt": func() *fakeChain { c := healthyChain(ev, header); c.head = 50; return c }(),
+		"block logs error": func() *fakeChain {
+			c := healthyChain(ev, header)
+			c.receiptErr = ethereum.NotFound
+			c.logsErr = boom
+			return c
+		}(),
+		"provider head behind event": func() *fakeChain { c := healthyChain(ev, header); c.head = 50; return c }(),
 	}
 	for name, chain := range cases {
-		d := confirmQueuedEvent(chain, ev, testConfirmations, testBlockTime)
+		d := decide(chain, ev)
 		if d.outcome != outcomeRetry {
 			t.Fatalf("%s: expected retry, got %s (%s)", name, d.outcome, d.reason)
 		}
@@ -106,7 +127,7 @@ func TestConfirmQueuedEventWaitsForConfirmations(t *testing.T) {
 	chain := healthyChain(ev, header)
 	chain.head = 105 // 5 of 12 confirmations
 
-	d := confirmQueuedEvent(chain, ev, testConfirmations, testBlockTime)
+	d := decide(chain, ev)
 	if d.outcome != outcomeRetry || d.err != nil {
 		t.Fatalf("expected a clean retry, got %s err=%v", d.outcome, d.err)
 	}
@@ -115,35 +136,67 @@ func TestConfirmQueuedEventWaitsForConfirmations(t *testing.T) {
 	}
 }
 
-func TestConfirmQueuedEventDiscardsRevertedTransaction(t *testing.T) {
+func TestConfirmQueuedEventRevertedReceiptIsNotTrustedAlone(t *testing.T) {
 	header := canonicalHeader(100)
 	ev := testEvent(100, header)
+
+	// Observed block still canonical and its logs carry the event: a
+	// "reverted" receipt can only come from a forked backend. Confirm.
 	chain := healthyChain(ev, header)
 	chain.receipt.Status = etypes.ReceiptStatusFailed
+	if d := decide(chain, ev); d.outcome != outcomeConfirmed {
+		t.Fatalf("expected confirmed via block logs, got %s (%s)", d.outcome, d.reason)
+	}
 
-	if d := confirmQueuedEvent(chain, ev, testConfirmations, testBlockTime); d.outcome != outcomeDiscard {
+	// Same, but the block logs do not show the event either: inconsistent
+	// backends, keep waiting rather than drop.
+	chain.logs = nil
+	if d := decide(chain, ev); d.outcome != outcomeRetry || d.err == nil {
+		t.Fatalf("expected transient retry, got %s (%s)", d.outcome, d.reason)
+	}
+
+	// Observed block reorged out: discard.
+	replacement := canonicalHeader(100)
+	replacement.Extra = []byte("fork")
+	chain.header = replacement
+	if d := decide(chain, ev); d.outcome != outcomeDiscard {
 		t.Fatalf("expected discard, got %s (%s)", d.outcome, d.reason)
 	}
 }
 
-func TestConfirmQueuedEventMissingReceiptKeepsWaitingWhileBlockCanonical(t *testing.T) {
+func TestConfirmQueuedEventMissingReceiptFallsBackToBlockLogs(t *testing.T) {
 	header := canonicalHeader(100)
 	ev := testEvent(100, header)
 	chain := healthyChain(ev, header)
 	chain.receiptErr = ethereum.NotFound
 
-	// The block the event was seen in is still canonical: the provider is
-	// inconsistent, not the chain. Never discard.
-	d := confirmQueuedEvent(chain, ev, testConfirmations, testBlockTime)
-	if d.outcome != outcomeRetry || d.err == nil {
+	// Receipts pruned but the canonical block still carries the log.
+	if d := decide(chain, ev); d.outcome != outcomeConfirmed {
+		t.Fatalf("expected confirmed via block logs, got %s (%s)", d.outcome, d.reason)
+	}
+
+	// Log for a different tx / index / contract must not match.
+	other := eventLog(ev)
+	other.Index = 9
+	foreign := eventLog(ev)
+	foreign.Address = ecommon.HexToAddress("0x1")
+	chain.logs = []etypes.Log{other, foreign}
+	if d := decide(chain, ev); d.outcome != outcomeRetry || d.err == nil {
 		t.Fatalf("expected transient retry, got %s (%s)", d.outcome, d.reason)
 	}
 
-	// Too early to judge a reorg at all: clean retry after one block.
+	// Affiliate events map back to the original on-chain log index.
+	affiliate := testEvent(100, header)
+	affiliate.LogIndex = 3 + common.AffiliateLogIndexAddition
+	chain.logs = []etypes.Log{eventLog(ev)}
+	if d := decide(chain, affiliate); d.outcome != outcomeConfirmed {
+		t.Fatalf("affiliate event should match original log, got %s (%s)", d.outcome, d.reason)
+	}
+
+	// Too early to judge anything: clean retry until confirmations exist.
 	chain.head = ev.BlockNumber + 2
-	d = confirmQueuedEvent(chain, ev, testConfirmations, testBlockTime)
-	if d.outcome != outcomeRetry || d.err != nil || d.retryAfter != testBlockTime {
-		t.Fatalf("expected clean retry after one block, got %+v", d)
+	if d := decide(chain, ev); d.outcome != outcomeRetry || d.err != nil || d.retryAfter != 10*testBlockTime {
+		t.Fatalf("expected clean retry for 10 blocks, got %+v", d)
 	}
 }
 
@@ -160,7 +213,7 @@ func TestConfirmQueuedEventDiscardsReorgedBlock(t *testing.T) {
 	chain := healthyChain(ev, observed)
 	chain.receiptErr = ethereum.NotFound
 	chain.header = replacement
-	if d := confirmQueuedEvent(chain, ev, testConfirmations, testBlockTime); d.outcome != outcomeDiscard {
+	if d := decide(chain, ev); d.outcome != outcomeDiscard {
 		t.Fatalf("expected discard for missing receipt after reorg, got %s (%s)", d.outcome, d.reason)
 	}
 
@@ -168,15 +221,15 @@ func TestConfirmQueuedEventDiscardsReorgedBlock(t *testing.T) {
 	chain = healthyChain(ev, observed)
 	chain.receipt.BlockHash = replacement.Hash()
 	chain.header = replacement
-	if d := confirmQueuedEvent(chain, ev, testConfirmations, testBlockTime); d.outcome != outcomeDiscard {
+	if d := decide(chain, ev); d.outcome != outcomeDiscard {
 		t.Fatalf("expected discard for receipt in another block after reorg, got %s (%s)", d.outcome, d.reason)
 	}
 
-	// Receipt in a different block but the observed block is still canonical:
-	// provider inconsistency, keep waiting.
+	// Receipt in a different block but the observed block is still canonical
+	// and carries the log: the receipt came from a forked backend. Confirm.
 	chain = healthyChain(ev, observed)
 	chain.receipt.BlockHash = replacement.Hash()
-	if d := confirmQueuedEvent(chain, ev, testConfirmations, testBlockTime); d.outcome != outcomeRetry {
-		t.Fatalf("expected retry for inconsistent receipt, got %s (%s)", d.outcome, d.reason)
+	if d := decide(chain, ev); d.outcome != outcomeConfirmed {
+		t.Fatalf("expected confirmed via block logs, got %s (%s)", d.outcome, d.reason)
 	}
 }

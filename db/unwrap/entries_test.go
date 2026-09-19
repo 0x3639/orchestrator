@@ -98,3 +98,58 @@ func TestGetUnsignedUnwrapRequestsExcludesReconciledEvents(t *testing.T) {
 		t.Fatalf("expected 2 unsigned after reset, got %d", len(got))
 	}
 }
+
+func TestConcurrentMutationsDoNotLoseWrites(t *testing.T) {
+	store := newTestStorage(t)
+	ev := sampleEvent("0x0a", 0)
+	if _, err := store.AddUnwrapRequestIfMissing(ev); err != nil {
+		t.Fatal(err)
+	}
+
+	const workers = 32
+	done := make(chan struct{})
+	errs := make(chan error, workers*3)
+	for i := 0; i < workers; i++ {
+		go func(i int) {
+			defer func() { done <- struct{}{} }()
+			refreshed := ev
+			refreshed.BlockNumber = uint64(1000 + i)
+			for j := 0; j < 50; j++ {
+				if err := store.UpdateUnwrapRequestBlockNumber(refreshed); err != nil {
+					errs <- err
+					return
+				}
+				if _, err := store.AddUnwrapRequestIfMissing(ev); err != nil {
+					errs <- err
+					return
+				}
+			}
+		}(i)
+	}
+	// One signer stores the signature and the sender marks it sent while
+	// the sync loop keeps refreshing the block number.
+	if err := store.SetUnwrapRequestSignature(ev.TransactionHash, 0, "sig"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetUnwrapRequestStatus(ev.TransactionHash, 0, common.PendingRedeemStatus); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < workers; i++ {
+		<-done
+	}
+	close(errs)
+	for err := range errs {
+		t.Fatal(err)
+	}
+
+	got, err := store.GetUnwrapRequestByHashAndLog(ev.TransactionHash, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Signature != "sig" || got.RedeemStatus != common.PendingRedeemStatus {
+		t.Fatalf("concurrent block-number refresh clobbered signature/status: %+v", got)
+	}
+	if got.BlockNumber < 1000 {
+		t.Fatalf("block number refresh was lost: %d", got.BlockNumber)
+	}
+}

@@ -2,6 +2,7 @@ package network
 
 import (
 	"crypto/ecdsa"
+	"fmt"
 	ecommon "github.com/ethereum/go-ethereum/common"
 	etypes "github.com/ethereum/go-ethereum/core/types"
 	"github.com/joncrlsn/dque"
@@ -17,6 +18,7 @@ import (
 	"orchestrator/rpc"
 	"os"
 	"strings"
+	"sync"
 	"syscall"
 
 	"math/big"
@@ -34,6 +36,15 @@ type evmNetwork struct {
 	state            *common.GlobalState
 	stopChan         chan os.Signal
 	logger           *zap.SugaredLogger
+
+	// done is closed by Stop so background loops can leave their sleeps
+	// and never signal on a channel the node has already closed.
+	done     chan struct{}
+	stopOnce sync.Once
+	// backfillBlocks, when non-zero, rewinds the sync cursor by that many
+	// blocks once at startup so an operator can repair a node that lost
+	// events without wiping and resyncing from the deployment height.
+	backfillBlocks uint64
 }
 
 func NewEvmNetwork(network *definition.NetworkInfo, dbManager *manager.Manager, rpcManager *rpc.Manager, state *common.GlobalState, stop chan os.Signal) (*evmNetwork, error) {
@@ -62,9 +73,43 @@ func NewEvmNetwork(network *definition.NetworkInfo, dbManager *manager.Manager, 
 		state:            state,
 		stopChan:         stop,
 		logger:           newLogger,
+		done:             make(chan struct{}),
 	}
 
 	return newEvmNetwork, nil
+}
+
+// SetBackfillBlocks asks Start to rewind the sync cursor once by the given
+// number of blocks (bounded by the contract deployment height).
+func (eN *evmNetwork) SetBackfillBlocks(blocks uint64) {
+	eN.backfillBlocks = blocks
+}
+
+// sleep waits for d unless the network is stopped first. It reports false
+// when the caller should exit.
+func (eN *evmNetwork) sleep(d time.Duration) bool {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return true
+	case <-eN.done:
+		return false
+	}
+}
+
+// requestStop asks the node to shut down unless it already is.
+func (eN *evmNetwork) requestStop() {
+	select {
+	case <-eN.done:
+		return
+	default:
+	}
+	select {
+	case eN.stopChan <- syscall.SIGINT:
+	default:
+		// a stop signal is already pending
+	}
 }
 
 func (eN *evmNetwork) Start() error {
@@ -88,6 +133,21 @@ func (eN *evmNetwork) Start() error {
 			eN.logger.Debug(err)
 			return err
 		}
+		lastUpdateHeight = eN.ContractDeploymentHeight()
+	}
+	if eN.backfillBlocks > 0 {
+		target := eN.ContractDeploymentHeight()
+		if lastUpdateHeight > eN.backfillBlocks && lastUpdateHeight-eN.backfillBlocks > target {
+			target = lastUpdateHeight - eN.backfillBlocks
+		}
+		if target < lastUpdateHeight {
+			eN.logger.Warnf("Backfill requested: rewinding sync cursor for chainId %d from %d to %d (%d blocks); already stored events are kept as-is",
+				eN.ChainId(), lastUpdateHeight, target, lastUpdateHeight-target)
+			if err := eN.dbManager.EvmStorage(eN.ChainId()).SetLastUpdateHeight(target); err != nil {
+				return err
+			}
+		}
+		eN.backfillBlocks = 0
 	}
 	if err := eN.Sync(); err != nil {
 		eN.logger.Debug(err)
@@ -145,8 +205,12 @@ func (eN *evmNetwork) Sync() error {
 				for _, log := range logs {
 					// if we have confirmations then we are live, otherwise we are not
 					if err := eN.InterpretLog(log, latestBlock-log.BlockNumber < eN.ConfirmationsToFinality()); err != nil {
-						eN.logger.Error(err)
-						continue
+						// Do not advance the cursor past a range with an unprocessed
+						// log; the next Sync retries the same range. Skipping it
+						// would silently lose the event on this signer only.
+						eN.logger.Errorf("Sync: failed to interpret log tx %s logIndex %d in block %d, range [%d, %d] will be retried: %v",
+							log.TxHash.String(), log.Index, log.BlockNumber, updateHeight, updateHeight+filterQuerySize, err)
+						return err
 					}
 				}
 			}
@@ -268,17 +332,11 @@ func (eN *evmNetwork) InterpretLog(log etypes.Log, live bool) error {
 				}
 				eN.logger.Info("Successfully enqueued event")
 			} else {
-				if localEvent, dbErr := eN.eventsStore().GetUnwrapRequestByHashAndLog(ev.TransactionHash, ev.LogIndex); dbErr != nil {
-					return dbErr
-				} else if localEvent == nil {
-					if err := eN.eventsStore().AddUnwrapRequest(*ev); err != nil {
-						return err
-					}
-				} else {
-					// the event was added by the znn sync, we update the block number
-					if err := eN.eventsStore().UpdateUnwrapRequestBlockNumber(*ev); err != nil {
-						return err
-					}
+				// Present already when the znn sync or a previous pass stored it;
+				// UpdateUnwrapRequestBlockNumber inserts when missing and otherwise
+				// only refreshes the block fields, never the signature or status.
+				if err := eN.eventsStore().UpdateUnwrapRequestBlockNumber(*ev); err != nil {
+					return err
 				}
 			}
 		}
@@ -567,7 +625,9 @@ func (eN *evmNetwork) SubscribeToEvents() {
 
 	go func() {
 		for {
-			time.Sleep(3 * time.Minute)
+			if !eN.sleep(3 * time.Minute) {
+				return
+			}
 			if logSub != nil {
 				logSub.Unsubscribe()
 			}
@@ -578,7 +638,7 @@ func (eN *evmNetwork) SubscribeToEvents() {
 			}
 			if logSub, logChan, err = eN.EvmRpc().SubscribeToLogs(); err != nil {
 				eN.logger.Error(err)
-				eN.stopChan <- syscall.SIGINT
+				eN.requestStop()
 			}
 		}
 	}()
@@ -602,13 +662,19 @@ const (
 	processEventsBaseBackoff = 5 * time.Second
 	processEventsMaxBackoff  = 2 * time.Minute
 	processEventsWarnEvery   = 10
+	// discardAgreement is how many consecutive attempts, each at least
+	// discardRecheckDelay apart, must report the observed block as
+	// non-canonical before the event is dropped. A single answer can come
+	// from a lagging or forked backend behind a load balancer.
+	discardAgreement    = 3
+	discardRecheckDelay = 30 * time.Second
 )
 
 // ProcessEvents drains the persistent queue of live unwrap events in order.
 // The head event is only removed once the chain has given a definitive
-// answer: confirmed (persisted to the events store) or rejected (reverted
-// or reorged out). Transient failures, above all RPC errors from an
-// overloaded EVM node, keep the event queued and retry with backoff.
+// answer: confirmed (persisted to the events store) or reorged out.
+// Transient failures, above all RPC errors from an overloaded EVM node,
+// keep the event queued and retry with backoff.
 //
 // Dropping an event on a transient error is never acceptable here. Each
 // signer builds its TSS signing pool from its local events store, and the
@@ -617,12 +683,14 @@ const (
 func (eN *evmNetwork) ProcessEvents() {
 	backoff := processEventsBaseBackoff
 	attempts := 0
+	discardVotes := 0
+	var discardFor string
 
 	for {
 		peeked, errQueue := eN.unconfirmedQueue.PeekBlock()
 		if errQueue != nil {
 			eN.logger.Error(errQueue)
-			eN.stopChan <- syscall.SIGINT
+			eN.requestStop()
 			return
 		}
 		frontEvent, ok := peeked.(*events.UnwrapRequestEvm)
@@ -633,21 +701,28 @@ func (eN *evmNetwork) ProcessEvents() {
 			}
 			continue
 		}
-		eN.logger.Debugf("Processing evm event with tx hash %s and logIndex: %d", frontEvent.TransactionHash.String(), frontEvent.LogIndex)
+		key := fmt.Sprintf("%s/%d", frontEvent.TransactionHash.String(), frontEvent.LogIndex)
+		if key != discardFor {
+			discardFor = key
+			discardVotes = 0
+		}
+		eN.logger.Debugf("Processing evm event %s", key)
 
-		decision := confirmQueuedEvent(eN.EvmRpc(), frontEvent, eN.EvmParams.ConfirmationsToFinality(), eN.EvmParams.EstimatedBlockTime())
+		decision := confirmQueuedEvent(eN.EvmRpc(), frontEvent, *eN.ContractAddress(), eN.EvmParams.ConfirmationsToFinality(), eN.EvmParams.EstimatedBlockTime())
 
 		switch decision.outcome {
 		case outcomeRetry:
+			discardVotes = 0
 			if decision.err != nil {
 				attempts++
-				eN.logger.Warnf("Event %s/%d not confirmable yet (%s): %v; attempt %d, retrying in %s, queue size %d",
-					frontEvent.TransactionHash.String(), frontEvent.LogIndex, decision.reason, decision.err, attempts, backoff, eN.unconfirmedQueue.Size())
+				eN.logger.Warnf("Event %s not confirmable yet (%s): %v; attempt %d, retrying in %s, queue size %d",
+					key, decision.reason, decision.err, attempts, backoff, eN.unconfirmedQueue.Size())
 				if attempts%processEventsWarnEvery == 0 {
-					eN.logger.Errorf("Event %s/%d has failed confirmation %d times in a row; the unconfirmed queue is blocked until the EVM node answers",
-						frontEvent.TransactionHash.String(), frontEvent.LogIndex, attempts)
+					eN.logger.Errorf("Event %s has failed confirmation %d times in a row; the unconfirmed queue is blocked until the EVM node answers consistently", key, attempts)
 				}
-				time.Sleep(backoff)
+				if !eN.sleep(backoff) {
+					return
+				}
 				backoff *= 2
 				if backoff > processEventsMaxBackoff {
 					backoff = processEventsMaxBackoff
@@ -663,14 +738,26 @@ func (eN *evmNetwork) ProcessEvents() {
 			} else if wait > processEventsMaxBackoff {
 				wait = processEventsMaxBackoff
 			}
-			eN.logger.Debugf("Event %s/%d: %s, checking again in %s", frontEvent.TransactionHash.String(), frontEvent.LogIndex, decision.reason, wait)
-			time.Sleep(wait)
+			eN.logger.Debugf("Event %s: %s, checking again in %s", key, decision.reason, wait)
+			if !eN.sleep(wait) {
+				return
+			}
 			continue
 
 		case outcomeDiscard:
 			attempts = 0
 			backoff = processEventsBaseBackoff
-			eN.logger.Warnf("Discarding event %s/%d: %s", frontEvent.TransactionHash.String(), frontEvent.LogIndex, decision.reason)
+			discardVotes++
+			if discardVotes < discardAgreement {
+				eN.logger.Warnf("Event %s looks reorged out (%s); confirmation %d/%d, re-checking in %s",
+					key, decision.reason, discardVotes, discardAgreement, discardRecheckDelay)
+				if !eN.sleep(discardRecheckDelay) {
+					return
+				}
+				continue
+			}
+			eN.logger.Warnf("Discarding event %s after %d consecutive checks: %s", key, discardVotes, decision.reason)
+			discardVotes = 0
 			if !eN.dropQueuedEvent() {
 				return
 			}
@@ -679,21 +766,26 @@ func (eN *evmNetwork) ProcessEvents() {
 		case outcomeConfirmed:
 			attempts = 0
 			backoff = processEventsBaseBackoff
-			eN.logger.Infof("Event with hash: %s and logIndex: %d is confirmed", frontEvent.TransactionHash.String(), frontEvent.LogIndex)
+			discardVotes = 0
+			if decision.reason != "" {
+				eN.logger.Infof("Event %s is confirmed (%s)", key, decision.reason)
+			} else {
+				eN.logger.Infof("Event %s is confirmed", key)
+			}
 
 			added, err := eN.eventsStore().AddUnwrapRequestIfMissing(*frontEvent)
 			if err != nil {
 				eN.logger.Error(err)
-				eN.stopChan <- syscall.SIGINT
+				eN.requestStop()
 				return
 			}
 			if added {
-				eN.logger.Infof("Added event hash: %s logIndex: %d to persistent storage", frontEvent.TransactionHash.String(), frontEvent.LogIndex)
+				eN.logger.Infof("Added event %s to persistent storage", key)
 			} else {
 				// The same event reaches the queue more than once (subscription
 				// plus periodic Sync). The existing record may already carry a
 				// signature or a sent status and must not be reset.
-				eN.logger.Infof("Event hash: %s logIndex: %d already in persistent storage, keeping the existing record", frontEvent.TransactionHash.String(), frontEvent.LogIndex)
+				eN.logger.Infof("Event %s already in persistent storage, keeping the existing record", key)
 			}
 			if !eN.dropQueuedEvent() {
 				return
@@ -707,13 +799,14 @@ func (eN *evmNetwork) ProcessEvents() {
 func (eN *evmNetwork) dropQueuedEvent() bool {
 	if _, err := eN.unconfirmedQueue.DequeueBlock(); err != nil {
 		eN.logger.Error(err)
-		eN.stopChan <- syscall.SIGINT
+		eN.requestStop()
 		return false
 	}
 	return true
 }
 
 func (eN *evmNetwork) Stop() {
+	eN.stopOnce.Do(func() { close(eN.done) })
 	eN.EvmRpc().Stop()
 	_ = eN.unconfirmedQueue.Close()
 }

@@ -9,6 +9,7 @@ import (
 	ecommon "github.com/ethereum/go-ethereum/common"
 	etypes "github.com/ethereum/go-ethereum/core/types"
 
+	"orchestrator/common"
 	"orchestrator/common/events"
 )
 
@@ -19,7 +20,8 @@ type evmChainReader interface {
 	BlockNumber() (uint64, error)
 	HeaderByNumber(number uint64) (*etypes.Header, error)
 	TransactionReceipt(txHash ecommon.Hash) (*etypes.Receipt, error)
-	TransactionByHash(hash ecommon.Hash) (*etypes.Transaction, bool, error)
+	// FilterBlockLogs returns the bridge contract's logs in the given block.
+	FilterBlockLogs(blockHash ecommon.Hash) ([]etypes.Log, error)
 }
 
 type confirmOutcome int
@@ -31,8 +33,10 @@ const (
 	outcomeRetry confirmOutcome = iota
 	// outcomeConfirmed means the event is final and must be persisted.
 	outcomeConfirmed
-	// outcomeDiscard means the chain has definitively rejected the event:
-	// the transaction reverted or its block was reorged out.
+	// outcomeDiscard means the chain reports that the block the event was
+	// observed in is no longer canonical. Because a load-balanced provider
+	// can answer from a lagging or forked backend, the caller only acts on
+	// this after several consecutive agreeing attempts.
 	outcomeDiscard
 )
 
@@ -69,64 +73,52 @@ func discardDecision(reason string) confirmDecision {
 }
 
 // confirmQueuedEvent decides whether the unwrap event at the head of the
-// unconfirmed queue is final, must wait, or was rejected by the chain.
+// unconfirmed queue is final, must wait, or was reorged out.
 //
-// Only two signals are treated as definitive: a receipt whose status is
-// failed, and a canonical header at the event's height whose hash differs
-// from the one the event was observed in. Everything else, including RPC
-// errors and a missing receipt while the event's block is still canonical,
-// is transient and keeps the event queued.
-func confirmQueuedEvent(chain evmChainReader, ev *events.UnwrapRequestEvm, confirmations uint64, blockTime time.Duration) confirmDecision {
+// The only definitive rejection is a canonical header at the event's height
+// whose hash differs from the block the event was observed in. A reverted
+// receipt or a receipt from another block is never trusted on its own: the
+// event's log was observed in a specific block, so if that block is still
+// canonical a contradicting receipt can only come from an inconsistent or
+// forked backend, and the event keeps waiting. A missing receipt while the
+// block is still canonical falls back to re-reading the block's logs, which
+// also covers providers that prune receipts.
+func confirmQueuedEvent(chain evmChainReader, ev *events.UnwrapRequestEvm, contract ecommon.Address, confirmations uint64, blockTime time.Duration) confirmDecision {
 	head, err := chain.BlockNumber()
 	if err != nil {
 		return retryDecision("cannot read chain head", err, 0)
 	}
-
-	receipt, err := chain.TransactionReceipt(ev.TransactionHash)
-	if errors.Is(err, ethereum.NotFound) {
-		return canonicalCheck(chain, ev, head, confirmations, blockTime, "receipt not found")
+	if head < ev.BlockNumber {
+		return retryDecision("provider head is behind the event block", fmt.Errorf("head %d < event block %d", head, ev.BlockNumber), 0)
 	}
-	if err != nil {
-		return retryDecision("cannot read receipt", err, 0)
-	}
-	if receipt.Status != etypes.ReceiptStatusSuccessful {
-		return discardDecision("transaction reverted")
-	}
-
-	receiptBlock := receipt.BlockNumber.Uint64()
-	if head < receiptBlock {
-		return retryDecision("provider head is behind the receipt block", fmt.Errorf("head %d < receipt block %d", head, receiptBlock), 0)
-	}
-	if elapsed := head - receiptBlock; elapsed < confirmations {
+	if elapsed := head - ev.BlockNumber; elapsed < confirmations {
 		remaining := confirmations - elapsed
 		return retryDecision(fmt.Sprintf("waiting for %d more confirmations", remaining), nil, time.Duration(remaining)*blockTime)
 	}
 
-	if receipt.BlockHash != ev.BlockHash {
-		return canonicalCheck(chain, ev, head, confirmations, blockTime, "receipt block hash differs from the observed block")
+	receipt, err := chain.TransactionReceipt(ev.TransactionHash)
+	switch {
+	case errors.Is(err, ethereum.NotFound) || (err == nil && receipt == nil):
+		return resolveAgainstCanonicalBlock(chain, ev, contract, "receipt not found")
+	case err != nil:
+		return retryDecision("cannot read receipt", err, 0)
+	case receipt.BlockHash != ev.BlockHash:
+		return resolveAgainstCanonicalBlock(chain, ev, contract, "receipt is in a different block than the observed log")
+	case receipt.Status != etypes.ReceiptStatusSuccessful:
+		// A reverted transaction emits no logs, yet we observed one in this
+		// block: the backend answering now disagrees with the one that
+		// delivered the log. Let the canonical block decide.
+		return resolveAgainstCanonicalBlock(chain, ev, contract, "receipt reports the transaction reverted")
 	}
-
-	tx, _, err := chain.TransactionByHash(ev.TransactionHash)
-	if errors.Is(err, ethereum.NotFound) || (err == nil && tx == nil) {
-		return canonicalCheck(chain, ev, head, confirmations, blockTime, "transaction not found")
-	}
-	if err != nil {
-		return retryDecision("cannot read transaction", err, 0)
-	}
-
 	return confirmDecision{outcome: outcomeConfirmed}
 }
 
-// canonicalCheck resolves an inconsistency between the event and what the
-// node reports. If the canonical block at the event's height is no longer
-// the block the event was observed in, the event was reorged out and the
-// canonical copy, if any, will arrive through the subscription or Sync. If
-// the block is still canonical the provider is simply inconsistent or
-// lagging, and the event must wait.
-func canonicalCheck(chain evmChainReader, ev *events.UnwrapRequestEvm, head, confirmations uint64, blockTime time.Duration, context string) confirmDecision {
-	if head < ev.BlockNumber+confirmations {
-		return retryDecision(context+"; too early to judge a reorg", nil, blockTime)
-	}
+// resolveAgainstCanonicalBlock handles every case where the receipt does
+// not vouch for the event. If the block the event was observed in is no
+// longer canonical, the event was reorged out. If it is still canonical the
+// block's own logs are the source of truth: the event is confirmed when its
+// log is there and otherwise waits for a consistent backend.
+func resolveAgainstCanonicalBlock(chain evmChainReader, ev *events.UnwrapRequestEvm, contract ecommon.Address, context string) confirmDecision {
 	header, err := chain.HeaderByNumber(ev.BlockNumber)
 	if err != nil {
 		return retryDecision(context+"; cannot read canonical header", err, 0)
@@ -137,5 +129,38 @@ func canonicalCheck(chain evmChainReader, ev *events.UnwrapRequestEvm, head, con
 	if header.Hash() != ev.BlockHash {
 		return discardDecision(fmt.Sprintf("%s; block %d was reorged out (canonical %s, observed %s)", context, ev.BlockNumber, header.Hash().Hex(), ev.BlockHash.Hex()))
 	}
-	return retryDecision(context+"; block is still canonical, provider inconsistent", errors.New(context), 0)
+
+	logs, err := chain.FilterBlockLogs(ev.BlockHash)
+	if err != nil {
+		return retryDecision(context+"; cannot read canonical block logs", err, 0)
+	}
+	if blockContainsEvent(logs, ev, contract) {
+		return confirmDecision{outcome: outcomeConfirmed, reason: context + "; verified against canonical block logs"}
+	}
+	return retryDecision(context+"; block is still canonical but its logs do not include the event, provider inconsistent", errors.New(context), 0)
+}
+
+// originalLogIndex maps an affiliate event's synthetic log index back to
+// the on-chain log it was derived from.
+func originalLogIndex(ev *events.UnwrapRequestEvm) uint32 {
+	if ev.LogIndex >= common.AffiliateLogIndexAddition {
+		return ev.LogIndex - common.AffiliateLogIndexAddition
+	}
+	return ev.LogIndex
+}
+
+func blockContainsEvent(logs []etypes.Log, ev *events.UnwrapRequestEvm, contract ecommon.Address) bool {
+	want := originalLogIndex(ev)
+	for _, log := range logs {
+		if log.Removed || log.Address != contract || len(log.Topics) == 0 {
+			continue
+		}
+		if log.Topics[0] != common.UnwrapSigHash {
+			continue
+		}
+		if log.TxHash == ev.TransactionHash && uint32(log.Index) == want && log.BlockHash == ev.BlockHash {
+			return true
+		}
+	}
+	return false
 }

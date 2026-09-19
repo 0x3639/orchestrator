@@ -20,6 +20,13 @@ func getUnwrapRequestKey(txHash ecommon.Hash, logIndex uint32) []byte {
 }
 
 func (es *evmStorage) AddUnwrapRequest(event events.UnwrapRequestEvm) error {
+	es.mu.Lock()
+	defer es.mu.Unlock()
+	return es.putUnwrapRequest(event)
+}
+
+// putUnwrapRequest writes the record. Callers must hold es.mu.
+func (es *evmStorage) putUnwrapRequest(event events.UnwrapRequestEvm) error {
 	if eventBytes, err := event.Serialize(); err != nil {
 		es.SendSigInt()
 		return err
@@ -33,6 +40,8 @@ func (es *evmStorage) AddUnwrapRequest(event events.UnwrapRequestEvm) error {
 }
 
 func (es *evmStorage) AddUnwrapRequestIfMissing(event events.UnwrapRequestEvm) (bool, error) {
+	es.mu.Lock()
+	defer es.mu.Unlock()
 	existing, err := es.GetUnwrapRequestByHashAndLog(event.TransactionHash, event.LogIndex)
 	if err != nil {
 		return false, err
@@ -40,19 +49,22 @@ func (es *evmStorage) AddUnwrapRequestIfMissing(event events.UnwrapRequestEvm) (
 	if existing != nil {
 		return false, nil
 	}
-	return true, es.AddUnwrapRequest(event)
+	return true, es.putUnwrapRequest(event)
 }
 
 func (es *evmStorage) UpdateUnwrapRequestBlockNumber(event events.UnwrapRequestEvm) error {
+	es.mu.Lock()
+	defer es.mu.Unlock()
 	localEvent, err := es.GetUnwrapRequestByHashAndLog(event.TransactionHash, event.LogIndex)
 	if err != nil {
 		es.SendSigInt()
 		return err
 	}
 	if localEvent == nil {
-		return es.AddUnwrapRequest(event)
+		return es.putUnwrapRequest(event)
 	}
 	localEvent.BlockNumber = event.BlockNumber
+	localEvent.BlockHash = event.BlockHash
 	localEventBytes, err := localEvent.Serialize()
 	if err != nil {
 		es.SendSigInt()
@@ -85,6 +97,8 @@ func (es *evmStorage) GetUnwrapRequestByHashAndLog(txHash ecommon.Hash, logIndex
 }
 
 func (es *evmStorage) SetUnwrapRequestStatus(txHash ecommon.Hash, logIndex, status uint32) error {
+	es.mu.Lock()
+	defer es.mu.Unlock()
 	if event, err := es.GetUnwrapRequestByHashAndLog(txHash, logIndex); err != nil {
 		es.SendSigInt()
 		return err
@@ -106,6 +120,8 @@ func (es *evmStorage) SetUnwrapRequestStatus(txHash ecommon.Hash, logIndex, stat
 }
 
 func (es *evmStorage) SetUnwrapRequestSignature(txHash ecommon.Hash, logIndex uint32, signature string) error {
+	es.mu.Lock()
+	defer es.mu.Unlock()
 	if event, err := es.GetUnwrapRequestByHashAndLog(txHash, logIndex); err != nil {
 		es.SendSigInt()
 		return err
@@ -127,6 +143,8 @@ func (es *evmStorage) SetUnwrapRequestSignature(txHash ecommon.Hash, logIndex ui
 }
 
 func (es *evmStorage) SetUnsentUnwrapRequestAsUnsigned(txHash ecommon.Hash, logIndex uint32) error {
+	es.mu.Lock()
+	defer es.mu.Unlock()
 	if event, err := es.GetUnwrapRequestByHashAndLog(txHash, logIndex); err != nil {
 		es.SendSigInt()
 		return err

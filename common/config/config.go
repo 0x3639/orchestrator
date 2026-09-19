@@ -39,6 +39,10 @@ type Config struct {
 	QueuesPath  string
 	GlobalState uint8
 	EvmAddress  string
+	// EvmBackfillBlocks is a one-shot, command-line only request to rewind
+	// every EVM network's sync cursor by this many blocks at startup. It is
+	// never persisted so it cannot re-trigger on the next start.
+	EvmBackfillBlocks uint64 `json:"-"`
 
 	Networks  map[string]BaseNetworkConfig
 	TssConfig TssManagerConfig

@@ -94,6 +94,9 @@ func NewNode(config *oconfig.Config, logger *zap.Logger) (*Node, error) {
 	if errInit := node.networksManager.Init(config.Networks, node.dbManager, node.state, node.SetBridgeMetadata); errInit != nil {
 		return nil, errInit
 	}
+	if config.EvmBackfillBlocks > 0 {
+		node.networksManager.SetEvmBackfillBlocks(config.EvmBackfillBlocks)
+	}
 
 	newKeyStore, err := wallet2.ReadKeyFile(config.ProducerKeyFileName, config.ProducerKeyFilePassphrase, path.Join(config.DataPath, config.ProducerKeyFileName))
 	if err != nil {
@@ -1132,7 +1135,10 @@ func (node *Node) processSignaturesUnwrap() (error, bool) {
 	if err != nil {
 		return err, true
 	}
-	requests = node.reconcileUnsignedUnwrapRequests(requests)
+	requests, err = node.reconcileUnsignedUnwrapRequests(requests)
+	if err != nil {
+		return err, true
+	}
 	if len(requests) == 0 {
 		return nil, false
 	}
@@ -1205,36 +1211,52 @@ func (node *Node) processSignaturesUnwrap() (error, bool) {
 }
 
 // reconcileUnsignedUnwrapRequests removes from the signing pool every event
-// that Zenon already knows about, marking it as sent locally. Such events
-// exist when this node missed the ceremony that signed them (offline, lost
-// the event, or the record was reset), and left in the pool they make this
-// node propose a different message set than its peers. The TSS ceremony
-// only forms a party between signers with an identical set, so one stale
-// entry here stalls unwrap signing for the whole bridge until operators
+// that Zenon already knows about, recording its Zenon status locally. Such
+// events exist when this node missed the ceremony that signed them (offline,
+// lost the event, or the record was reset), and left in the pool they make
+// this node propose a different message set than its peers. The TSS
+// ceremony only forms a party between signers with an identical set, so one
+// stale entry here keeps this node out of every ceremony until operators
 // wipe and resync the events store.
-func (node *Node) reconcileUnsignedUnwrapRequests(requests []*events.UnwrapRequestEvm) []*events.UnwrapRequestEvm {
-	remaining := make([]*events.UnwrapRequestEvm, 0, len(requests))
+//
+// Requests are visited in storage order and the walk stops once enough
+// remain to fill the ceremony pool, so the cost is bounded by the pool size
+// rather than the backlog. Any Zenon RPC failure aborts the ceremony for
+// this node: guessing would produce a pool its peers do not share.
+func (node *Node) reconcileUnsignedUnwrapRequests(requests []*events.UnwrapRequestEvm) ([]*events.UnwrapRequestEvm, error) {
+	remaining := make([]*events.UnwrapRequestEvm, 0, common.SignCeremonyPoolSize)
 	reconciled := 0
 	for _, req := range requests {
+		if len(remaining) >= common.SignCeremonyPoolSize {
+			break
+		}
 		rpcReq, err := node.networksManager.GetEvmUnwrapRequestByHashAndLogFromRPC(types.Hash(req.TransactionHash), req.LogIndex)
-		if rpcReq != nil {
-			if err := node.networksManager.SetEvmUnwrapRequestAsSent(req); err != nil {
-				node.logger.Warnf("reconcile: event %s/%d exists on Zenon but could not be marked as sent: %v", req.TransactionHash.String(), req.LogIndex, err)
+		if err != nil {
+			if err.Error() == constants.ErrDataNonExistent.Error() {
+				remaining = append(remaining, req)
 				continue
 			}
-			reconciled++
+			return nil, fmt.Errorf("reconcile: cannot query Zenon for event %s/%d: %w", req.TransactionHash.String(), req.LogIndex, err)
+		}
+		if rpcReq == nil {
+			remaining = append(remaining, req)
 			continue
 		}
-		if err != nil && err.Error() != constants.ErrDataNonExistent.Error() {
-			// Zenon RPC failure: keep the event in the pool rather than guess.
-			node.logger.Warnf("reconcile: cannot query Zenon for event %s/%d: %v", req.TransactionHash.String(), req.LogIndex, err)
+		status := common.PendingRedeemStatus
+		if rpcReq.Revoked != 0 {
+			status = common.RevokedStatus
+		} else if rpcReq.Redeemed != 0 {
+			status = common.RedeemedStatus
 		}
-		remaining = append(remaining, req)
+		if err := node.networksManager.SetEvmUnwrapRequestStatus(req, status); err != nil {
+			return nil, fmt.Errorf("reconcile: event %s/%d exists on Zenon but its local status could not be updated: %w", req.TransactionHash.String(), req.LogIndex, err)
+		}
+		reconciled++
 	}
 	if reconciled > 0 {
-		node.logger.Infof("reconcile: %d unsigned unwrap events already exist on Zenon and were marked as sent; %d remain to sign", reconciled, len(remaining))
+		node.logger.Infof("reconcile: %d unsigned unwrap events already exist on Zenon and were excluded from the pool; %d selected to sign", reconciled, len(remaining))
 	}
-	return remaining
+	return remaining, nil
 }
 
 // Send signatures methods

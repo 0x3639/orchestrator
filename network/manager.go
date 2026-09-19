@@ -642,6 +642,26 @@ func (m *NetworksManager) SetEvmUnwrapRequestAsSent(event *events.UnwrapRequestE
 	return nil
 }
 
+// SetEvmUnwrapRequestStatus updates only the redeem status of an existing record.
+func (m *NetworksManager) SetEvmUnwrapRequestStatus(event *events.UnwrapRequestEvm, status uint32) error {
+	for _, network := range m.evmNetworks {
+		if network.ChainId() == event.ChainId {
+			if err := network.SetUnwrapRequestStatus(event.TransactionHash, event.LogIndex, status); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// SetEvmBackfillBlocks asks every EVM network to rewind its sync cursor
+// once at start by the given number of blocks. Must be called before Start.
+func (m *NetworksManager) SetEvmBackfillBlocks(blocks uint64) {
+	for _, network := range m.evmNetworks {
+		network.SetBackfillBlocks(blocks)
+	}
+}
+
 // SetEvmUnwrapRequestSignature stores only the signature on an existing
 // record, leaving its redeem status untouched. Writing the whole event back
 // after a ceremony could undo a status change made meanwhile by the sender.
