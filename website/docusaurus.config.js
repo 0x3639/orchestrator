@@ -11,9 +11,11 @@ const config = {
   tagline: 'Operator guide for the Zenon TSS bridge orchestrator',
   favicon: 'img/znn-logo.svg',
 
-  url: 'https://0x3639.com',
-  // Change to '/orchestrator/' if the site is served from a sub-path.
-  baseUrl: '/',
+  // GitHub Pages serves this project site under the account's custom domain
+  // at the repository sub-path. Both values must change together if the
+  // site moves to its own domain.
+  url: 'https://www.0x3639.com',
+  baseUrl: '/orchestrator/',
 
   organizationName: '0x3639',
   projectName: 'orchestrator',
