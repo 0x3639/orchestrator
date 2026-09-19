@@ -51,7 +51,12 @@ The cost of the cap in CU per second is `RpcRequestsPerSecond × CU per call`, s
 Tuning:
 
 - **Provider rejects on frequency**: lower `RpcRequestsPerSecond`.
-- **Provider times out or rejects on size**: lower `FilterQuerySize` to `1000`. The retry loop handles the occasional timeout, but a range that always times out never completes.
+- **Provider rejects the window width or result size**: the sync narrows its `eth_getLogs` window automatically, halving it on each rejection down to 8 blocks and widening it again after 50 consecutive successes, and logs each change. `FilterQuerySize` is the ceiling it starts from. Lower it only if you want fewer, cheaper rejections at startup.
+- **Provider times out**: lower `FilterQuerySize`. A range that always times out never completes.
+
+:::caution dRPC's free plan and the initial scan
+dRPC's free plan rejects `eth_getLogs` windows wider than roughly 100 blocks, even though its error says `ranges over 10000 blocks are not supported`, and its free backends often cannot route queries for blocks far behind the head at all. The sync will narrow its window and get through, but a full first scan from the contract's deployment block at 8-block windows is tens of thousands of queries. For the initial scan use a provider whose free tier serves full log history in 2,000-block windows, or your own node; keep dRPC as the second endpoint for canonical-block agreement if you like.
+:::
 - **Several networks or URLs share one API key**: the caps add up per endpoint. Set each low enough that the sum fits the account.
 
 ## What the endpoint must support

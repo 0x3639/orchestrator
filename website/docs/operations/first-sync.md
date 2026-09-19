@@ -27,7 +27,7 @@ ranges  = blocks to scan / FilterQuerySize
 minutes = ranges × 2 / RpcRequestsPerSecond / 60
 ```
 
-Ethereum mainnet from an 18M-block deployment to a 26M head, at 2,000 blocks per query and 3 requests per second, is 4,000 ranges and about 45 minutes before any retries or historical-event validation. Halving `FilterQuerySize` doubles it.
+Ethereum mainnet from an 18M-block deployment to a 26M head, at 2,000 blocks per query and 3 requests per second, is 4,000 ranges and about 45 minutes before any retries or historical-event validation. Halving the window doubles it. If the provider rejects the window's width the sync narrows it automatically, down to 8 blocks; at that width the same scan is a million queries, which is the sign to switch providers for the initial scan. See [EVM networks](../networks.md#rate-limits).
 
 When the provider rejects or times out a query:
 
