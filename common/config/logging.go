@@ -27,23 +27,43 @@ func RegisterSecretURLs(c *Config) {
 	}
 }
 
-// RegisterSecretURL registers one URL with the log redactor.
+// RegisterSecretURL registers one URL with the log redactor, together with
+// the forms client libraries emit for it: the canonical rendering, the
+// password-masked rendering used by net/http errors, and the userinfo-less
+// rendering, plus its credential-bearing components.
 func RegisterSecretURL(raw string) {
 	parsed, err := url.Parse(raw)
 	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
 		return
 	}
-	common.LogRedactor.Register(raw, RedactURL(raw))
+	redacted := RedactURL(raw)
+	common.LogRedactor.Register(raw, redacted)
+	common.LogRedactor.Register(parsed.String(), redacted)
 	if parsed.User != nil {
-		if password, ok := parsed.User.Password(); ok && len(password) >= minRegisteredComponentLen {
-			common.LogRedactor.Register(password, common.RedactedPlaceholder)
+		if password, ok := parsed.User.Password(); ok {
+			// net/http renders credentials as user:***@host in url.Error.
+			masked := *parsed
+			masked.User = url.UserPassword(parsed.User.Username(), "***")
+			common.LogRedactor.Register(masked.String(), redacted)
+			if len(password) >= minRegisteredComponentLen {
+				common.LogRedactor.Register(password, common.RedactedPlaceholder)
+			}
 		}
 		if username := parsed.User.Username(); len(username) >= minRegisteredComponentLen {
 			common.LogRedactor.Register(username, common.RedactedPlaceholder)
 		}
+		stripped := *parsed
+		stripped.User = nil
+		common.LogRedactor.Register(stripped.String(), redacted)
 	}
 	if parsed.Path != "" && parsed.Path != "/" && len(parsed.Path) >= minRegisteredComponentLen {
 		common.LogRedactor.Register(parsed.Path, "/"+common.RedactedPlaceholder)
+		if escaped := parsed.EscapedPath(); escaped != parsed.Path {
+			common.LogRedactor.Register(escaped, "/"+common.RedactedPlaceholder)
+		}
+	}
+	if len(parsed.Fragment) >= minRegisteredComponentLen {
+		common.LogRedactor.Register(parsed.Fragment, common.RedactedPlaceholder)
 	}
 	for _, segment := range strings.Split(parsed.Path, "/") {
 		if len(segment) >= minRegisteredTokenLen {

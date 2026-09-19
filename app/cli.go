@@ -9,6 +9,7 @@ import (
 	"sort"
 	"time"
 
+	"orchestrator/common"
 	"orchestrator/metadata"
 
 	"gopkg.in/urfave/cli.v1"
@@ -22,7 +23,9 @@ var (
 func Run() {
 	err := app.Run(os.Args)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
+		// Errors returned here bypass the zap redacting core, so scrub them
+		// before they reach stderr and whatever captures it.
+		fmt.Fprintln(os.Stderr, common.LogRedactor.Redact(err.Error()))
 		os.Exit(1)
 	}
 }
@@ -30,7 +33,7 @@ func Run() {
 func Stop() {
 	err := nodeManager.Stop()
 	if err != nil {
-		panic(err)
+		panic(common.LogRedactor.Redact(err.Error()))
 	}
 }
 

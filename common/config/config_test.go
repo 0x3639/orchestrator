@@ -268,6 +268,29 @@ func TestReadConfigFileRefusesSymlinkAndSpecialFiles(t *testing.T) {
 	}
 }
 
+func TestRegisterSecretURLHandlesClientRenderedForms(t *testing.T) {
+	common.LogRedactor.Reset()
+	t.Cleanup(common.LogRedactor.Reset)
+	raw := "https://" + sentinelUser + ":" + sentinelUrlSecret + "@rpc.example.com/v3/" + sentinelToken + "#" + sentinelUrlSecret
+	RegisterSecretURL(raw)
+
+	// net/http masks the password as *** in url.Error; other clients drop
+	// userinfo entirely; fragments may be echoed verbatim.
+	forms := []string{
+		`Post "https://` + sentinelUser + `:***@rpc.example.com/v3/` + sentinelToken + `#` + sentinelUrlSecret + `": dial tcp: refused`,
+		`dial https://rpc.example.com/v3/` + sentinelToken + ` failed`,
+		`fragment ` + sentinelUrlSecret + ` echoed`,
+	}
+	for _, form := range forms {
+		got := common.LogRedactor.Redact(form)
+		for _, sentinel := range []string{sentinelUrlSecret, sentinelUser, sentinelToken} {
+			if strings.Contains(got, sentinel) {
+				t.Fatalf("form %q leaked %q: %s", form, sentinel, got)
+			}
+		}
+	}
+}
+
 func TestRegisterSecretURLScrubsClientErrors(t *testing.T) {
 	common.LogRedactor.Reset()
 	t.Cleanup(common.LogRedactor.Reset)
