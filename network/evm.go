@@ -329,15 +329,14 @@ func (eN *evmNetwork) Sync() error {
 
 		if !rangeFrozen {
 			distance := latestBlock - updateHeight
-			if distance == 0 {
-				// The cursor block was included in the previous range
-				// (ranges are inclusive and share their boundary block);
-				// there is nothing new to fetch.
-				break
-			}
 			filterQuerySize := eN.rpcManager.Evm(eN.ChainId()).FilterQuerySize()
 			rangeIsTip = false
-			if distance < eN.ConfirmationsToFinality() {
+			if distance < eN.ConfirmationsToFinality() || distance == 0 {
+				// The range reaches the head. A zero distance still queries
+				// the cursor block once: on first start the cursor is the
+				// deployment height, which has not been scanned yet, and the
+				// query is idempotent otherwise. rangeIsTip ends the pass so
+				// it cannot spin on the same block.
 				filterQuerySize = distance
 				rangeIsTip = true
 			} else if distance < filterQuerySize {
@@ -346,8 +345,20 @@ func (eN *evmNetwork) Sync() error {
 			rangeEnd = updateHeight + filterQuerySize
 			rangeFrozen = true
 		}
+		if latestBlock < rangeEnd {
+			// The head retreated below the frozen range end (a lagging
+			// backend behind a load balancer). A provider that clamps the
+			// query would report success for blocks it has not seen, and the
+			// cursor would then pass them for good. Wait for the head.
+			if err := retryRange(fmt.Sprintf("head %d is below the range end %d", latestBlock, rangeEnd), errors.New("provider head behind range")); err != nil {
+				return err
+			}
+			continue
+		}
 		filterQuerySize := rangeEnd - updateHeight
-		end := rangeIsTip
+		// Only stop when the covered range still reaches the current head;
+		// if the head moved on during retries there is more to fetch.
+		end := rangeIsTip && latestBlock == rangeEnd
 
 		logs, err := eN.EvmRpc().FilterLogs(updateHeight, rangeEnd)
 		if err != nil {

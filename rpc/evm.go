@@ -69,6 +69,13 @@ func NewEvmRpcClient(networkConfig config.BaseNetworkConfig, networkName string,
 		return nil, errLog
 	}
 
+	if networkConfig.RpcRequestsPerSecond < 0 {
+		return nil, fmt.Errorf("network %s: RpcRequestsPerSecond must be 0 (uncapped) or positive, got %v", networkName, networkConfig.RpcRequestsPerSecond)
+	}
+	if networkConfig.RpcBurst < 0 {
+		return nil, fmt.Errorf("network %s: RpcBurst must be 0 or positive, got %d", networkName, networkConfig.RpcBurst)
+	}
+
 	newUrls, err := config.NewUrlsInfo(networkConfig)
 	if err != nil {
 		return nil, err
@@ -90,12 +97,6 @@ func NewEvmRpcClient(networkConfig config.BaseNetworkConfig, networkName string,
 	newUrls.Clear()
 	warnAgreementConfiguration(logger, networkName, newUrls.Urls)
 
-	if networkConfig.RpcRequestsPerSecond < 0 {
-		return nil, fmt.Errorf("network %s: RpcRequestsPerSecond must be 0 (uncapped) or positive, got %v", networkName, networkConfig.RpcRequestsPerSecond)
-	}
-	if networkConfig.RpcBurst < 0 {
-		return nil, fmt.Errorf("network %s: RpcBurst must be 0 or positive, got %d", networkName, networkConfig.RpcBurst)
-	}
 	filterQuerySize := networkConfig.FilterQuerySize
 	if filterQuerySize == 0 {
 		filterQuerySize = defaultFilterQuerySize
