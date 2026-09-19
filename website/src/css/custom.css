@@ -1,0 +1,329 @@
+/* ============================================================================
+   Orchestrator docs — Zenon Network of Momentum design system on Docusaurus.
+   Semantic tokens from tokens/colors.css mapped onto Infima. Dark mode is the
+   native habitat. Two fonts only. Plasma is reserved for the main action.
+   ============================================================================ */
+
+:root {
+  /* Brand tri-color (raw), mirrored from the design system */
+  --zenon-green: #00d557;
+  --zenon-blue: #0061eb;
+  --zenon-pink: #f91690;
+  --zenon-black: #151515;
+  --plasma: linear-gradient(180deg, hsl(120 86% 63%) 0%, hsl(145 100% 38%) 100%);
+
+  /* Fonts */
+  --font-sans: "Space Grotesk", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, "SF Mono", "Menlo", monospace;
+  --ledger-tracking: 0.06em;
+
+  /* Radius: one tight token */
+  --radius: 0.375rem;
+
+  /* Light theme semantic tokens */
+  --background: hsl(0 0% 100%);
+  --foreground: hsl(0 0% 14.5%);
+  --card: hsl(0 0% 100%);
+  --muted: hsl(0 0% 96%);
+  --muted-foreground: hsl(0 0% 45%);
+  --accent: hsl(145 100% 95%);
+  --border: hsl(0 0% 90%);
+  --primary: hsl(145 100% 42%);
+  --primary-foreground: hsl(0 0% 8%);
+  --info: hsl(214 100% 46%);
+  --success: hsl(145 63% 38%);
+  --warning: hsl(38 92% 50%);
+  --destructive: hsl(352 84% 53%);
+  --elevation-2: 0 1px 3px 0 hsl(0 0% 0% / 0.08), 0 1px 2px -1px hsl(0 0% 0% / 0.06);
+
+  /* Infima mapping */
+  --ifm-color-primary: hsl(145 100% 36%);
+  --ifm-color-primary-dark: hsl(145 100% 32%);
+  --ifm-color-primary-darker: hsl(145 100% 30%);
+  --ifm-color-primary-darkest: hsl(145 100% 25%);
+  --ifm-color-primary-light: hsl(145 100% 40%);
+  --ifm-color-primary-lighter: hsl(145 100% 42%);
+  --ifm-color-primary-lightest: hsl(145 100% 48%);
+  --ifm-color-info: var(--info);
+  --ifm-color-success: var(--success);
+  --ifm-color-warning: var(--warning);
+  --ifm-color-danger: var(--destructive);
+  --ifm-link-color: var(--info);
+  --ifm-link-hover-color: var(--zenon-blue);
+  --ifm-background-color: var(--background);
+  --ifm-font-color-base: var(--foreground);
+  --ifm-color-emphasis-300: var(--border);
+  --ifm-font-family-base: var(--font-sans);
+  --ifm-font-family-monospace: var(--font-mono);
+  --ifm-code-font-size: 87.5%;
+  --ifm-global-radius: var(--radius);
+  --ifm-card-border-radius: calc(var(--radius) + 4px);
+  --ifm-heading-font-weight: 600;
+  --ifm-h1-font-size: 2.25rem;
+  --ifm-h2-font-size: 1.875rem;
+  --ifm-h3-font-size: 1.5rem;
+  --ifm-line-height-base: 1.75;
+  --ifm-navbar-background-color: var(--background);
+  --ifm-toc-border-color: var(--border);
+
+  /* Infima emphasis scale on the neutral ramp so menus, search and dropdowns
+     stay semantic in both themes. */
+  --ifm-color-emphasis-0: hsl(0 0% 100%);
+  --ifm-color-emphasis-100: hsl(0 0% 96%);
+  --ifm-color-emphasis-200: hsl(0 0% 92%);
+  --ifm-color-emphasis-400: hsl(0 0% 80%);
+  --ifm-color-emphasis-500: hsl(0 0% 65%);
+  --ifm-color-emphasis-600: var(--muted-foreground);
+  --ifm-color-emphasis-700: hsl(0 0% 35%);
+  --ifm-color-emphasis-800: hsl(0 0% 25%);
+  --ifm-color-emphasis-900: var(--foreground);
+  --ifm-color-emphasis-1000: hsl(0 0% 8%);
+  --ifm-color-content-secondary: var(--muted-foreground);
+  --ifm-dropdown-background-color: var(--card);
+  --ifm-menu-color: var(--foreground);
+
+  /* Theme-aware shadow scale from the design system's elevation tokens. */
+  --elevation-1: 0 1px 2px 0 hsl(0 0% 0% / 0.05);
+  --elevation-3: 0 4px 12px -2px hsl(0 0% 0% / 0.10);
+  --elevation-4: 0 12px 24px -6px hsl(0 0% 0% / 0.13);
+  --ifm-global-shadow-lw: var(--elevation-1);
+  --ifm-global-shadow-md: var(--elevation-3);
+  --ifm-global-shadow-tl: var(--elevation-4);
+  --ifm-table-border-color: var(--border);
+  --ifm-table-stripe-background: var(--muted);
+  --docusaurus-highlighted-code-line-bg: var(--accent);
+}
+
+[data-theme='dark'] {
+  --background: hsl(0 0% 8%);
+  --foreground: hsl(0 0% 98%);
+  --card: hsl(0 0% 10%);
+  --muted: hsl(0 0% 15%);
+  --muted-foreground: hsl(0 0% 65%);
+  --accent: hsl(145 100% 15%);
+  --border: hsl(0 0% 20%);
+  --primary: hsl(145 100% 42%);
+  --info: hsl(214 100% 62%);
+  --success: hsl(145 63% 45%);
+  --warning: hsl(38 95% 55%);
+  --destructive: hsl(352 86% 58%);
+  --elevation-2: 0 2px 6px -1px hsl(0 0% 0% / 0.55), inset 0 1px 0 0 hsl(0 0% 100% / 0.04);
+
+  --ifm-color-primary: var(--zenon-green);
+  --ifm-color-primary-dark: hsl(145 100% 38%);
+  --ifm-color-primary-darker: hsl(145 100% 35%);
+  --ifm-color-primary-darkest: hsl(145 100% 28%);
+  --ifm-color-primary-light: hsl(145 100% 46%);
+  --ifm-color-primary-lighter: hsl(145 100% 50%);
+  --ifm-color-primary-lightest: hsl(145 100% 58%);
+  --ifm-link-color: var(--info);
+  --ifm-link-hover-color: hsl(214 100% 70%);
+  --ifm-background-color: var(--background);
+  --ifm-background-surface-color: var(--card);
+  --ifm-font-color-base: var(--foreground);
+  --ifm-navbar-background-color: hsl(0 0% 7%);
+  --ifm-menu-color-background-active: var(--accent);
+  --ifm-color-emphasis-300: var(--border);
+  --docusaurus-highlighted-code-line-bg: var(--accent);
+
+  --ifm-color-emphasis-0: hsl(0 0% 8%);
+  --ifm-color-emphasis-100: hsl(0 0% 12%);
+  --ifm-color-emphasis-200: hsl(0 0% 16%);
+  --ifm-color-emphasis-400: hsl(0 0% 30%);
+  --ifm-color-emphasis-500: hsl(0 0% 45%);
+  --ifm-color-emphasis-600: var(--muted-foreground);
+  --ifm-color-emphasis-700: hsl(0 0% 78%);
+  --ifm-color-emphasis-800: hsl(0 0% 88%);
+  --ifm-color-emphasis-900: var(--foreground);
+  --ifm-color-emphasis-1000: hsl(0 0% 100%);
+  --ifm-color-content-secondary: var(--muted-foreground);
+  --ifm-dropdown-background-color: hsl(0 0% 14%);
+  --ifm-menu-color: var(--foreground);
+
+  --elevation-1: 0 1px 2px 0 hsl(0 0% 0% / 0.45), inset 0 1px 0 0 hsl(0 0% 100% / 0.03);
+  --elevation-3: 0 8px 18px -4px hsl(0 0% 0% / 0.60), inset 0 1px 0 0 hsl(0 0% 100% / 0.05);
+  --elevation-4: 0 14px 32px -8px hsl(0 0% 0% / 0.65), inset 0 1px 0 0 hsl(0 0% 100% / 0.05);
+  --ifm-global-shadow-lw: var(--elevation-1);
+  --ifm-global-shadow-md: var(--elevation-3);
+  --ifm-global-shadow-tl: var(--elevation-4);
+}
+
+/* The footer is always the near-black surface, in both themes; Infima's
+   .footer--dark tokens would otherwise paint it blue-grey. */
+.footer--dark {
+  --ifm-footer-background-color: hsl(0 0% 7%);
+  --ifm-footer-color: hsl(0 0% 65%);
+  --ifm-footer-link-color: hsl(0 0% 78%);
+  --ifm-footer-link-hover-color: var(--zenon-green);
+  --ifm-footer-title-color: hsl(0 0% 98%);
+  border-top: 1px solid hsl(0 0% 18%);
+}
+
+.footer__title {
+  font-family: var(--font-mono);
+  font-size: 0.6875rem;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: var(--ledger-tracking);
+}
+
+html {
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+/* Space Grotesk ships up to 700; the design system's "extrabold" h1 maps to it. */
+h1 {
+  font-weight: 700;
+  letter-spacing: -0.01em;
+}
+
+/* Data is the hero: identifiers, numbers and code are mono with tabular figures. */
+code,
+kbd,
+pre,
+.table-of-contents code {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+table {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Ledger label: the quiet on-chain texture, for labels only. */
+.text-ledger,
+table thead th,
+.theme-doc-sidebar-item-category > .menu__list-item-collapsible > .menu__link {
+  font-family: var(--font-mono);
+  font-size: 0.6875rem;
+  line-height: 1rem;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: var(--ledger-tracking);
+}
+
+table thead th {
+  color: var(--muted-foreground);
+}
+
+/* Plasma: the main action only. */
+.button--primary,
+.bg-plasma {
+  background-image: var(--plasma);
+  background-color: transparent;
+  border: none;
+  color: var(--primary-foreground);
+  font-weight: 600;
+}
+
+.button--primary:hover {
+  filter: brightness(1.1);
+  color: var(--primary-foreground);
+}
+
+.button--primary:active {
+  filter: brightness(0.95);
+}
+
+.button--secondary {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--foreground);
+}
+
+.button--secondary:hover {
+  background: var(--accent);
+  color: var(--foreground);
+}
+
+/* Cards: --card surface, hairline border, --radius-xl (10px, per the design
+   system's card spec), theme-aware shadow. */
+.card {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--ifm-card-border-radius);
+  box-shadow: var(--elevation-2);
+}
+
+.navbar {
+  border-bottom: 1px solid var(--border);
+  box-shadow: none;
+}
+
+.navbar__logo img {
+  height: 26px;
+}
+
+.theme-admonition {
+  border-left-width: 1px;
+  border-radius: var(--radius);
+}
+
+.theme-admonition-danger {
+  --ifm-alert-border-color: var(--destructive);
+}
+
+/* Homepage hero: calm, flat background; the data-first message; one plasma action. */
+.hero--orchestrator {
+  padding: 4rem 0 3rem;
+  background: var(--background);
+  border-bottom: 1px solid var(--border);
+}
+
+.hero--orchestrator .hero__eyebrow {
+  color: var(--muted-foreground);
+  margin-bottom: 0.75rem;
+}
+
+.hero--orchestrator .hero__title {
+  font-size: 2.75rem;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+  margin-bottom: 0.5rem;
+}
+
+.hero--orchestrator .hero__subtitle {
+  color: var(--muted-foreground);
+  font-size: 1.25rem;
+  max-width: 44rem;
+  margin: 0 auto 1.5rem;
+}
+
+.hero__actions {
+  display: flex;
+  gap: 0.75rem;
+  justify-content: center;
+  flex-wrap: wrap;
+}
+
+.feature-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(16rem, 1fr));
+  gap: 1rem;
+  padding: 2.5rem 0 3rem;
+}
+
+.feature-grid .card {
+  padding: 1.25rem;
+}
+
+.feature-grid .card h3 {
+  font-size: 1.125rem;
+  margin: 0.5rem 0 0.35rem;
+}
+
+.feature-grid .card p {
+  color: var(--muted-foreground);
+  margin: 0;
+}
+
+.feature-grid .card a {
+  font-weight: 500;
+}
+
+@media (max-width: 996px) {
+  .hero--orchestrator .hero__title {
+    font-size: 2.125rem;
+  }
+}
