@@ -368,12 +368,14 @@ func (eN *evmNetwork) Sync() error {
 
 		logs, err := eN.EvmRpc().FilterLogs(updateHeight, rangeEnd)
 		if err != nil {
-			if isRangeLimitError(err) && filterQuerySize > minQueryRange {
+			if isRangeLimitError(err) && filterQuerySize > 1 {
 				// The provider rejected the window's width or result size.
-				// Halve the window and retry at once; this is not a transient
+				// Narrow the window, to the width the message suggests when
+				// it gives one, and retry at once; this is not a transient
 				// failure, so it does not spend the retry budget. The reduced
 				// width is kept for the following ranges.
-				newSize, _ := eN.queryRange.shrink()
+				hint, _ := suggestedRange(err)
+				newSize, _ := eN.queryRange.shrink(hint)
 				if newSize < filterQuerySize {
 					eN.logger.Warnf("Sync for chainId %d: provider rejected an eth_getLogs window of %d blocks (%v); narrowing to %d blocks",
 						eN.ChainId(), filterQuerySize, err, newSize)

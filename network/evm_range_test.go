@@ -39,22 +39,49 @@ func TestIsRangeLimitError(t *testing.T) {
 	}
 }
 
+func TestSuggestedRange(t *testing.T) {
+	alchemy := errors.New("Under the Free tier plan, you can make eth_getLogs requests with up to a 10 block range. Based on your parameters, this block range should work: [0x106e0ed, 0x106e0f6]. Upgrade to PAYG for expanded block range.")
+	if w, ok := suggestedRange(alchemy); !ok || w != 10 {
+		t.Fatalf("expected hint 10, got %d ok=%v", w, ok)
+	}
+	if !isRangeLimitError(alchemy) {
+		t.Fatal("Alchemy's message must classify as a range limit")
+	}
+	for _, m := range []string{"ranges over 10000 blocks are not supported on free plan", "i/o timeout", "[0x10, 0x5]"} {
+		if _, ok := suggestedRange(errors.New(m)); ok {
+			t.Fatalf("no hint expected in %q", m)
+		}
+	}
+}
+
 func TestQueryRangeAdapterShrinksAndRegrows(t *testing.T) {
 	a := newQueryRangeAdapter(2000)
 	if a.size() != 2000 {
 		t.Fatalf("initial size %d", a.size())
 	}
 
+	// A provider hint jumps straight to the accepted width.
+	if got, changed := a.shrink(10); !changed || got != 10 {
+		t.Fatalf("hint: got %d changed=%v", got, changed)
+	}
+	a = newQueryRangeAdapter(2000)
+
 	want := []uint64{1000, 500, 250, 125, 62, 31, 15, 8}
 	for _, w := range want {
-		got, changed := a.shrink()
+		got, changed := a.shrink(0)
 		if !changed || got != w {
 			t.Fatalf("shrink: got %d changed=%v, want %d", got, changed, w)
 		}
 	}
-	if got, changed := a.shrink(); changed || got != minQueryRange {
+	if got, changed := a.shrink(0); changed || got != minQueryRange {
 		t.Fatalf("floor must hold: got %d changed=%v", got, changed)
 	}
+	// A hint below the halving floor is still honoured, down to one block.
+	if got, changed := a.shrink(3); !changed || got != 3 {
+		t.Fatalf("small hint: got %d changed=%v", got, changed)
+	}
+	a.current = 8
+	a.successes = 0
 
 	// Growth needs a run of successes and never exceeds the configured size.
 	for i := 0; i < growAfterRanges-1; i++ {
@@ -66,7 +93,7 @@ func TestQueryRangeAdapterShrinksAndRegrows(t *testing.T) {
 		t.Fatalf("expected growth to 16, got %d grew=%v", got, grew)
 	}
 	// A rejection after growth drops back and resets the run.
-	if got, _ := a.shrink(); got != 8 {
+	if got, _ := a.shrink(0); got != 8 {
 		t.Fatalf("expected 8 after shrink, got %d", got)
 	}
 	a.current = 1500

@@ -1,6 +1,8 @@
 package network
 
 import (
+	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 )
@@ -33,6 +35,29 @@ var rangeLimitPhrases = []string{
 	"blocks are not supported",
 	"log response",
 	"too many results",
+}
+
+// suggestedRangeRe matches the "[0xfrom, 0xto]" hint some providers put in
+// their range-limit message, for example Alchemy's "Based on your
+// parameters, this block range should work: [0x106e0ed, 0x106e0f6]".
+var suggestedRangeRe = regexp.MustCompile(`\[\s*0x([0-9a-fA-F]+)\s*,\s*0x([0-9a-fA-F]+)\s*\]`)
+
+// suggestedRange extracts the width of the block range a provider says it
+// would accept, when its error message includes one.
+func suggestedRange(err error) (uint64, bool) {
+	if err == nil {
+		return 0, false
+	}
+	m := suggestedRangeRe.FindStringSubmatch(err.Error())
+	if m == nil {
+		return 0, false
+	}
+	from, err1 := strconv.ParseUint(m[1], 16, 64)
+	to, err2 := strconv.ParseUint(m[2], 16, 64)
+	if err1 != nil || err2 != nil || to < from {
+		return 0, false
+	}
+	return to - from + 1, true
 }
 
 // isRangeLimitError reports whether an eth_getLogs error looks like the
@@ -82,11 +107,18 @@ func (a *queryRangeAdapter) size() uint64 {
 	return a.current
 }
 
-// shrink halves the window after a rejection. It reports the new size and
-// whether anything changed; false means the floor was already reached.
-func (a *queryRangeAdapter) shrink() (uint64, bool) {
+// shrink narrows the window after a rejection. With a hint from the
+// provider's message the window drops straight to that width (never below
+// one block); otherwise it halves, no lower than minQueryRange. It reports
+// the new size and whether anything changed.
+func (a *queryRangeAdapter) shrink(hint uint64) (uint64, bool) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if hint > 0 && hint < a.current {
+		a.current = hint
+		a.successes = 0
+		return a.current, true
+	}
 	if a.current <= minQueryRange {
 		return a.current, false
 	}
