@@ -54,6 +54,14 @@ func (m *Manager) ZnnStorage() db.ZnnStorage {
 	return m.znnStorage
 }
 
+// HasEvmStorage reports whether a store exists for the chain id. Use it
+// before EvmStorage when the chain id comes from chain data rather than from
+// configuration, since EvmStorage treats a missing store as fatal.
+func (m *Manager) HasEvmStorage(chainId uint32) bool {
+	_, ok := m.evmStorage[chainId]
+	return ok
+}
+
 func (m *Manager) EvmStorage(chainId uint32) db.EvmStorage {
 	store, ok := m.evmStorage[chainId]
 	if !ok {
