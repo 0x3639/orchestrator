@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	wallet2 "github.com/MoonBaZZe/znn-sdk-go/wallet"
 	zcommon "github.com/zenon-network/go-zenon/common"
 	"io"
