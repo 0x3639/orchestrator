@@ -55,10 +55,12 @@ jobs:
         run: |
           ORCHESTRATOR=$(cat metadata/version.go | grep Version | awk -F '"' '{print $2}')
           echo "ORCHESTRATOR_VERSION=$ORCHESTRATOR" >> $GITHUB_ENV
+          # Artifact names may not contain '/', which branch names like fix/x do.
+          echo "ARTIFACT_REF=$(echo "${{ github.ref_name }}" | tr '/' '-')" >> $GITHUB_ENV
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: orchestrator-${{ env.ORCHESTRATOR_VERSION }}-${{ github.ref_name }}-${{ github.sha }}
+          name: orchestrator-${{ env.ORCHESTRATOR_VERSION }}-${{ env.ARTIFACT_REF }}-${{ github.sha }}
           path: build/*
           retention-days: 14
       # Only master publishes to the versioned release. Test branches such as
