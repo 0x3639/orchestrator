@@ -48,7 +48,7 @@ Everything lives in `~/.orchestrator/config.json`. On first start the orchestrat
 
 | Field | Default | Meaning |
 | --- | --- | --- |
-| `DataPath` | `~/.orchestrator` | Directory for `config.json` and the producer key file. Created `0700`; an existing wider mode is tightened. Must be owned by the user running the orchestrator. **Only those two files follow this setting**: `events/`, `queues/` and `logs/` are always created under `~/.orchestrator` of the running user, and `TssConfig.BaseDir` defaults to `~/.orchestrator/tss` independently. Leave `DataPath` at its default unless you also move `BaseDir` and accept the split. |
+| `DataPath` | `~/.orchestrator` | **Leave at the default.** The orchestrator always reads `~/.orchestrator/config.json` of the running user at startup; there is no flag to point it elsewhere, despite what one log message suggests. A different `DataPath` inside that file only changes where the producer key is read from and where the file is rewritten to, while `events/`, `queues/` and `logs/` stay under `~/.orchestrator` and `TssConfig.BaseDir` is independent. The directory is created `0700`, an existing wider mode is tightened, and it must be owned by the running user. |
 | `GlobalState` | `0` | Persisted node state. Managed by the orchestrator; do not edit. See [States](operations/states.md). |
 | `EvmAddress` | derived | The signer's EVM address, derived from the producer key. Written for information. |
 | `ProducerKeyFileName` | `producer` | Name of the encrypted key file inside `DataPath`. |
@@ -60,7 +60,7 @@ Everything lives in `~/.orchestrator/config.json`. On first start the orchestrat
 
 `Networks` is a map from network name to settings. `Zenon` is required. At startup the orchestrator reads the networks registered on the Zenon bridge contract and requires an entry here **for each of them**, by name; startup fails if one is missing. Entries for names the bridge does not register are ignored.
 
-The file is loaded on top of the built-in defaults, which already contain `BSC`, `Ethereum` and `Supernova` entries pointing at localhost. Leaving a network out of your file therefore does not remove it; the default entry remains and is rewritten into the file. The example above shows only the entries you should edit.
+The file is loaded on top of the built-in defaults, which already contain `BSC` and `Ethereum` entries pointing at `ws://127.0.0.1:8545` and a `Supernova` entry pointing at `wss://rpc.novascan.io`. Leaving a network out of your file therefore does not remove it; the default entry remains and is rewritten into the file. The example above shows only the entries you should edit.
 
 | Field | Default | Meaning |
 | --- | --- | --- |
@@ -79,7 +79,7 @@ Network entries are replaced wholesale when the file is read, so an entry withou
 | --- | --- | --- |
 | `Port` | `55055` | libp2p port for TSS peers. Must be reachable by the other signers. |
 | `Bootstrap` | empty | Multiaddr of a peer to bootstrap from. |
-| `BaseDir` | `DataPath/tss` | Where key shares are stored. |
+| `BaseDir` | `~/.orchestrator/tss` | Where key shares are stored. Independent of `DataPath`. |
 | `PublicKey`, `DecompressedPublicKey`, `LocalPubKeys`, `PubKeyWhitelist` | managed | Written by the orchestrator after key generation. Do not edit. |
 | `BaseConfig` | managed | Ceremony timeouts. Overridden at runtime by bridge metadata. |
 

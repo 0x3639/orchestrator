@@ -21,7 +21,7 @@ For historical sync every endpoint must serve full history: headers at any heigh
 
 ### Sizing against a free tier
 
-The limits below are quoted from one free-tier provider's published terms as of September 2026, in that provider's compute units (CU). Providers differ and change their terms; check yours and redo the arithmetic.
+The limits below are [dRPC's](https://drpc.org/docs/howitworks/ratelimiting) free tier as published in September 2026, in its compute units (CU). Providers differ and change their terms; check yours and redo the arithmetic.
 
 | Limit | Value |
 | --- | --- |
@@ -32,7 +32,7 @@ The limits below are quoted from one free-tier provider's published terms as of 
 | Request timeout | 2 s |
 | `eth_getLogs` response cap | 10,000 entries |
 
-At about 75 CU per `eth_getLogs`, the default cap of 3 requests per second with a burst of 5 is roughly 225 CU/s: a quarter of the degraded floor and a tenth of the normal budget, leaving room for other clients on the same IP. A full first sync from contract deployment is a few thousand `eth_getLogs` calls, far below the monthly quota.
+The cost of the cap in CU per second is `RpcRequestsPerSecond × CU per call`, so look up `eth_getLogs` and `eth_blockNumber` in the provider's [compute-unit table](https://drpc.org/docs/pricing/compute-units), which changes over time. At 20 CU per call the default cap of 3 requests per second is 60 CU/s, about 7% of the degraded floor; at 75 CU per call it is 225 CU/s, about 27%. Either leaves room for other clients on the same IP. A full first sync from contract deployment is a few thousand `eth_getLogs` calls plus as many head reads, far below the monthly quota.
 
 ```json
 "Ethereum": {

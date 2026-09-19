@@ -63,7 +63,7 @@ Cached for `CachedResponseDelay` seconds.
 }
 ```
 
-`unwrapsHash` and `wrapsHash` are digests of the identities (transaction hash and log index, or wrap id) of **every** event this signer still has to sign, in order. **Compare them across signers.** Differing hashes mean at least one signer holds a different set and will not join the others' ceremony. Matching hashes rule that out but do not guarantee a ceremony: the signers must also agree on the group membership in `LocalPubKeys` and be able to reach each other. See [Signing stalls](operations/signing-stalls.md).
+`unwrapsHash` is a digest of the identities (transaction hash and log index) of every unwrap event this signer still has to sign, in order; `wrapsHash` covers the first 100 pending wraps. **Compare them across signers.** Differing hashes mean the signers' backlogs differ; whether that blocks the current ceremony depends on whether the difference falls inside the pool the ceremony takes from the front of the backlog, but it will block one eventually. Matching hashes rule that out but do not guarantee a ceremony: the signers must also agree on the group membership in `LocalPubKeys` and be able to reach each other. See [Signing stalls](operations/signing-stalls.md).
 
 `latestUpdateHeight` is the EVM sync cursor. It should track the chain head within a few minutes; a stalled value means sync is failing, see [First sync](operations/first-sync.md).
 

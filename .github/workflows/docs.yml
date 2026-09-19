@@ -1,7 +1,9 @@
 name: Deploy operator docs
 
 # Builds website/ and publishes it to GitHub Pages. Runs from dev while the
-# docs are in testing; change the branch below to master when they graduate.
+# docs are in testing; change the branch name in both places below when they
+# graduate to master. The custom domain is configured in the repository's
+# Pages settings, not in the site (Actions deployments ignore a CNAME file).
 on:
   push:
     branches:
@@ -13,8 +15,6 @@ on:
 
 permissions:
   contents: read
-  pages: write
-  id-token: write
 
 # One deployment at a time; a newer push supersedes a queued one.
 concurrency:
@@ -23,10 +23,12 @@ concurrency:
 
 jobs:
   build:
+    # Manual runs can be started from any ref; only dev may deploy.
+    if: github.ref == 'refs/heads/dev'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
         with:
           node-version: 24
           cache: npm
@@ -37,16 +39,20 @@ jobs:
       - name: Build
         working-directory: website
         run: npm run build
-      - uses: actions/upload-pages-artifact@v3
+      - uses: actions/upload-pages-artifact@v5
         with:
           path: website/build
 
   deploy:
     needs: build
+    if: github.ref == 'refs/heads/dev'
     runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - id: deployment
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@v5
