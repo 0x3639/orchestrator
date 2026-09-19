@@ -14,6 +14,7 @@ import (
 	"github.com/zenon-network/go-zenon/vm/embedded/implementation"
 	"go.uber.org/zap"
 	"golang.org/x/crypto/sha3"
+	"golang.org/x/time/rate"
 	"math/big"
 	"orchestrator/common"
 	"orchestrator/common/bridge"
@@ -40,6 +41,12 @@ type EvmRpc struct {
 	logChan chan etypes.Log
 	logger  *zap.SugaredLogger
 
+	// limiter caps requests to the connected endpoint; nil means uncapped.
+	limiter *rate.Limiter
+	// limit and burst are kept to build limiters for secondary endpoints.
+	limit rate.Limit
+	burst int
+
 	// secondary holds one entry per configured URL other than the connected
 	// one, used only for canonical-block agreement checks. Entries are
 	// created under secondaryMu; dialling and calls happen under the entry's
@@ -50,8 +57,9 @@ type EvmRpc struct {
 }
 
 type secondaryClient struct {
-	mu     sync.Mutex
-	client *ethclient.Client
+	mu      sync.Mutex
+	client  *ethclient.Client
+	limiter *rate.Limiter
 }
 
 func NewEvmRpcClient(networkConfig config.BaseNetworkConfig, networkName string, address ecommon.Address) (*EvmRpc, error) {
@@ -81,6 +89,15 @@ func NewEvmRpcClient(networkConfig config.BaseNetworkConfig, networkName string,
 	newUrls.Clear()
 	warnAgreementConfiguration(logger, networkName, newUrls.Urls)
 
+	limit, burst := rateSettings(networkConfig)
+	var limiter *rate.Limiter
+	if limit > 0 {
+		limiter = rate.NewLimiter(limit, burst)
+		logger.Infof("network %s: EVM RPC requests capped at %.2f/s per endpoint, burst %d", networkName, float64(limit), burst)
+	} else {
+		logger.Warnf("network %s: EVM RPC requests are not rate limited; set RpcRequestsPerSecond in config.json if the provider throttles the initial sync", networkName)
+	}
+
 	newBridgeContract, err := bridge.NewBridge(address, newRpcClient)
 	if err != nil {
 		return nil, err
@@ -101,7 +118,33 @@ func NewEvmRpcClient(networkConfig config.BaseNetworkConfig, networkName string,
 		filterQuerySize: networkConfig.FilterQuerySize,
 		logChan:         make(chan etypes.Log, 20000),
 		logger:          logger,
+		limiter:         limiter,
+		limit:           limit,
+		burst:           burst,
 	}, nil
+}
+
+// rateSettings turns the configured request cap into limiter parameters.
+// A rate without a burst gets a burst of 1; a zero or negative rate disables
+// limiting.
+func rateSettings(networkConfig config.BaseNetworkConfig) (rate.Limit, int) {
+	if networkConfig.RpcRequestsPerSecond <= 0 {
+		return 0, 0
+	}
+	burst := networkConfig.RpcBurst
+	if burst < 1 {
+		burst = 1
+	}
+	return rate.Limit(networkConfig.RpcRequestsPerSecond), burst
+}
+
+// throttle blocks until the connected endpoint's request budget allows one
+// more call, or the context expires.
+func (r *EvmRpc) throttle(ctx context.Context) error {
+	if r.limiter == nil {
+		return nil
+	}
+	return r.limiter.Wait(ctx)
 }
 
 /// Utils
@@ -160,7 +203,13 @@ func (r *EvmRpc) DeleteDirectories() {
 }
 
 func (r *EvmRpc) IsSynced() bool {
-	syncProgress, err := r.rpcClient.SyncProgress(context.Background())
+	ctx, cancel := callContext(evmCallTimeout)
+	defer cancel()
+	if err := r.throttle(ctx); err != nil {
+		r.logger.Debug(err)
+		return false
+	}
+	syncProgress, err := r.rpcClient.SyncProgress(ctx)
 	if err != nil {
 		r.logger.Debug(err)
 		return false
@@ -379,6 +428,9 @@ func (r *EvmRpc) FilterLogs(left, right uint64) ([]etypes.Log, error) {
 	}()
 	ctx, cancel := callContext(evmFilterLogsTimeout)
 	defer cancel()
+	if err := r.throttle(ctx); err != nil {
+		return nil, err
+	}
 	return r.rpcClient.FilterLogs(ctx, r.filterQuery)
 }
 
@@ -390,34 +442,63 @@ func (r *EvmRpc) FilterBlockLogs(blockHash ecommon.Hash) ([]etypes.Log, error) {
 	}
 	ctx, cancel := callContext(evmCallTimeout)
 	defer cancel()
+	if err := r.throttle(ctx); err != nil {
+		return nil, err
+	}
 	return r.rpcClient.FilterLogs(ctx, newFilterQuery)
 }
 
 func (r *EvmRpc) TransactionReceipt(txHash ecommon.Hash) (*etypes.Receipt, error) {
 	ctx, cancel := callContext(evmCallTimeout)
 	defer cancel()
+	if err := r.throttle(ctx); err != nil {
+		return nil, err
+	}
 	return r.rpcClient.TransactionReceipt(ctx, txHash)
 }
 
 func (r *EvmRpc) EstimateGas(msg ethereum.CallMsg) (uint64, error) {
-	return r.rpcClient.EstimateGas(context.Background(), msg)
+	ctx, cancel := callContext(evmCallTimeout)
+	defer cancel()
+	if err := r.throttle(ctx); err != nil {
+		return 0, err
+	}
+	return r.rpcClient.EstimateGas(ctx, msg)
 }
 
 func (r *EvmRpc) SuggestGasPrice() (*big.Int, error) {
-	return r.rpcClient.SuggestGasPrice(context.Background())
+	ctx, cancel := callContext(evmCallTimeout)
+	defer cancel()
+	if err := r.throttle(ctx); err != nil {
+		return nil, err
+	}
+	return r.rpcClient.SuggestGasPrice(ctx)
 }
 
 func (r *EvmRpc) NonceAt(address ecommon.Address, blockNumber uint64) (uint64, error) {
-	return r.rpcClient.NonceAt(context.Background(), address, big.NewInt(0).SetUint64(blockNumber))
+	ctx, cancel := callContext(evmCallTimeout)
+	defer cancel()
+	if err := r.throttle(ctx); err != nil {
+		return 0, err
+	}
+	return r.rpcClient.NonceAt(ctx, address, big.NewInt(0).SetUint64(blockNumber))
 }
 
 func (r *EvmRpc) BalanceAt(address ecommon.Address, blockNumber uint64) (*big.Int, error) {
-	return r.rpcClient.BalanceAt(context.Background(), address, big.NewInt(0).SetUint64(blockNumber))
+	ctx, cancel := callContext(evmCallTimeout)
+	defer cancel()
+	if err := r.throttle(ctx); err != nil {
+		return nil, err
+	}
+	return r.rpcClient.BalanceAt(ctx, address, big.NewInt(0).SetUint64(blockNumber))
 }
 
 func (r *EvmRpc) BlockNumber() (uint64, error) {
 	ctx, cancel := callContext(evmCallTimeout)
 	defer cancel()
+	if err := r.throttle(ctx); err != nil {
+		return 0, err
+	}
 	return r.rpcClient.BlockNumber(ctx)
 }
 
@@ -426,6 +507,9 @@ func (r *EvmRpc) BlockNumber() (uint64, error) {
 func (r *EvmRpc) HeaderByNumber(number uint64) (*etypes.Header, error) {
 	ctx, cancel := callContext(evmCallTimeout)
 	defer cancel()
+	if err := r.throttle(ctx); err != nil {
+		return nil, err
+	}
 	return r.rpcClient.HeaderByNumber(ctx, new(big.Int).SetUint64(number))
 }
 
@@ -540,6 +624,14 @@ func (r *EvmRpc) headerFromSecondary(url string, number uint64) (*etypes.Header,
 	}
 	ctx, cancel := callContext(evmCallTimeout)
 	defer cancel()
+	if r.limit > 0 {
+		if entry.limiter == nil {
+			entry.limiter = rate.NewLimiter(r.limit, r.burst)
+		}
+		if err := entry.limiter.Wait(ctx); err != nil {
+			return nil, err
+		}
+	}
 	if entry.client == nil {
 		client, err := ethclient.DialContext(ctx, url)
 		if err != nil {
@@ -577,7 +669,12 @@ func (r *EvmRpc) closeSecondaryClients() {
 }
 
 func (r *EvmRpc) BlockByHash(hash ecommon.Hash) (*etypes.Block, error) {
-	return r.rpcClient.BlockByHash(context.Background(), hash)
+	ctx, cancel := callContext(evmCallTimeout)
+	defer cancel()
+	if err := r.throttle(ctx); err != nil {
+		return nil, err
+	}
+	return r.rpcClient.BlockByHash(ctx, hash)
 }
 
 func (r *EvmRpc) GetCurrentTss() (ecommon.Address, error) {
@@ -616,5 +713,10 @@ func (r *EvmRpc) ContractDeploymentHeight() (uint64, error) {
 }
 
 func (r *EvmRpc) TransactionByHash(hash ecommon.Hash) (*etypes.Transaction, bool, error) {
-	return r.rpcClient.TransactionByHash(context.Background(), hash)
+	ctx, cancel := callContext(evmCallTimeout)
+	defer cancel()
+	if err := r.throttle(ctx); err != nil {
+		return nil, false, err
+	}
+	return r.rpcClient.TransactionByHash(ctx, hash)
 }
