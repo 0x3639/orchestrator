@@ -5,7 +5,6 @@ import (
 	"orchestrator/common"
 	"orchestrator/common/config"
 	"orchestrator/node"
-	"os"
 )
 
 func MakeConfig() (*config.Config, error) {
@@ -22,17 +21,21 @@ func MakeConfig() (*config.Config, error) {
 		return nil, err
 	}
 
-	// 3: Resolve the producer passphrase (env, passphrase file, config.json, prompt).
+	// 3: Teach the log redactor every configured RPC URL before anything
+	// that might dial them can log an error.
+	config.RegisterSecretURLs(&cfg)
+
+	// 4: Resolve the producer passphrase (env, passphrase file, config.json, prompt).
 	if err := config.LoadProducerPassphrase(&cfg, true); err != nil {
 		return nil, err
 	}
 
-	// 4: Log only the allowlisted, redacted view of the configuration.
+	// 5: Log only the allowlisted, redacted view of the configuration.
 	if j, err := json.MarshalIndent(cfg.LoggableSummary(), "", "    "); err == nil {
 		common.GlobalLogger.Info("Using the following orchestrator config: \n", string(j))
 	}
 
-	// 5: Write it so a default one is created after the first run
+	// 6: Write it so a default one is created after the first run
 	if err := config.WriteConfig(cfg); err != nil {
 		return nil, err
 	}
@@ -45,23 +48,14 @@ func readConfigFromFile(cfg *config.Config) error {
 	if err := config.EnsureDataDir(cfg.DataPath); err != nil {
 		return err
 	}
-	configPath := cfg.ConfigPath()
 
-	jsonConf, err := os.ReadFile(configPath)
+	found, err := config.ReadConfigFile(cfg)
 	if err != nil {
-		if os.IsNotExist(err) {
-			common.GlobalLogger.Infof("Config file missing: you can provide a data path using the --data flag or provide a config file using the --config flag; configPath: %s", configPath)
-			return nil
-		}
+		common.GlobalLogger.Errorf("Config could not be loaded from %s: %v", cfg.ConfigPath(), err)
 		return err
 	}
-	if err := config.VerifyOwnedPath(configPath); err != nil {
-		return err
-	}
-
-	if err := json.Unmarshal(jsonConf, cfg); err != nil {
-		common.GlobalLogger.Errorf("Config malformed: please check; error: %v", err)
-		return err
+	if !found {
+		common.GlobalLogger.Infof("Config file missing: you can provide a data path using the --data flag or provide a config file using the --config flag; configPath: %s", cfg.ConfigPath())
 	}
 	return nil
 }

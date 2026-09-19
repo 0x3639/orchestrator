@@ -2,9 +2,65 @@ package config
 
 import (
 	"net/url"
+	"orchestrator/common"
 	"sort"
 	"strings"
 )
+
+// minRegisteredComponentLen avoids registering tiny URL components whose
+// replacement would mangle unrelated log text. minRegisteredTokenLen applies
+// to individual path segments and query values, which are only worth
+// registering when they look like API keys.
+const (
+	minRegisteredComponentLen = 8
+	minRegisteredTokenLen     = 16
+)
+
+// RegisterSecretURLs teaches the process-wide log redactor every configured
+// RPC URL and its credential-bearing components, so client errors that echo
+// the endpoint are scrubbed at the logging sink.
+func RegisterSecretURLs(c *Config) {
+	for _, network := range c.Networks {
+		for _, raw := range network.Urls {
+			RegisterSecretURL(raw)
+		}
+	}
+}
+
+// RegisterSecretURL registers one URL with the log redactor.
+func RegisterSecretURL(raw string) {
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return
+	}
+	common.LogRedactor.Register(raw, RedactURL(raw))
+	if parsed.User != nil {
+		if password, ok := parsed.User.Password(); ok && len(password) >= minRegisteredComponentLen {
+			common.LogRedactor.Register(password, common.RedactedPlaceholder)
+		}
+		if username := parsed.User.Username(); len(username) >= minRegisteredComponentLen {
+			common.LogRedactor.Register(username, common.RedactedPlaceholder)
+		}
+	}
+	if parsed.Path != "" && parsed.Path != "/" && len(parsed.Path) >= minRegisteredComponentLen {
+		common.LogRedactor.Register(parsed.Path, "/"+common.RedactedPlaceholder)
+	}
+	for _, segment := range strings.Split(parsed.Path, "/") {
+		if len(segment) >= minRegisteredTokenLen {
+			common.LogRedactor.Register(segment, common.RedactedPlaceholder)
+		}
+	}
+	if len(parsed.RawQuery) >= minRegisteredComponentLen {
+		common.LogRedactor.Register(parsed.RawQuery, common.RedactedPlaceholder)
+	}
+	for _, values := range parsed.Query() {
+		for _, value := range values {
+			if len(value) >= minRegisteredTokenLen {
+				common.LogRedactor.Register(value, common.RedactedPlaceholder)
+			}
+		}
+	}
+}
 
 // RedactURLs applies RedactURL to every entry.
 func RedactURLs(raw []string) []string {
@@ -37,7 +93,7 @@ func RedactErrorForURL(err error, raw string) string {
 	return msg
 }
 
-const redactedPlaceholder = "<redacted>"
+const redactedPlaceholder = common.RedactedPlaceholder
 
 // NetworkSummary is the loggable view of a network configuration.
 type NetworkSummary struct {

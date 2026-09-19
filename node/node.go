@@ -96,7 +96,7 @@ func NewNode(config *oconfig.Config, logger *zap.Logger) (*Node, error) {
 	if err = oconfig.VerifyOwnedPath(producerKeyPath); err != nil {
 		return nil, err
 	}
-	newKeyStore, err := wallet2.ReadKeyFile(config.ProducerKeyFileName, config.ProducerKeyFilePassphrase, producerKeyPath)
+	newKeyStore, err := wallet2.ReadKeyFile(config.ProducerKeyFileName, config.ProducerPassphrase(), producerKeyPath)
 	if err != nil {
 		return nil, err
 	}

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	gotss "github.com/HyperCore-Team/go-tss/common"
+	"io"
 	"orchestrator/common"
 	"os"
 	"path/filepath"
@@ -68,15 +69,71 @@ type Config struct {
 	HealthConfig HealthRpcConfig
 
 	ProducerKeyFileName string
-	// ProducerKeyFilePassphrase may be set in config.json (which is kept at
-	// mode 0600 inside a 0700 data directory). ORCHESTRATOR_PRODUCER_PASSPHRASE
-	// and ProducerKeyFilePassphraseFile take precedence when present so the
-	// value can be moved out of the file. It is never logged.
+	// ProducerKeyFilePassphrase is the value stored in config.json (which is
+	// kept at mode 0600 inside a 0700 data directory). It is only what the
+	// operator wrote there; runtime sources never modify it. Use
+	// ProducerPassphrase() to obtain the effective passphrase.
 	ProducerKeyFilePassphrase string
 	// ProducerKeyFilePassphraseFile optionally points to an owner-only file
 	// holding the passphrase. It should live outside DataPath and its backups.
 	ProducerKeyFilePassphraseFile string
 	ProducerIndex                 uint32
+
+	// resolvedPassphrase is populated by LoadProducerPassphrase from the
+	// environment, the passphrase file, config.json or a prompt. It is
+	// unexported so it can never be serialized back into config.json.
+	resolvedPassphrase string
+}
+
+// ProducerPassphrase returns the passphrase resolved by LoadProducerPassphrase,
+// falling back to the config.json value when loading has not run.
+func (c *Config) ProducerPassphrase() string {
+	if c.resolvedPassphrase != "" {
+		return c.resolvedPassphrase
+	}
+	return c.ProducerKeyFilePassphrase
+}
+
+// maxConfigFileBytes bounds how much of config.json is read so a substituted
+// special file cannot exhaust memory.
+const maxConfigFileBytes = 1 << 20
+
+// ReadConfigFile loads config.json from DataPath into cfg. It returns false
+// with a nil error when the file does not exist. The file is opened once
+// without following symlinks and checked for type and ownership on that
+// descriptor before any bytes are parsed.
+func ReadConfigFile(cfg *Config) (bool, error) {
+	configPath := cfg.ConfigPath()
+	f, err := openNoFollow(configPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	defer f.Close()
+
+	info, err := f.Stat()
+	if err != nil {
+		return false, err
+	}
+	if !info.Mode().IsRegular() {
+		return false, fmt.Errorf("%s is not a regular file", configPath)
+	}
+	if err := verifyOwnedInfo(configPath, info); err != nil {
+		return false, err
+	}
+	raw, err := io.ReadAll(io.LimitReader(f, maxConfigFileBytes+1))
+	if err != nil {
+		return false, err
+	}
+	if len(raw) > maxConfigFileBytes {
+		return false, fmt.Errorf("%s exceeds %d bytes", configPath, maxConfigFileBytes)
+	}
+	if err := json.Unmarshal(raw, cfg); err != nil {
+		return true, fmt.Errorf("config malformed: %w", err)
+	}
+	return true, nil
 }
 
 func (c *Config) MakePathsAbsolute() error {
@@ -111,8 +168,17 @@ func EnsureDataDir(dataPath string) error {
 	if err != nil {
 		return err
 	}
+	if !info.IsDir() {
+		return fmt.Errorf("%s is not a directory", dataPath)
+	}
+	// MkdirAll only applies the mode to directories it creates; legacy
+	// installations were created with os.ModePerm. We own the directory, so
+	// tighten it rather than trusting a warning to be acted on.
 	if info.Mode().Perm()&0077 != 0 {
-		common.GlobalLogger.Warnf("data directory %s is accessible to other users (mode %04o); restrict it to %04o", dataPath, info.Mode().Perm(), DataDirPerm)
+		if err := os.Chmod(dataPath, DataDirPerm); err != nil {
+			return fmt.Errorf("data directory %s has mode %04o and could not be restricted to %04o: %w", dataPath, info.Mode().Perm(), DataDirPerm, err)
+		}
+		common.GlobalLogger.Warnf("data directory %s had mode %04o; restricted it to %04o", dataPath, info.Mode().Perm(), DataDirPerm)
 	}
 	return nil
 }

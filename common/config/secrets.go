@@ -22,13 +22,15 @@ var ErrPassphraseMissing = fmt.Errorf(
 	ProducerPassphraseEnv,
 )
 
-// LoadProducerPassphrase resolves cfg.ProducerKeyFilePassphrase from, in
-// order: the environment, the configured passphrase file, the value already
-// present in the configuration (config.json), and finally an interactive
-// terminal prompt when allowPrompt is set.
+// LoadProducerPassphrase resolves the effective passphrase from, in order:
+// the environment, the configured passphrase file, the value already present
+// in config.json, and finally an interactive terminal prompt when allowPrompt
+// is set. The result is available via Config.ProducerPassphrase and is kept
+// out of the serialized configuration, so a value supplied through the
+// environment, a file or a prompt is never written back to config.json.
 func LoadProducerPassphrase(cfg *Config, allowPrompt bool) error {
 	if value, ok := os.LookupEnv(ProducerPassphraseEnv); ok && value != "" {
-		cfg.ProducerKeyFilePassphrase = value
+		cfg.resolvedPassphrase = value
 		return nil
 	}
 
@@ -37,12 +39,13 @@ func LoadProducerPassphrase(cfg *Config, allowPrompt bool) error {
 		if err != nil {
 			return err
 		}
-		cfg.ProducerKeyFilePassphrase = value
+		cfg.resolvedPassphrase = value
 		return nil
 	}
 
 	if cfg.ProducerKeyFilePassphrase != "" {
 		common.GlobalLogger.Warnf("producer key passphrase is stored in %s; consider moving it to %s or ProducerKeyFilePassphraseFile", cfg.ConfigPath(), ProducerPassphraseEnv)
+		cfg.resolvedPassphrase = cfg.ProducerKeyFilePassphrase
 		return nil
 	}
 
@@ -51,7 +54,7 @@ func LoadProducerPassphrase(cfg *Config, allowPrompt bool) error {
 		if err != nil {
 			return err
 		}
-		cfg.ProducerKeyFilePassphrase = value
+		cfg.resolvedPassphrase = value
 		return nil
 	}
 

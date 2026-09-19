@@ -25,7 +25,7 @@ func main() {
 		return
 	}
 
-	newKeyStore, err := wallet2.ReadKeyFile(config.ProducerKeyFileName, config.ProducerKeyFilePassphrase, path.Join(config.DataPath, config.ProducerKeyFileName))
+	newKeyStore, err := wallet2.ReadKeyFile(config.ProducerKeyFileName, config.ProducerPassphrase(), path.Join(config.DataPath, config.ProducerKeyFileName))
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return

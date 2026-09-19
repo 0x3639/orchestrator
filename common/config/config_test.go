@@ -3,6 +3,7 @@ package config
 import (
 	"encoding/json"
 	"errors"
+	"orchestrator/common"
 	"os"
 	"path/filepath"
 	"strings"
@@ -11,7 +12,7 @@ import (
 
 const (
 	sentinelPassphrase = "SENTINEL-PASSPHRASE-9f8e7d"
-	sentinelToken      = "SENTINEL-TOKEN-1a2b3c"
+	sentinelToken      = "SENTINEL-TOKEN-1a2b3c4d5e6f"
 	sentinelUser       = "sentineluser"
 	sentinelUrlSecret  = "SENTINEL-URL-SECRET-4d5e6f"
 )
@@ -120,12 +121,31 @@ func TestWriteConfigUsesOwnerOnlyPermissions(t *testing.T) {
 
 func TestLoadProducerPassphraseFromEnv(t *testing.T) {
 	t.Setenv(ProducerPassphraseEnv, sentinelPassphrase)
-	cfg := Config{}
+	cfg := Config{DataPath: t.TempDir()}
 	if err := LoadProducerPassphrase(&cfg, false); err != nil {
 		t.Fatal(err)
 	}
-	if cfg.ProducerKeyFilePassphrase != sentinelPassphrase {
-		t.Fatalf("got %q", cfg.ProducerKeyFilePassphrase)
+	if cfg.ProducerPassphrase() != sentinelPassphrase {
+		t.Fatalf("got %q", cfg.ProducerPassphrase())
+	}
+
+	// A runtime-sourced passphrase must never be written back to config.json.
+	if err := WriteConfig(cfg); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(cfg.ConfigPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), sentinelPassphrase) {
+		t.Fatalf("env passphrase was persisted to config.json: %s", raw)
+	}
+	var reloaded Config
+	if err := json.Unmarshal(raw, &reloaded); err != nil {
+		t.Fatal(err)
+	}
+	if reloaded.ProducerKeyFilePassphrase != "" {
+		t.Fatalf("config.json value should stay empty, got %q", reloaded.ProducerKeyFilePassphrase)
 	}
 }
 
@@ -139,8 +159,11 @@ func TestLoadProducerPassphraseFromFile(t *testing.T) {
 	if err := LoadProducerPassphrase(&cfg, false); err != nil {
 		t.Fatal(err)
 	}
-	if cfg.ProducerKeyFilePassphrase != sentinelPassphrase {
-		t.Fatalf("got %q", cfg.ProducerKeyFilePassphrase)
+	if cfg.ProducerPassphrase() != sentinelPassphrase {
+		t.Fatalf("got %q", cfg.ProducerPassphrase())
+	}
+	if cfg.ProducerKeyFilePassphrase != "" {
+		t.Fatal("file passphrase must not populate the serialized field")
 	}
 
 	// Group/world readable secret files are refused.
@@ -159,18 +182,107 @@ func TestLoadProducerPassphraseFromConfig(t *testing.T) {
 	if err := LoadProducerPassphrase(&cfg, false); err != nil {
 		t.Fatal(err)
 	}
-	if cfg.ProducerKeyFilePassphrase != sentinelPassphrase {
-		t.Fatalf("got %q", cfg.ProducerKeyFilePassphrase)
+	if cfg.ProducerPassphrase() != sentinelPassphrase {
+		t.Fatalf("got %q", cfg.ProducerPassphrase())
+	}
+	// The operator's config.json value round-trips unchanged.
+	if err := WriteConfig(cfg); err != nil {
+		t.Fatal(err)
+	}
+	var reloaded Config
+	raw, err := os.ReadFile(cfg.ConfigPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(raw, &reloaded); err != nil {
+		t.Fatal(err)
+	}
+	if reloaded.ProducerKeyFilePassphrase != sentinelPassphrase {
+		t.Fatalf("config.json passphrase should be preserved, got %q", reloaded.ProducerKeyFilePassphrase)
 	}
 
-	// Environment and passphrase file override the config.json value.
+	// Environment overrides the config.json value in memory but leaves the
+	// stored value alone.
 	t.Setenv(ProducerPassphraseEnv, "from-env")
 	cfg = Config{ProducerKeyFilePassphrase: sentinelPassphrase}
 	if err := LoadProducerPassphrase(&cfg, false); err != nil {
 		t.Fatal(err)
 	}
-	if cfg.ProducerKeyFilePassphrase != "from-env" {
-		t.Fatalf("env should override config.json, got %q", cfg.ProducerKeyFilePassphrase)
+	if cfg.ProducerPassphrase() != "from-env" {
+		t.Fatalf("env should override config.json, got %q", cfg.ProducerPassphrase())
+	}
+	if cfg.ProducerKeyFilePassphrase != sentinelPassphrase {
+		t.Fatal("stored config value must not be modified by the environment")
+	}
+}
+
+func TestEnsureDataDirTightensLegacyMode(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "legacy")
+	if err := os.Mkdir(dir, 0777); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dir, 0777); err != nil {
+		t.Fatal(err)
+	}
+	if err := EnsureDataDir(dir); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != DataDirPerm {
+		t.Fatalf("mode = %04o, want %04o", info.Mode().Perm(), DataDirPerm)
+	}
+}
+
+func TestReadConfigFileRefusesSymlinkAndSpecialFiles(t *testing.T) {
+	dir := t.TempDir()
+	cfg := Config{DataPath: dir}
+
+	found, err := ReadConfigFile(&cfg)
+	if err != nil || found {
+		t.Fatalf("missing config should be (false, nil), got (%v, %v)", found, err)
+	}
+
+	real := filepath.Join(dir, "real.json")
+	if err := os.WriteFile(real, []byte(`{"ProducerIndex":7}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(real, cfg.ConfigPath()); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	if _, err := ReadConfigFile(&cfg); err == nil {
+		t.Fatal("symlinked config.json must be refused")
+	}
+	if err := os.Remove(cfg.ConfigPath()); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.Rename(real, cfg.ConfigPath()); err != nil {
+		t.Fatal(err)
+	}
+	found, err = ReadConfigFile(&cfg)
+	if err != nil || !found || cfg.ProducerIndex != 7 {
+		t.Fatalf("regular config should load, got found=%v err=%v index=%d", found, err, cfg.ProducerIndex)
+	}
+}
+
+func TestRegisterSecretURLScrubsClientErrors(t *testing.T) {
+	common.LogRedactor.Reset()
+	t.Cleanup(common.LogRedactor.Reset)
+	raw := "https://" + sentinelUser + ":" + sentinelUrlSecret + "@rpc.example.com/v3/" + sentinelToken + "?apikey=" + sentinelToken
+	RegisterSecretURL(raw)
+
+	clientErr := `Post "` + raw + `": dial tcp: connection refused; path /v3/` + sentinelToken + ` token ` + sentinelToken + ` pw ` + sentinelUrlSecret
+	got := common.LogRedactor.Redact(clientErr)
+	for _, sentinel := range []string{sentinelUrlSecret, sentinelUser, sentinelToken} {
+		if strings.Contains(got, sentinel) {
+			t.Fatalf("redactor leaked %q: %s", sentinel, got)
+		}
+	}
+	if !strings.Contains(got, "rpc.example.com") {
+		t.Fatalf("host should survive: %s", got)
 	}
 }
 
