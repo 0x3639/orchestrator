@@ -2,6 +2,7 @@ package config
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -178,5 +179,63 @@ func TestLoadProducerPassphraseMissing(t *testing.T) {
 	cfg := Config{}
 	if err := LoadProducerPassphrase(&cfg, false); err != ErrPassphraseMissing {
 		t.Fatalf("expected ErrPassphraseMissing, got %v", err)
+	}
+}
+
+func TestRedactErrorForURL(t *testing.T) {
+	raw := "wss://" + sentinelUser + ":" + sentinelUrlSecret + "@rpc.example.com/v1/" + sentinelToken
+	err := errors.New("dial " + raw + " failed: auth " + sentinelUrlSecret + " rejected for " + sentinelUser)
+	got := RedactErrorForURL(err, raw)
+	for _, sentinel := range []string{sentinelUrlSecret, sentinelUser, sentinelToken} {
+		if strings.Contains(got, sentinel) {
+			t.Fatalf("error message leaks %q: %s", sentinel, got)
+		}
+	}
+	if !strings.Contains(got, "rpc.example.com") {
+		t.Fatalf("host should be preserved: %s", got)
+	}
+	if RedactErrorForURL(nil, raw) != "" {
+		t.Fatal("nil error should render empty")
+	}
+}
+
+func TestReadPassphraseFileRefusesSymlinkAndOversize(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "real")
+	if err := os.WriteFile(target, []byte(sentinelPassphrase), 0600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "link")
+	if err := os.Symlink(target, link); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	if _, err := readPassphraseFile(link); err == nil {
+		t.Fatal("symlinked passphrase file must be refused")
+	}
+
+	big := filepath.Join(dir, "big")
+	if err := os.WriteFile(big, []byte(strings.Repeat("x", maxPassphraseFileBytes+1)), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readPassphraseFile(big); err == nil {
+		t.Fatal("oversized passphrase file must be refused")
+	}
+}
+
+func TestWriteConfigLeavesNoTempFiles(t *testing.T) {
+	cfg := sampleConfig(t)
+	if err := WriteConfig(cfg); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := os.ReadDir(cfg.DataPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Name() != DefaultNodeConfigFileName {
+		names := make([]string, 0, len(entries))
+		for _, e := range entries {
+			names = append(names, e.Name())
+		}
+		t.Fatalf("expected only config.json, got %v", names)
 	}
 }

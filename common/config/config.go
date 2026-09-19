@@ -130,13 +130,36 @@ func WriteConfig(cfg Config) error {
 	if err != nil {
 		return err
 	}
-	if err = os.WriteFile(configPath, configBytes, ConfigFilePerm); err != nil {
+
+	// Write to a fresh owner-only temporary file and rename it over the
+	// target so the on-disk config is never truncated, never inherits a
+	// wider legacy mode, and cannot be redirected through a pre-existing
+	// symlink at configPath.
+	tmp, err := os.CreateTemp(cfg.DataPath, "."+DefaultNodeConfigFileName+".*")
+	if err != nil {
 		return err
 	}
-	// WriteFile only applies the mode to newly created files; tighten
-	// pre-existing files that were created with a wider mode.
-	if err = os.Chmod(configPath, ConfigFilePerm); err != nil {
-		return fmt.Errorf("failed to restrict permissions on %s: %w", configPath, err)
+	tmpPath := tmp.Name()
+	cleanup := func() { _ = tmp.Close(); _ = os.Remove(tmpPath) }
+	if err = tmp.Chmod(ConfigFilePerm); err != nil {
+		cleanup()
+		return fmt.Errorf("failed to restrict permissions on %s: %w", tmpPath, err)
+	}
+	if _, err = tmp.Write(configBytes); err != nil {
+		cleanup()
+		return err
+	}
+	if err = tmp.Sync(); err != nil {
+		cleanup()
+		return err
+	}
+	if err = tmp.Close(); err != nil {
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	if err = os.Rename(tmpPath, configPath); err != nil {
+		_ = os.Remove(tmpPath)
+		return err
 	}
 	return nil
 }

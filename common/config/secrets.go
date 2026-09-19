@@ -3,6 +3,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"io"
 	"orchestrator/common"
 	"os"
 	"strings"
@@ -57,24 +58,39 @@ func LoadProducerPassphrase(cfg *Config, allowPrompt bool) error {
 	return ErrPassphraseMissing
 }
 
-// readPassphraseFile reads a single-line passphrase from an owner-only file.
+// maxPassphraseFileBytes bounds how much of a passphrase file is read.
+const maxPassphraseFileBytes = 4 * 1024
+
+// readPassphraseFile reads a single-line passphrase from an owner-only
+// regular file. The file is opened once without following symlinks and every
+// check runs against that descriptor, so the path cannot be swapped between
+// validation and use.
 func readPassphraseFile(path string) (string, error) {
-	if err := VerifyOwnedPath(path); err != nil {
+	f, err := openNoFollow(path)
+	if err != nil {
 		return "", fmt.Errorf("passphrase file: %w", err)
 	}
-	info, err := os.Stat(path)
+	defer f.Close()
+
+	info, err := f.Stat()
 	if err != nil {
 		return "", fmt.Errorf("passphrase file: %w", err)
 	}
 	if !info.Mode().IsRegular() {
 		return "", fmt.Errorf("passphrase file %s is not a regular file", path)
 	}
+	if err := verifyOwnedInfo(path, info); err != nil {
+		return "", fmt.Errorf("passphrase file: %w", err)
+	}
 	if info.Mode().Perm()&0077 != 0 {
 		return "", fmt.Errorf("passphrase file %s must not be readable by group or others (mode %04o)", path, info.Mode().Perm())
 	}
-	raw, err := os.ReadFile(path)
+	raw, err := io.ReadAll(io.LimitReader(f, maxPassphraseFileBytes+1))
 	if err != nil {
 		return "", fmt.Errorf("passphrase file: %w", err)
+	}
+	if len(raw) > maxPassphraseFileBytes {
+		return "", fmt.Errorf("passphrase file %s exceeds %d bytes", path, maxPassphraseFileBytes)
 	}
 	value := strings.TrimRight(string(raw), "\r\n")
 	if value == "" {

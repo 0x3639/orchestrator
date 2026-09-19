@@ -118,6 +118,14 @@ func TestServeHTTPRejectsMultipleJSONValues(t *testing.T) {
 	}
 }
 
+func TestServeHTTPRejectsParametersBeforeLimiter(t *testing.T) {
+	handler := newTestHandler(t, generousConfig())
+	rec := doRequest(handler, http.MethodPost, "application/json", "", strings.NewReader(`{"method":"getBuildInfo","params":[1]}`))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
 func TestServeHTTPUnknownMethod(t *testing.T) {
 	handler := newTestHandler(t, generousConfig())
 	rec := doRequest(handler, http.MethodPost, "application/json", "", strings.NewReader(`{"method":"nope","params":[]}`))
@@ -139,6 +147,7 @@ func TestMalformedRequestsDoNotConsumeBudget(t *testing.T) {
 		doRequest(handler, http.MethodPost, "text/plain", "", buildInfoRequest())
 		doRequest(handler, http.MethodPost, "application/json", "", strings.NewReader(`{not json`))
 		doRequest(handler, http.MethodPost, "application/json", "", strings.NewReader(`{"method":"nope"}`))
+		doRequest(handler, http.MethodPost, "application/json", "", strings.NewReader(`{"method":"getBuildInfo","params":[1]}`))
 	}
 
 	rec := doRequest(handler, http.MethodPost, "application/json", "", buildInfoRequest())

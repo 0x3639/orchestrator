@@ -17,6 +17,12 @@ func VerifyOwnedPath(path string) error {
 	if err != nil {
 		return err
 	}
+	return verifyOwnedInfo(path, info)
+}
+
+// verifyOwnedInfo applies the ownership check to an already obtained
+// FileInfo, typically from an open descriptor.
+func verifyOwnedInfo(path string, info os.FileInfo) error {
 	stat, ok := info.Sys().(*syscall.Stat_t)
 	if !ok {
 		return nil
@@ -25,4 +31,10 @@ func VerifyOwnedPath(path string) error {
 		return fmt.Errorf("%s is owned by uid %d but the orchestrator runs as uid %d", path, stat.Uid, uid)
 	}
 	return nil
+}
+
+// openNoFollow opens path read-only and refuses to follow a symlink at the
+// final path component.
+func openNoFollow(path string) (*os.File, error) {
+	return os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
 }

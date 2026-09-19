@@ -305,6 +305,13 @@ func (s *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Every exposed method takes no parameters; reject bad shapes before
+	// charging the quota so they cannot be used to starve real probes.
+	if len(req.Params) != 0 {
+		writeError(w, http.StatusBadRequest, "Invalid request: this method does not accept parameters")
+		return
+	}
+
 	// Only well-formed requests for known methods are charged against the quota.
 	if !s.allow(r) {
 		writeError(w, http.StatusTooManyRequests, "Too many requests, retry later")

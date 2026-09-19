@@ -6,6 +6,37 @@ import (
 	"strings"
 )
 
+// RedactURLs applies RedactURL to every entry.
+func RedactURLs(raw []string) []string {
+	out := make([]string, 0, len(raw))
+	for _, u := range raw {
+		out = append(out, RedactURL(u))
+	}
+	return out
+}
+
+// RedactErrorForURL renders err for logging with the raw URL, and any
+// password embedded in it, replaced. Client libraries frequently echo the
+// dial target inside their error strings.
+func RedactErrorForURL(err error, raw string) string {
+	if err == nil {
+		return ""
+	}
+	msg := err.Error()
+	if raw != "" {
+		msg = strings.ReplaceAll(msg, raw, RedactURL(raw))
+	}
+	if parsed, perr := url.Parse(raw); perr == nil && parsed.User != nil {
+		if password, ok := parsed.User.Password(); ok && password != "" {
+			msg = strings.ReplaceAll(msg, password, redactedPlaceholder)
+		}
+		if username := parsed.User.Username(); username != "" {
+			msg = strings.ReplaceAll(msg, username, redactedPlaceholder)
+		}
+	}
+	return msg
+}
+
 const redactedPlaceholder = "<redacted>"
 
 // NetworkSummary is the loggable view of a network configuration.
@@ -53,10 +84,7 @@ type Summary struct {
 func (c Config) LoggableSummary() Summary {
 	networks := make(map[string]NetworkSummary, len(c.Networks))
 	for name, network := range c.Networks {
-		urls := make([]string, 0, len(network.Urls))
-		for _, raw := range network.Urls {
-			urls = append(urls, RedactURL(raw))
-		}
+		urls := RedactURLs(network.Urls)
 		sort.Strings(urls)
 		networks[name] = NetworkSummary{Urls: urls, FilterQuerySize: network.FilterQuerySize}
 	}

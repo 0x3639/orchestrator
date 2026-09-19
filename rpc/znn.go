@@ -45,7 +45,7 @@ func NewZnnRpcClient(networkConfig config.BaseNetworkConfig) (*ZnnRpc, error) {
 	for {
 		newZnnClient, err = sdk_rpc_client.NewRpcClient(currentUrl)
 		if err != nil {
-			common.GlobalLogger.Infof("Error when dialing %s, got: %s\n", currentUrl, err)
+			common.GlobalLogger.Infof("Error when dialing %s, got: %s\n", config.RedactURL(currentUrl), config.RedactErrorForURL(err, currentUrl))
 		} else {
 			break
 		}

@@ -9,3 +9,9 @@ func VerifyOwnedPath(path string) error {
 	_, err := os.Stat(path)
 	return err
 }
+
+func verifyOwnedInfo(string, os.FileInfo) error { return nil }
+
+func openNoFollow(path string) (*os.File, error) {
+	return os.Open(path)
+}

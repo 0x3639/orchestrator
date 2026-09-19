@@ -523,7 +523,7 @@ func (rC *znnNetwork) InterpretSendBlockData(sendBlock *api.AccountBlock, live b
 				rC.stopChan <- syscall.SIGINT
 				return errors.New("network url non existent")
 			}
-			rC.logger.Info("configData: ", configData)
+			rC.logger.Infof("configData for network %s: urls=%v filterQuerySize=%d", network.Name, config.RedactURLs(configData.Urls), configData.FilterQuerySize)
 			newEvmNetwork, err := NewEvmNetwork(network, rC.dbManager, rC.rpcManager, rC.state, rC.stopChan)
 			if err != nil {
 				rC.logger.Error(err)
