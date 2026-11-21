@@ -27,6 +27,7 @@ import (
 	"orchestrator/common/config"
 	"orchestrator/common/events"
 	"orchestrator/db"
+	dbmanager "orchestrator/db/manager"
 	"orchestrator/db/unwrap"
 	"orchestrator/network"
 )
@@ -34,9 +35,10 @@ import (
 type signerLookup func(uint32) (*definition.UnwrapTokenRequest, error)
 
 type reconciliationChain struct {
-	lookup signerLookup
-	write  func(uint32, uint32) error
-	head   func() (*api.AccountBlockMarshal, error)
+	signingKey string
+	lookup     signerLookup
+	write      func(uint32, uint32) error
+	head       func() (*api.AccountBlockMarshal, error)
 	db.EvmStorage
 }
 
@@ -84,16 +86,22 @@ func signerWithEvents(t *testing.T, requests []*events.UnwrapRequestEvm) reconci
 }
 
 // Serve the same SDK calls as a Zenon endpoint. No peer or signing service is started.
-type fixtureBridge struct{ lookup signerLookup }
+type fixtureBridge struct {
+	lookup     signerLookup
+	signingKey string
+}
 
 func (b fixtureBridge) GetBridgeInfo() *definition.BridgeInfoVariable {
-	return &definition.BridgeInfoVariable{}
+	return &definition.BridgeInfoVariable{CompressedTssECDSAPubKey: b.signingKey}
 }
 func (b fixtureBridge) GetSecurityInfo() *definition.SecurityInfoVariable {
 	return &definition.SecurityInfoVariable{Guardians: make([]types.Address, constants.MinGuardians)}
 }
 func (b fixtureBridge) GetOrchestratorInfo() *definition.OrchestratorInfo {
 	return &definition.OrchestratorInfo{WindowSize: 10, KeyGenThreshold: 1, ConfirmationsToFinality: 1, EstimatedMomentumTime: 1}
+}
+func (b fixtureBridge) GetAllUnsignedWrapTokenRequests(uint32, uint32) *embedded.WrapTokenRequestList {
+	return &embedded.WrapTokenRequestList{}
 }
 func (b fixtureBridge) GetAllNetworks(uint32, uint32) *embedded.NetworkInfoList {
 	return &embedded.NetworkInfoList{}
@@ -137,7 +145,7 @@ func (c reconciliationChain) openNetworks(t *testing.T) (*network.NetworksManage
 	t.Helper()
 	t.Setenv("HOME", t.TempDir()) // isolate the EVM network's disk queue
 	srv := server.NewServer()
-	if err := srv.RegisterName("embedded.bridge", fixtureBridge{c.lookup}); err != nil {
+	if err := srv.RegisterName("embedded.bridge", fixtureBridge{lookup: c.lookup, signingKey: c.signingKey}); err != nil {
 		t.Fatal(err)
 	}
 	if err := srv.RegisterName("ledger", fixtureLedger{c.head}); err != nil {
@@ -152,7 +160,14 @@ func (c reconciliationChain) openNetworks(t *testing.T) (*network.NetworksManage
 		t.Fatal(err)
 	}
 	cfg := config.BaseNetworkConfig{Urls: []string{endpoint.URL}}
-	if err := manager.Init(map[string]config.BaseNetworkConfig{common.ZenonNetworkName: cfg, "fixture": cfg}, nil, nil, nil); err != nil {
+	var stores *dbmanager.Manager
+	if c.signingKey != "" {
+		stores, err = dbmanager.NewDbManager(stop)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := manager.Init(map[string]config.BaseNetworkConfig{common.ZenonNetworkName: cfg, "fixture": cfg}, stores, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	net, err := network.NewEvmNetwork(&definition.NetworkInfo{NetworkClass: definition.EvmClass, Id: 1, Name: "fixture"}, fixtureStores{c}, manager.RpcManager(), nil, stop)

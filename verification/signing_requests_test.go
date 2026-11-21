@@ -23,6 +23,14 @@ func TestWindowResizePreservesUnwrapProgress(t *testing.T) {
 	runSigningTransportTest(t, "TestWindowResizeAtSigningTransport")
 }
 
+func TestLiveSchedulerRecoversExpiredUnwrap(t *testing.T) {
+	runSigningTransportTest(t, "TestLiveLoopRetriesExpiredUnwrap")
+}
+
+func TestRestoredContractWindowPreservesVote(t *testing.T) {
+	runSigningTransportTest(t, "TestRestoredWindowAtSigningTransport")
+}
+
 func runSigningTransportTest(t *testing.T, name string) {
 	t.Helper()
 	root, err := filepath.Abs("..")

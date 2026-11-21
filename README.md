@@ -32,18 +32,32 @@ reconciliation. [Prototype tests and replay instructions](verification/testdata/
 
 Each signer requests a threshold certificate for the signing key, window size,
 ceremony number and exact ordered unwrap messages before requesting bridge
-signatures. Resizing the window creates a distinct round even when the number
-repeats. Before requesting bridge signatures the signer rechecks the window size,
-its locally observed chain height, and the signing key.
+signatures. Before requesting bridge signatures the signer rechecks the window
+size, its locally observed chain height, and the signing key.
+
+The bridge stores the current window size in momentums. Its administrator can
+set it to 100, then 50, then 100. After the third update, the contract returns
+the original settings when the other fields are unchanged. Vote identity is an
+orchestrator rule. It identifies a period by its size and the block height
+divided by that size.
+At heights 1710 and 1760, size 100 puts both attempts in window 17. Restoring
+size 100 preserves the signer's original vote for that interval. The same batch
+can retry, and a different batch can be proposed in a later eligible window.
+[Bridge settings](https://github.com/zenon-network/go-zenon/blob/f18efb89169be331b51ad88e29476c950b700fce/vm/embedded/definition/bridge.go#L980-L1008)
+and [administrator update](https://github.com/zenon-network/go-zenon/blob/f18efb89169be331b51ad88e29476c950b700fce/vm/embedded/implementation/bridge.go#L1373-L1405).
 
 Both unwrap rounds use go-tss's leaderless protocol. With three signers, two
 matching signers can finish both rounds when the third chooses a different pool.
 The signing threshold still comes from the original key shares. On a split,
-allow time for peer discovery in both rounds. Run the three-signer regression
-on Linux with the command below.
+allow time for peer discovery in both rounds. If agreement takes the rest of
+a window, the pending batch can be retried in the next eligible window.
+Even-numbered windows give wraps priority and can try unwraps when there are
+no wraps to sign. The recovery regression keeps the third signer offline across
+both windows and verifies the signatures returned by the remaining two.
+Run the real-coordinator regressions on Linux with the command below.
 
 ```sh
-go test -race -count=1 -ldflags '-extldflags=-Wl,--allow-multiple-definition' -run '^TestUnwrapTwoOfThreeRealCoordinator$' ./tss
+go test -race -count=1 -ldflags '-extldflags=-Wl,--allow-multiple-definition' -run '^Test(UnwrapTwoOfThree|OfflineSignerRecoversNextWindow)RealCoordinator$' ./tss
 ```
 
 Upgrade the signing group together. An older signer can still request bridge

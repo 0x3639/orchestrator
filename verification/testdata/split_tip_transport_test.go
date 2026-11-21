@@ -8,7 +8,10 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"math/big"
+	"runtime"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -17,10 +20,14 @@ import (
 	"github.com/HyperCore-Team/go-tss/conversion"
 	"github.com/HyperCore-Team/go-tss/keysign"
 	"github.com/ethereum/go-ethereum/crypto"
+	"github.com/zenon-network/go-zenon/chain/nom"
+	zdb "github.com/zenon-network/go-zenon/common/db"
 	"github.com/zenon-network/go-zenon/common/types"
 	"github.com/zenon-network/go-zenon/rpc/api"
 	"github.com/zenon-network/go-zenon/vm/constants"
 	"github.com/zenon-network/go-zenon/vm/embedded/definition"
+	"github.com/zenon-network/go-zenon/vm/embedded/implementation"
+	"github.com/zenon-network/go-zenon/vm/vm_context"
 	"go.uber.org/zap"
 
 	"orchestrator/common"
@@ -54,12 +61,17 @@ type signingPeer struct {
 }
 
 func newSigningPeer(t *testing.T, tip byte, key string) *signingPeer {
+	return buildSigningPeer(t, tip, key, "")
+}
+
+func buildSigningPeer(t *testing.T, tip byte, key, activeBridgeKey string) *signingPeer {
 	t.Helper()
 	events := candidates(6)
 	for _, event := range events {
 		event.To = types.ZeroAddress.String()
 	}
 	c := signerWithEvents(t, events)
+	c.signingKey = activeBridgeKey
 	c.head = func() (*api.AccountBlockMarshal, error) {
 		return frontierBlock(types.BridgeContract, types.Hash{tip}, uint64(10+tip)), nil
 	}
@@ -235,7 +247,15 @@ func runScheduledUnwrap(t *testing.T, n *Node, number uint64) (error, bool) {
 	}
 }
 
-func TestWindowResizeAtSigningTransport(t *testing.T) {
+type windowTransport struct {
+	first, later *signingPeer
+	commitments  []string
+	bridgeCalls  int
+	onAgreement  func()
+}
+
+func newWindowTransport(t *testing.T) *windowTransport {
+	t.Helper()
 	key, err := crypto.GenerateKey()
 	if err != nil {
 		t.Fatal(err)
@@ -245,17 +265,15 @@ func TestWindowResizeAtSigningTransport(t *testing.T) {
 	later := newSigningPeer(t, 2, pub)
 	// Two different chain views, but one signer, signing key and vote database.
 	later.node.tssManager = first.node.tssManager
-	var agreements int
-	var onAgreement func()
-	var bridgeCalls int
+	f := &windowTransport{first: first, later: later}
 	signtransport.Receive = func(_ string, r keysign.Request) (keysign.Response, error) {
 		if len(r.Messages) != 1 {
-			bridgeCalls++
+			f.bridgeCalls++
 			return keysign.Response{Status: tcommon.Fail}, nil
 		}
-		agreements++
-		if onAgreement != nil {
-			onAgreement()
+		f.commitments = append(f.commitments, r.Messages[0])
+		if f.onAgreement != nil {
+			f.onAgreement()
 		}
 		d, err := base64.StdEncoding.DecodeString(r.Messages[0])
 		if err != nil {
@@ -267,32 +285,162 @@ func TestWindowResizeAtSigningTransport(t *testing.T) {
 		}
 		return keysign.Response{Status: tcommon.Success, Signatures: []keysign.Signature{{Msg: r.Messages[0], Signature: base64.StdEncoding.EncodeToString(sig[:64])}}}, nil
 	}
-	defer func() { signtransport.Receive = nil }()
-	attempt := func(p *signingPeer, height, size uint64) error {
-		p.node.networksManager.Znn().SetWindowSize(size)
-		if err := p.node.state.SetFrontierMomentum(height); err != nil {
-			t.Fatal(err)
-		}
-		err, _ := runScheduledUnwrap(t, p.node, height/size)
-		return err
-	}
-	if err := attempt(first, 1750, 100); err != nil {
+	t.Cleanup(func() { signtransport.Receive = nil })
+	return f
+}
+
+func (p *signingPeer) attempt(t *testing.T, height, size uint64) error {
+	t.Helper()
+	p.node.networksManager.Znn().SetWindowSize(size)
+	if err := p.node.state.SetFrontierMomentum(height); err != nil {
 		t.Fatal(err)
 	}
-	if err := attempt(later, 3500, 200); err != nil {
+	err, _ := runScheduledUnwrap(t, p.node, height/size)
+	return err
+}
+
+func TestWindowResizeAtSigningTransport(t *testing.T) {
+	f := newWindowTransport(t)
+	if err := f.first.attempt(t, 1750, 100); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.later.attempt(t, 3500, 200); err != nil {
 		t.Fatalf("later window reused number 17 and blocked a new pool: %v", err)
 	}
-	if agreements != 2 || bridgeCalls != 2 {
-		t.Fatalf("got %d agreement requests and %d bridge requests, want two of each", agreements, bridgeCalls)
+	if len(f.commitments) != 2 || f.bridgeCalls != 2 {
+		t.Fatalf("got %d agreement requests and %d bridge requests, want two of each", len(f.commitments), f.bridgeCalls)
 	}
-	if err := attempt(first, 3501, 200); err == nil || agreements != 2 || bridgeCalls != 2 {
+	if err := f.first.attempt(t, 3501, 200); err == nil || len(f.commitments) != 2 || f.bridgeCalls != 2 {
 		t.Fatal("signer could change its vote within the resized window")
 	}
 
 	// An already-issued certificate must also expire when governance resizes
 	// the window while the round number stays 17 at the observed height.
-	onAgreement = func() { later.node.networksManager.Znn().SetWindowSize(201) }
-	if err := attempt(later, 3502, 200); err == nil || agreements != 3 || bridgeCalls != 2 {
-		t.Fatalf("round changed during agreement: err=%v, agreements=%d, bridge requests=%d", err, agreements, bridgeCalls)
+	f.onAgreement = func() { f.later.node.networksManager.Znn().SetWindowSize(201) }
+	if err := f.later.attempt(t, 3502, 200); err == nil || len(f.commitments) != 3 || f.bridgeCalls != 2 {
+		t.Fatalf("round changed during agreement: err=%v, agreements=%d, bridge requests=%d", err, len(f.commitments), f.bridgeCalls)
+	}
+}
+
+// The bridge setter uses only contract storage. Exercise its real receive
+// handler so the window sequence below comes from contract state.
+type bridgeWindowContext struct {
+	vm_context.AccountVmContext
+	store zdb.DB
+}
+
+func (c bridgeWindowContext) Storage() zdb.DB { return c.store }
+
+func TestRestoredWindowAtSigningTransport(t *testing.T) {
+	f := newWindowTransport(t)
+	ctx := bridgeWindowContext{store: zdb.DisableNotFound(zdb.NewMemDB())}
+	method := implementation.SetOrchestratorInfoMethod{MethodName: definition.SetOrchestratorInfoMethodName}
+	setSize := func(size uint64) definition.OrchestratorInfo {
+		t.Helper()
+		data, err := definition.ABIBridge.PackMethod(method.MethodName, size, uint32(1), uint32(1), uint32(1))
+		if err != nil {
+			t.Fatal(err)
+		}
+		send := &nom.AccountBlock{Address: constants.InitialBridgeAdministrator, Amount: new(big.Int), Data: data}
+		if _, err := method.ReceiveBlock(ctx, send); err != nil {
+			t.Fatal(err)
+		}
+		info, err := definition.GetOrchestratorInfoVariable(ctx.Storage())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.WindowSize != size {
+			t.Fatalf("contract stored window size %d, want %d", info.WindowSize, size)
+		}
+		return *info
+	}
+
+	original := setSize(100)
+	if err := f.first.attempt(t, 1710, original.WindowSize); err != nil {
+		t.Fatal(err)
+	}
+	shorter := setSize(50)
+	if err := f.first.attempt(t, 1740, shorter.WindowSize); err != nil {
+		t.Fatal(err)
+	}
+	restored := setSize(100)
+	if restored != original {
+		t.Fatalf("restored contract settings differ: original=%+v restored=%+v", original, restored)
+	}
+
+	// One signer's persisted vote, two possible pools. The contract stores
+	// no activation identifier. Under the PR's interval-based signing rule,
+	// both heights 1710 and 1760 are in [1700, 1800) after size 100 returns.
+	if err := f.later.attempt(t, 1760, restored.WindowSize); err == nil || !strings.Contains(err.Error(), "already voted for another unwrap pool") || len(f.commitments) != 2 || f.bridgeCalls != 2 {
+		t.Fatalf("conflicting pool in restored interval: err=%v agreements=%d bridge calls=%d", err, len(f.commitments), f.bridgeCalls)
+	}
+	if err := f.first.attempt(t, 1761, restored.WindowSize); err != nil {
+		t.Fatalf("retry original pool: %v", err)
+	}
+	if len(f.commitments) != 3 || f.commitments[0] != f.commitments[2] || f.bridgeCalls != 3 {
+		t.Fatal("retry of the original pool did not reuse its commitment and reach bridge signing")
+	}
+	if err := f.later.attempt(t, 1900, restored.WindowSize); err != nil {
+		t.Fatalf("new pool in next unwrap-first window: %v", err)
+	}
+	if len(f.commitments) != 4 || f.bridgeCalls != 4 {
+		t.Fatal("new pool never reached bridge signing in window 19")
+	}
+}
+
+// The isolated overlay test runs the production polling loop. Only the chain
+// and signing transport are fixtures. Never invoke the unwrap retry directly.
+func TestLiveLoopRetriesExpiredUnwrap(t *testing.T) {
+	key, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	pub := base64.StdEncoding.EncodeToString(crypto.CompressPubkey(&key.PublicKey))
+	p := buildSigningPeer(t, 1, pub, pub)
+	p.node.networksManager.Znn().SetWindowSize(100)
+	if err := p.node.state.SetFrontierMomentum(1799); err != nil {
+		t.Fatal(err)
+	}
+
+	var agreements []string
+	var bridgeBatch []string
+	var observedHeight uint64
+	signtransport.Receive = func(_ string, r keysign.Request) (keysign.Response, error) {
+		if len(r.Messages) != 1 {
+			bridgeBatch = slices.Clone(r.Messages)
+			observedHeight, err = p.node.state.GetFrontierMomentum()
+			// This request is the observation point. End the process-lifetime
+			// signing loop here, before tearing down its RPC and storage.
+			runtime.Goexit()
+		}
+		agreements = append(agreements, r.Messages[0])
+		if len(agreements) == 1 {
+			if err := p.node.state.SetFrontierMomentum(1800); err != nil {
+				return keysign.Response{}, err
+			}
+		}
+		digest, err := base64.StdEncoding.DecodeString(r.Messages[0])
+		if err != nil {
+			return keysign.Response{}, err
+		}
+		sig, err := crypto.Sign(digest, key)
+		if err != nil {
+			return keysign.Response{}, err
+		}
+		return keysign.Response{Status: tcommon.Success, Signatures: []keysign.Signature{{Msg: r.Messages[0], Signature: base64.StdEncoding.EncodeToString(sig[:64])}}}, nil
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		p.node.processSignatures()
+	}()
+	select {
+	case <-done:
+		signtransport.Receive = nil
+	case <-time.After(55 * time.Second):
+		t.Fatal("live scheduler never requested bridge signatures in the next window")
+	}
+	if err != nil || observedHeight != 1800 || len(agreements) != 2 || agreements[0] == agreements[1] || !slices.Equal(bridgeBatch, p.messages) {
+		t.Fatalf("expected fresh agreement and original batch at height 1800, got height=%d agreements=%v batch=%v err=%v", observedHeight, agreements, bridgeBatch, err)
 	}
 }
