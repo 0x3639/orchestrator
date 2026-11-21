@@ -14,7 +14,6 @@ import (
 	"orchestrator/common/config"
 	"orchestrator/common/storage"
 	"orchestrator/db"
-	"orchestrator/db/manager"
 	"orchestrator/rpc"
 	"os"
 	"strings"
@@ -30,7 +29,7 @@ import (
 type evmNetwork struct {
 	config.EvmParams
 	unconfirmedQueue *dque.DQue
-	dbManager        *manager.Manager
+	dbManager        networkEventStores
 	rpcManager       *rpc.Manager
 	UrlsInfo         config.UrlsInfo
 	state            *common.GlobalState
@@ -88,7 +87,7 @@ func (eN *evmNetwork) resetCanonicalCache() {
 	eN.canonicalMu.Unlock()
 }
 
-func NewEvmNetwork(network *definition.NetworkInfo, dbManager *manager.Manager, rpcManager *rpc.Manager, state *common.GlobalState, stop chan os.Signal) (*evmNetwork, error) {
+func NewEvmNetwork(network *definition.NetworkInfo, dbManager networkEventStores, rpcManager *rpc.Manager, state *common.GlobalState, stop chan os.Signal) (*evmNetwork, error) {
 	newConfig, err := config.NewEvmParams(network)
 	if err != nil {
 		return nil, err

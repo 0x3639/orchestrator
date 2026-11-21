@@ -29,9 +29,16 @@ import (
 	"time"
 )
 
+type networkEventStores interface {
+	ZnnStorage() db.ZnnStorage
+	EvmStorage(uint32) db.EvmStorage
+	HasEvmStorage(uint32) bool
+	AddEvmEventStore(uint32, string, uint64)
+}
+
 type znnNetwork struct {
 	config.ZnnParams
-	dbManager         *manager.Manager
+	dbManager         networkEventStores
 	rpcManager        *rpc.Manager
 	networkManager    *NetworksManager
 	networksInfo      map[string]config.BaseNetworkConfig
@@ -348,14 +355,14 @@ func (rC *znnNetwork) InterpretSendBlockData(sendBlock *api.AccountBlock, live b
 					rC.logger.Debug(err)
 					return err
 				} else {
-					logIndexToCheck := param.LogIndex
-					if logIndexToCheck >= common.AffiliateLogIndexAddition {
-						logIndexToCheck -= common.AffiliateLogIndexAddition
+					event := &events.UnwrapRequestEvm{
+						TransactionHash: ecommon.Hash(param.TransactionHash),
+						LogIndex:        param.LogIndex,
+						BlockHash:       tx.BlockHash,
 					}
-					if uint32(len(logs)) <= logIndexToCheck {
-						rC.logger.Debugf("Logs length %d is less than log index %d", len(logs), param.LogIndex)
+					if log, ok := findUnwrapLog(logs, event, rC.rpcManager.Evm(param.ChainId).BridgeAddress()); !ok {
+						rC.logger.Debugf("Matching unwrap log not found for tx %s and log index %d", param.TransactionHash.String(), param.LogIndex)
 					} else {
-						log := logs[logIndexToCheck]
 						if strings.ToLower(log.Address.String()) != strings.ToLower(rC.rpcManager.Evm(param.ChainId).BridgeAddress().String()) {
 							rC.logger.Debugf("Address that generated this log %s is different than contract address %s",
 								strings.ToLower(log.Address.String()), strings.ToLower(rC.rpcManager.Evm(param.ChainId).BridgeAddress().String()))
