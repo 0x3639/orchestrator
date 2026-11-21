@@ -9,6 +9,7 @@ import (
 	"os"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 
@@ -68,8 +69,13 @@ func stableLookup(i uint32) (*definition.UnwrapTokenRequest, error) {
 
 func newSigner(t *testing.T) reconciliationChain {
 	t.Helper()
+	return signerWithEvents(t, candidates(6))
+}
+
+func signerWithEvents(t *testing.T, requests []*events.UnwrapRequestEvm) reconciliationChain {
+	t.Helper()
 	c := reconciliationChain{lookup: stableLookup, EvmStorage: unwrap.NewEvmStorage(zdb.NewMemDB(), nil, 0)}
-	for _, r := range candidates(6) {
+	for _, r := range requests {
 		if err := c.AddUnwrapRequest(*r); err != nil {
 			t.Fatal(err)
 		}
@@ -127,13 +133,10 @@ func (c reconciliationChain) SetUnwrapRequestStatus(hash ecommon.Hash, i, status
 	return c.EvmStorage.SetUnwrapRequestStatus(hash, i, status)
 }
 
-// Exercise the dev node through its SDK client and network manager. Supply only
-// the provider responses and storage, leaving reconciliation in the node.
-func (c reconciliationChain) reconcile(t *testing.T, requests []*events.UnwrapRequestEvm, slots int) ([]*events.UnwrapRequestEvm, bool, error) {
+func (c reconciliationChain) openNetworks(t *testing.T) (*network.NetworksManager, func()) {
 	t.Helper()
 	t.Setenv("HOME", t.TempDir()) // isolate the EVM network's disk queue
 	srv := server.NewServer()
-	defer srv.Stop()
 	if err := srv.RegisterName("embedded.bridge", fixtureBridge{c.lookup}); err != nil {
 		t.Fatal(err)
 	}
@@ -141,7 +144,8 @@ func (c reconciliationChain) reconcile(t *testing.T, requests []*events.UnwrapRe
 		t.Fatal(err)
 	}
 	endpoint := httptest.NewServer(srv)
-	defer endpoint.Close()
+	closeEndpoint := sync.OnceFunc(func() { endpoint.Close(); srv.Stop() })
+	t.Cleanup(closeEndpoint)
 	stop := make(chan os.Signal, 1)
 	manager, err := network.NewNetworksManager(stop)
 	if err != nil {
@@ -158,8 +162,19 @@ func (c reconciliationChain) reconcile(t *testing.T, requests []*events.UnwrapRe
 	if err := manager.RpcManager().AddEvmClient(cfg, 1, "fixture", ecommon.Address{}); err != nil {
 		t.Fatal(err)
 	}
-	defer net.Stop()
+
 	manager.AddEvmNetwork(net)
+	closeNetworks := sync.OnceFunc(func() { net.Stop(); closeEndpoint() })
+	t.Cleanup(closeNetworks)
+	return manager, closeNetworks
+}
+
+// Exercise the dev node through its SDK client and network manager. Supply only
+// the provider responses and storage, leaving reconciliation in the node.
+func (c reconciliationChain) reconcile(t *testing.T, requests []*events.UnwrapRequestEvm, slots int) ([]*events.UnwrapRequestEvm, bool, error) {
+	t.Helper()
+	manager, closeNetworks := c.openNetworks(t)
+	defer closeNetworks()
 	previous := common.SignCeremonyPoolSize
 	common.SignCeremonyPoolSize = slots
 	defer func() { common.SignCeremonyPoolSize = previous }()
