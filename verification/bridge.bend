@@ -53,6 +53,13 @@ type Pool is Type:
   PoolIncomplete{}
   PoolAborted{}
 
+# Each nonempty scan must observe the same bridge account block at both ends.
+# Failure to establish that view discards the entire decision.
+def checked_pool(same_frontier: Bool, pool: Pool) -> Pool:
+  match same_frontier:
+    case False{}: PoolAborted{}
+    case True{}: pool
+
 def include(id: Nat, result: Pool) -> Pool:
   match result:
     case PoolReady{ids}: PoolReady{id <> ids}

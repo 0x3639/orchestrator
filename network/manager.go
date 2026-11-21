@@ -225,6 +225,10 @@ func (m *NetworksManager) GetTssNonceZnn() (uint64, error) {
 	return bridgeInfo.TssNonce, nil
 }
 
+func (m *NetworksManager) GetBridgeFrontierHash() (types.Hash, error) {
+	return m.Znn().ZnnRpc().GetBridgeFrontierHash()
+}
+
 func (m *NetworksManager) GetEvmUnwrapRequestByHashAndLogFromRPC(txHash types.Hash, logIndex uint32) (*definition.UnwrapTokenRequest, error) {
 	return m.Znn().GetUnwrapTokenRequestByHashAndLog(txHash, logIndex)
 }

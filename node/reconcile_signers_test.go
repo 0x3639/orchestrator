@@ -129,37 +129,40 @@ func inReplyOrder(t *testing.T, order [4]uint32, lookup signerLookup) signerLook
 }
 
 func TestReconcileSignerReplyOrdersAndFailureRecovery(t *testing.T) {
-	for a := uint32(0); a < 4; a++ {
-		for b := uint32(0); b < 4; b++ {
-			for c := uint32(0); c < 4; c++ {
-				if a == b || a == c || b == c {
-					continue
-				}
-				order := [4]uint32{a, b, c, 6 - a - b - c}
-				for failure := -1; failure < 4; failure++ {
-					t.Run(fmt.Sprintf("%v/failure=%d", order, failure), func(t *testing.T) {
-						chain := newSigner(t)
-						unavailable := errors.New("provider unavailable")
-						chain.lookup = inReplyOrder(t, order, func(i uint32) (*definition.UnwrapTokenRequest, error) {
-							if int(i) == failure {
-								return nil, unavailable
-							}
-							return stableLookup(i)
-						})
-						ids, ready, err := chain.pool(t)
-						if failure >= 0 {
-							if !errors.Is(err, unavailable) || ready || len(ids) != 0 {
-								t.Errorf("failed pass: pool=%v ready=%v err=%v", ids, ready, err)
-							}
-						} else if err != nil || !ready || !slices.Equal(ids, []uint32{1, 3, 4, 5}) {
-							t.Errorf("pool=%v ready=%v err=%v, want [1 3 4 5]", ids, ready, err)
-						}
-						chain.checkRecovery(t)
-					})
-				}
+	order := [4]uint32{0, 1, 2, 3}
+	var permute func(int)
+	permute = func(n int) {
+		if n < len(order) {
+			for i := n; i < len(order); i++ {
+				order[n], order[i] = order[i], order[n]
+				permute(n + 1)
+				order[n], order[i] = order[i], order[n]
 			}
+			return
+		}
+		for failure := -1; failure < len(order); failure++ {
+			t.Run(fmt.Sprintf("%v/failure=%d", order, failure), func(t *testing.T) {
+				chain := newSigner(t)
+				unavailable := errors.New("provider unavailable")
+				chain.lookup = inReplyOrder(t, order, func(i uint32) (*definition.UnwrapTokenRequest, error) {
+					if int(i) == failure {
+						return nil, unavailable
+					}
+					return stableLookup(i)
+				})
+				ids, ready, err := chain.pool(t)
+				if failure >= 0 {
+					if !errors.Is(err, unavailable) || ready || len(ids) != 0 {
+						t.Errorf("failed pass: pool=%v ready=%v err=%v", ids, ready, err)
+					}
+				} else if err != nil || !ready || !slices.Equal(ids, []uint32{1, 3, 4, 5}) {
+					t.Errorf("pool=%v ready=%v err=%v, want [1 3 4 5]", ids, ready, err)
+				}
+				chain.checkRecovery(t)
+			})
 		}
 	}
+	permute(0)
 }
 
 // Serve the pinned SDK over an in-process JSON-RPC connection so its actual
@@ -175,12 +178,13 @@ type invalidParams struct{}
 func (invalidParams) ErrorCode() int { return -32602 }
 func (invalidParams) Error() string  { return constants.ErrDataNonExistent.Error() }
 
-func TestReconcileInconclusiveRPCReplies(t *testing.T) {
+func TestReconcileRPCReplies(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
 		index uint32
 		reply signerLookup
 	}{
+		{"canonical replies", 0, nil},
 		{"null result", 1, func(uint32) (*definition.UnwrapTokenRequest, error) { return nil, nil }},
 		{"another transaction", 1, func(i uint32) (*definition.UnwrapTokenRequest, error) {
 			r := registeredLog(i)
@@ -204,7 +208,7 @@ func TestReconcileInconclusiveRPCReplies(t *testing.T) {
 			srv := server.NewServer()
 			defer srv.Stop()
 			if err := srv.RegisterName("embedded.bridge", unwrapRPCFixture{func(i uint32) (*definition.UnwrapTokenRequest, error) {
-				if i == tc.index {
+				if i == tc.index && tc.reply != nil {
 					return tc.reply(i)
 				}
 				return stableLookup(i)
@@ -219,7 +223,11 @@ func TestReconcileInconclusiveRPCReplies(t *testing.T) {
 				return bridge.GetUnwrapTokenRequestByHashAndLog(types.Hash(signerTestTx), i)
 			}
 			ids, ready, err := chain.pool(t)
-			if err == nil || ready || len(ids) != 0 {
+			if tc.reply == nil {
+				if err != nil || !ready || !slices.Equal(ids, []uint32{1, 3, 4, 5}) {
+					t.Errorf("canonical RPC replies: pool=%v ready=%v err=%v", ids, ready, err)
+				}
+			} else if err == nil || ready || len(ids) != 0 {
 				t.Errorf("inconclusive reply yielded pool=%v ready=%v err=%v", ids, ready, err)
 			}
 			chain.checkRecovery(t)

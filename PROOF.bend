@@ -46,6 +46,12 @@ def Laws.refreshed_block_survives_backfill(signed, unredeemed):
 def Laws.stale_unsigned_record_can_be_removed():
   {==}
 
+def Laws.unverified_bridge_view_aborts(pool):
+  {==}
+
+def Laws.stable_bridge_view_preserves_pool(pool):
+  {==}
+
 def Laws.full_pool_ignores_tail(tail, budget):
   {==}
 

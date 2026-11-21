@@ -55,6 +55,14 @@ law stale_unsigned_record_can_be_removed:
 
 # Signing consumes a bounded prefix. These laws quantify over every possible
 # remaining sequence of Zenon answers, including transport and storage errors.
+law unverified_bridge_view_aborts:
+  for pool: Bridge.Pool
+  {Bridge.checked_pool(False{}, pool) == Bridge.PoolAborted{} : Bridge.Pool}
+
+law stable_bridge_view_preserves_pool:
+  for pool: Bridge.Pool
+  {Bridge.checked_pool(True{}, pool) == pool : Bridge.Pool}
+
 law full_pool_ignores_tail:
   for tail: List<Bridge.Lookup>
   for budget: Nat

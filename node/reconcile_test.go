@@ -22,6 +22,8 @@ type reconciliationChain struct {
 	write  func(uint32, uint32) error
 }
 
+func (reconciliationChain) GetBridgeFrontierHash() (types.Hash, error) { return types.Hash{1}, nil }
+
 func (c reconciliationChain) GetEvmUnwrapRequestByHashAndLogFromRPC(_ types.Hash, index uint32) (*definition.UnwrapTokenRequest, error) {
 	return c.lookup(index)
 }
@@ -64,15 +66,13 @@ func TestReconcileBoundsReadsAndAppliesResultsInStorageOrder(t *testing.T) {
 			}
 			switch i {
 			case 0:
-				return &definition.UnwrapTokenRequest{Revoked: 1, Redeemed: 1}, nil
+				return &definition.UnwrapTokenRequest{LogIndex: i, Revoked: 1, Redeemed: 1}, nil
 			case 2:
-				return &definition.UnwrapTokenRequest{Redeemed: 1}, nil
-			case 3:
-				return nil, errors.New(constants.ErrDataNonExistent.Error())
+				return &definition.UnwrapTokenRequest{LogIndex: i, Redeemed: 1}, nil
 			case 4:
-				return &definition.UnwrapTokenRequest{}, nil
+				return &definition.UnwrapTokenRequest{LogIndex: i}, nil
 			}
-			return nil, nil
+			return nil, constants.ErrDataNonExistent
 		},
 		write: func(i, status uint32) error {
 			writes = append(writes, statusWrite{i, status})
@@ -126,7 +126,7 @@ func BenchmarkReconcileMissing(b *testing.B) {
 	logger := zap.NewNop().Sugar()
 	chain := reconciliationChain{lookup: func(uint32) (*definition.UnwrapTokenRequest, error) {
 		time.Sleep(2 * time.Millisecond)
-		return nil, nil
+		return nil, constants.ErrDataNonExistent
 	}}
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
@@ -165,9 +165,9 @@ func TestReconcileStoppingPoints(t *testing.T) {
 						return nil, providerErr
 					}
 					if int(i) < tc.known {
-						return &definition.UnwrapTokenRequest{}, nil
+						return &definition.UnwrapTokenRequest{LogIndex: i}, nil
 					}
-					return nil, nil
+					return nil, constants.ErrDataNonExistent
 				},
 				write: func(i, status uint32) error {
 					writes = append(writes, i)

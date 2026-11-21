@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/zenon-network/go-zenon/common/types"
+	"github.com/zenon-network/go-zenon/vm/constants"
 	"github.com/zenon-network/go-zenon/vm/embedded/definition"
 	"go.uber.org/zap"
 
@@ -23,11 +25,11 @@ func TestReconcileAgreesWithBend(t *testing.T) {
 			lookup: func(i uint32) (*definition.UnwrapTokenRequest, error) {
 				switch trace[i] {
 				case "Known":
-					return &definition.UnwrapTokenRequest{}, nil
+					return &definition.UnwrapTokenRequest{LogIndex: i}, nil
 				case "Failed":
 					return nil, errors.New("lookup failed")
 				}
-				return nil, nil
+				return nil, constants.ErrDataNonExistent
 			},
 			write: func(uint32, uint32) error { return nil },
 		}
@@ -72,5 +74,47 @@ func TestReconcileAgreesWithBend(t *testing.T) {
 	check(atBudget, 2)
 	check(append(atBudget, "Missing"), 2)
 
+	cases.Check(t)
+}
+
+// Exercise both frontier reads against the same six persisted logs. A failed
+// closing read must also discard the known statuses staged by earlier batches.
+func TestReconcileBridgeViewAgreesWithBend(t *testing.T) {
+	var cases verification.Comparisons
+	for _, scenario := range []string{"stable", "changed", "opening read failed", "closing read failed"} {
+		chain := newSigner(t)
+		reads := 0
+		chain.head = func() (types.Hash, error) {
+			reads++
+			switch {
+			case reads == 1 && scenario == "opening read failed", reads == 2 && scenario == "closing read failed":
+				return types.ZeroHash, errors.New("frontier unavailable")
+			case reads == 2 && scenario == "changed":
+				return types.Hash{2}, nil
+			default:
+				return types.Hash{1}, nil
+			}
+		}
+		ids, ready, err := chain.pool(t)
+		result := "B.PoolIncomplete{}"
+		if err != nil && !ready && len(ids) == 0 {
+			result = "B.PoolAborted{}"
+		} else if err == nil && ready {
+			var items []string
+			for _, id := range ids {
+				items = append(items, fmt.Sprintf("%dn", id))
+			}
+			result = "B.PoolReady{[" + strings.Join(items, ", ") + "]}"
+		}
+		same := scenario == "stable"
+		expr := fmt.Sprintf("B.checked_pool(%s, B.PoolReady{[1n, 3n, 4n, 5n]})", verification.Bool(same))
+		cases.Equal(expr, result, "B.Pool")
+		if !same {
+			unsigned, err := chain.GetUnsignedUnwrapRequests()
+			if err != nil || len(unsigned) != 6 {
+				t.Errorf("%s: %d unsigned logs after failed pass, err=%v", scenario, len(unsigned), err)
+			}
+		}
+	}
 	cases.Check(t)
 }

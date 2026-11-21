@@ -178,6 +178,19 @@ func (r *ZnnRpc) GetAllWrapTokenRequests(pageIndex, pageSize uint32) (*embedded.
 	return r.rpcClient.BridgeApi.GetAllWrapTokenRequests(pageIndex, pageSize)
 }
 
+// Bridge lookups read the frontier account store. Its block hash changes on
+// bridge updates, while unrelated momentums can advance throughout the scan.
+func (r *ZnnRpc) GetBridgeFrontierHash() (types.Hash, error) {
+	block, err := r.rpcClient.LedgerApi.GetFrontierAccountBlock(types.BridgeContract)
+	if err != nil {
+		return types.ZeroHash, err
+	}
+	if block == nil || block.Address != types.BridgeContract || block.Height == 0 || block.Hash.IsZero() {
+		return types.ZeroHash, errors.New("missing or invalid Zenon bridge frontier block")
+	}
+	return block.Hash, nil
+}
+
 func (r *ZnnRpc) GetAccountBlockByHash(hash types.Hash) (*api.AccountBlock, error) {
 	return r.rpcClient.LedgerApi.GetAccountBlockByHash(hash)
 }
