@@ -726,24 +726,17 @@ func (node *Node) processSignatures() {
 					node.logger.Debug(err.Error())
 				}
 			} else if node.tssManager.CanProcessSignatures() && bridgeInfo.CompressedTssECDSAPubKey == node.tssManager.GetPubKey() {
-				frontierMomentum, getFrErr := node.state.GetFrontierMomentum()
-				if getFrErr != nil {
-					node.logger.Debug(getFrErr)
+				currentCeremony, err := node.networksManager.Znn().CurrentCeremony()
+				if err != nil {
+					node.logger.Debug(err)
 					continue
 				}
-
-				window := node.networksManager.WindowSize()
-				if window == 0 {
-					node.logger.Error("cannot schedule a ceremony with a zero window")
-					continue
-				}
-				currentCeremony := common.CeremonyWindow{Number: frontierMomentum / window, Size: window}
 				state := currentCeremony.Number % 2
 				if !node.state.BeginCeremony(currentCeremony) {
 					continue
 				}
 				if state == common.WrapCeremonyState {
-					node.logger.Debugf("wrap ceremony %d (window size %d)", currentCeremony.Number, window)
+					node.logger.Debugf("wrap ceremony %d (window size %d)", currentCeremony.Number, currentCeremony.Size)
 					if err, ok := node.processSignaturesWrap(); err != nil {
 						node.logger.Debug(err)
 					} else if ok == false {
@@ -754,7 +747,7 @@ func (node *Node) processSignatures() {
 						}
 					}
 				} else if state == common.UnwrapCeremonyState {
-					node.logger.Debugf("unwrap ceremony %d (window size %d)", currentCeremony.Number, window)
+					node.logger.Debugf("unwrap ceremony %d (window size %d)", currentCeremony.Number, currentCeremony.Size)
 					if err, ok := node.processSignaturesUnwrap(currentCeremony.Number, currentCeremony.Size); err != nil {
 						node.logger.Debug(err)
 					} else if ok == false {
@@ -1184,14 +1177,23 @@ func (node *Node) processSignaturesUnwrap(number, size uint64) (error, bool) {
 	}
 	messagesToSign = messagesToSign[:right]
 	//node.logger.Debug("MessagesToSign: ", messagesToSign)
-	response, err := node.tssManager.SignUnwrapPool(common.CeremonyWindow{Number: number, Size: size}, messagesToSign, func() error {
-		height, err := node.state.GetFrontierMomentum()
+	ceremony := common.CeremonyWindow{Number: number, Size: size}
+	response, err := node.tssManager.SignUnwrapPool(ceremony, messagesToSign, func() error {
+		current, err := node.networksManager.Znn().CurrentCeremony()
 		if err != nil {
 			return err
 		}
-		window := node.networksManager.WindowSize()
-		if window == 0 || window != size || height/window != number {
+		if current != ceremony {
 			return errors.New("unwrap ceremony expired before signing")
+		}
+		// The listener can enter emergency mode during agreement or either RPC
+		// read. Check live state last, immediately before requesting signatures.
+		state, err := node.state.GetState()
+		if err != nil {
+			return err
+		}
+		if state != common.LiveState {
+			return errors.New("node is no longer live before unwrap signing")
 		}
 		return nil
 	})

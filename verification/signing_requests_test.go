@@ -31,6 +31,16 @@ func TestRestoredContractWindowPreservesVote(t *testing.T) {
 	runSigningTransportTest(t, "TestRestoredWindowAtSigningTransport")
 }
 
+func TestMissedResizeRecovery(t *testing.T) {
+	runSigningTransportTest(t, "TestSigningRecoversAfterMissedResize")
+}
+func TestEmergencyBeforeBridgeSigning(t *testing.T) {
+	runSigningTransportTest(t, "TestEmergencyAfterAgreementStopsBridgeSigning")
+}
+func TestCoherentSigningWindow(t *testing.T) {
+	runSigningTransportTest(t, "TestChangingFrontierCannotAdmitMixedWindow")
+}
+
 func runSigningTransportTest(t *testing.T, name string) {
 	t.Helper()
 	root, err := filepath.Abs("..")

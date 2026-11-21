@@ -14,6 +14,7 @@ import (
 	"testing"
 
 	ecommon "github.com/ethereum/go-ethereum/common"
+	"github.com/zenon-network/go-zenon/chain/nom"
 	zdb "github.com/zenon-network/go-zenon/common/db"
 	"github.com/zenon-network/go-zenon/common/types"
 	"github.com/zenon-network/go-zenon/rpc/api"
@@ -35,6 +36,7 @@ import (
 type signerLookup func(uint32) (*definition.UnwrapTokenRequest, error)
 
 type reconciliationChain struct {
+	ceremony   *fixtureCeremony
 	signingKey string
 	lookup     signerLookup
 	write      func(uint32, uint32) error
@@ -86,7 +88,24 @@ func signerWithEvents(t *testing.T, requests []*events.UnwrapRequestEvm) reconci
 }
 
 // Serve the same SDK calls as a Zenon endpoint. No peer or signing service is started.
+// The SDK endpoint and the asynchronous subscription cache can be advanced
+// independently, just as they can on a running signer.
+type fixtureCeremony struct {
+	mu           sync.Mutex
+	height, size uint64
+	fork         byte
+	infoErr      error
+	afterTip     func()
+}
+
+func (c *fixtureCeremony) set(height, size uint64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.height, c.size = height, size
+}
+
 type fixtureBridge struct {
+	ceremony   *fixtureCeremony
 	lookup     signerLookup
 	signingKey string
 }
@@ -97,8 +116,17 @@ func (b fixtureBridge) GetBridgeInfo() *definition.BridgeInfoVariable {
 func (b fixtureBridge) GetSecurityInfo() *definition.SecurityInfoVariable {
 	return &definition.SecurityInfoVariable{Guardians: make([]types.Address, constants.MinGuardians)}
 }
-func (b fixtureBridge) GetOrchestratorInfo() *definition.OrchestratorInfo {
-	return &definition.OrchestratorInfo{WindowSize: 10, KeyGenThreshold: 1, ConfirmationsToFinality: 1, EstimatedMomentumTime: 1}
+func (b fixtureBridge) GetOrchestratorInfo() (*definition.OrchestratorInfo, error) {
+	size := uint64(10)
+	if b.ceremony != nil {
+		b.ceremony.mu.Lock()
+		defer b.ceremony.mu.Unlock()
+		if b.ceremony.infoErr != nil {
+			return nil, b.ceremony.infoErr
+		}
+		size = b.ceremony.size
+	}
+	return &definition.OrchestratorInfo{WindowSize: size, KeyGenThreshold: 1, ConfirmationsToFinality: 1, EstimatedMomentumTime: 1}, nil
 }
 func (b fixtureBridge) GetAllUnsignedWrapTokenRequests(uint32, uint32) *embedded.WrapTokenRequestList {
 	return &embedded.WrapTokenRequestList{}
@@ -114,7 +142,22 @@ func (b fixtureBridge) GetUnwrapTokenRequestByHashAndLog(hash types.Hash, index 
 }
 
 type fixtureLedger struct {
+	ceremony *fixtureCeremony
 	frontier func() (*api.AccountBlockMarshal, error)
+}
+
+func (l fixtureLedger) GetFrontierMomentum() (*api.Momentum, error) {
+	c := l.ceremony
+	if c == nil {
+		return nil, errors.New("unexpected signing frontier query")
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	tip := &api.Momentum{Momentum: &nom.Momentum{Height: c.height, Hash: types.Hash{byte(c.height >> 8), byte(c.height), c.fork}}}
+	if c.afterTip != nil {
+		c.afterTip()
+	}
+	return tip, nil
 }
 
 func (l fixtureLedger) GetFrontierAccountBlock(address types.Address) (*api.AccountBlockMarshal, error) {
@@ -141,14 +184,14 @@ func (c reconciliationChain) SetUnwrapRequestStatus(hash ecommon.Hash, i, status
 	return c.EvmStorage.SetUnwrapRequestStatus(hash, i, status)
 }
 
-func (c reconciliationChain) openNetworks(t *testing.T) (*network.NetworksManager, func()) {
+func (c reconciliationChain) openNetworks(t *testing.T, state *common.GlobalState) (*network.NetworksManager, func()) {
 	t.Helper()
 	t.Setenv("HOME", t.TempDir()) // isolate the EVM network's disk queue
 	srv := server.NewServer()
-	if err := srv.RegisterName("embedded.bridge", fixtureBridge{lookup: c.lookup, signingKey: c.signingKey}); err != nil {
+	if err := srv.RegisterName("embedded.bridge", fixtureBridge{lookup: c.lookup, signingKey: c.signingKey, ceremony: c.ceremony}); err != nil {
 		t.Fatal(err)
 	}
-	if err := srv.RegisterName("ledger", fixtureLedger{c.head}); err != nil {
+	if err := srv.RegisterName("ledger", fixtureLedger{frontier: c.head, ceremony: c.ceremony}); err != nil {
 		t.Fatal(err)
 	}
 	endpoint := httptest.NewServer(srv)
@@ -167,7 +210,7 @@ func (c reconciliationChain) openNetworks(t *testing.T) (*network.NetworksManage
 			t.Fatal(err)
 		}
 	}
-	if err := manager.Init(map[string]config.BaseNetworkConfig{common.ZenonNetworkName: cfg, "fixture": cfg}, stores, nil, nil); err != nil {
+	if err := manager.Init(map[string]config.BaseNetworkConfig{common.ZenonNetworkName: cfg, "fixture": cfg}, stores, state, nil); err != nil {
 		t.Fatal(err)
 	}
 	net, err := network.NewEvmNetwork(&definition.NetworkInfo{NetworkClass: definition.EvmClass, Id: 1, Name: "fixture"}, fixtureStores{c}, manager.RpcManager(), nil, stop)
@@ -188,7 +231,7 @@ func (c reconciliationChain) openNetworks(t *testing.T) (*network.NetworksManage
 // the provider responses and storage, leaving reconciliation in the node.
 func (c reconciliationChain) reconcile(t *testing.T, requests []*events.UnwrapRequestEvm, slots int) ([]*events.UnwrapRequestEvm, bool, error) {
 	t.Helper()
-	manager, closeNetworks := c.openNetworks(t)
+	manager, closeNetworks := c.openNetworks(t, nil)
 	defer closeNetworks()
 	previous := common.SignCeremonyPoolSize
 	common.SignCeremonyPoolSize = slots

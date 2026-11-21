@@ -32,8 +32,14 @@ reconciliation. [Prototype tests and replay instructions](verification/testdata/
 
 Each signer requests a threshold certificate for the signing key, window size,
 ceremony number and exact ordered unwrap messages before requesting bridge
-signatures. Before requesting bridge signatures the signer rechecks the window
-size, its locally observed chain height, and the signing key.
+signatures. At scheduling time and again after agreement, the signer reads the
+current window size from the Zenon endpoint between two frontier reads. Both
+reads must identify the same momentum by height and hash. If the tip changes,
+the signer retries once. A failed settings read or a second tip change skips
+the attempt. The signer also rejects a tip behind its observed chain height.
+The next scheduling poll reads the settings again, so missing a
+resize notification does not require a restart. Immediately before requesting
+bridge signatures, the signer also rechecks live mode and the signing key.
 
 The bridge stores the current window size in momentums. Its administrator can
 set it to 100, then 50, then 100. After the third update, the contract returns

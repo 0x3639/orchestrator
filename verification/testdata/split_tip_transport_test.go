@@ -3,9 +3,12 @@ package node
 
 import (
 	"context"
+	"crypto/ecdsa"
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"math/big"
@@ -54,6 +57,7 @@ func TestRequestsAtSigningTransport(t *testing.T) {
 const testCeremony uint64 = 17
 
 type signingPeer struct {
+	chain      *fixtureCeremony
 	node       *Node
 	messages   []string
 	commitment string
@@ -71,6 +75,7 @@ func buildSigningPeer(t *testing.T, tip byte, key, activeBridgeKey string) *sign
 		event.To = types.ZeroAddress.String()
 	}
 	c := signerWithEvents(t, events)
+	c.ceremony = &fixtureCeremony{height: testCeremony * 10, size: 10}
 	c.signingKey = activeBridgeKey
 	c.head = func() (*api.AccountBlockMarshal, error) {
 		return frontierBlock(types.BridgeContract, types.Hash{tip}, uint64(10+tip)), nil
@@ -97,7 +102,8 @@ func buildSigningPeer(t *testing.T, tip byte, key, activeBridgeKey string) *sign
 		}
 		messages = append(messages, base64.StdEncoding.EncodeToString(msg))
 	}
-	networks, _ := c.openNetworks(t)
+	state := common.NewGlobalState(new(uint8))
+	networks, _ := c.openNetworks(t, state)
 	_, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		t.Fatal(err)
@@ -107,11 +113,11 @@ func buildSigningPeer(t *testing.T, tip byte, key, activeBridgeKey string) *sign
 		t.Fatal(err)
 	}
 	t.Cleanup(manager.Stop)
-	state := common.NewGlobalState(new(uint8))
 	if err := state.SetFrontierMomentum(testCeremony * networks.WindowSize()); err != nil {
 		t.Fatal(err)
 	}
 	return &signingPeer{
+		chain:    c.ceremony,
 		node:     &Node{networksManager: networks, tssManager: manager, state: state, logger: zap.NewNop().Sugar()},
 		messages: messages,
 	}
@@ -291,6 +297,7 @@ func newWindowTransport(t *testing.T) *windowTransport {
 
 func (p *signingPeer) attempt(t *testing.T, height, size uint64) error {
 	t.Helper()
+	p.chain.set(height, size)
 	p.node.networksManager.Znn().SetWindowSize(size)
 	if err := p.node.state.SetFrontierMomentum(height); err != nil {
 		t.Fatal(err)
@@ -316,7 +323,7 @@ func TestWindowResizeAtSigningTransport(t *testing.T) {
 
 	// An already-issued certificate must also expire when governance resizes
 	// the window while the round number stays 17 at the observed height.
-	f.onAgreement = func() { f.later.node.networksManager.Znn().SetWindowSize(201) }
+	f.onAgreement = func() { f.later.chain.set(3502, 201); f.later.node.networksManager.Znn().SetWindowSize(201) }
 	if err := f.later.attempt(t, 3502, 200); err == nil || len(f.commitments) != 3 || f.bridgeCalls != 2 {
 		t.Fatalf("round changed during agreement: err=%v, agreements=%d, bridge requests=%d", err, len(f.commitments), f.bridgeCalls)
 	}
@@ -388,36 +395,19 @@ func TestRestoredWindowAtSigningTransport(t *testing.T) {
 	}
 }
 
-// The isolated overlay test runs the production polling loop. Only the chain
-// and signing transport are fixtures. Never invoke the unwrap retry directly.
-func TestLiveLoopRetriesExpiredUnwrap(t *testing.T) {
-	key, err := crypto.GenerateKey()
-	if err != nil {
-		t.Fatal(err)
-	}
-	pub := base64.StdEncoding.EncodeToString(crypto.CompressPubkey(&key.PublicKey))
-	p := buildSigningPeer(t, 1, pub, pub)
-	p.node.networksManager.Znn().SetWindowSize(100)
-	if err := p.node.state.SetFrontierMomentum(1799); err != nil {
-		t.Fatal(err)
-	}
-
-	var agreements []string
-	var bridgeBatch []string
-	var observedHeight uint64
+// Observe the first bridge request from the polling loop in its isolated test
+// process. A real certificate from the fixture key is required to reach it.
+func observeLiveUnwrap(t *testing.T, p *signingPeer, key *ecdsa.PrivateKey, onFirstAgreement func()) []string {
+	t.Helper()
+	var agreements, batch []string
 	signtransport.Receive = func(_ string, r keysign.Request) (keysign.Response, error) {
 		if len(r.Messages) != 1 {
-			bridgeBatch = slices.Clone(r.Messages)
-			observedHeight, err = p.node.state.GetFrontierMomentum()
-			// This request is the observation point. End the process-lifetime
-			// signing loop here, before tearing down its RPC and storage.
+			batch = slices.Clone(r.Messages)
 			runtime.Goexit()
 		}
 		agreements = append(agreements, r.Messages[0])
-		if len(agreements) == 1 {
-			if err := p.node.state.SetFrontierMomentum(1800); err != nil {
-				return keysign.Response{}, err
-			}
+		if len(agreements) == 1 && onFirstAgreement != nil {
+			onFirstAgreement()
 		}
 		digest, err := base64.StdEncoding.DecodeString(r.Messages[0])
 		if err != nil {
@@ -430,17 +420,179 @@ func TestLiveLoopRetriesExpiredUnwrap(t *testing.T) {
 		return keysign.Response{Status: tcommon.Success, Signatures: []keysign.Signature{{Msg: r.Messages[0], Signature: base64.StdEncoding.EncodeToString(sig[:64])}}}, nil
 	}
 	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		p.node.processSignatures()
-	}()
+	go func() { defer close(done); p.node.processSignatures() }()
 	select {
 	case <-done:
 		signtransport.Receive = nil
 	case <-time.After(55 * time.Second):
-		t.Fatal("live scheduler never requested bridge signatures in the next window")
+		t.Fatal("live scheduler never requested bridge signatures")
 	}
-	if err != nil || observedHeight != 1800 || len(agreements) != 2 || agreements[0] == agreements[1] || !slices.Equal(bridgeBatch, p.messages) {
-		t.Fatalf("expected fresh agreement and original batch at height 1800, got height=%d agreements=%v batch=%v err=%v", observedHeight, agreements, bridgeBatch, err)
+	if !slices.Equal(batch, p.messages) {
+		t.Fatalf("unexpected bridge batch: %v", batch)
+	}
+	return agreements
+}
+
+func newLiveSigningPeer(t *testing.T) (*signingPeer, *ecdsa.PrivateKey) {
+	t.Helper()
+	key, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	pub := base64.StdEncoding.EncodeToString(crypto.CompressPubkey(&key.PublicKey))
+	return buildSigningPeer(t, 1, pub, pub), key
+}
+
+func TestLiveLoopRetriesExpiredUnwrap(t *testing.T) {
+	p, key := newLiveSigningPeer(t)
+	p.chain.set(1799, 100)
+	p.node.networksManager.Znn().SetWindowSize(100)
+	if err := p.node.state.SetFrontierMomentum(1799); err != nil {
+		t.Fatal(err)
+	}
+	agreements := observeLiveUnwrap(t, p, key, func() {
+		p.chain.set(1800, 100)
+		if err := p.node.state.SetFrontierMomentum(1800); err != nil {
+			t.Error(err)
+		}
+	})
+	height, err := p.node.state.GetFrontierMomentum()
+	if err != nil || height != 1800 || len(agreements) != 2 || agreements[0] == agreements[1] {
+		t.Fatalf("expected fresh agreement at height 1800, got height=%d agreements=%v err=%v", height, agreements, err)
+	}
+}
+
+func TestEmergencyAfterAgreementStopsBridgeSigning(t *testing.T) {
+	f := newWindowTransport(t)
+	f.onAgreement = func() {
+		if err := f.first.node.state.SetState(common.EmergencyState); err != nil {
+			t.Fatal(err)
+		}
+	}
+	err := f.first.attempt(t, 1750, 100)
+	if err == nil || len(f.commitments) != 1 || f.bridgeCalls != 0 {
+		t.Fatalf("emergency during agreement: agreements=%d bridge requests=%d err=%v", len(f.commitments), f.bridgeCalls, err)
+	}
+	// The state can also change while the signer is fetching its final
+	// window snapshot. A state check made before that read is too early.
+	if err := f.first.node.state.SetState(common.LiveState); err != nil {
+		t.Fatal(err)
+	}
+	f.onAgreement = func() {
+		chain := f.first.chain
+		chain.mu.Lock()
+		defer chain.mu.Unlock()
+		chain.afterTip = func() {
+			chain.afterTip = nil
+			if err := f.first.node.state.SetState(common.EmergencyState); err != nil {
+				t.Error(err)
+			}
+		}
+	}
+	if err := f.first.attempt(t, 1751, 100); err == nil || f.bridgeCalls != 0 {
+		t.Fatalf("emergency during final chain read: bridge requests=%d err=%v", f.bridgeCalls, err)
+	}
+	f.onAgreement = nil
+	if err := f.first.node.state.SetState(common.LiveState); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.first.attempt(t, 1751, 100); err != nil || f.bridgeCalls != 1 {
+		t.Fatalf("live signer could not retry original pool: bridge requests=%d err=%v", f.bridgeCalls, err)
+	}
+}
+
+func TestChangingFrontierCannotAdmitMixedWindow(t *testing.T) {
+	f := newWindowTransport(t)
+	p := f.first
+	f.onAgreement = func() {
+		// While approval is in flight the real chain is at (1799, 50).
+		// A size notification can reach the local cache before the next
+		// height notification. During a fresh read, deliver the boundary
+		// immediately after the endpoint sampled the first frontier.
+		p.chain.mu.Lock()
+		defer p.chain.mu.Unlock()
+		p.chain.height, p.chain.size = 1799, 50
+		p.chain.afterTip = func() {
+			p.chain.height, p.chain.size = 1800, 100
+			p.chain.afterTip = nil
+		}
+	}
+	err := p.attempt(t, 1799, 100)
+	if err == nil || len(f.commitments) != 1 || f.bridgeCalls != 0 {
+		t.Fatalf("stale certificate for (17,100): agreements=%d bridge requests=%d err=%v", len(f.commitments), f.bridgeCalls, err)
+	}
+	f.onAgreement = nil
+	if err := p.attempt(t, 1800, 100); err != nil || f.bridgeCalls != 1 {
+		t.Fatalf("stable new interval did not sign: bridge requests=%d err=%v", f.bridgeCalls, err)
+	}
+	// A replacement at the same height is still a different tip. If the
+	// endpoint cannot supply one stable snapshot, keep the certificate gated.
+	f.onAgreement = func() {
+		p.chain.mu.Lock()
+		defer p.chain.mu.Unlock()
+		p.chain.afterTip = func() { p.chain.fork++ }
+	}
+	if err := p.attempt(t, 1801, 100); err == nil || f.bridgeCalls != 1 {
+		t.Fatalf("changing hashes at the same height: bridge requests=%d err=%v", f.bridgeCalls, err)
+	}
+	// Retain the original local expiry guard if the RPC itself lags behind
+	// an already observed subscription height.
+	f.onAgreement = func() {
+		p.chain.mu.Lock()
+		p.chain.afterTip = nil
+		p.chain.mu.Unlock()
+		if err := p.node.state.SetFrontierMomentum(1800); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := p.attempt(t, 1799, 100); err == nil || f.bridgeCalls != 1 {
+		t.Fatalf("lagging RPC revived an expired certificate: bridge requests=%d err=%v", f.bridgeCalls, err)
+	}
+}
+
+func TestSigningRecoversAfterMissedResize(t *testing.T) {
+	p, key := newLiveSigningPeer(t)
+	// Subscription height is current, but neither attempt to read the
+	// administrator's resize succeeded. The cache still contains size 100.
+	p.node.networksManager.Znn().SetWindowSize(100)
+	if err := p.node.state.SetFrontierMomentum(1760); err != nil {
+		t.Fatal(err)
+	}
+	p.chain.set(1760, 50)
+	p.chain.mu.Lock()
+	p.chain.infoErr = errors.New("settings endpoint unavailable")
+	p.chain.mu.Unlock()
+	data, err := definition.ABIBridge.PackMethod(definition.SetOrchestratorInfoMethodName, uint64(50), uint32(1), uint32(1), uint32(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	send := &api.AccountBlock{AccountBlock: nom.AccountBlock{Address: types.ZeroAddress, Data: data}}
+	for range 2 {
+		if err := p.node.networksManager.Znn().InterpretSendBlockData(send, true, 55); err == nil || !strings.Contains(err.Error(), "settings endpoint unavailable") {
+			t.Fatalf("did not exercise failed resize lookup: %v", err)
+		}
+	}
+	p.chain.mu.Lock()
+	p.chain.infoErr = nil
+	p.chain.mu.Unlock()
+	// Let the real scheduler select the window. Compare the *outgoing*
+	// commitment against the contract's size and height, independently of
+	// both the subscription cache and the scheduler's chosen round.
+	agreements := observeLiveUnwrap(t, p, key, nil)
+	h := sha256.New()
+	h.Write([]byte("zenon/orchestrator/unwrap-pool/v2\x00"))
+	h.Write(crypto.CompressPubkey(&key.PublicKey))
+	h.Write(binary.BigEndian.AppendUint64(nil, 50))
+	h.Write(binary.BigEndian.AppendUint64(nil, 35))
+	for _, msg := range p.messages {
+		raw, err := base64.StdEncoding.DecodeString(msg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		h.Write(raw)
+	}
+	want := base64.StdEncoding.EncodeToString(h.Sum(nil))
+	if !slices.Equal(agreements, []string{want}) || p.node.networksManager.WindowSize() != 50 {
+		t.Fatalf("after RPC recovery: cached size=%d commitments=%v, want size 50 and commitment %s for window 35", p.node.networksManager.WindowSize(), agreements, want)
 	}
 }

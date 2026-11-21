@@ -25,6 +25,7 @@ import (
 	"orchestrator/rpc"
 	"os"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -37,6 +38,7 @@ type networkEventStores interface {
 }
 
 type znnNetwork struct {
+	settingsMu sync.Mutex // serialize contract reads that update the cached window size
 	config.ZnnParams
 	dbManager         networkEventStores
 	rpcManager        *rpc.Manager
@@ -752,6 +754,8 @@ func (rC *znnNetwork) InterpretSendBlockData(sendBlock *api.AccountBlock, live b
 			break
 		}
 
+		rC.settingsMu.Lock()
+		defer rC.settingsMu.Unlock()
 		orchestratorInfo, err := rC.GetOrchestratorInfo()
 		if err != nil {
 			rC.logger.Error(err)
@@ -906,6 +910,53 @@ func (rC *znnNetwork) Halt(signature string, keyPair *wallet.KeyPair) error {
 }
 
 /// Rpc Calls
+
+// CurrentCeremony reads the authoritative size even if a resize notification
+// was missed. The settings RPC has no height argument. Bracket it with tip
+// identifiers from the same endpoint so height and size describe one observation.
+func (rC *znnNetwork) CurrentCeremony() (common.CeremonyWindow, error) {
+	rC.settingsMu.Lock()
+	defer rC.settingsMu.Unlock()
+	tip, err := rC.signingTip()
+	if err != nil {
+		return common.CeremonyWindow{}, err
+	}
+	for range 2 {
+		info, err := rC.GetOrchestratorInfo()
+		if err != nil {
+			return common.CeremonyWindow{}, err
+		}
+		next, err := rC.signingTip()
+		if err != nil {
+			return common.CeremonyWindow{}, err
+		}
+		if tip == next {
+			// A lagging RPC must not revive a window the signer already left.
+			observed, err := rC.state.GetFrontierMomentum()
+			if err != nil {
+				return common.CeremonyWindow{}, err
+			}
+			if tip.Height < observed {
+				return common.CeremonyWindow{}, errors.Errorf("signing frontier %d is behind observed height %d", tip.Height, observed)
+			}
+			rC.SetWindowSize(info.WindowSize)
+			return common.CeremonyWindow{Number: tip.Height / info.WindowSize, Size: info.WindowSize}, nil
+		}
+		tip = next
+	}
+	return common.CeremonyWindow{}, errors.New("frontier changed while reading the signing window")
+}
+
+func (rC *znnNetwork) signingTip() (types.HashHeight, error) {
+	m, err := rC.GetFrontierMomentum()
+	if err != nil {
+		return types.HashHeight{}, err
+	}
+	if m == nil || m.Momentum == nil || m.Height == 0 || m.Hash == types.ZeroHash {
+		return types.HashHeight{}, errors.New("invalid signing frontier")
+	}
+	return m.Identifier(), nil
+}
 
 func (rC *znnNetwork) GetFrontierMomentum() (*api.Momentum, error) {
 	return rC.ZnnRpc().GetFrontierMomentum()
