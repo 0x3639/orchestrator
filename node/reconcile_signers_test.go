@@ -59,6 +59,7 @@ func signerStore(t *testing.T) db.EvmStorage {
 
 type signerChain struct {
 	lookup signerLookup
+	agree  func([]*events.UnwrapRequestEvm) error
 	head   func() (types.Hash, error)
 	db.EvmStorage
 }
@@ -262,5 +263,84 @@ func TestReconcileBridgeAdvancesDuringParallelReads(t *testing.T) {
 			}
 			chain.checkRecovery(t)
 		})
+	}
+}
+
+// Peers 0 and 1 see the same stable bridge history. Peer 2 sees a different
+// stable tip where log 0 is absent. All three have identical local EVM logs.
+func TestSameCeremonyDifferentStableBridgeTips(t *testing.T) {
+	type vote struct {
+		pool  string
+		reply chan error
+	}
+	votes := make(chan vote, 3)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	go func() {
+		var ballot []vote
+		count := map[string]int{}
+		for len(ballot) < 3 {
+			select {
+			case v := <-votes:
+				ballot = append(ballot, v)
+				count[v.pool]++
+			case <-ctx.Done():
+				return
+			}
+		}
+		for _, v := range ballot {
+			if count[v.pool] < 2 {
+				v.reply <- errors.New("no quorum for this pool")
+			} else {
+				v.reply <- nil
+			}
+		}
+	}()
+	type proposal struct {
+		peer  int
+		pool  []uint32
+		ready bool
+		err   error
+	}
+	proposals := make(chan proposal, 3)
+	for peer := 0; peer < 3; peer++ {
+		chain := newSigner(t)
+		if peer == 2 {
+			chain.head = func() (types.Hash, error) { return types.Hash{2}, nil }
+			chain.lookup = func(index uint32) (*definition.UnwrapTokenRequest, error) {
+				if index == 0 {
+					return nil, constants.ErrDataNonExistent
+				}
+				return stableLookup(index)
+			}
+		}
+		chain.agree = func(pool []*events.UnwrapRequestEvm) error {
+			var ids []uint32
+			for _, r := range pool {
+				ids = append(ids, r.LogIndex)
+			}
+			reply := make(chan error, 1)
+			votes <- vote{fmt.Sprint(ids), reply}
+			select {
+			case err := <-reply:
+				return err
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+		go func() {
+			ids, ready, err := chain.pool(t)
+			proposals <- proposal{peer, ids, ready, err}
+		}()
+	}
+	for range 3 {
+		p := <-proposals
+		if p.peer == 2 {
+			if p.ready || len(p.pool) != 0 || p.err == nil {
+				t.Errorf("minority signer proposed %v ready=%v err=%v; majority pool is [1 3 4 5]", p.pool, p.ready, p.err)
+			}
+		} else if !p.ready || p.err != nil || !slices.Equal(p.pool, []uint32{1, 3, 4, 5}) {
+			t.Errorf("majority signer %d: pool=%v ready=%v err=%v", p.peer, p.pool, p.ready, p.err)
+		}
 	}
 }
