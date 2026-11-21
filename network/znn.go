@@ -1,6 +1,7 @@
 package network
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -25,6 +26,7 @@ import (
 	"orchestrator/rpc"
 	"os"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -37,6 +39,8 @@ type networkEventStores interface {
 }
 
 type znnNetwork struct {
+	settingsMu           sync.Mutex // serialize settings reads and signing height updates
+	highestSigningHeight uint64
 	config.ZnnParams
 	dbManager         networkEventStores
 	rpcManager        *rpc.Manager
@@ -200,6 +204,10 @@ func (rC *znnNetwork) Sync() error {
 
 // InterpretSendBlockData We assume that if the receive acc block was created then it was no error
 func (rC *znnNetwork) InterpretSendBlockData(sendBlock *api.AccountBlock, live bool, receiveBlockHeight uint64) error {
+	return rC.interpretSendBlockData(sendBlock, live, receiveBlockHeight, rC.refreshSettings)
+}
+
+func (rC *znnNetwork) interpretSendBlockData(sendBlock *api.AccountBlock, live bool, receiveBlockHeight uint64, refreshSettings func() error) error {
 	rC.logger.Debugf("InterpretSendBlockData, live: %v", live)
 	methodSig := base64.StdEncoding.EncodeToString(sendBlock.Data[0:4])
 	switch methodSig {
@@ -752,18 +760,9 @@ func (rC *znnNetwork) InterpretSendBlockData(sendBlock *api.AccountBlock, live b
 			break
 		}
 
-		orchestratorInfo, err := rC.GetOrchestratorInfo()
-		if err != nil {
-			rC.logger.Error(err)
+		if err := refreshSettings(); err != nil {
 			return err
 		}
-		rC.SetWindowSize(orchestratorInfo.WindowSize)
-		rC.SetKeyGenThreshold(orchestratorInfo.KeyGenThreshold)
-		rC.SetConfirmationsToFinality(orchestratorInfo.ConfirmationsToFinality)
-		rC.SetEstimatedMomentumTime(orchestratorInfo.EstimatedMomentumTime)
-
-		common.AdministratorLogger.Infof("SetOrchestratorInfoMethodName WindowSize: %d, KeyGenThreshold: %d, ConfirmationsToFinality: %d, EstimatedMomentumTime: %d",
-			orchestratorInfo.WindowSize, orchestratorInfo.KeyGenThreshold, orchestratorInfo.ConfirmationsToFinality, orchestratorInfo.EstimatedMomentumTime)
 	case base64.StdEncoding.EncodeToString(definition.ABIBridge.Methods[definition.SetBridgeMetadataMethodName].Id()):
 		if !live || sendBlock.Address.String() != rC.administrator {
 			break
@@ -813,8 +812,8 @@ func (rC *znnNetwork) ListenForMomentumHeight() {
 			if errSub != nil {
 				rC.logger.Debugf("listen mom err: %s", errSub.Error())
 				rC.stopChan <- syscall.SIGINT
-				return
 			}
+			return
 		case momentums := <-momChan:
 			for _, mom := range momentums {
 				if frMom, errState := rC.state.GetFrontierMomentum(); errState != nil {
@@ -833,6 +832,24 @@ func (rC *znnNetwork) ListenForMomentumHeight() {
 	}
 }
 
+func (rC *znnNetwork) refreshSettings() error {
+	rC.settingsMu.Lock()
+	defer rC.settingsMu.Unlock()
+	orchestratorInfo, err := rC.GetOrchestratorInfo()
+	if err != nil {
+		rC.logger.Error(err)
+		return err
+	}
+	rC.SetWindowSize(orchestratorInfo.WindowSize)
+	rC.SetKeyGenThreshold(orchestratorInfo.KeyGenThreshold)
+	rC.SetConfirmationsToFinality(orchestratorInfo.ConfirmationsToFinality)
+	rC.SetEstimatedMomentumTime(orchestratorInfo.EstimatedMomentumTime)
+
+	common.AdministratorLogger.Infof("SetOrchestratorInfoMethodName WindowSize: %d, KeyGenThreshold: %d, ConfirmationsToFinality: %d, EstimatedMomentumTime: %d",
+		orchestratorInfo.WindowSize, orchestratorInfo.KeyGenThreshold, orchestratorInfo.ConfirmationsToFinality, orchestratorInfo.EstimatedMomentumTime)
+	return nil
+}
+
 func (rC *znnNetwork) ListenForEmbeddedBridgeAccountBlocks() {
 	rC.logger.Debug("ListenForEmbeddedBridgeAccountBlocks")
 	accBlSub, accBlCh, err := rC.ZnnRpc().SubscribeToAccountBlocks(types.BridgeContract)
@@ -841,6 +858,39 @@ func (rC *znnNetwork) ListenForEmbeddedBridgeAccountBlocks() {
 		rC.stopChan <- syscall.SIGINT
 		return
 	}
+	// Refresh the current contract values off the listener. Multiple resize
+	// notifications need only one pending read. The listener still records
+	// each account-block height in order, including a halt following a resize.
+	pending := make(chan struct{}, 1)
+	done := make(chan struct{})
+	var worker sync.WaitGroup
+	worker.Add(1)
+	go func() {
+		defer worker.Done()
+		for {
+			select {
+			case <-done:
+				return
+			case <-pending:
+				if err := rC.refreshSettings(); err != nil {
+					select {
+					case <-done:
+						return
+					case <-time.After(3 * time.Second):
+					}
+					rC.refreshSettings() // logs a failed retry
+				}
+			}
+		}
+	}()
+	defer func() { close(done); worker.Wait() }()
+	requestRefresh := func() error {
+		select {
+		case pending <- struct{}{}:
+		default:
+		}
+		return nil
+	}
 	rC.logger.Debug("Successfully started to listen for account blocks")
 	for {
 		select {
@@ -848,8 +898,8 @@ func (rC *znnNetwork) ListenForEmbeddedBridgeAccountBlocks() {
 			if errSub != nil {
 				rC.logger.Debugf("listen accB err: %s", errSub.Error())
 				rC.stopChan <- syscall.SIGINT
-				return
 			}
+			return
 		case accBlocks := <-accBlCh:
 			// these accountBlocks are seen before being inserted in a momentum
 			for _, accBlock := range accBlocks {
@@ -877,11 +927,11 @@ func (rC *znnNetwork) ListenForEmbeddedBridgeAccountBlocks() {
 				} else {
 					rC.logger.Info("found send block")
 					rC.logger.Infof("confirmationDetail is nil: %v", sendBlock.ConfirmationDetail == nil)
-					if newErr := rC.InterpretSendBlockData(sendBlock, true, accBlock.Height); newErr != nil {
+					if newErr := rC.interpretSendBlockData(sendBlock, true, accBlock.Height, requestRefresh); newErr != nil {
 						rC.logger.Info(newErr)
 						// Try one more time
 						time.Sleep(3 * time.Second)
-						if newErr = rC.InterpretSendBlockData(sendBlock, true, accBlock.Height); newErr != nil {
+						if newErr = rC.interpretSendBlockData(sendBlock, true, accBlock.Height, requestRefresh); newErr != nil {
 							rC.logger.Info(newErr)
 						}
 					}
@@ -906,6 +956,57 @@ func (rC *znnNetwork) Halt(signature string, keyPair *wallet.KeyPair) error {
 }
 
 /// Rpc Calls
+
+// CurrentCeremony reads the authoritative size even if a resize notification
+// was missed. The settings RPC has no height argument. Bracket it with tip
+// identifiers from the same endpoint so height and size describe one observation.
+func (rC *znnNetwork) CurrentCeremony() (common.CeremonyWindow, error) {
+	rC.settingsMu.Lock()
+	defer rC.settingsMu.Unlock()
+	ctx, cancel := context.WithTimeout(context.Background(), rpc.ZnnSettingsTimeout)
+	defer cancel()
+	tip, err := rC.signingTip(ctx)
+	if err != nil {
+		return common.CeremonyWindow{}, err
+	}
+	for range 2 {
+		info, err := rC.ZnnRpc().GetOrchestratorInfoContext(ctx)
+		if err != nil {
+			return common.CeremonyWindow{}, err
+		}
+		next, err := rC.signingTip(ctx)
+		if err != nil {
+			return common.CeremonyWindow{}, err
+		}
+		if tip == next {
+			// A lagging RPC must not revive a window the signer already left.
+			observed, err := rC.state.GetFrontierMomentum()
+			if err != nil {
+				return common.CeremonyWindow{}, err
+			}
+			minHeight := max(observed, rC.highestSigningHeight)
+			if tip.Height < minHeight {
+				return common.CeremonyWindow{}, errors.Errorf("signing frontier %d is behind observed height %d", tip.Height, minHeight)
+			}
+			rC.highestSigningHeight = tip.Height
+			rC.SetWindowSize(info.WindowSize)
+			return common.CeremonyWindow{Number: tip.Height / info.WindowSize, Size: info.WindowSize}, nil
+		}
+		tip = next
+	}
+	return common.CeremonyWindow{}, errors.New("frontier changed while reading the signing window")
+}
+
+func (rC *znnNetwork) signingTip(ctx context.Context) (types.HashHeight, error) {
+	m, err := rC.ZnnRpc().GetFrontierMomentumContext(ctx)
+	if err != nil {
+		return types.HashHeight{}, err
+	}
+	if m == nil || m.Momentum == nil || m.Height == 0 || m.Hash == types.ZeroHash {
+		return types.HashHeight{}, errors.New("invalid signing frontier")
+	}
+	return m.Identifier(), nil
+}
 
 func (rC *znnNetwork) GetFrontierMomentum() (*api.Momentum, error) {
 	return rC.ZnnRpc().GetFrontierMomentum()

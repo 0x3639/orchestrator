@@ -1,11 +1,13 @@
 package rpc
 
 import (
+	"context"
 	"encoding/base64"
 	sdk_rpc_client "github.com/MoonBaZZe/znn-sdk-go/rpc_client"
 	"github.com/MoonBaZZe/znn-sdk-go/zenon"
 	ic "github.com/libp2p/go-libp2p-core/crypto"
 	"github.com/libp2p/go-libp2p-core/peer"
+	"time"
 
 	"github.com/pkg/errors"
 	"github.com/zenon-network/go-zenon/chain/nom"
@@ -24,9 +26,13 @@ import (
 	"orchestrator/common/events"
 )
 
+// ZnnSettingsTimeout bounds a settings refresh or an entire signing-window read.
+const ZnnSettingsTimeout = 10 * time.Second
+
 type ZnnRpc struct {
-	rpcClient *sdk_rpc_client.RpcClient
-	Urls      config.UrlsInfo
+	settingsClient *server.Client
+	rpcClient      *sdk_rpc_client.RpcClient
+	Urls           config.UrlsInfo
 
 	momentumsSub  *server.ClientSubscription
 	momentumsChan chan []subscribe.Momentum
@@ -41,9 +47,21 @@ func NewZnnRpcClient(networkConfig config.BaseNetworkConfig) (*ZnnRpc, error) {
 		return nil, err
 	}
 	var newZnnClient *sdk_rpc_client.RpcClient
+	var settingsClient *server.Client
 	currentUrl := newUrls.GetCurrentUrl()
 	for {
 		newZnnClient, err = sdk_rpc_client.NewRpcClient(currentUrl)
+		if err == nil {
+			// The SDK hides its transport and only exposes calls without a
+			// context. Reuse a second connection to this endpoint for reads
+			// that must be cancellable.
+			ctx, cancel := context.WithTimeout(context.Background(), ZnnSettingsTimeout)
+			settingsClient, err = server.DialContext(ctx, currentUrl)
+			cancel()
+			if err != nil {
+				newZnnClient.Stop()
+			}
+		}
 		if err != nil {
 			common.GlobalLogger.Infof("Error when dialing %s, got: %s\n", config.RedactURL(currentUrl), config.RedactErrorForURL(err, currentUrl))
 		} else {
@@ -57,19 +75,19 @@ func NewZnnRpcClient(networkConfig config.BaseNetworkConfig) (*ZnnRpc, error) {
 
 	newUrls.Clear()
 	return &ZnnRpc{
-		rpcClient: newZnnClient,
-		Urls:      *newUrls,
+		rpcClient:      newZnnClient,
+		settingsClient: settingsClient,
+		Urls:           *newUrls,
 	}, nil
 }
 
 /// Utils
 
 func (r *ZnnRpc) Stop() error {
-	close(r.momentumsChan)
-	close(r.accountBlocksChan)
 	if r.rpcClient == nil {
 		return errors.New("znn rpc client is nil")
 	}
+	r.settingsClient.Close()
 	r.rpcClient.Stop()
 	return nil
 }
@@ -148,14 +166,20 @@ func (r *ZnnRpc) GetSyncInfo() (*protocol.SyncInfo, error) {
 }
 
 func (r *ZnnRpc) GetOrchestratorInfo() (*definition.OrchestratorInfo, error) {
-	orchestratorInfo, err := r.rpcClient.BridgeApi.GetOrchestratorInfo()
-	if err != nil {
+	ctx, cancel := context.WithTimeout(context.Background(), ZnnSettingsTimeout)
+	defer cancel()
+	return r.GetOrchestratorInfoContext(ctx)
+}
+
+func (r *ZnnRpc) GetOrchestratorInfoContext(ctx context.Context) (*definition.OrchestratorInfo, error) {
+	var orchestratorInfo definition.OrchestratorInfo
+	if err := r.settingsClient.CallContext(ctx, &orchestratorInfo, "embedded.bridge.getOrchestratorInfo"); err != nil {
 		return nil, err
 	}
 	if orchestratorInfo.WindowSize == 0 || orchestratorInfo.KeyGenThreshold == 0 || orchestratorInfo.ConfirmationsToFinality == 0 || orchestratorInfo.EstimatedMomentumTime == 0 {
 		return nil, constants.ErrOrchestratorNotInitialized
 	}
-	return orchestratorInfo, nil
+	return &orchestratorInfo, nil
 }
 
 func (r *ZnnRpc) GetSecurityInfo() (*definition.SecurityInfoVariable, error) {
@@ -192,6 +216,14 @@ func (r *ZnnRpc) GetMomentumsByHeight(height, count uint64) (*api.MomentumList, 
 
 func (r *ZnnRpc) GetFrontierMomentum() (*api.Momentum, error) {
 	return r.rpcClient.LedgerApi.GetFrontierMomentum()
+}
+
+func (r *ZnnRpc) GetFrontierMomentumContext(ctx context.Context) (*api.Momentum, error) {
+	var tip *api.Momentum
+	if err := r.settingsClient.CallContext(ctx, &tip, "ledger.getFrontierMomentum"); err != nil {
+		return nil, err
+	}
+	return tip, nil
 }
 
 func (r *ZnnRpc) GetAllPillars() (*embedded.PillarInfoList, error) {

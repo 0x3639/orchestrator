@@ -13,14 +13,21 @@ import (
 	"github.com/libp2p/go-libp2p-peerstore/addr"
 	maddr "github.com/multiformats/go-multiaddr"
 	"github.com/pkg/errors"
+	"github.com/syndtr/goleveldb/leveldb"
 	"orchestrator/common"
 	"orchestrator/common/config"
 	"os"
+	"path/filepath"
+	"slices"
 	"sync"
 	"time"
 )
 
 type TssManager struct {
+	settingsMu        sync.RWMutex
+	voteMu            sync.Mutex
+	unwrapVotes       *leveldb.DB
+	keyShareDir       string
 	server            *tss.TssServer
 	port              int
 	privateKey        string
@@ -83,6 +90,10 @@ func NewTssManager(conf config.TssManagerConfig, privateKey string) (*TssManager
 
 	common.GlobalLogger.Infof("peerId: %s\n", id.String())
 
+	votes, err := leveldb.OpenFile(filepath.Join(conf.BaseDir, "unwrap-pool-votes"), nil)
+	if err != nil {
+		return nil, err
+	}
 	var server *tss.TssServer
 	var wg sync.WaitGroup
 	wg.Add(1)
@@ -100,17 +111,20 @@ func NewTssManager(conf config.TssManagerConfig, privateKey string) (*TssManager
 	}()
 	wg.Wait()
 	if err != nil {
+		votes.Close()
 		return nil, err
 	}
 
 	return &TssManager{
+		unwrapVotes:       votes,
+		keyShareDir:       conf.BaseDir,
 		port:              conf.Port,
 		server:            server,
 		privateKey:        privateKey,
 		publicKey:         conf.PublicKey,
 		peerPubKey:        peerPubKey,
 		peerId:            id,
-		localPubKeys:      conf.LocalPubKeys,
+		localPubKeys:      slices.Clone(conf.LocalPubKeys),
 		joinPartyVersion:  common.DefaultKeyGenVersion,
 		leaderBlockHeight: common.DefaultLeaderBlockHeight,
 	}, nil
@@ -123,9 +137,14 @@ func (m *TssManager) Start() error {
 
 func (m *TssManager) Stop() {
 	m.server.Stop()
+	m.unwrapVotes.Close()
 }
 
 func (m *TssManager) BulkSign(messagesBytes [][]byte, algo messages.Algo) (*keysign.Response, error) {
+	return m.bulkSignWithKey(m.GetPubKey(), messagesBytes, algo, m.GetLocalPubKeys(), m.GetJoinPartyVersion())
+}
+
+func (m *TssManager) bulkSignWithKey(key string, messagesBytes [][]byte, algo messages.Algo, signers []string, version string) (*keysign.Response, error) {
 	var keySignReq keysign.Request
 	messagesStr := make([]string, len(messagesBytes))
 	for idx, msg := range messagesBytes {
@@ -133,9 +152,9 @@ func (m *TssManager) BulkSign(messagesBytes [][]byte, algo messages.Algo) (*keys
 		common.GlobalLogger.Info("encoded msg:", messagesStr[idx])
 	}
 	common.GlobalLogger.Info("before sending sign request")
-	common.GlobalLogger.Info("PublicKey: ", m.publicKey)
+	common.GlobalLogger.Info("PublicKey: ", key)
 	if algo == messages.ECDSAKEYSIGN {
-		keySignReq = keysign.NewRequest(m.publicKey, messagesStr, m.GetLeaderBlockHeight(), m.localPubKeys, m.GetJoinPartyVersion(), "ecdsa")
+		keySignReq = keysign.NewRequest(key, messagesStr, m.GetLeaderBlockHeight(), slices.Clone(signers), version, "ecdsa")
 		resSign, err := m.server.KeySign(keySignReq)
 		return &resSign, err
 	} else {
@@ -168,7 +187,7 @@ func (m *TssManager) KeyGen(algo messages.Algo) (*keygen.Response, error) {
 
 	var req keygen.Request
 	if algo == messages.ECDSAKEYGEN {
-		req = keygen.NewRequest(m.localPubKeys, m.leaderBlockHeight, m.joinPartyVersion, algorithm)
+		req = keygen.NewRequest(m.GetLocalPubKeys(), m.GetLeaderBlockHeight(), m.GetJoinPartyVersion(), algorithm)
 		response, err := m.server.Keygen(req)
 		if err != nil {
 			return nil, err
@@ -197,22 +216,32 @@ func (m *TssManager) SetPreParamsTimeout(preParamsTimeout time.Duration) {
 }
 
 func (m *TssManager) SetJoinPartyVersion(version string) {
+	m.settingsMu.Lock()
+	defer m.settingsMu.Unlock()
 	m.joinPartyVersion = version
 }
 
 func (m *TssManager) GetJoinPartyVersion() string {
+	m.settingsMu.RLock()
+	defer m.settingsMu.RUnlock()
 	return m.joinPartyVersion
 }
 
 func (m *TssManager) SetLeaderBlockHeight(height int64) {
+	m.settingsMu.Lock()
+	defer m.settingsMu.Unlock()
 	m.leaderBlockHeight = height
 }
 
 func (m *TssManager) GetLeaderBlockHeight() int64 {
+	m.settingsMu.RLock()
+	defer m.settingsMu.RUnlock()
 	return m.leaderBlockHeight
 }
 
 func (m *TssManager) SetPubKey(pubKey string) {
+	m.settingsMu.Lock()
+	defer m.settingsMu.Unlock()
 	m.publicKey = pubKey
 }
 
@@ -221,6 +250,8 @@ func (m *TssManager) Config() tcommon.TssConfig {
 }
 
 func (m *TssManager) DeleteLocalPubKey(pubKey string) {
+	m.settingsMu.Lock()
+	defer m.settingsMu.Unlock()
 	for idx, localPubKey := range m.localPubKeys {
 		if localPubKey == pubKey {
 			m.localPubKeys = append(m.localPubKeys[:idx], m.localPubKeys[idx+1:]...)
@@ -237,22 +268,25 @@ func (m *TssManager) GetPeerPubKey() string {
 }
 
 func (m *TssManager) GetLocalPubKeys() []string {
-	return m.localPubKeys
+	m.settingsMu.RLock()
+	defer m.settingsMu.RUnlock()
+	return slices.Clone(m.localPubKeys)
 }
 
 func (m *TssManager) SetNewLocalPubKeys(newPubKeys []string) {
-	m.localPubKeys = make([]string, 0)
-	for _, pubKey := range newPubKeys {
-		m.localPubKeys = append(m.localPubKeys, pubKey)
-	}
+	m.settingsMu.Lock()
+	defer m.settingsMu.Unlock()
+	m.localPubKeys = slices.Clone(newPubKeys)
 }
 
 func (m *TssManager) GetPubKey() string {
+	m.settingsMu.RLock()
+	defer m.settingsMu.RUnlock()
 	return m.publicKey
 }
 
 func (m *TssManager) CanProcessSignatures() bool {
-	return m.publicKey != ""
+	return m.GetPubKey() != ""
 }
 
 func (m *TssManager) GetWhitelists() (map[string]bool, map[string]bool, map[string]bool) {
