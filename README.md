@@ -41,7 +41,9 @@ the signer retries once. A failed settings read or a second tip change skips
 the attempt. The chain queries for one signing window share a ten-second
 deadline. A live resize triggers a background settings refresh so the bridge
 listener can process a subsequent halt while the settings endpoint is silent.
-The signer also rejects a tip behind its observed chain height.
+The signer rejects a tip below either its subscription height or the highest
+height it has accepted for signing since startup. A window-size change at the
+same height still takes effect, even if it lowers the ceremony number.
 The next scheduling poll reads the settings again, so missing a
 resize notification does not require a restart. Immediately before requesting
 bridge signatures, the signer also rechecks live mode and the signing key.

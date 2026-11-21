@@ -39,7 +39,8 @@ type networkEventStores interface {
 }
 
 type znnNetwork struct {
-	settingsMu sync.Mutex // serialize contract reads that update the cached window size
+	settingsMu           sync.Mutex // serialize settings reads and signing height updates
+	highestSigningHeight uint64
 	config.ZnnParams
 	dbManager         networkEventStores
 	rpcManager        *rpc.Manager
@@ -983,9 +984,11 @@ func (rC *znnNetwork) CurrentCeremony() (common.CeremonyWindow, error) {
 			if err != nil {
 				return common.CeremonyWindow{}, err
 			}
-			if tip.Height < observed {
-				return common.CeremonyWindow{}, errors.Errorf("signing frontier %d is behind observed height %d", tip.Height, observed)
+			minHeight := max(observed, rC.highestSigningHeight)
+			if tip.Height < minHeight {
+				return common.CeremonyWindow{}, errors.Errorf("signing frontier %d is behind observed height %d", tip.Height, minHeight)
 			}
+			rC.highestSigningHeight = tip.Height
 			rC.SetWindowSize(info.WindowSize)
 			return common.CeremonyWindow{Number: tip.Height / info.WindowSize, Size: info.WindowSize}, nil
 		}
