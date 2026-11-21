@@ -732,7 +732,12 @@ func (node *Node) processSignatures() {
 					continue
 				}
 
-				currentCeremony := frontierMomentum / node.networksManager.WindowSize()
+				window := node.networksManager.WindowSize()
+				if window == 0 {
+					node.logger.Error("cannot schedule a ceremony with a zero window")
+					continue
+				}
+				currentCeremony := frontierMomentum / window
 				state := currentCeremony % 2
 				lastCeremony := node.state.GetLastCeremony()
 				if state == common.WrapCeremonyState && currentCeremony != lastCeremony {
@@ -743,14 +748,14 @@ func (node *Node) processSignatures() {
 					} else if ok == false {
 						node.logger.Debug("Nothing to sign, try unwrap")
 						// If we had nothing to sign we try the other direction
-						if err, _ := node.processSignaturesUnwrap(); err != nil {
+						if err, _ := node.processSignaturesUnwrap(currentCeremony); err != nil {
 							node.logger.Debug(err)
 						}
 					}
 				} else if state == common.UnwrapCeremonyState && currentCeremony != lastCeremony {
 					node.logger.Debugf("state unwrap - lastCeremony: %d", lastCeremony)
 					node.state.SetLastCeremony(currentCeremony)
-					if err, ok := node.processSignaturesUnwrap(); err != nil {
+					if err, ok := node.processSignaturesUnwrap(currentCeremony); err != nil {
 						node.logger.Debug(err)
 					} else if ok == false {
 						node.logger.Debug("Nothing to sign, try wrap")
@@ -1129,7 +1134,7 @@ func (node *Node) processSignaturesWrap() (error, bool) {
 
 // ok == true means that we had a signing ceremony or at least we tried
 // ok == false means that we had nothing to sign
-func (node *Node) processSignaturesUnwrap() (error, bool) {
+func (node *Node) processSignaturesUnwrap(ceremony uint64) (error, bool) {
 	// todo discuss what requests should the orchestrator sign in a ceremony
 	requests, err := node.networksManager.GetUnsignedUnwrapRequests()
 	if err != nil {
@@ -1179,7 +1184,17 @@ func (node *Node) processSignaturesUnwrap() (error, bool) {
 	}
 	messagesToSign = messagesToSign[:right]
 	//node.logger.Debug("MessagesToSign: ", messagesToSign)
-	response, err := node.signMessages(messagesToSign, msgsIndexes)
+	response, err := node.tssManager.SignUnwrapPool(ceremony, messagesToSign, func() error {
+		height, err := node.state.GetFrontierMomentum()
+		if err != nil {
+			return err
+		}
+		window := node.networksManager.WindowSize()
+		if window == 0 || height/window != ceremony {
+			return errors.New("unwrap ceremony expired before signing")
+		}
+		return nil
+	})
 	if err != nil {
 		return err, true
 	} else if response.Status != tcommon.Success {
@@ -1188,6 +1203,7 @@ func (node *Node) processSignaturesUnwrap() (error, bool) {
 		return nil, true
 	}
 
+	sortSignatures(response, msgsIndexes)
 	for idx, sig := range response.Signatures {
 		signature, err := base64.StdEncoding.DecodeString(sig.Signature)
 		if err != nil {
@@ -1597,10 +1613,14 @@ func (node *Node) signMessages(messagesToSign [][]byte, msgsIndexes map[string]i
 	}
 	elapsed := time.Since(start)
 	node.logger.Infof("bulkSign took %f", elapsed.Seconds())
+	sortSignatures(response, msgsIndexes)
+	return response, err
+}
+
+func sortSignatures(response *keysign.Response, msgsIndexes map[string]int) {
 	sort.Slice(response.Signatures, func(i, j int) bool {
 		return msgsIndexes[response.Signatures[i].Msg] < msgsIndexes[response.Signatures[j].Msg]
 	})
-	return response, err
 }
 
 func (node *Node) validateSignatures(response *keysign.Response, pubKey string, messagesToSign [][]byte) (string, [][]byte, error) {
