@@ -120,11 +120,11 @@ func (s fixtureStores) HasEvmStorage(id uint32) bool            { return id == 1
 func (s fixtureStores) AddEvmEventStore(uint32, string, uint64) {}
 func (s fixtureStores) ZnnStorage() db.ZnnStorage               { return nil }
 
-func (c reconciliationChain) SetUnwrapRequestStatus(hash ecommon.Hash, i, status uint32) error {
+func (c reconciliationChain) SetUnwrapRequestStatusIfCurrent(hash ecommon.Hash, i, expected, status uint32) error {
 	if c.write != nil {
 		return c.write(i, status)
 	}
-	return c.EvmStorage.SetUnwrapRequestStatus(hash, i, status)
+	return c.EvmStorage.SetUnwrapRequestStatusIfCurrent(hash, i, expected, status)
 }
 
 // Exercise the dev node through its SDK client and network manager. Supply only

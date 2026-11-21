@@ -642,11 +642,12 @@ func (m *NetworksManager) SetEvmUnwrapRequestAsSent(event *events.UnwrapRequestE
 	return nil
 }
 
-// SetEvmUnwrapRequestStatus updates only the redeem status of an existing record.
+// SetEvmUnwrapRequestStatus records a reconciliation result when the stored
+// status still matches the snapshot selected before the Zenon lookup.
 func (m *NetworksManager) SetEvmUnwrapRequestStatus(event *events.UnwrapRequestEvm, status uint32) error {
 	for _, network := range m.evmNetworks {
 		if network.ChainId() == event.ChainId {
-			if err := network.SetUnwrapRequestStatus(event.TransactionHash, event.LogIndex, status); err != nil {
+			if err := network.eventsStore().SetUnwrapRequestStatusIfCurrent(event.TransactionHash, event.LogIndex, event.RedeemStatus, status); err != nil {
 				return err
 			}
 		}
