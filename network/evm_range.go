@@ -1,6 +1,7 @@
 package network
 
 import (
+	"math"
 	"regexp"
 	"strconv"
 	"strings"
@@ -8,9 +9,8 @@ import (
 )
 
 const (
-	// minQueryRange is the smallest eth_getLogs window the sync will shrink
-	// to. Below this the provider is refusing something other than width.
-	minQueryRange uint64 = 8
+	// minQueryRange counts blocks, including both endpoints of the RPC range.
+	minQueryRange uint64 = 1
 	// growAfterRanges is how many consecutive successful ranges at a reduced
 	// width earn one attempt at doubling it back toward the configured size.
 	growAfterRanges = 50
@@ -57,7 +57,11 @@ func suggestedRange(err error) (uint64, bool) {
 	if err1 != nil || err2 != nil || to < from {
 		return 0, false
 	}
-	return to - from + 1, true
+	span := to - from
+	if span == math.MaxUint64 {
+		return 0, false
+	}
+	return span + 1, true
 }
 
 // isRangeLimitError reports whether an eth_getLogs error looks like the
@@ -107,27 +111,22 @@ func (a *queryRangeAdapter) size() uint64 {
 	return a.current
 }
 
-// shrink narrows the window after a rejection. With a hint from the
-// provider's message the window drops straight to that width (never below
-// one block); otherwise it halves, no lower than minQueryRange. It reports
-// the new size and whether anything changed.
-func (a *queryRangeAdapter) shrink(hint uint64) (uint64, bool) {
+// shrink narrows the window from the actual attempted width. A smaller
+// provider hint supplies the new size, otherwise the width is halved.
+// Every rejection breaks the growth streak, even at the one-block floor.
+func (a *queryRangeAdapter) shrink(attempted, hint uint64) (uint64, bool) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if hint > 0 && hint < a.current {
-		a.current = hint
-		a.successes = 0
-		return a.current, true
-	}
-	if a.current <= minQueryRange {
+	a.successes = 0
+	width := min(attempted, a.current)
+	if width <= minQueryRange {
 		return a.current, false
 	}
-	next := a.current / 2
-	if next < minQueryRange {
-		next = minQueryRange
+	if hint >= minQueryRange && hint < width {
+		a.current = hint
+	} else {
+		a.current = width / 2
 	}
-	a.current = next
-	a.successes = 0
 	return a.current, true
 }
 
@@ -145,10 +144,10 @@ func (a *queryRangeAdapter) noteSuccess() (uint64, bool) {
 		return a.current, false
 	}
 	a.successes = 0
-	next := a.current * 2
-	if next > a.configured {
-		next = a.configured
+	if a.current <= a.configured/2 {
+		a.current *= 2
+	} else {
+		a.current = a.configured
 	}
-	a.current = next
 	return a.current, true
 }

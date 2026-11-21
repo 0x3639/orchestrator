@@ -51,7 +51,7 @@ The cost of the cap in CU per second is `RpcRequestsPerSecond × CU per call`, s
 Tuning:
 
 - **Provider rejects on frequency**: lower `RpcRequestsPerSecond`.
-- **Provider rejects the window width or result size**: the sync narrows its `eth_getLogs` window automatically. When the provider's message names the width it accepts, as Alchemy's does, the window drops straight to it; otherwise it halves on each rejection down to 8 blocks. It widens again after 50 consecutive successes, and logs each change. `FilterQuerySize` is the ceiling it starts from.
+- **Provider rejects the window width or result size**: the sync narrows the attempted `eth_getLogs` window to the provider's hint when available. Otherwise it halves the attempted width down to one block. `FilterQuerySize` caps the number of blocks in each query, including both endpoints. The sync can widen the window after 50 consecutive successes. A width rejection resets that count.
 - **Provider times out**: lower `FilterQuerySize`. A range that always times out never completes.
 
 :::caution Free provider plans cannot do the initial scan
