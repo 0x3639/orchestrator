@@ -5,11 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"net/http/httptest"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
-	sdkbridge "github.com/MoonBaZZe/znn-sdk-go/api/embedded"
 	ecommon "github.com/ethereum/go-ethereum/common"
 	zdb "github.com/zenon-network/go-zenon/common/db"
 	"github.com/zenon-network/go-zenon/common/types"
@@ -18,9 +19,11 @@ import (
 	"github.com/zenon-network/go-zenon/vm/embedded/definition"
 	"go.uber.org/zap"
 
+	"orchestrator/common/config"
 	"orchestrator/common/events"
 	"orchestrator/db"
 	"orchestrator/db/unwrap"
+	"orchestrator/rpc"
 )
 
 var signerTestTx = ecommon.HexToHash("0xa1")
@@ -59,20 +62,24 @@ func signerStore(t *testing.T) db.EvmStorage {
 
 type signerChain struct {
 	lookup signerLookup
+	reader *rpc.UnwrapReader
 	agree  func([]*events.UnwrapRequestEvm) error
 	head   func() (types.Hash, error)
 	db.EvmStorage
 }
 
 func (c signerChain) GetBridgeFrontierHash() (types.Hash, error) { return c.head() }
-func (c signerChain) GetEvmUnwrapRequestByHashAndLogFromRPC(hash types.Hash, index uint32) (*definition.UnwrapTokenRequest, error) {
+func (c signerChain) LookupUnwrap(ctx context.Context, hash types.Hash, index uint32) (*definition.UnwrapTokenRequest, error) {
 	if hash != types.Hash(signerTestTx) {
 		return nil, fmt.Errorf("unexpected transaction %s", hash)
+	}
+	if c.reader != nil {
+		return c.reader.LookupUnwrap(ctx, hash, index)
 	}
 	return c.lookup(index)
 }
 func (c signerChain) SetEvmUnwrapRequestStatus(req *events.UnwrapRequestEvm, status uint32) error {
-	return c.SetUnwrapRequestStatus(req.TransactionHash, req.LogIndex, status)
+	return c.ReconcileUnwrapRequestStatus(req, status)
 }
 func (c signerChain) pool(t *testing.T) ([]uint32, bool, error) {
 	t.Helper()
@@ -80,7 +87,7 @@ func (c signerChain) pool(t *testing.T) ([]uint32, bool, error) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	pool, ready, err := reconcileUnsignedUnwrapRequests(c, zap.NewNop().Sugar(), unsigned, 4)
+	pool, ready, err := reconcileUnsignedUnwrapRequests(c, zap.NewNop().Sugar(), unsigned, 4, c.agree)
 	var ids []uint32
 	for _, req := range pool {
 		ids = append(ids, req.LogIndex)
@@ -89,11 +96,12 @@ func (c signerChain) pool(t *testing.T) ([]uint32, bool, error) {
 }
 
 func newSigner(t *testing.T) signerChain {
-	return signerChain{lookup: stableLookup, head: func() (types.Hash, error) { return types.Hash{1}, nil }, EvmStorage: signerStore(t)}
+	return signerChain{agree: approveTestPool, lookup: stableLookup, head: func() (types.Hash, error) { return types.Hash{1}, nil }, EvmStorage: signerStore(t)}
 }
 
 func (c signerChain) checkRecovery(t *testing.T) {
 	t.Helper()
+	c.reader = nil
 	c.lookup = stableLookup
 	ids, ready, err := c.pool(t)
 	if err != nil || !ready || !slices.Equal(ids, []uint32{1, 3, 4, 5}) {
@@ -166,8 +174,7 @@ func TestReconcileSignerReplyOrdersAndFailureRecovery(t *testing.T) {
 	permute(0)
 }
 
-// Serve the pinned SDK over an in-process JSON-RPC connection so its actual
-// null decoding and error codes reach the production reconciler.
+// Serve the production reader over JSON-RPC to exercise decoding and cancellation.
 type unwrapRPCFixture struct{ lookup signerLookup }
 
 func (f unwrapRPCFixture) GetUnwrapTokenRequestByHashAndLog(_ types.Hash, index uint32) (*definition.UnwrapTokenRequest, error) {
@@ -216,13 +223,8 @@ func TestReconcileRPCReplies(t *testing.T) {
 			}}); err != nil {
 				t.Fatal(err)
 			}
-			client := server.DialInProc(srv)
-			defer client.Close()
-			bridge := sdkbridge.NewBridgeApi(client)
 			chain := newSigner(t)
-			chain.lookup = func(i uint32) (*definition.UnwrapTokenRequest, error) {
-				return bridge.GetUnwrapTokenRequestByHashAndLog(types.Hash(signerTestTx), i)
-			}
+			chain.reader = unwrapTestReader(t, srv)
 			ids, ready, err := chain.pool(t)
 			if tc.reply == nil {
 				if err != nil || !ready || !slices.Equal(ids, []uint32{1, 3, 4, 5}) {
@@ -266,20 +268,26 @@ func TestReconcileBridgeAdvancesDuringParallelReads(t *testing.T) {
 	}
 }
 
-// Peers 0 and 1 see the same stable bridge history. Peer 2 sees a different
-// stable tip where log 0 is absent. All three have identical local EVM logs.
 func TestSameCeremonyDifferentStableBridgeTips(t *testing.T) {
+	for _, peers := range []int{2, 3} {
+		t.Run(fmt.Sprintf("%d signers", peers), func(t *testing.T) { checkStableTips(t, peers) })
+	}
+}
+
+// The last signer sees a stable tip where log 0 is absent. An even split
+// must abstain; with a third signer only the two matching peers can proceed.
+func checkStableTips(t *testing.T, peers int) {
 	type vote struct {
 		pool  string
 		reply chan error
 	}
-	votes := make(chan vote, 3)
+	votes := make(chan vote, peers)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	go func() {
 		var ballot []vote
 		count := map[string]int{}
-		for len(ballot) < 3 {
+		for len(ballot) < peers {
 			select {
 			case v := <-votes:
 				ballot = append(ballot, v)
@@ -302,10 +310,10 @@ func TestSameCeremonyDifferentStableBridgeTips(t *testing.T) {
 		ready bool
 		err   error
 	}
-	proposals := make(chan proposal, 3)
-	for peer := 0; peer < 3; peer++ {
+	proposals := make(chan proposal, peers)
+	for peer := 0; peer < peers; peer++ {
 		chain := newSigner(t)
-		if peer == 2 {
+		if peer == peers-1 {
 			chain.head = func() (types.Hash, error) { return types.Hash{2}, nil }
 			chain.lookup = func(index uint32) (*definition.UnwrapTokenRequest, error) {
 				if index == 0 {
@@ -333,14 +341,93 @@ func TestSameCeremonyDifferentStableBridgeTips(t *testing.T) {
 			proposals <- proposal{peer, ids, ready, err}
 		}()
 	}
-	for range 3 {
-		p := <-proposals
-		if p.peer == 2 {
+	for range peers {
+		var p proposal
+		select {
+		case p = <-proposals:
+		case <-ctx.Done():
+			t.Fatal("signers did not finish the ceremony")
+		}
+		if peers == 2 || p.peer == peers-1 {
 			if p.ready || len(p.pool) != 0 || p.err == nil {
-				t.Errorf("minority signer proposed %v ready=%v err=%v; majority pool is [1 3 4 5]", p.pool, p.ready, p.err)
+				t.Errorf("signer without a quorum proposed %v ready=%v err=%v", p.pool, p.ready, p.err)
 			}
 		} else if !p.ready || p.err != nil || !slices.Equal(p.pool, []uint32{1, 3, 4, 5}) {
 			t.Errorf("majority signer %d: pool=%v ready=%v err=%v", p.peer, p.pool, p.ready, p.err)
 		}
+	}
+}
+
+func unwrapTestReader(t *testing.T, srv *server.Server) *rpc.UnwrapReader {
+	t.Helper()
+	httpServer := httptest.NewServer(srv)
+	t.Cleanup(httpServer.Close)
+	client := rpc.ZnnRpc{Urls: config.UrlsInfo{Urls: []string{httpServer.URL}}}
+	reader, err := client.OpenUnwrapReader()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(reader.Close)
+	return reader
+}
+
+type stalledUnwrapRPC struct {
+	started, cancelled chan struct{}
+	stop               chan struct{}
+}
+
+func (p stalledUnwrapRPC) GetUnwrapTokenRequestByHashAndLog(ctx context.Context, _ types.Hash, index uint32) (*definition.UnwrapTokenRequest, error) {
+	switch index {
+	case 0:
+		select {
+		case <-p.started:
+			return nil, errors.New("first lookup failed")
+		case <-p.stop:
+			return nil, errors.New("test stopped")
+		}
+	case 1:
+		close(p.started)
+		select {
+		case <-ctx.Done():
+			close(p.cancelled)
+			return nil, ctx.Err()
+		case <-p.stop:
+			return nil, errors.New("test stopped")
+		}
+	default:
+		return stableLookup(index)
+	}
+}
+
+func TestOrderedFailureCancelsOutstandingRPC(t *testing.T) {
+	p := stalledUnwrapRPC{make(chan struct{}), make(chan struct{}), make(chan struct{})}
+	srv := server.NewServer()
+	t.Cleanup(srv.Stop)
+	if err := srv.RegisterName("embedded.bridge", p); err != nil {
+		t.Fatal(err)
+	}
+	chain := newSigner(t)
+	chain.reader = unwrapTestReader(t, srv)
+	defer close(p.stop)
+	done := make(chan error, 1)
+	go func() {
+		ids, ready, err := chain.pool(t)
+		if ready || len(ids) > 0 {
+			err = fmt.Errorf("unexpected pool %v", ids)
+		}
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), "first lookup failed") {
+			t.Fatalf("expected original ordered failure, got %v", err)
+		}
+	case <-time.After(4 * time.Second):
+		t.Fatal("earlier failure waited on stalled RPC")
+	}
+	select {
+	case <-p.cancelled:
+	case <-time.After(4 * time.Second):
+		t.Fatal("the HTTP lookup was not cancelled")
 	}
 }

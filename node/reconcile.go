@@ -1,9 +1,11 @@
 package node
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/zenon-network/go-zenon/common/types"
 	"github.com/zenon-network/go-zenon/rpc/server"
@@ -22,7 +24,7 @@ const (
 
 type unwrapReconciler interface {
 	GetBridgeFrontierHash() (types.Hash, error)
-	GetEvmUnwrapRequestByHashAndLogFromRPC(types.Hash, uint32) (*definition.UnwrapTokenRequest, error)
+	LookupUnwrap(context.Context, types.Hash, uint32) (*definition.UnwrapTokenRequest, error)
 	SetEvmUnwrapRequestStatus(*events.UnwrapRequestEvm, uint32) error
 }
 
@@ -33,18 +35,34 @@ type unwrapLookup struct {
 
 // Only the independent RPC reads overlap. Each result belongs to the request
 // at the same index, even when the provider replies out of order.
-func lookupUnwrapBatch(chain unwrapReconciler, batch []*events.UnwrapRequestEvm) []unwrapLookup {
-	results := make([]unwrapLookup, len(batch))
+func lookupUnwrapBatch(chain unwrapReconciler, batch []*events.UnwrapRequestEvm) ([]uint32, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	results := make([]chan unwrapLookup, len(batch))
 	var wg sync.WaitGroup
+	defer func() {
+		cancel()
+		wg.Wait()
+	}()
 	for i, req := range batch {
+		result := make(chan unwrapLookup, 1)
+		results[i] = result
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			results[i].record, results[i].err = chain.GetEvmUnwrapRequestByHashAndLogFromRPC(types.Hash(req.TransactionHash), req.LogIndex)
+			record, err := chain.LookupUnwrap(ctx, types.Hash(req.TransactionHash), req.LogIndex)
+			result <- unwrapLookup{record, err}
 		}()
 	}
-	wg.Wait()
-	return results
+	statuses := make([]uint32, 0, len(batch))
+	for i, result := range results {
+		req := batch[i]
+		status, err := (<-result).status(req)
+		if err != nil {
+			return statuses, fmt.Errorf("reconcile: cannot query Zenon for event %s/%d: %w", req.TransactionHash, req.LogIndex, err)
+		}
+		statuses = append(statuses, status)
+	}
+	return statuses, nil
 }
 
 // Zenon returns the VM sentinel as a server error across JSON-RPC. Other
@@ -80,7 +98,7 @@ func (r unwrapLookup) status(req *events.UnwrapRequestEvm) (uint32, error) {
 // A signer proposes the first poolSize locally unsigned requests still missing
 // on Zenon, in storage order. A lookup or write failure aborts the ceremony.
 // On budget exhaustion the caller skips signing but keeps prior status writes.
-func reconcileUnsignedUnwrapRequests(chain unwrapReconciler, logger *zap.SugaredLogger, requests []*events.UnwrapRequestEvm, poolSize int) ([]*events.UnwrapRequestEvm, bool, error) {
+func reconcileUnsignedUnwrapRequests(chain unwrapReconciler, logger *zap.SugaredLogger, requests []*events.UnwrapRequestEvm, poolSize int, approve func([]*events.UnwrapRequestEvm) error) ([]*events.UnwrapRequestEvm, bool, error) {
 	if poolSize < 0 {
 		return nil, false, fmt.Errorf("reconcile: negative ceremony pool size %d", poolSize)
 	}
@@ -102,34 +120,40 @@ func reconcileUnsignedUnwrapRequests(chain unwrapReconciler, logger *zap.Sugared
 	var statuses []uint32
 	var lookupErr error
 	lookups := 0
-scan:
 	for lookups < budget && len(selected) < poolSize {
 		// Even if every answer is missing, this batch ends at or before the
 		// same stopping point as the sequential walk.
 		count := min(reconcileConcurrency, budget-lookups, poolSize-len(selected))
 		batch := requests[lookups : lookups+count]
-		results := lookupUnwrapBatch(chain, batch)
+		batchStatuses, err := lookupUnwrapBatch(chain, batch)
+		statuses = append(statuses, batchStatuses...)
 		lookups += count
-		for i, result := range results {
-			req := batch[i]
-			status, err := result.status(req)
-			if err != nil {
-				lookupErr = fmt.Errorf("reconcile: cannot query Zenon for event %s/%d: %w", req.TransactionHash, req.LogIndex, err)
-				break scan
-			}
-			statuses = append(statuses, status)
+		for i, status := range batchStatuses {
 			if status == common.UnredeemedStatus {
-				selected = append(selected, req)
+				selected = append(selected, batch[i])
 			}
 		}
+		if err != nil {
+			lookupErr = err
+			break
+		}
+	}
+	if lookupErr != nil && len(statuses) == len(selected) {
+		return nil, false, lookupErr
 	}
 
-	end, err := chain.GetBridgeFrontierHash()
-	if err != nil {
-		return nil, false, fmt.Errorf("reconcile: cannot verify Zenon bridge frontier: %w", err)
+	if err := verifyBridgeFrontier(chain, start); err != nil {
+		return nil, false, err
 	}
-	if end != start {
-		return nil, false, fmt.Errorf("reconcile: Zenon bridge changed during lookups (%s to %s)", start, end)
+	complete := len(selected) == poolSize || lookups == len(requests)
+	if lookupErr == nil && complete && len(selected) > 0 {
+		if err := approve(selected); err != nil {
+			return nil, false, err
+		}
+		// Agreement is a network round. Recheck before persisting or signing.
+		if err := verifyBridgeFrontier(chain, start); err != nil {
+			return nil, false, err
+		}
 	}
 	reconciled := 0
 	for i, status := range statuses {
@@ -145,11 +169,21 @@ scan:
 	if lookupErr != nil {
 		return nil, false, lookupErr
 	}
-	complete := len(selected) == poolSize || lookups == len(requests)
 	if !complete {
 		logger.Warnf("reconcile: stopped after %d Zenon lookups with %d records selected; %d reconciled this pass", lookups, len(selected), reconciled)
 	} else if reconciled > 0 {
 		logger.Infof("reconcile: %d unsigned unwrap events already exist on Zenon and were excluded from the pool; %d selected to sign", reconciled, len(selected))
 	}
 	return selected, complete, nil
+}
+
+func verifyBridgeFrontier(chain unwrapReconciler, start types.Hash) error {
+	end, err := chain.GetBridgeFrontierHash()
+	if err != nil {
+		return fmt.Errorf("reconcile: cannot verify Zenon bridge frontier: %w", err)
+	}
+	if end != start {
+		return fmt.Errorf("reconcile: Zenon bridge changed during lookups (%s to %s)", start, end)
+	}
+	return nil
 }

@@ -1,6 +1,7 @@
 package node
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"slices"
@@ -17,6 +18,8 @@ import (
 	"orchestrator/common/events"
 )
 
+func approveTestPool([]*events.UnwrapRequestEvm) error { return nil }
+
 type reconciliationChain struct {
 	lookup func(uint32) (*definition.UnwrapTokenRequest, error)
 	write  func(uint32, uint32) error
@@ -24,7 +27,7 @@ type reconciliationChain struct {
 
 func (reconciliationChain) GetBridgeFrontierHash() (types.Hash, error) { return types.Hash{1}, nil }
 
-func (c reconciliationChain) GetEvmUnwrapRequestByHashAndLogFromRPC(_ types.Hash, index uint32) (*definition.UnwrapTokenRequest, error) {
+func (c reconciliationChain) LookupUnwrap(_ context.Context, _ types.Hash, index uint32) (*definition.UnwrapTokenRequest, error) {
 	return c.lookup(index)
 }
 
@@ -82,7 +85,7 @@ func TestReconcileBoundsReadsAndAppliesResultsInStorageOrder(t *testing.T) {
 	requests := candidates(size)
 	done := make(chan error, 1)
 	go func() {
-		selected, complete, err := reconcileUnsignedUnwrapRequests(chain, zap.NewNop().Sugar(), requests, size)
+		selected, complete, err := reconcileUnsignedUnwrapRequests(chain, zap.NewNop().Sugar(), requests, size, approveTestPool)
 		if err == nil && (!complete || !slices.Equal(selected, []*events.UnwrapRequestEvm{requests[1], requests[3], requests[5]})) {
 			err = fmt.Errorf("unexpected pool %v, complete=%v", selected, complete)
 		}
@@ -130,7 +133,7 @@ func BenchmarkReconcileMissing(b *testing.B) {
 	}}
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		pool, complete, err := reconcileUnsignedUnwrapRequests(chain, logger, requests, len(requests))
+		pool, complete, err := reconcileUnsignedUnwrapRequests(chain, logger, requests, len(requests), approveTestPool)
 		if err != nil || !complete || len(pool) != len(requests) {
 			b.Fatalf("unexpected result %d, complete=%v, err=%v", len(pool), complete, err)
 		}
@@ -177,7 +180,7 @@ func TestReconcileStoppingPoints(t *testing.T) {
 					return nil
 				},
 			}
-			got, complete, err := reconcileUnsignedUnwrapRequests(chain, zap.NewNop().Sugar(), candidates(tc.count), tc.size)
+			got, complete, err := reconcileUnsignedUnwrapRequests(chain, zap.NewNop().Sugar(), candidates(tc.count), tc.size, approveTestPool)
 			var selected []uint32
 			for _, req := range got {
 				selected = append(selected, req.LogIndex)

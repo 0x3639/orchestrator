@@ -25,6 +25,7 @@ type EvmStorage interface {
 	// the storage lock, it still has no signature, is still unredeemed and
 	// still refers to the given block hash. It reports whether it deleted.
 	DeleteUnwrapRequestIfUnsigned(txHash ecommon.Hash, logIndex uint32, blockHash ecommon.Hash) (bool, error)
+	ReconcileUnwrapRequestStatus(*events.UnwrapRequestEvm, uint32) error
 	SetUnwrapRequestStatus(ecommon.Hash, uint32, uint32) error
 	SetUnwrapRequestSignature(ecommon.Hash, uint32, string) error
 	GetUnwrapRequestsByStatus(uint32) ([]*events.UnwrapRequestEvm, error)

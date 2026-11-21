@@ -118,27 +118,29 @@ func (es *evmStorage) GetUnwrapRequestByHashAndLog(txHash ecommon.Hash, logIndex
 	return event, nil
 }
 
+func (es *evmStorage) ReconcileUnwrapRequestStatus(observed *events.UnwrapRequestEvm, status uint32) error {
+	return es.setUnwrapStatus(observed.TransactionHash, observed.LogIndex, status, observed)
+}
+
 func (es *evmStorage) SetUnwrapRequestStatus(txHash ecommon.Hash, logIndex, status uint32) error {
+	return es.setUnwrapStatus(txHash, logIndex, status, nil)
+}
+
+func (es *evmStorage) setUnwrapStatus(txHash ecommon.Hash, logIndex, status uint32, observed *events.UnwrapRequestEvm) error {
 	es.mu.Lock()
 	defer es.mu.Unlock()
-	if event, err := es.GetUnwrapRequestByHashAndLog(txHash, logIndex); err != nil {
-		es.SendSigInt()
+	event, err := es.GetUnwrapRequestByHashAndLog(txHash, logIndex)
+	if err != nil {
 		return err
-	} else if event == nil {
-		return leveldb.ErrNotFound
-	} else {
-		event.RedeemStatus = status
-		if eventBytes, err := event.Serialize(); err != nil {
-			es.SendSigInt()
-			return err
-		} else {
-			if err := es.DB.Put(getUnwrapRequestKey(event.TransactionHash, event.LogIndex), eventBytes); err != nil {
-				es.SendSigInt()
-				return err
-			}
-		}
 	}
-	return nil
+	if event == nil {
+		return leveldb.ErrNotFound
+	}
+	if observed != nil && (event.RedeemStatus != observed.RedeemStatus || event.Signature != observed.Signature || event.BlockHash != observed.BlockHash) {
+		return nil
+	}
+	event.RedeemStatus = status
+	return es.putUnwrapRequest(*event)
 }
 
 func (es *evmStorage) SetUnwrapRequestSignature(txHash ecommon.Hash, logIndex uint32, signature string) error {

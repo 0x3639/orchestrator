@@ -4,8 +4,6 @@ import (
 	"errors"
 	"testing"
 
-	sdkapi "github.com/MoonBaZZe/znn-sdk-go/api"
-	sdkclient "github.com/MoonBaZZe/znn-sdk-go/rpc_client"
 	"github.com/zenon-network/go-zenon/common/types"
 	"github.com/zenon-network/go-zenon/rpc/api"
 	"github.com/zenon-network/go-zenon/rpc/server"
@@ -49,7 +47,7 @@ func TestBridgeFrontierHashFromLedger(t *testing.T) {
 			}
 			client := server.DialInProc(srv)
 			defer client.Close()
-			r := ZnnRpc{rpcClient: &sdkclient.RpcClient{LedgerApi: sdkapi.NewLedgerApi(client)}}
+			r := UnwrapReader{client}
 			got, err := r.GetBridgeFrontierHash()
 			if tc.name == "bridge" {
 				if got != hash || err != nil {

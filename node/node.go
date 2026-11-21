@@ -13,9 +13,11 @@ import (
 	"net/http"
 	"orchestrator/common"
 	oconfig "orchestrator/common/config"
+	"orchestrator/common/events"
 	"orchestrator/db/manager"
 	"orchestrator/health"
 	"orchestrator/network"
+	"orchestrator/rpc"
 	"orchestrator/tss"
 	"os"
 	"path"
@@ -729,7 +731,12 @@ func (node *Node) processSignatures() {
 					continue
 				}
 
-				currentCeremony := frontierMomentum / node.networksManager.WindowSize()
+				window := node.networksManager.WindowSize()
+				if window == 0 {
+					node.logger.Error("cannot schedule a ceremony with a zero window")
+					continue
+				}
+				currentCeremony := frontierMomentum / window
 				state := currentCeremony % 2
 				lastCeremony := node.state.GetLastCeremony()
 				if state == common.WrapCeremonyState && currentCeremony != lastCeremony {
@@ -740,14 +747,14 @@ func (node *Node) processSignatures() {
 					} else if ok == false {
 						node.logger.Debug("Nothing to sign, try unwrap")
 						// If we had nothing to sign we try the other direction
-						if err, _ := node.processSignaturesUnwrap(); err != nil {
+						if err, _ := node.processSignaturesUnwrap(currentCeremony); err != nil {
 							node.logger.Debug(err)
 						}
 					}
 				} else if state == common.UnwrapCeremonyState && currentCeremony != lastCeremony {
 					node.logger.Debugf("state unwrap - lastCeremony: %d", lastCeremony)
 					node.state.SetLastCeremony(currentCeremony)
-					if err, ok := node.processSignaturesUnwrap(); err != nil {
+					if err, ok := node.processSignaturesUnwrap(currentCeremony); err != nil {
 						node.logger.Debug(err)
 					} else if ok == false {
 						node.logger.Debug("Nothing to sign, try wrap")
@@ -1126,13 +1133,43 @@ func (node *Node) processSignaturesWrap() (error, bool) {
 
 // ok == true means that we had a signing ceremony or at least we tried
 // ok == false means that we had nothing to sign
-func (node *Node) processSignaturesUnwrap() (error, bool) {
+func (node *Node) processSignaturesUnwrap(ceremony uint64) (error, bool) {
 	// todo discuss what requests should the orchestrator sign in a ceremony
 	requests, err := node.networksManager.GetUnsignedUnwrapRequests()
 	if err != nil {
 		return err, true
 	}
-	requests, complete, err := reconcileUnsignedUnwrapRequests(node.networksManager, node.logger, requests, common.SignCeremonyPoolSize)
+	poolSize := common.SignCeremonyPoolSize
+	if len(requests) == 0 || poolSize == 0 {
+		return nil, false
+	}
+	reader, err := node.networksManager.Znn().ZnnRpc().OpenUnwrapReader()
+	if err != nil {
+		return err, true
+	}
+	defer reader.Close()
+	chain := struct {
+		*rpc.UnwrapReader
+		*network.NetworksManager
+	}{reader, node.networksManager}
+	var messagesToSign [][]byte
+	msgsIndexes := make(map[string]int)
+	approve := func(pool []*events.UnwrapRequestEvm) error {
+		for i, req := range pool {
+			msg, err := req.GetMessage()
+			if err != nil {
+				node.logger.Debug(err)
+				continue
+			}
+			messagesToSign = append(messagesToSign, msg)
+			msgsIndexes[base64.StdEncoding.EncodeToString(msg)] = i
+		}
+		if len(messagesToSign) == 0 {
+			return nil
+		}
+		return node.tssManager.ApproveUnwrapPool(ceremony, messagesToSign)
+	}
+	requests, complete, err := reconcileUnsignedUnwrapRequests(chain, node.logger, requests, poolSize, approve)
 	if err != nil {
 		return err, true
 	}
@@ -1143,39 +1180,18 @@ func (node *Node) processSignaturesUnwrap() (error, bool) {
 		node.logger.Info("unwrap reconciliation incomplete for this ceremony, skipping signing until the backlog is worked off")
 		return nil, false
 	}
-	if len(requests) == 0 {
-		return nil, false
-	}
-
-	msgsIndexes := make(map[string]int)
-	// arr for signing
-	messagesToSign := make([][]byte, 0)
-	for idx, req := range requests {
-		node.logger.Debugf("req.To: %s", req.To)
-		node.logger.Debugf("req.Amount: %d", req.Amount.Uint64())
-		node.logger.Debugf("req.Token: %s", req.Token.String())
-		node.logger.Debugf("req.TransactionHash: %s", req.TransactionHash.String())
-
-		msg, err := req.GetMessage()
-		if err != nil {
-			node.logger.Debug(err)
-			// todo set status to skipped
-			continue
-		}
-		messagesToSign = append(messagesToSign, msg)
-		msgsIndexes[base64.StdEncoding.EncodeToString(msg)] = idx
-	}
-
 	if len(messagesToSign) == 0 {
 		return nil, false
 	}
 
-	right := len(messagesToSign)
-	if right > common.SignCeremonyPoolSize {
-		right = common.SignCeremonyPoolSize
+	height, err := node.state.GetFrontierMomentum()
+	if err != nil {
+		return err, true
 	}
-	messagesToSign = messagesToSign[:right]
-	//node.logger.Debug("MessagesToSign: ", messagesToSign)
+	window := node.networksManager.WindowSize()
+	if window == 0 || height/window != ceremony {
+		return errors.New("unwrap ceremony expired before signing"), true
+	}
 	response, err := node.signMessages(messagesToSign, msgsIndexes)
 	if err != nil {
 		return err, true

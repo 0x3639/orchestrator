@@ -225,10 +225,6 @@ func (m *NetworksManager) GetTssNonceZnn() (uint64, error) {
 	return bridgeInfo.TssNonce, nil
 }
 
-func (m *NetworksManager) GetBridgeFrontierHash() (types.Hash, error) {
-	return m.Znn().ZnnRpc().GetBridgeFrontierHash()
-}
-
 func (m *NetworksManager) GetEvmUnwrapRequestByHashAndLogFromRPC(txHash types.Hash, logIndex uint32) (*definition.UnwrapTokenRequest, error) {
 	return m.Znn().GetUnwrapTokenRequestByHashAndLog(txHash, logIndex)
 }
@@ -650,16 +646,14 @@ func (m *NetworksManager) SetEvmUnwrapRequestAsSent(event *events.UnwrapRequestE
 	return nil
 }
 
-// SetEvmUnwrapRequestStatus updates only the redeem status of an existing record.
+// Reconciliation must preserve a listener update made after the unsigned scan.
 func (m *NetworksManager) SetEvmUnwrapRequestStatus(event *events.UnwrapRequestEvm, status uint32) error {
 	for _, network := range m.evmNetworks {
 		if network.ChainId() == event.ChainId {
-			if err := network.SetUnwrapRequestStatus(event.TransactionHash, event.LogIndex, status); err != nil {
-				return err
-			}
+			return network.eventsStore().ReconcileUnwrapRequestStatus(event, status)
 		}
 	}
-	return nil
+	return errors.Errorf("cannot reconcile unwrap for unknown chain %d", event.ChainId)
 }
 
 // SetEvmBackfillBlocks asks every EVM network to rewind its sync cursor

@@ -1,11 +1,13 @@
 package rpc
 
 import (
+	"context"
 	"encoding/base64"
 	sdk_rpc_client "github.com/MoonBaZZe/znn-sdk-go/rpc_client"
 	"github.com/MoonBaZZe/znn-sdk-go/zenon"
 	ic "github.com/libp2p/go-libp2p-core/crypto"
 	"github.com/libp2p/go-libp2p-core/peer"
+	"time"
 
 	"github.com/pkg/errors"
 	"github.com/zenon-network/go-zenon/chain/nom"
@@ -178,11 +180,35 @@ func (r *ZnnRpc) GetAllWrapTokenRequests(pageIndex, pageSize uint32) (*embedded.
 	return r.rpcClient.BridgeApi.GetAllWrapTokenRequests(pageIndex, pageSize)
 }
 
-// Bridge lookups read the frontier account store. Its block hash changes on
-// bridge updates, while unrelated momentums can advance throughout the scan.
-func (r *ZnnRpc) GetBridgeFrontierHash() (types.Hash, error) {
-	block, err := r.rpcClient.LedgerApi.GetFrontierAccountBlock(types.BridgeContract)
+// The SDK hides its transport and its bridge methods use context.Background.
+// Share one cancellable RPC connection across all reads in a reconciliation.
+type UnwrapReader struct{ client *server.Client }
+
+func (r *ZnnRpc) OpenUnwrapReader() (*UnwrapReader, error) {
+	ctx, cancel := callContext(30 * time.Second)
+	defer cancel()
+	url := r.Urls.GetCurrentUrl()
+	client, err := server.DialContext(ctx, url)
 	if err != nil {
+		return nil, errors.New(config.RedactErrorForURL(err, url))
+	}
+	return &UnwrapReader{client}, nil
+}
+
+func (r *UnwrapReader) Close() { r.client.Close() }
+
+func (r *UnwrapReader) LookupUnwrap(ctx context.Context, tx types.Hash, index uint32) (*definition.UnwrapTokenRequest, error) {
+	var record *definition.UnwrapTokenRequest
+	err := r.client.CallContext(ctx, &record, "embedded.bridge.getUnwrapTokenRequestByHashAndLog", tx, index)
+	return record, err
+}
+
+// The account frontier changes on bridge updates, independently of unrelated momentums.
+func (r *UnwrapReader) GetBridgeFrontierHash() (types.Hash, error) {
+	ctx, cancel := callContext(30 * time.Second)
+	defer cancel()
+	var block *api.AccountBlock
+	if err := r.client.CallContext(ctx, &block, "ledger.getFrontierAccountBlock", types.BridgeContract); err != nil {
 		return types.ZeroHash, err
 	}
 	if block == nil || block.Address != types.BridgeContract || block.Height == 0 || block.Hash.IsZero() {

@@ -33,7 +33,7 @@ func TestReconcileAgreesWithBend(t *testing.T) {
 			},
 			write: func(uint32, uint32) error { return nil },
 		}
-		selected, complete, err := reconcileUnsignedUnwrapRequests(chain, zap.NewNop().Sugar(), candidates(len(trace)), slots)
+		selected, complete, err := reconcileUnsignedUnwrapRequests(chain, zap.NewNop().Sugar(), candidates(len(trace)), slots, approveTestPool)
 		pool := "B.PoolIncomplete{}"
 		switch {
 		case err != nil:
@@ -81,7 +81,7 @@ func TestReconcileAgreesWithBend(t *testing.T) {
 // closing read must also discard the known statuses staged by earlier batches.
 func TestReconcileBridgeViewAgreesWithBend(t *testing.T) {
 	var cases verification.Comparisons
-	for _, scenario := range []string{"stable", "changed", "opening read failed", "closing read failed"} {
+	for _, scenario := range []string{"stable", "changed", "opening read failed", "closing read failed", "changed during agreement"} {
 		chain := newSigner(t)
 		reads := 0
 		chain.head = func() (types.Hash, error) {
@@ -89,7 +89,7 @@ func TestReconcileBridgeViewAgreesWithBend(t *testing.T) {
 			switch {
 			case reads == 1 && scenario == "opening read failed", reads == 2 && scenario == "closing read failed":
 				return types.ZeroHash, errors.New("frontier unavailable")
-			case reads == 2 && scenario == "changed":
+			case reads == 2 && scenario == "changed", reads == 3 && scenario == "changed during agreement":
 				return types.Hash{2}, nil
 			default:
 				return types.Hash{1}, nil

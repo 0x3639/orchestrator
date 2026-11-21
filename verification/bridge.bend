@@ -92,3 +92,15 @@ def scan_count(available: Nat, limit: Nat) -> Nat:
     case 0n _: 0n
     case 1n+a 0n: 0n
     case 1n+a 1n+l: 1n+scan_count(a, l)
+
+# Each signer has at most one durable vote for a given key and ceremony.
+# To have a quorum a pool must outnumber the votes for any competing pool.
+def outnumbers(a: Nat, b: Nat) -> Bool:
+  match a b:
+    case 0n _: False{}
+    case 1n+x 0n: True{}
+    case 1n+x 1n+y: outnumbers(x, y)
+
+# The current TSS key needs ceil(2 * participants / 3) distinct shares.
+def can_certify(+votes: Nat, +others: Nat) -> Bool:
+  outnumbers(votes, others) && Nat.is_le(Nat.add(others, others), votes)

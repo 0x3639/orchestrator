@@ -100,3 +100,10 @@ def Laws.one_block_limit_makes_progress(more):
   match more:
     case 0n: {==}
     case 1n+m: {==}
+
+def Laws.competing_pools_cannot_both_outnumber_each_other(a, b):
+  match a b:
+    case 0n 0n: {==}
+    case 0n 1n+y: {==}
+    case 1n+x 0n: {==}
+    case 1n+x 1n+y: Laws.competing_pools_cannot_both_outnumber_each_other(x, y)

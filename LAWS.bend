@@ -119,3 +119,8 @@ law scan_stops_at_head:
 law one_block_limit_makes_progress:
   for more: Nat
   {Bridge.scan_count(1n+more, 1n) == 1n : Nat}
+
+law competing_pools_cannot_both_outnumber_each_other:
+  for +a: Nat
+  for +b: Nat
+  {Bridge.outnumbers(a, b) && Bridge.outnumbers(b, a) == False{} : Bool}
