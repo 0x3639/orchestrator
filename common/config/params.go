@@ -4,7 +4,6 @@ import (
 	ecommon "github.com/ethereum/go-ethereum/common"
 	"github.com/zenon-network/go-zenon/vm/embedded/definition"
 	"orchestrator/common"
-	"sync/atomic"
 	"time"
 )
 
@@ -96,7 +95,7 @@ func NewZnnParams(orchestratorInfo *definition.OrchestratorInfo) (*ZnnParams, er
 }
 
 func (zP *ZnnParams) SetWindowSize(windowSize uint64) {
-	atomic.StoreUint64(&zP.windowSize, windowSize)
+	zP.windowSize = windowSize
 }
 func (zP *ZnnParams) SetKeyGenThreshold(keyGenThreshold uint32) {
 	zP.keyGenThreshold = keyGenThreshold
@@ -119,5 +118,5 @@ func (zP *ZnnParams) EstimatedMomentumTime() uint32 {
 	return zP.estimatedMomentumTime
 }
 func (zP *ZnnParams) WindowSize() uint64 {
-	return atomic.LoadUint64(&zP.windowSize)
+	return zP.windowSize
 }

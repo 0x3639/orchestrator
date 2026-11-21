@@ -13,18 +13,14 @@ import (
 	"github.com/libp2p/go-libp2p-peerstore/addr"
 	maddr "github.com/multiformats/go-multiaddr"
 	"github.com/pkg/errors"
-	"github.com/syndtr/goleveldb/leveldb"
 	"orchestrator/common"
 	"orchestrator/common/config"
 	"os"
-	"path/filepath"
 	"sync"
 	"time"
 )
 
 type TssManager struct {
-	voteMu            sync.Mutex
-	unwrapVotes       *leveldb.DB
 	server            *tss.TssServer
 	port              int
 	privateKey        string
@@ -87,10 +83,6 @@ func NewTssManager(conf config.TssManagerConfig, privateKey string) (*TssManager
 
 	common.GlobalLogger.Infof("peerId: %s\n", id.String())
 
-	votes, err := leveldb.OpenFile(filepath.Join(conf.BaseDir, "unwrap-pool-votes"), nil)
-	if err != nil {
-		return nil, err
-	}
 	var server *tss.TssServer
 	var wg sync.WaitGroup
 	wg.Add(1)
@@ -108,12 +100,10 @@ func NewTssManager(conf config.TssManagerConfig, privateKey string) (*TssManager
 	}()
 	wg.Wait()
 	if err != nil {
-		votes.Close()
 		return nil, err
 	}
 
 	return &TssManager{
-		unwrapVotes:       votes,
 		port:              conf.Port,
 		server:            server,
 		privateKey:        privateKey,
@@ -133,7 +123,6 @@ func (m *TssManager) Start() error {
 
 func (m *TssManager) Stop() {
 	m.server.Stop()
-	m.unwrapVotes.Close()
 }
 
 func (m *TssManager) BulkSign(messagesBytes [][]byte, algo messages.Algo) (*keysign.Response, error) {

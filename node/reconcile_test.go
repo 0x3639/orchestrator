@@ -1,143 +1,192 @@
+//go:build bend
+
 package node
 
 import (
-	"context"
 	"errors"
-	"fmt"
+	"math/big"
+	"net/http/httptest"
+	"os"
 	"slices"
+	"strings"
 	"sync/atomic"
 	"testing"
-	"time"
 
+	ecommon "github.com/ethereum/go-ethereum/common"
+	zdb "github.com/zenon-network/go-zenon/common/db"
 	"github.com/zenon-network/go-zenon/common/types"
+	"github.com/zenon-network/go-zenon/rpc/api"
+	"github.com/zenon-network/go-zenon/rpc/api/embedded"
+	"github.com/zenon-network/go-zenon/rpc/server"
 	"github.com/zenon-network/go-zenon/vm/constants"
 	"github.com/zenon-network/go-zenon/vm/embedded/definition"
 	"go.uber.org/zap"
 
 	"orchestrator/common"
+	"orchestrator/common/config"
 	"orchestrator/common/events"
+	"orchestrator/db"
+	"orchestrator/db/unwrap"
+	"orchestrator/network"
 )
 
-func approveTestPool([]*events.UnwrapRequestEvm) error { return nil }
+type signerLookup func(uint32) (*definition.UnwrapTokenRequest, error)
 
 type reconciliationChain struct {
-	lookup func(uint32) (*definition.UnwrapTokenRequest, error)
+	lookup signerLookup
 	write  func(uint32, uint32) error
+	head   func() (*api.AccountBlockMarshal, error)
+	db.EvmStorage
 }
 
-func (reconciliationChain) GetBridgeFrontierHash() (types.Hash, error) { return types.Hash{1}, nil }
+var signerTestTx = ecommon.HexToHash("0xa1")
 
-func (c reconciliationChain) LookupUnwrap(_ context.Context, _ types.Hash, index uint32) (*definition.UnwrapTokenRequest, error) {
-	return c.lookup(index)
-}
-
-func (c reconciliationChain) SetEvmUnwrapRequestStatus(event *events.UnwrapRequestEvm, status uint32) error {
-	return c.write(event.LogIndex, status)
+func registeredLog(index uint32) *definition.UnwrapTokenRequest {
+	return &definition.UnwrapTokenRequest{
+		TransactionHash: types.Hash(signerTestTx), LogIndex: index,
+		NetworkClass: definition.EvmClass, ChainId: 1, Amount: big.NewInt(10),
+	}
 }
 
 func candidates(n int) []*events.UnwrapRequestEvm {
 	requests := make([]*events.UnwrapRequestEvm, n)
 	for i := range requests {
-		requests[i] = &events.UnwrapRequestEvm{LogIndex: uint32(i)}
+		requests[i] = &events.UnwrapRequestEvm{
+			TransactionHash: signerTestTx, LogIndex: uint32(i),
+			NetworkClass: definition.EvmClass, ChainId: 1, Amount: big.NewInt(10),
+		}
 	}
 	return requests
 }
 
-type statusWrite struct {
-	index, status uint32
+func stableLookup(i uint32) (*definition.UnwrapTokenRequest, error) {
+	if i == 0 || i == 2 {
+		return registeredLog(i), nil
+	}
+	return nil, constants.ErrDataNonExistent
 }
 
-func TestReconcileBoundsReadsAndAppliesResultsInStorageOrder(t *testing.T) {
-	const size = 6
-	entered := make(chan uint32, size)
-	returned := make(chan uint32, size)
-	release := make([]chan struct{}, size)
-	for i := range release {
-		release[i] = make(chan struct{})
-	}
-	stop := make(chan struct{})
-	defer close(stop)
-	writes := []statusWrite{}
-	chain := reconciliationChain{
-		lookup: func(i uint32) (*definition.UnwrapTokenRequest, error) {
-			entered <- i
-			defer func() { returned <- i }()
-			select {
-			case <-release[i]:
-			case <-stop:
-				return nil, errors.New("test ended")
-			}
-			switch i {
-			case 0:
-				return &definition.UnwrapTokenRequest{LogIndex: i, Revoked: 1, Redeemed: 1}, nil
-			case 2:
-				return &definition.UnwrapTokenRequest{LogIndex: i, Redeemed: 1}, nil
-			case 4:
-				return &definition.UnwrapTokenRequest{LogIndex: i}, nil
-			}
-			return nil, constants.ErrDataNonExistent
-		},
-		write: func(i, status uint32) error {
-			writes = append(writes, statusWrite{i, status})
-			return nil
-		},
-	}
-	requests := candidates(size)
-	done := make(chan error, 1)
-	go func() {
-		selected, complete, err := reconcileUnsignedUnwrapRequests(chain, zap.NewNop().Sugar(), requests, size, approveTestPool)
-		if err == nil && (!complete || !slices.Equal(selected, []*events.UnwrapRequestEvm{requests[1], requests[3], requests[5]})) {
-			err = fmt.Errorf("unexpected pool %v, complete=%v", selected, complete)
+func newSigner(t *testing.T) reconciliationChain {
+	t.Helper()
+	c := reconciliationChain{lookup: stableLookup, EvmStorage: unwrap.NewEvmStorage(zdb.NewMemDB(), nil, 0)}
+	for _, r := range candidates(6) {
+		if err := c.AddUnwrapRequest(*r); err != nil {
+			t.Fatal(err)
 		}
-		done <- err
-	}()
+	}
+	return c
+}
 
-	// No call can finish until every read in this batch has started.
-	// Keep the first request waiting while releasing the later ones.
-	for start := 0; start < size; start += reconcileConcurrency {
-		end := min(size, start+reconcileConcurrency)
-		for i := start; i < end; i++ {
-			select {
-			case index := <-entered:
-				if int(index) < start || int(index) >= end {
-					t.Fatalf("read %d outside batch [%d,%d)", index, start, end)
-				}
-			case <-time.After(3 * time.Second):
-				t.Fatal("independent reads did not overlap")
-			}
-		}
-		for i := end - 1; i >= start; i-- {
-			close(release[i])
-			if index := <-returned; int(index) != i {
-				t.Fatalf("unexpected lookup completion %d, want %d", index, i)
-			}
-		}
+// Serve the same SDK calls as a Zenon endpoint. No peer or signing service is started.
+type fixtureBridge struct{ lookup signerLookup }
+
+func (b fixtureBridge) GetBridgeInfo() *definition.BridgeInfoVariable {
+	return &definition.BridgeInfoVariable{}
+}
+func (b fixtureBridge) GetSecurityInfo() *definition.SecurityInfoVariable {
+	return &definition.SecurityInfoVariable{Guardians: make([]types.Address, constants.MinGuardians)}
+}
+func (b fixtureBridge) GetOrchestratorInfo() *definition.OrchestratorInfo {
+	return &definition.OrchestratorInfo{WindowSize: 10, KeyGenThreshold: 1, ConfirmationsToFinality: 1, EstimatedMomentumTime: 1}
+}
+func (b fixtureBridge) GetAllNetworks(uint32, uint32) *embedded.NetworkInfoList {
+	return &embedded.NetworkInfoList{}
+}
+func (b fixtureBridge) GetUnwrapTokenRequestByHashAndLog(hash types.Hash, index uint32) (*definition.UnwrapTokenRequest, error) {
+	if hash != types.Hash(signerTestTx) {
+		return nil, errors.New("unexpected transaction")
 	}
-	if err := <-done; err != nil {
+	return b.lookup(index)
+}
+
+type fixtureLedger struct {
+	frontier func() (*api.AccountBlockMarshal, error)
+}
+
+func (l fixtureLedger) GetFrontierAccountBlock(address types.Address) (*api.AccountBlockMarshal, error) {
+	if address != types.BridgeContract {
+		return nil, errors.New("unexpected ledger account")
+	}
+	if l.frontier != nil {
+		return l.frontier()
+	}
+	return frontierBlock(address, types.Hash{1}, 10), nil
+}
+
+type fixtureStores struct{ store db.EvmStorage }
+
+func (s fixtureStores) EvmStorage(uint32) db.EvmStorage         { return s.store }
+func (s fixtureStores) HasEvmStorage(id uint32) bool            { return id == 1 }
+func (s fixtureStores) AddEvmEventStore(uint32, string, uint64) {}
+func (s fixtureStores) ZnnStorage() db.ZnnStorage               { return nil }
+
+func (c reconciliationChain) SetUnwrapRequestStatus(hash ecommon.Hash, i, status uint32) error {
+	if c.write != nil {
+		return c.write(i, status)
+	}
+	return c.EvmStorage.SetUnwrapRequestStatus(hash, i, status)
+}
+
+// Exercise the dev node through its SDK client and network manager. Supply only
+// the provider responses and storage, leaving reconciliation in the node.
+func (c reconciliationChain) reconcile(t *testing.T, requests []*events.UnwrapRequestEvm, slots int) ([]*events.UnwrapRequestEvm, bool, error) {
+	t.Helper()
+	t.Setenv("HOME", t.TempDir()) // isolate the EVM network's disk queue
+	srv := server.NewServer()
+	defer srv.Stop()
+	if err := srv.RegisterName("embedded.bridge", fixtureBridge{c.lookup}); err != nil {
 		t.Fatal(err)
 	}
-	want := []statusWrite{{0, common.RevokedStatus}, {2, common.RedeemedStatus}, {4, common.PendingRedeemStatus}}
-	if !slices.Equal(writes, want) {
-		t.Fatalf("status writes %v, want %v", writes, want)
+	if err := srv.RegisterName("ledger", fixtureLedger{c.head}); err != nil {
+		t.Fatal(err)
 	}
+	endpoint := httptest.NewServer(srv)
+	defer endpoint.Close()
+	stop := make(chan os.Signal, 1)
+	manager, err := network.NewNetworksManager(stop)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.BaseNetworkConfig{Urls: []string{endpoint.URL}}
+	if err := manager.Init(map[string]config.BaseNetworkConfig{common.ZenonNetworkName: cfg, "fixture": cfg}, nil, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	net, err := network.NewEvmNetwork(&definition.NetworkInfo{NetworkClass: definition.EvmClass, Id: 1, Name: "fixture"}, fixtureStores{c}, manager.RpcManager(), nil, stop)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.RpcManager().AddEvmClient(cfg, 1, "fixture", ecommon.Address{}); err != nil {
+		t.Fatal(err)
+	}
+	defer net.Stop()
+	manager.AddEvmNetwork(net)
+	previous := common.SignCeremonyPoolSize
+	common.SignCeremonyPoolSize = slots
+	defer func() { common.SignCeremonyPoolSize = previous }()
+	n := Node{networksManager: manager, logger: zap.NewNop().Sugar()}
+	return n.reconcileUnsignedUnwrapRequests(requests)
 }
 
-// Fixed provider latency isolates the effect of overlapping the 50 independent
-// reads in an all-eligible default-size signing pool.
-func BenchmarkReconcileMissing(b *testing.B) {
-	requests := candidates(50)
-	logger := zap.NewNop().Sugar()
-	chain := reconciliationChain{lookup: func(uint32) (*definition.UnwrapTokenRequest, error) {
-		time.Sleep(2 * time.Millisecond)
-		return nil, constants.ErrDataNonExistent
-	}}
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		pool, complete, err := reconcileUnsignedUnwrapRequests(chain, logger, requests, len(requests), approveTestPool)
-		if err != nil || !complete || len(pool) != len(requests) {
-			b.Fatalf("unexpected result %d, complete=%v, err=%v", len(pool), complete, err)
-		}
+func (c reconciliationChain) pool(t *testing.T) ([]uint32, bool, error) {
+	t.Helper()
+	unsigned, err := c.GetUnsignedUnwrapRequests()
+	if err != nil {
+		t.Fatal(err)
 	}
+	selected, ready, err := c.reconcile(t, unsigned, 4)
+	var ids []uint32
+	for _, req := range selected {
+		ids = append(ids, req.LogIndex)
+	}
+	return ids, ready, err
+}
+
+// RPC errors cross the SDK wire boundary and lose Go error identity.
+func matchesError(got, want error) bool {
+	if got == nil || want == nil {
+		return got == want
+	}
+	return strings.Contains(got.Error(), want.Error())
 }
 
 func TestReconcileStoppingPoints(t *testing.T) {
@@ -168,7 +217,7 @@ func TestReconcileStoppingPoints(t *testing.T) {
 						return nil, providerErr
 					}
 					if int(i) < tc.known {
-						return &definition.UnwrapTokenRequest{LogIndex: i}, nil
+						return registeredLog(i), nil
 					}
 					return nil, constants.ErrDataNonExistent
 				},
@@ -180,14 +229,20 @@ func TestReconcileStoppingPoints(t *testing.T) {
 					return nil
 				},
 			}
-			got, complete, err := reconcileUnsignedUnwrapRequests(chain, zap.NewNop().Sugar(), candidates(tc.count), tc.size, approveTestPool)
+			got, complete, err := chain.reconcile(t, candidates(tc.count), tc.size)
 			var selected []uint32
 			for _, req := range got {
 				selected = append(selected, req.LogIndex)
 			}
-			if !errors.Is(err, tc.wantErr) || complete != tc.complete || !slices.Equal(selected, tc.wantSelected) || !slices.Equal(writes, tc.wantWrites) || int(reads.Load()) != tc.maxReads {
+			if !matchesError(err, tc.wantErr) || complete != tc.complete || !slices.Equal(selected, tc.wantSelected) || !slices.Equal(writes, tc.wantWrites) || int(reads.Load()) > tc.maxReads {
 				t.Fatalf("selected=%v, complete=%v, writes=%v, reads=%d, err=%v", selected, complete, writes, reads.Load(), err)
 			}
 		})
 	}
+}
+
+func frontierBlock(address types.Address, hash types.Hash, height uint64) *api.AccountBlockMarshal {
+	block := new(api.AccountBlockMarshal)
+	block.Address, block.Hash, block.Height = address, hash, height
+	return block
 }

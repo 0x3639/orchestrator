@@ -4,33 +4,25 @@ Use `--ldflags '-extldflags "-Wl,--allow-multiple-definition"` as build argument
 
 ## Checking the bridge laws
 
-[LAWS.bend](LAWS.bend) specifies wrap finality, queued EVM event confirmation,
-backfill deletion guards, selection of the unwrap signing pool, and block counts
-for inclusive EVM log queries.
-[PROOF.bend](PROOF.bend) proves those properties of the
-[decision model](verification/bridge.bend). The Go comparison tests exercise
-the production decisions with simulated RPC replies and an in-memory event store.
+The 27 laws cover wrap finality, EVM event confirmation, deletion of stale
+unwrap records, signing-pool selection and agreement, and inclusive EVM scan
+limits. Bend checks the laws against the decision model. The Go tests compare
+those decisions with the orchestrator using local RPC fixtures and event stores.
+[Model](verification/bridge.bend) · [Laws](LAWS.bend) · [Proofs](PROOF.bend)
 
-Run both checks with Bend 2.0.40 on the path. The Go command below uses the
-project's Linux linker flags. The sync tests record the actual RPC queries and
-check the saved cursor after a provider returns a log outside the requested range.
+On Linux with Bend 2.0.40 on the path, run both checks from the repository root.
 
 ```sh
-bend PROOF.bend
-go test -race -count=1 -tags=bend -ldflags '-extldflags=-Wl,--allow-multiple-definition' ./node ./network ./db/unwrap ./rpc
+bend PROOF.bend --verdict
+go test -race -count=1 -tags=bend -ldflags '-extldflags=-Wl,--allow-multiple-definition' ./...
 ```
 
-Unwrap reconciliation overlaps up to four read-only Zenon lookups. Pool
-selection and status writes follow storage order. A failed lookup or status
-write aborts signing, and an exhausted lookup budget defers an incomplete pool
-to the next ceremony.
+A model proof can pass while a Go comparison fails. Keep the failing input and
+the expected result so a later fix can be checked against the same case.
+The split-tip regression, for example, feeds two signers identical local events
+but different stable bridge views, then checks which pools they mark ready.
+[Observed dev failures and proposed follow-up](https://github.com/0x3639/orchestrator/issues/12)
 
-Before requesting unwrap signatures, signers use the existing threshold key
-to certify a SHA-256 digest of the key, ceremony number, and ordered bridge
-messages under the `zenon/orchestrator/unwrap-pool/v1` domain. A split with
-no signing quorum skips the unwrap ceremony. Certification adds one threshold
-signing round per ready, nonempty pool. Each signer records its vote before
-contacting peers and can retry only that pool for the same key and ceremony.
-Keep the `unwrap-pool-votes` directory alongside the TSS key shares across
-restarts and restores. Coordinate the signer upgrade, since older versions
-can request bridge signatures without this agreement round.
+Tests specific to the earlier parallel-worker, ledger-reader, and certificate
+prototype are preserved separately. The ordinary Go suite on `dev` uses serial
+reconciliation. [Prototype tests and replay instructions](verification/testdata/prototype/README.md)

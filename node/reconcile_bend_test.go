@@ -9,9 +9,9 @@ import (
 	"testing"
 
 	"github.com/zenon-network/go-zenon/common/types"
+	"github.com/zenon-network/go-zenon/rpc/api"
 	"github.com/zenon-network/go-zenon/vm/constants"
 	"github.com/zenon-network/go-zenon/vm/embedded/definition"
-	"go.uber.org/zap"
 
 	"orchestrator/verification"
 )
@@ -25,7 +25,7 @@ func TestReconcileAgreesWithBend(t *testing.T) {
 			lookup: func(i uint32) (*definition.UnwrapTokenRequest, error) {
 				switch trace[i] {
 				case "Known":
-					return &definition.UnwrapTokenRequest{LogIndex: i}, nil
+					return registeredLog(i), nil
 				case "Failed":
 					return nil, errors.New("lookup failed")
 				}
@@ -33,7 +33,7 @@ func TestReconcileAgreesWithBend(t *testing.T) {
 			},
 			write: func(uint32, uint32) error { return nil },
 		}
-		selected, complete, err := reconcileUnsignedUnwrapRequests(chain, zap.NewNop().Sugar(), candidates(len(trace)), slots, approveTestPool)
+		selected, complete, err := chain.reconcile(t, candidates(len(trace)), slots)
 		pool := "B.PoolIncomplete{}"
 		switch {
 		case err != nil:
@@ -84,15 +84,15 @@ func TestReconcileBridgeViewAgreesWithBend(t *testing.T) {
 	for _, scenario := range []string{"stable", "changed", "opening read failed", "closing read failed", "changed during agreement"} {
 		chain := newSigner(t)
 		reads := 0
-		chain.head = func() (types.Hash, error) {
+		chain.head = func() (*api.AccountBlockMarshal, error) {
 			reads++
 			switch {
 			case reads == 1 && scenario == "opening read failed", reads == 2 && scenario == "closing read failed":
-				return types.ZeroHash, errors.New("frontier unavailable")
+				return nil, errors.New("frontier unavailable")
 			case reads == 2 && scenario == "changed", reads == 3 && scenario == "changed during agreement":
-				return types.Hash{2}, nil
+				return frontierBlock(types.BridgeContract, types.Hash{2}, 11), nil
 			default:
-				return types.Hash{1}, nil
+				return frontierBlock(types.BridgeContract, types.Hash{1}, 10), nil
 			}
 		}
 		ids, ready, err := chain.pool(t)

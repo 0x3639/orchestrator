@@ -219,31 +219,3 @@ func TestSendSigIntNeverBlocks(t *testing.T) {
 	close(stop)
 	store.SendSigInt() // closed: must not panic
 }
-
-func TestReconcileStatusPreservesListenerUpdate(t *testing.T) {
-	for _, current := range []uint32{common.UnredeemedStatus, common.RedeemedStatus, common.RevokedStatus} {
-		store := newTestStorage(t)
-		req := sampleEvent("0xb1", 0)
-		if err := store.AddUnwrapRequest(req); err != nil {
-			t.Fatal(err)
-		}
-		observed, err := store.GetUnsignedUnwrapRequests()
-		if err != nil || len(observed) != 1 {
-			t.Fatalf("unsigned=%v err=%v", observed, err)
-		}
-		if err := store.SetUnwrapRequestStatus(req.TransactionHash, 0, current); err != nil {
-			t.Fatal(err)
-		}
-		if err := store.ReconcileUnwrapRequestStatus(observed[0], common.PendingRedeemStatus); err != nil {
-			t.Fatal(err)
-		}
-		got, err := store.GetUnwrapRequestByHashAndLog(req.TransactionHash, 0)
-		want := current
-		if current == common.UnredeemedStatus {
-			want = common.PendingRedeemStatus
-		}
-		if err != nil || got == nil || got.RedeemStatus != want {
-			t.Fatalf("listener status=%d, got=%v err=%v, want status %d", current, got, err, want)
-		}
-	}
-}

@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	wallet2 "github.com/MoonBaZZe/znn-sdk-go/wallet"
 	zcommon "github.com/zenon-network/go-zenon/common"
 	"io"
@@ -17,7 +18,6 @@ import (
 	"orchestrator/db/manager"
 	"orchestrator/health"
 	"orchestrator/network"
-	"orchestrator/rpc"
 	"orchestrator/tss"
 	"os"
 	"path"
@@ -38,6 +38,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/prometheus/tsdb/fileutil"
 	"github.com/zenon-network/go-zenon/common/types"
+	"github.com/zenon-network/go-zenon/vm/constants"
 	"github.com/zenon-network/go-zenon/vm/embedded/definition"
 	"github.com/zenon-network/go-zenon/vm/embedded/implementation"
 	"github.com/zenon-network/go-zenon/wallet"
@@ -731,12 +732,7 @@ func (node *Node) processSignatures() {
 					continue
 				}
 
-				window := node.networksManager.WindowSize()
-				if window == 0 {
-					node.logger.Error("cannot schedule a ceremony with a zero window")
-					continue
-				}
-				currentCeremony := frontierMomentum / window
+				currentCeremony := frontierMomentum / node.networksManager.WindowSize()
 				state := currentCeremony % 2
 				lastCeremony := node.state.GetLastCeremony()
 				if state == common.WrapCeremonyState && currentCeremony != lastCeremony {
@@ -747,14 +743,14 @@ func (node *Node) processSignatures() {
 					} else if ok == false {
 						node.logger.Debug("Nothing to sign, try unwrap")
 						// If we had nothing to sign we try the other direction
-						if err, _ := node.processSignaturesUnwrap(currentCeremony); err != nil {
+						if err, _ := node.processSignaturesUnwrap(); err != nil {
 							node.logger.Debug(err)
 						}
 					}
 				} else if state == common.UnwrapCeremonyState && currentCeremony != lastCeremony {
 					node.logger.Debugf("state unwrap - lastCeremony: %d", lastCeremony)
 					node.state.SetLastCeremony(currentCeremony)
-					if err, ok := node.processSignaturesUnwrap(currentCeremony); err != nil {
+					if err, ok := node.processSignaturesUnwrap(); err != nil {
 						node.logger.Debug(err)
 					} else if ok == false {
 						node.logger.Debug("Nothing to sign, try wrap")
@@ -1133,43 +1129,13 @@ func (node *Node) processSignaturesWrap() (error, bool) {
 
 // ok == true means that we had a signing ceremony or at least we tried
 // ok == false means that we had nothing to sign
-func (node *Node) processSignaturesUnwrap(ceremony uint64) (error, bool) {
+func (node *Node) processSignaturesUnwrap() (error, bool) {
 	// todo discuss what requests should the orchestrator sign in a ceremony
 	requests, err := node.networksManager.GetUnsignedUnwrapRequests()
 	if err != nil {
 		return err, true
 	}
-	poolSize := common.SignCeremonyPoolSize
-	if len(requests) == 0 || poolSize == 0 {
-		return nil, false
-	}
-	reader, err := node.networksManager.Znn().ZnnRpc().OpenUnwrapReader()
-	if err != nil {
-		return err, true
-	}
-	defer reader.Close()
-	chain := struct {
-		*rpc.UnwrapReader
-		*network.NetworksManager
-	}{reader, node.networksManager}
-	var messagesToSign [][]byte
-	msgsIndexes := make(map[string]int)
-	approve := func(pool []*events.UnwrapRequestEvm) error {
-		for i, req := range pool {
-			msg, err := req.GetMessage()
-			if err != nil {
-				node.logger.Debug(err)
-				continue
-			}
-			messagesToSign = append(messagesToSign, msg)
-			msgsIndexes[base64.StdEncoding.EncodeToString(msg)] = i
-		}
-		if len(messagesToSign) == 0 {
-			return nil
-		}
-		return node.tssManager.ApproveUnwrapPool(ceremony, messagesToSign)
-	}
-	requests, complete, err := reconcileUnsignedUnwrapRequests(chain, node.logger, requests, poolSize, approve)
+	requests, complete, err := node.reconcileUnsignedUnwrapRequests(requests)
 	if err != nil {
 		return err, true
 	}
@@ -1180,18 +1146,39 @@ func (node *Node) processSignaturesUnwrap(ceremony uint64) (error, bool) {
 		node.logger.Info("unwrap reconciliation incomplete for this ceremony, skipping signing until the backlog is worked off")
 		return nil, false
 	}
+	if len(requests) == 0 {
+		return nil, false
+	}
+
+	msgsIndexes := make(map[string]int)
+	// arr for signing
+	messagesToSign := make([][]byte, 0)
+	for idx, req := range requests {
+		node.logger.Debugf("req.To: %s", req.To)
+		node.logger.Debugf("req.Amount: %d", req.Amount.Uint64())
+		node.logger.Debugf("req.Token: %s", req.Token.String())
+		node.logger.Debugf("req.TransactionHash: %s", req.TransactionHash.String())
+
+		msg, err := req.GetMessage()
+		if err != nil {
+			node.logger.Debug(err)
+			// todo set status to skipped
+			continue
+		}
+		messagesToSign = append(messagesToSign, msg)
+		msgsIndexes[base64.StdEncoding.EncodeToString(msg)] = idx
+	}
+
 	if len(messagesToSign) == 0 {
 		return nil, false
 	}
 
-	height, err := node.state.GetFrontierMomentum()
-	if err != nil {
-		return err, true
+	right := len(messagesToSign)
+	if right > common.SignCeremonyPoolSize {
+		right = common.SignCeremonyPoolSize
 	}
-	window := node.networksManager.WindowSize()
-	if window == 0 || height/window != ceremony {
-		return errors.New("unwrap ceremony expired before signing"), true
-	}
+	messagesToSign = messagesToSign[:right]
+	//node.logger.Debug("MessagesToSign: ", messagesToSign)
 	response, err := node.signMessages(messagesToSign, msgsIndexes)
 	if err != nil {
 		return err, true
@@ -1228,6 +1215,73 @@ func (node *Node) processSignaturesUnwrap(ceremony uint64) (error, bool) {
 		node.logger.Debugf("\n%d. sig: %s, recoveryID: %s, FinalSig: %s \n", msgsIndexes[sig.Msg], sig.Signature, sig.RecoveryID, requests[msgsIndexes[sig.Msg]].Signature)
 	}
 	return nil, true
+}
+
+// reconcileLookupsPerPool bounds Zenon lookups per ceremony to this multiple
+// of the pool size.
+const reconcileLookupsPerPool = 4
+
+// reconcileUnsignedUnwrapRequests removes from the signing pool every event
+// that Zenon already knows about, recording its Zenon status locally. Such
+// events exist when this node missed the ceremony that signed them (offline,
+// lost the event, or the record was reset), and left in the pool they make
+// this node propose a different message set than its peers. The TSS
+// ceremony only forms a party between signers with an identical set, so one
+// stale entry here keeps this node out of every ceremony until operators
+// wipe and resync the events store.
+//
+// Requests are visited in storage order. The walk stops once enough remain
+// to fill the ceremony pool. It also stops after a bounded number of Zenon
+// lookups; in that case the result is reported as incomplete and the caller
+// skips signing, because a signer with a larger stale backlog than the
+// budget would otherwise select a different pool than its peers. Reconciled
+// statuses are persisted either way, so successive ceremonies work the
+// backlog off. Any Zenon RPC failure aborts the ceremony for this node:
+// guessing would produce a pool its peers do not share.
+func (node *Node) reconcileUnsignedUnwrapRequests(requests []*events.UnwrapRequestEvm) ([]*events.UnwrapRequestEvm, bool, error) {
+	poolSize := common.SignCeremonyPoolSize
+	lookupCap := reconcileLookupsPerPool * poolSize
+	remaining := make([]*events.UnwrapRequestEvm, 0, poolSize)
+	reconciled := 0
+	lookups := 0
+	complete := true
+	for _, req := range requests {
+		if len(remaining) >= poolSize {
+			break
+		}
+		if lookups >= lookupCap {
+			node.logger.Warnf("reconcile: stopped after %d Zenon lookups with %d records selected; %d reconciled this pass, the rest is worked off in later ceremonies", lookups, len(remaining), reconciled)
+			complete = false
+			break
+		}
+		lookups++
+		rpcReq, err := node.networksManager.GetEvmUnwrapRequestByHashAndLogFromRPC(types.Hash(req.TransactionHash), req.LogIndex)
+		if err != nil {
+			if err.Error() == constants.ErrDataNonExistent.Error() {
+				remaining = append(remaining, req)
+				continue
+			}
+			return nil, false, fmt.Errorf("reconcile: cannot query Zenon for event %s/%d: %w", req.TransactionHash.String(), req.LogIndex, err)
+		}
+		if rpcReq == nil {
+			remaining = append(remaining, req)
+			continue
+		}
+		status := common.PendingRedeemStatus
+		if rpcReq.Revoked != 0 {
+			status = common.RevokedStatus
+		} else if rpcReq.Redeemed != 0 {
+			status = common.RedeemedStatus
+		}
+		if err := node.networksManager.SetEvmUnwrapRequestStatus(req, status); err != nil {
+			return nil, false, fmt.Errorf("reconcile: event %s/%d exists on Zenon but its local status could not be updated: %w", req.TransactionHash.String(), req.LogIndex, err)
+		}
+		reconciled++
+	}
+	if reconciled > 0 {
+		node.logger.Infof("reconcile: %d unsigned unwrap events already exist on Zenon and were excluded from the pool; %d selected to sign", reconciled, len(remaining))
+	}
+	return remaining, complete, nil
 }
 
 // Send signatures methods

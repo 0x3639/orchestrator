@@ -9,7 +9,6 @@ import (
 
 	"github.com/ethereum/go-ethereum"
 	"github.com/zenon-network/go-zenon/rpc/api/embedded"
-	"github.com/zenon-network/go-zenon/vm/embedded/definition"
 
 	"orchestrator/verification"
 )
@@ -17,8 +16,8 @@ import (
 func TestWrapFinalityAgreesWithBend(t *testing.T) {
 	var cases verification.Comparisons
 	for _, remaining := range []uint64{0, 1, 12, 256} {
-		request := &embedded.WrapTokenRequest{WrapTokenRequest: new(definition.WrapTokenRequest), ConfirmationsToFinality: remaining}
-		pool := finalizedUnsignedWraps(&embedded.WrapTokenRequestList{List: []*embedded.WrapTokenRequest{request}})
+		request := wrapRequest(1, remaining)
+		pool := readWrapPool(t, &embedded.WrapTokenRequestList{List: []*embedded.WrapTokenRequest{request}})
 		cases.Equal(fmt.Sprintf("B.wrap_is_final(%dn)", remaining), verification.Bool(len(pool) == 1), "Bool")
 	}
 	cases.Check(t)

@@ -43,7 +43,7 @@ func (c Comparisons) Check(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "cases.bend"), []byte(source), 0600); err != nil {
 		t.Fatal(err)
 	}
-	cmd := exec.Command("bend", "cases.bend")
+	cmd := exec.Command("bend", "cases.bend", "--verdict")
 	cmd.Dir = dir
 	if output, err := cmd.CombinedOutput(); err != nil || !strings.Contains(string(output), "ALL PROOFS CHECK") {
 		t.Fatalf("Bend comparison failed: %v\n%s", err, output)

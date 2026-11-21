@@ -1,3 +1,5 @@
+//go:build bend
+
 package network
 
 import (
@@ -46,6 +48,11 @@ type scanTrace struct {
 // A second oversized request stops the test instead of waiting for production backoff.
 func runCappedSync(t *testing.T, start, head, configured, limit, finality uint64, unexpectedLog *etypes.Log) scanTrace {
 	t.Helper()
+	return runSyncWithHint(t, start, head, configured, limit, finality, unexpectedLog, true)
+}
+
+func runSyncWithHint(t *testing.T, start, head, configured, limit, finality uint64, unexpectedLog *etypes.Log, hint bool) scanTrace {
+	t.Helper()
 	var trace scanTrace
 	done := make(chan struct{})
 	stop := sync.OnceFunc(func() { close(done) })
@@ -62,6 +69,9 @@ func runCappedSync(t *testing.T, start, head, configured, limit, finality uint64
 				stop()
 			}
 			rejected = true
+			if !hint {
+				return nil, fmt.Errorf("block range too large")
+			}
 			return nil, fmt.Errorf("block range too large; supported range [%#x, %#x]", from, from+(limit-1))
 		}
 		if unexpectedLog != nil {
@@ -165,5 +175,16 @@ func TestSyncAcceptsLogsAtBothInclusiveBounds(t *testing.T) {
 		if trace.err != nil || trace.saved != 102 {
 			t.Fatalf("in-range block %d: saved cursor %d, err=%v", block, trace.saved, trace.err)
 		}
+	}
+}
+
+func TestShrinkUsesAttemptedSizeAtTip(t *testing.T) {
+	trace := runSyncWithHint(t, 100, 119, 2000, 10, 0, nil, false)
+	if len(trace.queries) < 2 {
+		t.Fatalf("expected a retry after rejecting 20 blocks, got %v", trace.queries)
+	}
+	q := trace.queries[1]
+	if width := uint64(q.To-q.From) + 1; width != 10 {
+		t.Fatalf("after rejecting 20 blocks, next query covered %d, want 10", width)
 	}
 }

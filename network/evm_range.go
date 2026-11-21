@@ -8,8 +8,8 @@ import (
 )
 
 const (
-	// minQueryRange is the floor for automatic halving. Explicit smaller
-	// limits from the operator or the provider are honored.
+	// minQueryRange is the smallest eth_getLogs window the sync will shrink
+	// to. Below this the provider is refusing something other than width.
 	minQueryRange uint64 = 8
 	// growAfterRanges is how many consecutive successful ranges at a reduced
 	// width earn one attempt at doubling it back toward the configured size.
@@ -94,7 +94,7 @@ type queryRangeAdapter struct {
 }
 
 func newQueryRangeAdapter(configured uint64) *queryRangeAdapter {
-	if configured == 0 {
+	if configured < minQueryRange {
 		configured = minQueryRange
 	}
 	return &queryRangeAdapter{configured: configured, current: configured}
@@ -111,20 +111,23 @@ func (a *queryRangeAdapter) size() uint64 {
 // provider's message the window drops straight to that width (never below
 // one block); otherwise it halves, no lower than minQueryRange. It reports
 // the new size and whether anything changed.
-func (a *queryRangeAdapter) shrink(attempted, hint uint64) (uint64, bool) {
+func (a *queryRangeAdapter) shrink(hint uint64) (uint64, bool) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	a.successes = 0 // a rejection breaks the growth streak even at the floor
-	// Near the tip the rejected query may already be smaller than current.
-	width := min(attempted, a.current)
-	next := hint
-	if hint == 0 || hint >= width {
-		if width <= minQueryRange {
-			return a.current, false
-		}
-		next = max(minQueryRange, width/2)
+	if hint > 0 && hint < a.current {
+		a.current = hint
+		a.successes = 0
+		return a.current, true
+	}
+	if a.current <= minQueryRange {
+		return a.current, false
+	}
+	next := a.current / 2
+	if next < minQueryRange {
+		next = minQueryRange
 	}
 	a.current = next
+	a.successes = 0
 	return a.current, true
 }
 
@@ -142,6 +145,10 @@ func (a *queryRangeAdapter) noteSuccess() (uint64, bool) {
 		return a.current, false
 	}
 	a.successes = 0
-	a.current += min(a.current, a.configured-a.current)
+	next := a.current * 2
+	if next > a.configured {
+		next = a.configured
+	}
+	a.current = next
 	return a.current, true
 }

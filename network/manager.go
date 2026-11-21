@@ -317,12 +317,8 @@ func (m *NetworksManager) GetUnsignedWrapRequests() ([]*definition.WrapTokenRequ
 	if err != nil {
 		return nil, err
 	}
-	return finalizedUnsignedWraps(requests), nil
-}
-
-func finalizedUnsignedWraps(requests *embedded.WrapTokenRequestList) []*definition.WrapTokenRequest {
 	if requests == nil || len(requests.List) == 0 {
-		return nil
+		return nil, nil
 	}
 	ans := make([]*definition.WrapTokenRequest, 0)
 	for _, request := range requests.List {
@@ -330,7 +326,7 @@ func finalizedUnsignedWraps(requests *embedded.WrapTokenRequestList) []*definiti
 			ans = append(ans, request.WrapTokenRequest)
 		}
 	}
-	return ans
+	return ans, nil
 }
 
 // / Evm
@@ -646,14 +642,16 @@ func (m *NetworksManager) SetEvmUnwrapRequestAsSent(event *events.UnwrapRequestE
 	return nil
 }
 
-// Reconciliation must preserve a listener update made after the unsigned scan.
+// SetEvmUnwrapRequestStatus updates only the redeem status of an existing record.
 func (m *NetworksManager) SetEvmUnwrapRequestStatus(event *events.UnwrapRequestEvm, status uint32) error {
 	for _, network := range m.evmNetworks {
 		if network.ChainId() == event.ChainId {
-			return network.eventsStore().ReconcileUnwrapRequestStatus(event, status)
+			if err := network.SetUnwrapRequestStatus(event.TransactionHash, event.LogIndex, status); err != nil {
+				return err
+			}
 		}
 	}
-	return errors.Errorf("cannot reconcile unwrap for unknown chain %d", event.ChainId)
+	return nil
 }
 
 // SetEvmBackfillBlocks asks every EVM network to rewind its sync cursor
