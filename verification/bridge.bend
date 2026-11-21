@@ -77,3 +77,11 @@ def missing_prefix(ids: List<Nat>, tail: List<Lookup>) -> List<Lookup>:
   match ids:
     case Nil{}: tail
     case Con{id, rest}: Missing{id} <> missing_prefix(rest, tail)
+
+# Count actual blocks in a contiguous query. Both RPC endpoints are inclusive.
+# Pair each available block with one permit until either supply is exhausted.
+def scan_count(available: Nat, limit: Nat) -> Nat:
+  match available limit:
+    case 0n _: 0n
+    case 1n+a 0n: 0n
+    case 1n+a 1n+l: 1n+scan_count(a, l)

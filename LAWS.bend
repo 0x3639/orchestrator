@@ -96,3 +96,18 @@ law partial_candidates_cannot_override_failure:
 law partial_candidates_cannot_override_budget:
   for id: Nat
   {Bridge.include(id, Bridge.PoolIncomplete{}) == Bridge.PoolIncomplete{} : Bridge.Pool}
+
+# A provider's advertised block count applies even inside the finality window.
+law scan_respects_block_limit:
+  for available: Nat
+  for limit: Nat
+  {Nat.is_le(Bridge.scan_count(available, limit), limit) == True{} : Bool}
+
+law scan_stops_at_head:
+  for available: Nat
+  for limit: Nat
+  {Nat.is_le(Bridge.scan_count(available, limit), available) == True{} : Bool}
+
+law one_block_limit_makes_progress:
+  for more: Nat
+  {Bridge.scan_count(1n+more, 1n) == 1n : Nat}

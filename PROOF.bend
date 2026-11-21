@@ -76,3 +76,21 @@ def Laws.partial_candidates_cannot_override_failure(id):
 
 def Laws.partial_candidates_cannot_override_budget(id):
   {==}
+
+def Laws.scan_respects_block_limit(available, limit):
+  match available limit:
+    case 0n 0n: {==}
+    case 0n 1n+l: {==}
+    case 1n+a 0n: {==}
+    case 1n+a 1n+l: Laws.scan_respects_block_limit(a, l)
+
+def Laws.scan_stops_at_head(available, limit):
+  match available limit:
+    case 0n _: {==}
+    case 1n+a 0n: {==}
+    case 1n+a 1n+l: Laws.scan_stops_at_head(a, l)
+
+def Laws.one_block_limit_makes_progress(more):
+  match more:
+    case 0n: {==}
+    case 1n+m: {==}
