@@ -107,3 +107,24 @@ def Laws.competing_pools_cannot_both_outnumber_each_other(a, b):
     case 0n 1n+y: {==}
     case 1n+x 0n: {==}
     case 1n+x 1n+y: Laws.competing_pools_cannot_both_outnumber_each_other(x, y)
+
+def Laws.one_to_one_pool_split_abstains():
+  {==}
+
+def Laws.minority_pool_with_one_of_three_abstains():
+  {==}
+
+def Laws.matching_pool_with_two_of_three_can_proceed():
+  {==}
+
+def Laws.redeemed_survives_pending_reconciliation():
+  {==}
+
+def Laws.revoked_survives_pending_reconciliation():
+  {==}
+
+def Laws.invalid_scan_preserves_checkpoint(previous, last):
+  {==}
+
+def Laws.valid_scan_commits_through_last_block(previous, last):
+  {==}

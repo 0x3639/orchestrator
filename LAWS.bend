@@ -124,3 +124,29 @@ law competing_pools_cannot_both_outnumber_each_other:
   for +a: Nat
   for +b: Nat
   {Bridge.outnumbers(a, b) && Bridge.outnumbers(b, a) == False{} : Bool}
+
+# Ordered pools from the same ceremony on two different stable views.
+law one_to_one_pool_split_abstains:
+  {Bridge.can_certify(1n, 1n) == False{} : Bool}
+
+law minority_pool_with_one_of_three_abstains:
+  {Bridge.can_certify(1n, 2n) == False{} : Bool}
+
+law matching_pool_with_two_of_three_can_proceed:
+  {Bridge.can_certify(2n, 1n) == True{} : Bool}
+
+law redeemed_survives_pending_reconciliation:
+  {Bridge.apply_pending(Bridge.Redeemed{}) == Bridge.Redeemed{} : Bridge.UnwrapStatus}
+
+law revoked_survives_pending_reconciliation:
+  {Bridge.apply_pending(Bridge.Revoked{}) == Bridge.Revoked{} : Bridge.UnwrapStatus}
+
+law invalid_scan_preserves_checkpoint:
+  for previous: Nat
+  for last: Nat
+  {Bridge.scan_checkpoint(previous, last, False{}) == previous : Nat}
+
+law valid_scan_commits_through_last_block:
+  for previous: Nat
+  for +last: Nat
+  {Bridge.scan_checkpoint(previous, last, True{}) == last : Nat}

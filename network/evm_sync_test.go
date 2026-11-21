@@ -20,6 +20,7 @@ import (
 	"orchestrator/common/config"
 	"orchestrator/db/unwrap"
 	"orchestrator/rpc"
+	"orchestrator/verification"
 )
 
 // Capture the inclusive bounds that reach eth_getLogs, after configuration,
@@ -163,8 +164,9 @@ func TestSyncKeepsCursorOnOutOfRangeLog(t *testing.T) {
 			// this response inconsistent with the requested range [100,102].
 			trace := runCappedSync(t, 100, 102, 10, 10, 12, &etypes.Log{Removed: true, BlockNumber: block, Topics: []ecommon.Hash{}, Data: []byte{}})
 			if trace.err == nil || trace.saved != 100 {
-				t.Fatalf("out-of-range block %d: saved cursor %d, err=%v", block, trace.saved, trace.err)
+				t.Errorf("out-of-range block %d: saved cursor %d, err=%v", block, trace.saved, trace.err)
 			}
+			checkScanCheckpoint(t, trace, block)
 		})
 	}
 }
@@ -173,8 +175,9 @@ func TestSyncAcceptsLogsAtBothInclusiveBounds(t *testing.T) {
 	for _, block := range []uint64{100, 102} {
 		trace := runCappedSync(t, 100, 102, 10, 10, 12, &etypes.Log{Removed: true, BlockNumber: block, Topics: []ecommon.Hash{}, Data: []byte{}})
 		if trace.err != nil || trace.saved != 102 {
-			t.Fatalf("in-range block %d: saved cursor %d, err=%v", block, trace.saved, trace.err)
+			t.Errorf("in-range block %d: saved cursor %d, err=%v", block, trace.saved, trace.err)
 		}
+		checkScanCheckpoint(t, trace, block)
 	}
 }
 
@@ -187,4 +190,17 @@ func TestShrinkUsesAttemptedSizeAtTip(t *testing.T) {
 	if width := uint64(q.To-q.From) + 1; width != 10 {
 		t.Fatalf("after rejecting 20 blocks, next query covered %d, want 10", width)
 	}
+}
+
+func checkScanCheckpoint(t *testing.T, trace scanTrace, block uint64) {
+	t.Helper()
+	if len(trace.queries) != 1 {
+		t.Fatalf("expected one log query, got %v", trace.queries)
+	}
+	q := trace.queries[0]
+	// The fixture persisted 100 before Sync and returned exactly one log.
+	fits := fmt.Sprintf("B.logs_in_range(%dn, %dn, [%dn])", uint64(q.From), uint64(q.To), block)
+	var checks verification.Comparisons
+	checks.Equal(fmt.Sprintf("B.scan_checkpoint(100n, %dn, %s)", uint64(q.To), fits), fmt.Sprintf("%dn", trace.saved), "Nat")
+	checks.Check(t)
 }

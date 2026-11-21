@@ -14,6 +14,7 @@ import (
 	"github.com/zenon-network/go-zenon/vm/constants"
 	"github.com/zenon-network/go-zenon/vm/embedded/definition"
 	"orchestrator/common"
+	"orchestrator/verification"
 )
 
 func (c reconciliationChain) checkRecovery(t *testing.T) {
@@ -104,6 +105,7 @@ func TestSameCeremonyDifferentStableBridgeTips(t *testing.T) {
 	for _, peers := range []int{2, 3} {
 		t.Run(fmt.Sprintf("%d signers", peers), func(t *testing.T) {
 			var readyPools [][]uint32
+			var checks verification.Comparisons
 			for peer := 0; peer < peers; peer++ {
 				c := newSigner(t)
 				if peer == peers-1 {
@@ -118,16 +120,25 @@ func TestSameCeremonyDifferentStableBridgeTips(t *testing.T) {
 					}
 				}
 				ids, ready, err := c.pool(t)
-				if err == nil && ready && len(ids) > 0 {
+				// The fixture assigns all but the final peer to the first view.
+				// These counts are independent of the pools returned by Go.
+				supporters := peers - 1
+				if peer == peers-1 {
+					supporters = 1
+				}
+				proceeds := err == nil && ready && len(ids) > 0
+				checks.Equal(fmt.Sprintf("B.can_certify(%dn, %dn)", supporters, peers-supporters), verification.Bool(proceeds), "Bool")
+				if proceeds {
 					readyPools = append(readyPools, ids)
 				}
 			}
 			if peers == 2 && len(readyPools) > 0 {
-				t.Fatalf("split peers marked pools ready: %v", readyPools)
+				t.Errorf("split peers marked pools ready: %v", readyPools)
 			}
 			if peers == 3 && (len(readyPools) != 2 || !slices.Equal(readyPools[0], []uint32{1, 3, 4, 5}) || !slices.Equal(readyPools[1], readyPools[0])) {
-				t.Fatalf("expected only the two matching peers to proceed, ready pools: %v", readyPools)
+				t.Errorf("expected only the two matching peers to proceed, ready pools: %v", readyPools)
 			}
+			checks.Check(t)
 		})
 	}
 }
@@ -156,9 +167,20 @@ func TestReconcileStatusPreservesListenerUpdate(t *testing.T) {
 			if err != nil || got == nil {
 				t.Fatalf("could not read reconciled event: %v", err)
 			}
-			if got.RedeemStatus != want {
-				t.Fatalf("after listener status %d, stored status %d; want %d", status, got.RedeemStatus, want)
+			names := map[uint32]string{
+				common.UnredeemedStatus: "B.Unredeemed{}", common.PendingRedeemStatus: "B.Pending{}",
+				common.RedeemedStatus: "B.Redeemed{}", common.RevokedStatus: "B.Revoked{}",
 			}
+			observed, ok := names[got.RedeemStatus]
+			if !ok {
+				t.Fatalf("unexpected stored status %d", got.RedeemStatus)
+			}
+			var checks verification.Comparisons
+			checks.Equal("B.apply_pending("+names[status]+")", observed, "B.UnwrapStatus")
+			if got.RedeemStatus != want {
+				t.Errorf("after listener status %d, stored status %d; want %d", status, got.RedeemStatus, want)
+			}
+			checks.Check(t)
 		})
 	}
 }

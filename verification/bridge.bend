@@ -104,3 +104,28 @@ def outnumbers(a: Nat, b: Nat) -> Bool:
 # The current TSS key needs ceil(2 * participants / 3) distinct shares.
 def can_certify(+votes: Nat, +others: Nat) -> Bool:
   outnumbers(votes, others) && Nat.is_le(Nat.add(others, others), votes)
+
+type UnwrapStatus is Data:
+  Unredeemed{}
+  Pending{}
+  Redeemed{}
+  Revoked{}
+
+# A pending lookup can arrive after a listener has stored a terminal status.
+def apply_pending(current: UnwrapStatus) -> UnwrapStatus:
+  match current:
+    case Unredeemed{}: Pending{}
+    case Pending{}: Pending{}
+    case Redeemed{}: Redeemed{}
+    case Revoked{}: Revoked{}
+
+# Every returned block must belong to the inclusive interval before it commits.
+def logs_in_range(+first: Nat, +last: Nat, heights: List<Nat>) -> Bool:
+  match heights:
+    case Nil{}: True{}
+    case Con{+h, rest}: Nat.is_le(first, h) && Nat.is_le(h, last) && logs_in_range(first, last, rest)
+
+def scan_checkpoint(previous: Nat, last: Nat, valid: Bool) -> Nat:
+  match valid:
+    case False{}: previous
+    case True{}: last
