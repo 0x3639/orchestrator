@@ -5,13 +5,15 @@ Use `--ldflags '-extldflags "-Wl,--allow-multiple-definition"` as build argument
 ## Checking the bridge laws
 
 [LAWS.bend](LAWS.bend) specifies wrap finality, queued EVM event confirmation,
-backfill deletion guards and selection of the unwrap signing pool.
+backfill deletion guards, selection of the unwrap signing pool, and block counts
+for inclusive EVM log queries.
 [PROOF.bend](PROOF.bend) proves those properties of the
 [decision model](verification/bridge.bend). The Go comparison tests exercise
 the production decisions with simulated RPC replies and an in-memory event store.
 
 Run both checks with Bend 2.0.40 on the path. The Go command below uses the
-project's Linux linker flags.
+project's Linux linker flags. The sync tests record the actual RPC queries and
+check the saved cursor after a provider returns a log outside the requested range.
 
 ```sh
 bend PROOF.bend

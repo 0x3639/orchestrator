@@ -158,3 +158,12 @@ func TestSyncKeepsCursorOnOutOfRangeLog(t *testing.T) {
 		})
 	}
 }
+
+func TestSyncAcceptsLogsAtBothInclusiveBounds(t *testing.T) {
+	for _, block := range []uint64{100, 102} {
+		trace := runCappedSync(t, 100, 102, 10, 10, 12, &etypes.Log{Removed: true, BlockNumber: block, Topics: []ecommon.Hash{}, Data: []byte{}})
+		if trace.err != nil || trace.saved != 102 {
+			t.Fatalf("in-range block %d: saved cursor %d, err=%v", block, trace.saved, trace.err)
+		}
+	}
+}
