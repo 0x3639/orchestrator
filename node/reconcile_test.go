@@ -4,6 +4,7 @@ package node
 
 import (
 	"errors"
+	"fmt"
 	"math/big"
 	"net/http/httptest"
 	"os"
@@ -184,7 +185,12 @@ func (c reconciliationChain) SetUnwrapRequestStatus(hash ecommon.Hash, i, status
 	return c.EvmStorage.SetUnwrapRequestStatus(hash, i, status)
 }
 
-func (c reconciliationChain) openNetworks(t *testing.T, state *common.GlobalState) (*network.NetworksManager, func()) {
+type fixtureNetwork struct {
+	id    uint32
+	store db.EvmStorage
+}
+
+func (c reconciliationChain) openNetworks(t *testing.T, state *common.GlobalState, ordered ...fixtureNetwork) (*network.NetworksManager, func()) {
 	t.Helper()
 	t.Setenv("HOME", t.TempDir()) // isolate the EVM network's disk queue
 	srv := server.NewServer()
@@ -213,16 +219,28 @@ func (c reconciliationChain) openNetworks(t *testing.T, state *common.GlobalStat
 	if err := manager.Init(map[string]config.BaseNetworkConfig{common.ZenonNetworkName: cfg, "fixture": cfg}, stores, state, nil); err != nil {
 		t.Fatal(err)
 	}
-	net, err := network.NewEvmNetwork(&definition.NetworkInfo{NetworkClass: definition.EvmClass, Id: 1, Name: "fixture"}, fixtureStores{c}, manager.RpcManager(), nil, stop)
-	if err != nil {
-		t.Fatal(err)
+	if len(ordered) == 0 {
+		ordered = []fixtureNetwork{{1, c}}
 	}
-	if err := manager.RpcManager().AddEvmClient(cfg, 1, "fixture", ecommon.Address{}); err != nil {
-		t.Fatal(err)
+	var stops []func()
+	for _, entry := range ordered {
+		name := fmt.Sprintf("fixture-%d", entry.id)
+		net, err := network.NewEvmNetwork(&definition.NetworkInfo{NetworkClass: definition.EvmClass, Id: entry.id, Name: name}, fixtureStores{entry.store}, manager.RpcManager(), nil, stop)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := manager.RpcManager().AddEvmClient(cfg, entry.id, name, ecommon.Address{}); err != nil {
+			t.Fatal(err)
+		}
+		manager.AddEvmNetwork(net)
+		stops = append(stops, net.Stop)
 	}
-
-	manager.AddEvmNetwork(net)
-	closeNetworks := sync.OnceFunc(func() { net.Stop(); closeEndpoint() })
+	closeNetworks := sync.OnceFunc(func() {
+		for _, stop := range stops {
+			stop()
+		}
+		closeEndpoint()
+	})
 	t.Cleanup(closeNetworks)
 	return manager, closeNetworks
 }

@@ -1,6 +1,8 @@
 package network
 
 import (
+	"bytes"
+	"cmp"
 	"crypto/ecdsa"
 	"encoding/base64"
 	"encoding/hex"
@@ -20,6 +22,7 @@ import (
 	"orchestrator/db/manager"
 	"orchestrator/rpc"
 	"os"
+	"slices"
 )
 
 type NetworksManager struct {
@@ -603,6 +606,17 @@ func (m *NetworksManager) GetUnsignedUnwrapRequests() ([]*events.UnwrapRequestEv
 			ans = append(ans, req)
 		}
 	}
+	// Signers may discover their networks in different orders. Order the
+	// combined candidates before reconciliation applies either of its limits.
+	slices.SortFunc(ans, func(a, b *events.UnwrapRequestEvm) int {
+		if c := cmp.Compare(a.ChainId, b.ChainId); c != 0 {
+			return c
+		}
+		if c := bytes.Compare(a.TransactionHash[:], b.TransactionHash[:]); c != 0 {
+			return c
+		}
+		return cmp.Compare(a.LogIndex, b.LogIndex)
+	})
 	return ans, nil
 }
 

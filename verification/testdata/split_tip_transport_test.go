@@ -35,6 +35,7 @@ import (
 
 	"orchestrator/common"
 	"orchestrator/common/config"
+	"orchestrator/common/events"
 	"orchestrator/tss"
 	"orchestrator/verification"
 	"orchestrator/verification/testdata/signtransport"
@@ -68,7 +69,7 @@ func newSigningPeer(t *testing.T, tip byte, key string) *signingPeer {
 	return buildSigningPeer(t, tip, key, "")
 }
 
-func buildSigningPeer(t *testing.T, tip byte, key, activeBridgeKey string) *signingPeer {
+func buildSigningPeer(t *testing.T, tip byte, key, activeBridgeKey string, ordered ...fixtureNetwork) *signingPeer {
 	t.Helper()
 	events := candidates(6)
 	for _, event := range events {
@@ -103,7 +104,7 @@ func buildSigningPeer(t *testing.T, tip byte, key, activeBridgeKey string) *sign
 		messages = append(messages, base64.StdEncoding.EncodeToString(msg))
 	}
 	state := common.NewGlobalState(new(uint8))
-	networks, _ := c.openNetworks(t, state)
+	networks, _ := c.openNetworks(t, state, ordered...)
 	_, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		t.Fatal(err)
@@ -594,5 +595,68 @@ func TestSigningRecoversAfterMissedResize(t *testing.T) {
 	want := base64.StdEncoding.EncodeToString(h.Sum(nil))
 	if !slices.Equal(agreements, []string{want}) || p.node.networksManager.WindowSize() != 50 {
 		t.Fatalf("after RPC recovery: cached size=%d commitments=%v, want size 50 and commitment %s for window 35", p.node.networksManager.WindowSize(), agreements, want)
+	}
+}
+
+func TestNetworkLoadOrderAtSigningTransport(t *testing.T) {
+	key, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	pub := base64.StdEncoding.EncodeToString(crypto.CompressPubkey(&key.PublicKey))
+	previous := common.SignCeremonyPoolSize
+	common.SignCeremonyPoolSize = 3
+	t.Cleanup(func() { common.SignCeremonyPoolSize = previous; signtransport.Receive = nil })
+
+	candidatesByChain := map[uint32][]*events.UnwrapRequestEvm{1: candidates(4), 2: candidates(4)}
+	for chain, requests := range candidatesByChain {
+		for _, r := range requests {
+			r.To = types.ZeroAddress.String()
+			r.ChainId = chain
+		}
+	}
+	// Logs 0 and 2 are already registered. Three signing slots leave one
+	// eligible transfer on the second chain outside the certified batch.
+	var want []string
+	for _, r := range []*events.UnwrapRequestEvm{candidatesByChain[1][1], candidatesByChain[1][3], candidatesByChain[2][1]} {
+		msg, err := r.GetMessage()
+		if err != nil {
+			t.Fatal(err)
+		}
+		want = append(want, base64.StdEncoding.EncodeToString(msg))
+	}
+
+	var commitments []string
+	var batches [][]string
+	signtransport.Receive = func(_ string, req keysign.Request) (keysign.Response, error) {
+		if len(req.Messages) != 1 {
+			batches = append(batches, slices.Clone(req.Messages))
+			return keysign.Response{Status: tcommon.Fail}, nil
+		}
+		commitment := req.Messages[0]
+		commitments = append(commitments, commitment)
+		digest, err := base64.StdEncoding.DecodeString(commitment)
+		if err != nil {
+			return keysign.Response{}, err
+		}
+		sig, err := crypto.Sign(digest, key)
+		if err != nil {
+			return keysign.Response{}, err
+		}
+		return keysign.Response{Status: tcommon.Success, Signatures: []keysign.Signature{{Msg: commitment, Signature: base64.StdEncoding.EncodeToString(sig[:64])}}}, nil
+	}
+	for _, order := range [][]uint32{{1, 2}, {2, 1}} {
+		// Reconciliation writes to each signer's own store.
+		var nets []fixtureNetwork
+		for _, chain := range order {
+			nets = append(nets, fixtureNetwork{id: chain, store: signerWithEvents(t, candidatesByChain[chain])})
+		}
+		peer := buildSigningPeer(t, 1, pub, "", nets...)
+		if err, _ := runScheduledUnwrap(t, peer.node, testCeremony); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(batches) != 2 || !slices.Equal(batches[0], want) || !slices.Equal(batches[1], want) || len(commitments) != 2 || commitments[0] != commitments[1] {
+		t.Fatalf("different network load orders: commitments=%v bridge-signature requests=%v, want both batches %v", commitments, batches, want)
 	}
 }

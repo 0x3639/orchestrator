@@ -19,6 +19,10 @@ func TestSplitTipBridgeSignatureRequestsAgreeWithBend(t *testing.T) {
 	runSigningTransportTest(t, "TestRequestsAtSigningTransport")
 }
 
+func TestNetworkLoadOrderPreservesUnwrapPool(t *testing.T) {
+	runSigningTransportTest(t, "TestNetworkLoadOrderAtSigningTransport")
+}
+
 func TestWindowResizePreservesUnwrapProgress(t *testing.T) {
 	runSigningTransportTest(t, "TestWindowResizeAtSigningTransport")
 }
