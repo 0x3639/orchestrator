@@ -317,8 +317,12 @@ func (m *NetworksManager) GetUnsignedWrapRequests() ([]*definition.WrapTokenRequ
 	if err != nil {
 		return nil, err
 	}
+	return finalizedUnsignedWraps(requests), nil
+}
+
+func finalizedUnsignedWraps(requests *embedded.WrapTokenRequestList) []*definition.WrapTokenRequest {
 	if requests == nil || len(requests.List) == 0 {
-		return nil, nil
+		return nil
 	}
 	ans := make([]*definition.WrapTokenRequest, 0)
 	for _, request := range requests.List {
@@ -326,7 +330,7 @@ func (m *NetworksManager) GetUnsignedWrapRequests() ([]*definition.WrapTokenRequ
 			ans = append(ans, request.WrapTokenRequest)
 		}
 	}
-	return ans, nil
+	return ans
 }
 
 // / Evm

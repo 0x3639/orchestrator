@@ -1,0 +1,79 @@
+import Base
+
+# network/manager.go selects ordinary unsigned wraps in Zenon RPC order.
+# The RPC reports confirmations still required, rather than confirmations seen.
+def wrap_is_final(remaining: Nat) -> Bool:
+  match remaining:
+    case 0n: True{}
+    case 1n+r: False{}
+
+# network/evm_confirm.go. Depth is checked before interpreting any receipt.
+# Canonical evidence is used when a receipt is missing or contradicts the log.
+type Receipt is Data:
+  SuccessfulInBlock{}
+  ReadError{}
+  NeedsBlockCheck{}
+
+type Canonical is Data:
+  Uncertain{}
+  Replacement{}
+  ObservedWithLog{}
+  ObservedWithoutLog{}
+
+type Decision is Data:
+  Retry{}
+  Confirm{}
+  RecheckReplacement{}
+
+def confirm(mature: Bool, receipt: Receipt, block: Canonical) -> Decision:
+  match mature receipt block:
+    case False{} _ _: Retry{}
+    case True{} SuccessfulInBlock{} _: Confirm{}
+    case True{} ReadError{} _: Retry{}
+    case True{} NeedsBlockCheck{} Replacement{}: RecheckReplacement{}
+    case True{} NeedsBlockCheck{} ObservedWithLog{}: Confirm{}
+    case True{} NeedsBlockCheck{} _: Retry{}
+
+# db/unwrap/entries.go re-reads these three predicates under the storage lock
+# after the caller establishes that the previously observed block was replaced.
+def can_delete(signed: Bool, unredeemed: Bool, same_block: Bool) -> Bool:
+  match signed:
+    case True{}: False{}
+    case False{}: unredeemed && same_block
+
+# node/reconcile.go. Each input is the result for a request in storage order.
+# Failed includes a lookup error or failure to persist a known request's status.
+type Lookup is Data:
+  Missing{id: Nat}
+  Known{}
+  Failed{}
+
+type Pool is Type:
+  PoolReady{ids: List<Nat>}
+  PoolIncomplete{}
+  PoolAborted{}
+
+def include(id: Nat, result: Pool) -> Pool:
+  match result:
+    case PoolReady{ids}: PoolReady{id <> ids}
+    case PoolIncomplete{}: PoolIncomplete{}
+    case PoolAborted{}: PoolAborted{}
+
+# Only a complete pool reaches signing. The Go implementation also returns a
+# diagnostic prefix when incomplete. That prefix is never proposed to peers.
+def signing_pool(slots: Nat, budget: Nat, xs: List<Lookup>) -> Pool:
+  match slots budget xs:
+    case 0n _ _: PoolReady{[]}
+    case 1n+s 0n Nil{}: PoolReady{[]}
+    case 1n+s 0n Con{_, _}: PoolIncomplete{}
+    case 1n+s 1n+b Nil{}: PoolReady{[]}
+    case 1n+s 1n+b Con{Failed{}, _}: PoolAborted{}
+    case 1n+s 1n+b Con{Known{}, tail}: signing_pool(1n+s, b, tail)
+    case 1n+s 1n+b Con{Missing{id}, tail}: include(id, signing_pool(s, b, tail))
+
+# A reference trace for a prefix of eligible requests, followed by arbitrary
+# provider results. The prefix length is both the slot count and lookup budget.
+def missing_prefix(ids: List<Nat>, tail: List<Lookup>) -> List<Lookup>:
+  match ids:
+    case Nil{}: tail
+    case Con{id, rest}: Missing{id} <> missing_prefix(rest, tail)
