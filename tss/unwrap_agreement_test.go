@@ -4,25 +4,28 @@ import (
 	"bytes"
 	"context"
 	"crypto/ecdsa"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/binary"
+	"errors"
 	"math/big"
+	"path/filepath"
 	"slices"
+	"testing"
 	"time"
 
-	"encoding/base64"
-	"errors"
-	"github.com/HyperCore-Team/go-tss/conversion"
-	ecommon "github.com/ethereum/go-ethereum/common"
-	"github.com/zenon-network/go-zenon/common/types"
-	"github.com/zenon-network/go-zenon/vm/embedded/definition"
-	"orchestrator/common/events"
-	"path/filepath"
-	"testing"
-
 	tcommon "github.com/HyperCore-Team/go-tss/common"
+	"github.com/HyperCore-Team/go-tss/conversion"
 	"github.com/HyperCore-Team/go-tss/keysign"
 	"github.com/HyperCore-Team/go-tss/messages"
+	ecommon "github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/syndtr/goleveldb/leveldb"
+	"github.com/zenon-network/go-zenon/common/types"
+	"github.com/zenon-network/go-zenon/vm/embedded/definition"
+
+	"orchestrator/common"
+	"orchestrator/common/events"
 )
 
 func TestUnwrapVoteSurvivesFailureRestartAndConcurrentRetries(t *testing.T) {
@@ -58,7 +61,7 @@ func TestUnwrapVoteSurvivesFailureRestartAndConcurrentRetries(t *testing.T) {
 		}}}, nil
 	}
 	m := open()
-	if err := m.approveUnwrapPool(m.GetPubKey(), 17, pool, sign); err == nil {
+	if err := m.approveUnwrapPool(m.GetPubKey(), common.CeremonyWindow{Number: 17, Size: 100}, pool, sign); err == nil {
 		t.Fatal("approved a failed vote")
 	}
 	if err := m.unwrapVotes.Close(); err != nil {
@@ -66,19 +69,21 @@ func TestUnwrapVoteSurvivesFailureRestartAndConcurrentRetries(t *testing.T) {
 	}
 	m = open()
 	defer m.unwrapVotes.Close()
-	if err := m.approveUnwrapPool(m.GetPubKey(), 17, reversed, sign); err == nil || calls != 1 {
+	if err := m.approveUnwrapPool(m.GetPubKey(), common.CeremonyWindow{Number: 17, Size: 100}, reversed, sign); err == nil || calls != 1 {
 		t.Fatal("voted twice after restart")
 	}
-	if err := m.approveUnwrapPool(m.GetPubKey(), 17, pool, sign); err != nil {
+	if err := m.approveUnwrapPool(m.GetPubKey(), common.CeremonyWindow{Number: 17, Size: 100}, pool, sign); err != nil {
 		t.Fatal(err)
 	}
-	if err := m.approveUnwrapPool(m.GetPubKey(), 18, reversed, sign); err != nil {
+	if err := m.approveUnwrapPool(m.GetPubKey(), common.CeremonyWindow{Number: 18, Size: 100}, reversed, sign); err != nil {
 		t.Fatal(err)
 	}
 
 	result := make(chan error, 2)
 	for _, digest := range pool {
-		go func() { result <- m.reserveUnwrapVote(crypto.CompressPubkey(&key.PublicKey), 19, digest) }()
+		go func() {
+			result <- m.reserveUnwrapVote(crypto.CompressPubkey(&key.PublicKey), common.CeremonyWindow{Number: 19, Size: 100}, digest, pool)
+		}()
 	}
 	first, second := <-result, <-result
 	if (first == nil) == (second == nil) {
@@ -97,7 +102,8 @@ func TestUnwrapCertificateBindsKeyWindowAndOrderedMessages(t *testing.T) {
 	}
 	pub := crypto.CompressPubkey(&key.PublicKey)
 	a, b := bytes.Repeat([]byte{1}, 32), bytes.Repeat([]byte{2}, 32)
-	digest, err := unwrapPoolDigest(pub, 17, [][]byte{a, b})
+	window := common.CeremonyWindow{Number: 17, Size: 100}
+	digest, err := unwrapPoolDigest(pub, window, [][]byte{a, b})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -108,12 +114,15 @@ func TestUnwrapCertificateBindsKeyWindowAndOrderedMessages(t *testing.T) {
 	for _, tc := range []struct {
 		name     string
 		key      []byte
-		ceremony uint64
+		ceremony common.CeremonyWindow
 		pool     [][]byte
 	}{
-		{"same", pub, 17, [][]byte{a, b}}, {"reordered", pub, 17, [][]byte{b, a}},
-		{"shorter", pub, 17, [][]byte{a}}, {"next ceremony", pub, 18, [][]byte{a, b}},
-		{"other key", crypto.CompressPubkey(&other.PublicKey), 17, [][]byte{a, b}},
+		{"same", pub, window, [][]byte{a, b}},
+		{"reordered", pub, window, [][]byte{b, a}},
+		{"shorter", pub, window, [][]byte{a}},
+		{"next ceremony", pub, common.CeremonyWindow{Number: 18, Size: 100}, [][]byte{a, b}},
+		{"same number after resize", pub, common.CeremonyWindow{Number: 17, Size: 200}, [][]byte{a, b}},
+		{"other key", crypto.CompressPubkey(&other.PublicKey), window, [][]byte{a, b}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			d, err := unwrapPoolDigest(tc.key, tc.ceremony, tc.pool)
@@ -200,7 +209,7 @@ func TestDifferentStableTipsGateBridgeSigning(t *testing.T) {
 							return nil, ctx.Err()
 						}
 					}
-					_, err := m.signUnwrapPool(pub, 17, pool, func() error { return nil }, sign)
+					_, err := m.signUnwrapPool(pub, common.CeremonyWindow{Number: 17, Size: 100}, pool, func() error { return nil }, sign)
 					outcomes <- outcome{peer, bridgeCalls, err}
 				}()
 			}
@@ -284,9 +293,65 @@ func TestUnwrapAgreementExpiresBeforeBridgeSigning(t *testing.T) {
 				}
 				return nil
 			}
-			if _, err := m.signUnwrapPool(pub, 17, pool, check, sign); err == nil || calls != 1 {
+			if _, err := m.signUnwrapPool(pub, common.CeremonyWindow{Number: 17, Size: 100}, pool, check, sign); err == nil || calls != 1 {
 				t.Fatalf("%d sign requests, err=%v", calls, err)
 			}
 		})
+	}
+}
+
+// Construct the unversioned record exactly as earlier PR builds wrote it.
+func TestLegacyUnwrapVoteAcrossUpgradeAndResize(t *testing.T) {
+	key, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	pub := crypto.CompressPubkey(&key.PublicKey)
+	original := [][]byte{bytes.Repeat([]byte{1}, 32)}
+	different := [][]byte{bytes.Repeat([]byte{2}, 32)}
+	oldID := binary.BigEndian.AppendUint64(bytes.Clone(pub), 17)
+	h := sha256.New()
+	h.Write([]byte("zenon/orchestrator/unwrap-pool/v1\x00"))
+	h.Write(oldID)
+	h.Write(original[0])
+	path := t.TempDir()
+	open := func() *TssManager {
+		db, err := leveldb.OpenFile(path, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return &TssManager{unwrapVotes: db}
+	}
+	m := open()
+	if err := m.unwrapVotes.Put(oldID, h.Sum(nil), nil); err != nil {
+		t.Fatal(err)
+	}
+	reserve := func(size uint64, pool [][]byte) error {
+		window := common.CeremonyWindow{Number: 17, Size: size}
+		digest, err := unwrapPoolDigest(pub, window, pool)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return m.reserveUnwrapVote(pub, window, digest, pool)
+	}
+	if err := reserve(100, different); err == nil {
+		t.Fatal("upgrade allowed a second pool in an active window")
+	}
+	if err := m.unwrapVotes.Close(); err != nil {
+		t.Fatal(err)
+	}
+	m = open()
+	defer m.unwrapVotes.Close()
+	if err := reserve(100, different); err == nil {
+		t.Fatal("restart forgot the legacy vote")
+	}
+	if err := reserve(100, original); err != nil {
+		t.Fatalf("same-pool retry: %v", err)
+	}
+	if err := reserve(200, different); err != nil {
+		t.Fatalf("independent resized window: %v", err)
+	}
+	if err := reserve(200, original); err == nil {
+		t.Fatal("resized window allowed a second vote")
 	}
 }

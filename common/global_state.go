@@ -15,12 +15,18 @@ const (
 	ReSignState    uint8 = 4
 )
 
+// CeremonyWindow identifies the chain interval even when governance resizes windows.
+type CeremonyWindow struct {
+	Number uint64
+	Size   uint64
+}
+
 type GlobalState struct {
 	state                  *uint8
 	stateSemaphore         *semaphore.Weighted
 	frontierMomentumHeight uint64
 	frontierMomSemaphore   *semaphore.Weighted
-	lastCeremony           uint64
+	lastCeremony           CeremonyWindow
 	isAdministratorActive  bool
 	tokensMap              map[uint32]map[string]string
 	// [chainId][token] -> bool
@@ -34,7 +40,6 @@ type GlobalState struct {
 func NewGlobalState(state *uint8) *GlobalState {
 	return &GlobalState{
 		state:                    state,
-		lastCeremony:             0,
 		frontierMomentumHeight:   0,
 		stateSemaphore:           semaphore.NewWeighted(1),
 		frontierMomSemaphore:     semaphore.NewWeighted(1),
@@ -83,12 +88,13 @@ func (gs *GlobalState) GetFrontierMomentum() (uint64, error) {
 	return gs.frontierMomentumHeight, nil
 }
 
-func (gs *GlobalState) SetLastCeremony(ceremony uint64) {
-	gs.lastCeremony = ceremony
-}
-
-func (gs *GlobalState) GetLastCeremony() uint64 {
-	return gs.lastCeremony
+// BeginCeremony is called by the signing loop before attempting either round.
+func (gs *GlobalState) BeginCeremony(window CeremonyWindow) bool {
+	if window.Size == 0 || window == gs.lastCeremony || (gs.lastCeremony.Size == 0 && window.Number == 0) {
+		return false
+	}
+	gs.lastCeremony = window
+	return true
 }
 
 func (gs *GlobalState) SetTokensMap(chainId uint32, zts, token string) {

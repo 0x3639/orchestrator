@@ -16,6 +16,15 @@ import (
 // commitment generation, certificate verification and both calls to KeySign
 // still come from the checkout under test.
 func TestSplitTipBridgeSignatureRequestsAgreeWithBend(t *testing.T) {
+	runSigningTransportTest(t, "TestRequestsAtSigningTransport")
+}
+
+func TestWindowResizePreservesUnwrapProgress(t *testing.T) {
+	runSigningTransportTest(t, "TestWindowResizeAtSigningTransport")
+}
+
+func runSigningTransportTest(t *testing.T, name string) {
+	t.Helper()
 	root, err := filepath.Abs("..")
 	if err != nil {
 		t.Fatal(err)
@@ -46,13 +55,13 @@ func TestSplitTipBridgeSignatureRequestsAgreeWithBend(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Go 1.22 vet reopens the on-disk files and cannot see virtual test files.
-	cmd := exec.Command("go", "test", "-vet=off", "-race", "-count=1", "-tags=bend", "-ldflags=-extldflags=-Wl,--allow-multiple-definition", "-overlay", overlayPath, "-run", "^TestRequestsAtSigningTransport$", "-v", "./node")
+	cmd := exec.Command("go", "test", "-vet=off", "-race", "-count=1", "-tags=bend", "-ldflags=-extldflags=-Wl,--allow-multiple-definition", "-overlay", overlayPath, "-run", "^"+name+"$", "-v", "./node")
 	cmd.Dir = root
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("signing transport comparison: %v\n%s", err, out)
 	}
-	if !bytes.Contains(out, []byte("--- PASS: TestRequestsAtSigningTransport ")) {
+	if !bytes.Contains(out, []byte("--- PASS: "+name+" ")) {
 		t.Fatalf("signing test did not run:\n%s", out)
 	}
 	for _, line := range bytes.Split(out, []byte("\n")) {

@@ -99,7 +99,6 @@ func newSigningPeer(t *testing.T, tip byte, key string) *signingPeer {
 	if err := state.SetFrontierMomentum(testCeremony * networks.WindowSize()); err != nil {
 		t.Fatal(err)
 	}
-	state.SetLastCeremony(testCeremony)
 	return &signingPeer{
 		node:     &Node{networksManager: networks, tssManager: manager, state: state, logger: zap.NewNop().Sugar()},
 		messages: messages,
@@ -197,16 +196,7 @@ func checkBridgeRequests(t *testing.T, tips []byte) {
 		wg.Add(1)
 		go func(n *Node) {
 			defer wg.Done()
-			// dev's unwrap method originally took no argument. Invoke the actual
-			// entry point for each checkout with the same scheduled window.
-			switch run := any(n.processSignaturesUnwrap).(type) {
-			case func() (error, bool):
-				run()
-			case func(uint64) (error, bool):
-				run(testCeremony)
-			default:
-				t.Error("unsupported unwrap entry point")
-			}
+			_, _ = runScheduledUnwrap(t, n, testCeremony)
 		}(p.node)
 	}
 	wg.Wait()
@@ -227,4 +217,82 @@ func checkBridgeRequests(t *testing.T, tips []byte) {
 		checks.Equal(fmt.Sprintf("B.can_certify(%dn, %dn)", supporters, len(peers)-supporters), verification.Bool(p.requests > 0), "Bool")
 	}
 	checks.Check(t)
+}
+
+func runScheduledUnwrap(t *testing.T, n *Node, number uint64) (error, bool) {
+	t.Helper()
+	// The same fixture can also be run on dev, before certificates existed.
+	switch run := any(n.processSignaturesUnwrap).(type) {
+	case func() (error, bool):
+		return run()
+	case func(uint64) (error, bool):
+		return run(number)
+	case func(uint64, uint64) (error, bool):
+		return run(number, n.networksManager.WindowSize())
+	default:
+		t.Fatal("unsupported unwrap entry point")
+		return nil, false
+	}
+}
+
+func TestWindowResizeAtSigningTransport(t *testing.T) {
+	key, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	pub := base64.StdEncoding.EncodeToString(crypto.CompressPubkey(&key.PublicKey))
+	first := newSigningPeer(t, 1, pub)
+	later := newSigningPeer(t, 2, pub)
+	// Two different chain views, but one signer, signing key and vote database.
+	later.node.tssManager = first.node.tssManager
+	var agreements int
+	var onAgreement func()
+	var bridgeCalls int
+	signtransport.Receive = func(_ string, r keysign.Request) (keysign.Response, error) {
+		if len(r.Messages) != 1 {
+			bridgeCalls++
+			return keysign.Response{Status: tcommon.Fail}, nil
+		}
+		agreements++
+		if onAgreement != nil {
+			onAgreement()
+		}
+		d, err := base64.StdEncoding.DecodeString(r.Messages[0])
+		if err != nil {
+			return keysign.Response{}, err
+		}
+		sig, err := crypto.Sign(d, key)
+		if err != nil {
+			return keysign.Response{}, err
+		}
+		return keysign.Response{Status: tcommon.Success, Signatures: []keysign.Signature{{Msg: r.Messages[0], Signature: base64.StdEncoding.EncodeToString(sig[:64])}}}, nil
+	}
+	defer func() { signtransport.Receive = nil }()
+	attempt := func(p *signingPeer, height, size uint64) error {
+		p.node.networksManager.Znn().SetWindowSize(size)
+		if err := p.node.state.SetFrontierMomentum(height); err != nil {
+			t.Fatal(err)
+		}
+		err, _ := runScheduledUnwrap(t, p.node, height/size)
+		return err
+	}
+	if err := attempt(first, 1750, 100); err != nil {
+		t.Fatal(err)
+	}
+	if err := attempt(later, 3500, 200); err != nil {
+		t.Fatalf("later window reused number 17 and blocked a new pool: %v", err)
+	}
+	if agreements != 2 || bridgeCalls != 2 {
+		t.Fatalf("got %d agreement requests and %d bridge requests, want two of each", agreements, bridgeCalls)
+	}
+	if err := attempt(first, 3501, 200); err == nil || agreements != 2 || bridgeCalls != 2 {
+		t.Fatal("signer could change its vote within the resized window")
+	}
+
+	// An already-issued certificate must also expire when governance resizes
+	// the window while the round number stays 17 at the observed height.
+	onAgreement = func() { later.node.networksManager.Znn().SetWindowSize(201) }
+	if err := attempt(later, 3502, 200); err == nil || agreements != 3 || bridgeCalls != 2 {
+		t.Fatalf("round changed during agreement: err=%v, agreements=%d, bridge requests=%d", err, agreements, bridgeCalls)
+	}
 }

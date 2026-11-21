@@ -30,11 +30,21 @@ reconciliation. [Prototype tests and replay instructions](verification/testdata/
 
 ## Upgrading unwrap signers
 
-Each signer requests a threshold certificate for the signing key, ceremony
-number, and exact ordered unwrap messages before it requests bridge signatures.
-A split without a quorum skips the unwrap signing round. A ready pool requires
-one additional threshold round, and agreement that finishes after the ceremony
-expires is discarded.
+Each signer requests a threshold certificate for the signing key, window size,
+ceremony number and exact ordered unwrap messages before requesting bridge
+signatures. Resizing the window creates a distinct round even when the number
+repeats. Before requesting bridge signatures the signer rechecks the window size,
+its locally observed chain height, and the signing key.
+
+Both unwrap rounds use go-tss's leaderless protocol. With three signers, two
+matching signers can finish both rounds when the third chooses a different pool.
+The signing threshold still comes from the original key shares. On a split,
+allow time for peer discovery in both rounds. Run the three-signer regression
+on Linux with the command below.
+
+```sh
+go test -race -count=1 -ldflags '-extldflags=-Wl,--allow-multiple-definition' -run '^TestUnwrapTwoOfThreeRealCoordinator$' ./tss
+```
 
 Upgrade the signing group together. An older signer can still request bridge
 signatures directly. Back up and restore the current `unwrap-pool-votes`
