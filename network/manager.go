@@ -181,6 +181,20 @@ func (m *NetworksManager) Networks() []*evmNetwork {
 
 ///////// state
 
+// AllBridgeHaltFlagsSet checks the explicit flags. An RPC failure or the
+// temporary delay after an unhalt cannot acknowledge a recorded incident.
+func (m *NetworksManager) AllBridgeHaltFlagsSet() (bool, error) {
+	info, err := m.Znn().GetBridgeInfo()
+	if err != nil {
+		return false, err
+	}
+	if info == nil || !info.Halted {
+		return false, nil
+	}
+	_, unhalted, err := m.CountNetworksHaltState()
+	return err == nil && unhalted == 0, err
+}
+
 func (m *NetworksManager) CountNetworksHaltState() (int, int, error) {
 	halted, unhalted := 0, 0
 	for _, network := range m.evmNetworks {

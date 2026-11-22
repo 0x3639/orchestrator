@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/zenon-network/go-zenon/common/types"
 	"golang.org/x/sync/semaphore"
@@ -31,6 +32,10 @@ type GlobalState struct {
 	Health                 *snapshot.Store
 	state                  *uint8
 	stateSemaphore         *semaphore.Weighted
+	redeemIncidents        RedeemIncidentStore
+	redeemHaltPending      atomic.Uint64
+	redeemWriteFailed      bool
+	redeemGeneration       uint64 // guarded by stateSemaphore
 	frontierMomentumHeight uint64
 	frontierMomSemaphore   *semaphore.Weighted
 	lastCeremony           CeremonyWindow
@@ -63,11 +68,18 @@ func (gs *GlobalState) SetState(newState uint8) error {
 	if err != nil {
 		return err
 	}
+	defer gs.stateSemaphore.Release(1)
+	if gs.RedeemHaltGeneration() != 0 && newState != EmergencyState {
+		return nil // Only the completed halt procedure can release the incident.
+	}
+	gs.setStateLocked(newState)
+	return nil
+}
+
+func (gs *GlobalState) setStateLocked(newState uint8) {
 	GlobalLogger.Infof("Old state: %s, New state: %s\n", StateToText(*gs.state), StateToText(newState))
 	*gs.state = newState
 	gs.Health.SetBridgeState(StateToText(newState))
-	gs.stateSemaphore.Release(1)
-	return nil
 }
 
 func (gs *GlobalState) GetState() (uint8, error) {
