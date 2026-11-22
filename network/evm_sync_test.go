@@ -1,6 +1,7 @@
 package network
 
 import (
+	"errors"
 	"fmt"
 	"math"
 	"net/http"
@@ -48,10 +49,10 @@ type scanTrace struct {
 // A second oversized request stops the test instead of waiting for production backoff.
 func runCappedSync(t *testing.T, start, head, configured, limit, finality uint64, unexpectedLog *etypes.Log) scanTrace {
 	t.Helper()
-	return runSyncWithHint(t, start, head, configured, limit, finality, unexpectedLog, true)
+	return runSyncWithRejection(t, start, head, configured, limit, finality, unexpectedLog, "")
 }
 
-func runSyncWithHint(t *testing.T, start, head, configured, limit, finality uint64, unexpectedLog *etypes.Log, hint bool) scanTrace {
+func runSyncWithRejection(t *testing.T, start, head, configured, limit, finality uint64, unexpectedLog *etypes.Log, rejection string) scanTrace {
 	t.Helper()
 	var trace scanTrace
 	done := make(chan struct{})
@@ -69,8 +70,8 @@ func runSyncWithHint(t *testing.T, start, head, configured, limit, finality uint
 				stop()
 			}
 			rejected = true
-			if !hint {
-				return nil, fmt.Errorf("block range too large")
+			if rejection != "" {
+				return nil, errors.New(rejection)
 			}
 			return nil, fmt.Errorf("block range too large; supported range [%#x, %#x]", from, from+(limit-1))
 		}
@@ -164,13 +165,20 @@ func TestSyncHonorsInclusiveRanges(t *testing.T) {
 }
 
 func TestShrinkUsesAttemptedSizeAtTip(t *testing.T) {
-	trace := runSyncWithHint(t, 100, 119, 2000, 10, 0, nil, false)
-	if len(trace.queries) < 2 {
-		t.Fatalf("expected a retry after rejecting 20 blocks, got %v", trace.queries)
-	}
-	q := trace.queries[1]
-	if width := uint64(q.To-q.From) + 1; width != 10 {
-		t.Fatalf("after rejecting 20 blocks, next query covered %d, want 10", width)
+	for _, rejection := range []string{
+		"block range too large",
+		"logs matched by query exceeds limit of 10000",
+		"query exceeds max results 20000",
+	} {
+		t.Run(rejection, func(t *testing.T) {
+			trace := runSyncWithRejection(t, 100, 119, 2000, 10, 0, nil, rejection)
+			if trace.err != nil || trace.saved != 119 {
+				t.Fatalf("sync saved %d, want 119, err=%v", trace.saved, trace.err)
+			}
+			if len(trace.queries) < 2 || trace.queries[1] != (scanQuery{100, 109}) {
+				t.Fatalf("expected a retry of [100,109] after rejecting [100,119], got %v", trace.queries)
+			}
+		})
 	}
 }
 

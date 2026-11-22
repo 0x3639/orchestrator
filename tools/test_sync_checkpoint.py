@@ -1,7 +1,9 @@
+from contextlib import contextmanager
 import fcntl
 import json
 import os
 from pathlib import Path
+import shutil
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -32,6 +34,23 @@ class CheckpointTests(unittest.TestCase):
 
     def command(self, action, name="healthy"):
         return checkpoint.run(action, self.data, name)
+
+    def test_create_and_restore_with_python_36_37_cleanup(self):
+        @contextmanager
+        def strict_tempdir(**kwargs):
+            # These runtimes always rmtree the original name on context exit.
+            directory = tempfile.mkdtemp(**kwargs)
+            try:
+                yield directory
+            finally:
+                shutil.rmtree(directory)
+
+        with patch.object(tempfile, "TemporaryDirectory", strict_tempdir):
+            self.command("create")
+            self.cursor.write_bytes(b"later block")
+            self.command("restore")
+        self.assertEqual(self.cursor.read_bytes(), b"cursor and events")
+        self.assertFalse((self.data / checkpoint.PENDING).exists())
 
     def test_checkpoint_round_trip(self):
         self.command("create")

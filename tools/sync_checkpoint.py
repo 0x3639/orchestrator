@@ -175,15 +175,24 @@ def scan_tree(source, destination=None, installed=None):
     return entries
 
 
+@contextmanager
+def stage_for_publish(destination, prefix):
+    # Python 3.6/3.7 clean up the original temporary directory by name.
+    # Move its completed child so that the directory itself can be removed.
+    with tempfile.TemporaryDirectory(prefix=prefix, dir=destination.parent) as tmp:
+        stage = Path(tmp) / "stage"
+        stage.mkdir(mode=0o700)
+        yield stage
+        sync_dir(stage)
+        move(stage, destination)
+
+
 def create(data, checkpoint):
     if os.path.lexists(checkpoint):
         raise ValueError(f"checkpoint already exists: {checkpoint.name}")
-    with tempfile.TemporaryDirectory(prefix=".building-", dir=checkpoint.parent) as tmp:
-        stage = Path(tmp)
+    with stage_for_publish(checkpoint, ".building-") as stage:
         entries = scan_tree(data, stage)
         write_json(stage / "manifest.json", {"version": 1, "entries": entries})
-        sync_dir(stage)
-        move(stage, checkpoint)
 
 
 def checked_copy(checkpoint, destination=None):
@@ -204,8 +213,7 @@ def restore(data, checkpoint, lock):
                 if os.path.ismount(live):
                     raise ValueError(f"cannot rename mount point {live}")
         # Verify and fully stage both stores before moving either active tree.
-        with tempfile.TemporaryDirectory(prefix=".restoring-", dir=data) as tmp:
-            stage = Path(tmp)
+        with stage_for_publish(pending, ".restoring-") as stage:
             (stage / "incoming").mkdir()
             (stage / "previous").mkdir()
             checked_copy(checkpoint, stage / "incoming")
@@ -213,8 +221,6 @@ def restore(data, checkpoint, lock):
                 "checkpoint": checkpoint.name,
                 "previous": "pre-restore-" + uuid.uuid4().hex,
             })
-            sync_dir(stage)
-            move(stage, pending)
     require_directory(pending)
     state = read_json(pending / "restore.json")
     if state["checkpoint"] != checkpoint.name:

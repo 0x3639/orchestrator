@@ -42,6 +42,10 @@ var rangeLimitPhrases = []string{
 // range". A quantity in requests per minute is a different kind of limit.
 var rangeQuantityRe = regexp.MustCompile(`\b(?:limited to|more than|up to|at most)\s+(?:a\s+)?[0-9][0-9,.]*[km]?[\s-]+(?:blocks?|range|results?|logs?)\b`)
 
+// Match per-query result limits without treating an exceeded request quota as
+// a reason to shrink the block window.
+var queryResultLimitRe = regexp.MustCompile(`\b(?:logs matched by (?:the )?query exceed(?:s|ed)? (?:the )?limit|query exceed(?:s|ed)? (?:the )?max(?:imum)? (?:results|logs))\b`)
+
 // suggestedRangeRe matches the "[0xfrom, 0xto]" hint some providers put in
 // their range-limit message, for example Alchemy's "Based on your
 // parameters, this block range should work: [0x106e0ed, 0x106e0f6]".
@@ -92,7 +96,7 @@ func isRangeLimitError(err error) bool {
 			return true
 		}
 	}
-	return rangeQuantityRe.MatchString(msg)
+	return rangeQuantityRe.MatchString(msg) || queryResultLimitRe.MatchString(msg)
 }
 
 // queryRangeAdapter narrows the sync's eth_getLogs window when the provider
