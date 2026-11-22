@@ -1,7 +1,6 @@
 package network
 
 import (
-	"bytes"
 	"crypto/ecdsa"
 	"fmt"
 	ecommon "github.com/ethereum/go-ethereum/common"
@@ -484,11 +483,11 @@ func (eN *evmNetwork) InterpretLog(log etypes.Log, live bool) error {
 			if err != nil {
 				return err
 			}
-			if !slices.Equal(source.Topics, log.Topics) || !bytes.Equal(source.Data, log.Data) {
+			if !slices.Equal(source.Topics, log.Topics) || !slices.Equal(source.Data, log.Data) {
 				return errors.New("historical range log differs from the agreed unwrap evidence")
 			}
 		}
-		eventsToProcess, err := eN.unwrapRequestsFromLog(log)
+		eventsToProcess, err := eN.unwrapRequestsFromLog(log, nil)
 		if err != nil {
 			return err
 		}
@@ -507,7 +506,7 @@ func (eN *evmNetwork) InterpretLog(log etypes.Log, live bool) error {
 			} else {
 				// Present already when the znn sync or a previous pass stored it;
 				// UpdateUnwrapRequestBlockNumber inserts when missing and otherwise
-				// only refreshes the block fields, never the signature or status.
+				// refreshes the block fields and missing sender, preserving signature and status.
 				if err := eN.eventsStore().UpdateUnwrapRequestBlockNumber(*ev); err != nil {
 					return err
 				}

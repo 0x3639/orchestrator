@@ -186,6 +186,18 @@ func TestUnwrapHistoricalIngestionAndStoredSigningEvidence(t *testing.T) {
 	if err := manager.VerifyUnwrapsForSigning(requests); err != nil {
 		t.Fatal(err)
 	}
+	// Simulate restart with different current metadata and the original event store.
+	net.state = common.NewGlobalState(new(uint8))
+	if err := net.InterpretLog(log, false); err != nil {
+		t.Fatal(err)
+	}
+	requests, err = net.eventsStore().GetUnsignedUnwrapRequests()
+	if err != nil || len(requests) != 2 {
+		t.Fatalf("replayed affiliate rows=%d, err=%v", len(requests), err)
+	}
+	if err := manager.VerifyUnwrapsForSigning(requests); err != nil {
+		t.Fatal(err)
+	}
 	for _, req := range requests {
 		expected := int64(154)
 		if req.LogIndex >= common.AffiliateLogIndexAddition {
@@ -282,5 +294,59 @@ func TestUnwrapEvidenceResolvesReceiptAgainstCanonicalLog(t *testing.T) {
 				t.Fatal("incomplete source evidence passed")
 			}
 		})
+	}
+}
+
+func TestRestoredUnwrapVerifiedBeforeHydration(t *testing.T) {
+	ev := testEvent(100, canonicalHeader(100))
+	ev.From, ev.Token = ecommon.HexToAddress("0x22"), ecommon.HexToAddress("0x10")
+	log := transferLog(t, ev, testRecipient, 150)
+	primary, secondary := &unwrapProvider{}, &unwrapProvider{}
+	primary.set(evidenceReceipt(log), nil, 140)
+	net := sourceNetwork(t, primary, secondary)
+	manager := &NetworksManager{evmNetworks: []*evmNetwork{net}}
+	addr, err := types.ParseAddress(testRecipient)
+	if err != nil {
+		t.Fatal(err)
+	}
+	restore := common.ZnnUnwrapToOrchestatorUnwrap(&definition.UnwrapTokenRequest{
+		NetworkClass: net.NetworkClass(), ChainId: net.ChainId(), TransactionHash: types.Hash(ev.TransactionHash),
+		LogIndex: ev.LogIndex, ToAddress: addr, TokenAddress: ev.Token.Hex(), Amount: big.NewInt(150),
+	})
+	store := net.eventsStore()
+	if err := store.AddUnwrapRequest(restore); err != nil {
+		t.Fatal(err)
+	}
+	check := func() error {
+		rows, err := store.GetUnsignedUnwrapRequests()
+		if err != nil || len(rows) != 1 {
+			t.Fatalf("stored rows=%d, err=%v", len(rows), err)
+		}
+		return manager.VerifyUnwrapsForSigning(rows)
+	}
+	if err := check(); err == nil {
+		t.Fatal("restored row accepted without endpoint agreement")
+	}
+	pending, err := store.GetUnwrapRequestByHashAndLog(ev.TransactionHash, ev.LogIndex)
+	if err != nil || pending.From != (ecommon.Address{}) || pending.BlockNumber != 0 {
+		t.Fatal("incomplete evidence mutated the row", pending, err)
+	}
+	secondary.set(evidenceReceipt(log), nil, 140)
+	if err := check(); err != nil {
+		t.Fatal(err)
+	}
+	verified, err := store.GetUnwrapRequestByHashAndLog(ev.TransactionHash, ev.LogIndex)
+	if err != nil || verified.From != ev.From || verified.BlockNumber != ev.BlockNumber || verified.BlockHash != ev.BlockHash {
+		t.Fatal("incorrect persisted source", verified, err)
+	}
+	if err := store.AddUnwrapRequest(restore); err != nil {
+		t.Fatal(err)
+	}
+	if err := net.InterpretLog(log, false); err != nil {
+		t.Fatal(err)
+	}
+	verified, err = store.GetUnwrapRequestByHashAndLog(ev.TransactionHash, ev.LogIndex)
+	if err != nil || verified.From != ev.From {
+		t.Fatal("historical replay did not restore the sender", verified, err)
 	}
 }

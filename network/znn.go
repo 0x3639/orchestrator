@@ -396,12 +396,18 @@ func (rC *znnNetwork) interpretSendBlockData(sendBlock *api.AccountBlock, live b
 										}
 									}
 
-									// No matter if affiliate program is active, this transaction should be treated as normal
-									zts := rC.state.GetTokensMap(param.ChainId, strings.ToLower(unwrapRequest.Token.String()))
-									affiliateStartingHeight := rC.state.GetAffiliateStartingHeight(param.ChainId).Uint64()
-									isAffiliateProgramActive := rC.state.GetIsAffiliateProgramActive(param.ChainId, zts)
-									isAffiliateProgramActive = isAffiliateProgramActive && (log.BlockNumber >= affiliateStartingHeight)
-									isAffiliateProgramActive = isAffiliateProgramActive && (affiliateStartingHeight > 0)
+									var policy common.AffiliatePolicy
+									if parseOk {
+										stored, exists, err := rC.dbManager.EvmStorage(param.ChainId).UnwrapAffiliatePolicy(affiliateEvidenceKey(log))
+										if err != nil {
+											return err
+										}
+										policy = stored
+										if !exists {
+											policy = rC.state.AffiliatePolicyAt(param.ChainId, unwrapRequest.Token.Hex(), log.BlockNumber)
+										}
+									}
+									isAffiliateProgramActive := policy&common.VerifyAffiliate != 0
 
 									// Here we check the zts because the checks on evm only might not be active
 									if len(addresses) == 1 || !parseOk || !isAffiliateProgramActive {

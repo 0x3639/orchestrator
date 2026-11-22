@@ -635,15 +635,35 @@ func (m *NetworksManager) VerifyUnwrapsForSigning(requests []*events.UnwrapReque
 		if source == nil {
 			return fmt.Errorf("no source network for unwrap %s/%d", req.TransactionHash, req.LogIndex)
 		}
-		canonical, err := source.EvmRpc().CanonicalHash(req.BlockNumber)
+		candidate := *req
+		if candidate.BlockHash == (ecommon.Hash{}) {
+			// A receipt is a locator only. The canonical hash, finality depth and
+			// transfer below still require agreement from all configured endpoints.
+			receipt, err := source.EvmRpc().TransactionReceipt(candidate.TransactionHash)
+			if err != nil {
+				return fmt.Errorf("unwrap %s/%d cannot be signed: locating its source block: %w", req.TransactionHash, req.LogIndex, err)
+			}
+			if receipt == nil || receipt.TxHash != candidate.TransactionHash || receipt.BlockNumber == nil || !receipt.BlockNumber.IsUint64() ||
+				receipt.BlockHash == (ecommon.Hash{}) || (candidate.BlockNumber != 0 && candidate.BlockNumber != receipt.BlockNumber.Uint64()) {
+				return fmt.Errorf("unwrap %s/%d cannot be signed: no matching source block", req.TransactionHash, req.LogIndex)
+			}
+			candidate.BlockNumber, candidate.BlockHash = receipt.BlockNumber.Uint64(), receipt.BlockHash
+		}
+		canonical, err := source.EvmRpc().CanonicalHash(candidate.BlockNumber)
 		if err != nil {
 			return fmt.Errorf("unwrap %s/%d cannot be signed: %w", req.TransactionHash, req.LogIndex, err)
 		}
-		if canonical != req.BlockHash {
+		if canonical != candidate.BlockHash {
 			return fmt.Errorf("unwrap %s/%d cannot be signed: its block was replaced", req.TransactionHash, req.LogIndex)
 		}
-		if err := source.verifyUnwrapTransfer(req); err != nil {
+		if err := source.verifyUnwrapTransfer(&candidate, true); err != nil {
 			return fmt.Errorf("unwrap %s/%d cannot be signed: %w", req.TransactionHash, req.LogIndex, err)
+		}
+		if candidate.BlockHash != req.BlockHash || candidate.From != req.From {
+			if err := source.eventsStore().HydrateUnsignedUnwrap(*req, candidate); err != nil {
+				return err
+			}
+			*req = candidate
 		}
 	}
 	return nil

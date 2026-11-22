@@ -2,10 +2,12 @@ package common
 
 import (
 	"context"
+	"strings"
+	"sync"
+
 	"github.com/zenon-network/go-zenon/common/types"
 	"golang.org/x/sync/semaphore"
 	"math/big"
-	"sync"
 )
 
 const (
@@ -34,7 +36,7 @@ type GlobalState struct {
 	// [chainId][token] -> bool
 	isAffiliateProgramActive map[uint32]map[string]bool
 	// [chainId] -> height
-	affiliateStartingHeight map[uint32]*big.Int
+	affiliateStartingHeight map[uint32]uint64
 	resignNetworkClass      uint32
 	resignNetworkChainId    uint32
 }
@@ -48,6 +50,7 @@ func NewGlobalState(state *uint8) *GlobalState {
 		isAdministratorActive:    false,
 		tokensMap:                make(map[uint32]map[string]string),
 		isAffiliateProgramActive: make(map[uint32]map[string]bool),
+		affiliateStartingHeight:  make(map[uint32]uint64),
 	}
 }
 
@@ -100,6 +103,9 @@ func (gs *GlobalState) BeginCeremony(window CeremonyWindow) bool {
 }
 
 func (gs *GlobalState) SetTokensMap(chainId uint32, zts, token string) {
+	gs.affiliateMu.Lock()
+	defer gs.affiliateMu.Unlock()
+	token = strings.ToLower(token)
 	if _, found := gs.tokensMap[chainId]; !found {
 		gs.tokensMap[chainId] = make(map[string]string)
 	}
@@ -109,7 +115,9 @@ func (gs *GlobalState) SetTokensMap(chainId uint32, zts, token string) {
 }
 
 func (gs *GlobalState) GetTokensMap(chainId uint32, ztsOrToken string) string {
-	if value, found := gs.tokensMap[chainId][ztsOrToken]; found {
+	gs.affiliateMu.RLock()
+	defer gs.affiliateMu.RUnlock()
+	if value, found := gs.tokensMap[chainId][strings.ToLower(ztsOrToken)]; found {
 		return value
 	}
 	return ""
@@ -127,93 +135,64 @@ func (gs *GlobalState) GetIsAdministratorActive() bool {
 func (gs *GlobalState) SetIsAffiliateProgram(program AffiliateProgram) {
 	gs.affiliateMu.Lock()
 	defer gs.affiliateMu.Unlock()
-	for chainId, networkValues := range program.Networks {
-		GlobalLogger.Infof("Set affiliate program values for network: %d", chainId)
-		if _, foundNetwork := gs.isAffiliateProgramActive[chainId]; !foundNetwork {
-			gs.isAffiliateProgramActive = make(map[uint32]map[string]bool)
+	// An update replaces the listed chains. Unlisted chains keep their settings.
+	for id, values := range program.Networks {
+		znn, qsr := types.ZnnTokenStandard.String(), types.QsrTokenStandard.String()
+		flags := map[string]bool{znn: values.ZNN, qsr: values.QSR}
+		if addr := gs.tokensMap[id][znn]; addr != "" {
+			flags[addr] = values.WZNN
 		}
-
-		gs.setAffiliateStartingHeight(chainId, networkValues.StartingHeight)
-		GlobalLogger.Infof("SetAffiliateStartingHeight: %d", networkValues.StartingHeight)
-
-		if tokenInfo, found := gs.isAffiliateProgramActive[chainId]; found {
-			tokenInfo[types.ZnnTokenStandard.String()] = networkValues.ZNN
-		} else {
-			gs.isAffiliateProgramActive[chainId] = make(map[string]bool)
-			gs.isAffiliateProgramActive[chainId][types.ZnnTokenStandard.String()] = networkValues.ZNN
+		if addr := gs.tokensMap[id][qsr]; addr != "" {
+			flags[addr] = values.WQSR
 		}
-		GlobalLogger.Infof("SetIsAffiliateProgramActive for %s to : %t", types.ZnnTokenStandard.String(), networkValues.ZNN)
-
-		if tokenInfo, found := gs.isAffiliateProgramActive[chainId]; found {
-			tokenInfo[types.QsrTokenStandard.String()] = networkValues.QSR
-		} else {
-			gs.isAffiliateProgramActive[chainId] = make(map[string]bool)
-			gs.isAffiliateProgramActive[chainId][types.QsrTokenStandard.String()] = networkValues.QSR
-		}
-		GlobalLogger.Infof("SetIsAffiliateProgramActive for %s to : %t", types.QsrTokenStandard.String(), networkValues.QSR)
-
-		wZnnTokenAddress := gs.GetTokensMap(chainId, types.ZnnTokenStandard.String())
-		if len(wZnnTokenAddress) > 0 {
-			if tokenInfo, found := gs.isAffiliateProgramActive[chainId]; found {
-				tokenInfo[wZnnTokenAddress] = networkValues.WZNN
-			} else {
-				gs.isAffiliateProgramActive[chainId] = make(map[string]bool)
-				gs.isAffiliateProgramActive[chainId][wZnnTokenAddress] = networkValues.WZNN
-			}
-			GlobalLogger.Infof("SetIsAffiliateProgramActive for %s (wZNN) to : %t", wZnnTokenAddress, networkValues.WZNN)
-		}
-		wQsrTokenAddress := gs.GetTokensMap(chainId, types.QsrTokenStandard.String())
-		if len(wQsrTokenAddress) > 0 {
-			if tokenInfo, found := gs.isAffiliateProgramActive[chainId]; found {
-				tokenInfo[wQsrTokenAddress] = networkValues.WQSR
-			} else {
-				gs.isAffiliateProgramActive[chainId] = make(map[string]bool)
-				gs.isAffiliateProgramActive[chainId][wQsrTokenAddress] = networkValues.WQSR
-			}
-			GlobalLogger.Infof("SetIsAffiliateProgramActive for %s (wQSR) to : %t", wQsrTokenAddress, networkValues.WQSR)
-		}
+		gs.isAffiliateProgramActive[id] = flags
+		gs.affiliateStartingHeight[id] = values.StartingHeight
+		GlobalLogger.Infof("Updated affiliate program for network %d at starting height %d", id, values.StartingHeight)
 	}
 }
 
-func (gs *GlobalState) GetIsAffiliateProgramActive(chainId uint32, token string) bool {
+func (gs *GlobalState) GetIsAffiliateProgramActive(id uint32, token string) bool {
 	gs.affiliateMu.RLock()
 	defer gs.affiliateMu.RUnlock()
-	if networkInfo, foundNetwork := gs.isAffiliateProgramActive[chainId]; foundNetwork {
-		if value, foundToken := networkInfo[token]; foundToken {
-			return value
-		}
-	}
-	return false
+	return gs.isAffiliateProgramActive[id][strings.ToLower(token)]
 }
 
-func (gs *GlobalState) SetAffiliateStartingHeight(chainId uint32, value uint64) {
+func (gs *GlobalState) SetAffiliateStartingHeight(id uint32, height uint64) {
 	gs.affiliateMu.Lock()
 	defer gs.affiliateMu.Unlock()
-	gs.setAffiliateStartingHeight(chainId, value)
+	gs.affiliateStartingHeight[id] = height
 }
 
-func (gs *GlobalState) setAffiliateStartingHeight(chainId uint32, value uint64) {
-	if _, foundNetwork := gs.isAffiliateProgramActive[chainId]; !foundNetwork {
-		gs.affiliateStartingHeight = make(map[uint32]*big.Int)
-	}
-	gs.affiliateStartingHeight[chainId] = big.NewInt(0).SetUint64(value)
-}
-
-func (gs *GlobalState) GetAffiliateStartingHeight(chainId uint32) *big.Int {
+func (gs *GlobalState) GetAffiliateStartingHeight(id uint32) *big.Int {
 	gs.affiliateMu.RLock()
 	defer gs.affiliateMu.RUnlock()
-	if value, found := gs.affiliateStartingHeight[chainId]; found {
-		return value
-	}
-	return big.NewInt(0)
+	return new(big.Int).SetUint64(gs.affiliateStartingHeight[id])
 }
 
-// AffiliateActiveAt reads both fields from the same bridge metadata update.
-func (gs *GlobalState) AffiliateActiveAt(chainID uint32, token string, height uint64) bool {
+// Wrapped and native token flags govern distinct sides of the bridge.
+type AffiliatePolicy byte
+
+const (
+	SplitAffiliate AffiliatePolicy = 1 << iota
+	VerifyAffiliate
+)
+
+func (gs *GlobalState) AffiliatePolicyAt(id uint32, token string, height uint64) AffiliatePolicy {
 	gs.affiliateMu.RLock()
 	defer gs.affiliateMu.RUnlock()
-	start := gs.affiliateStartingHeight[chainID]
-	return start != nil && start.Sign() > 0 && height >= start.Uint64() && gs.isAffiliateProgramActive[chainID][token]
+	if start := gs.affiliateStartingHeight[id]; start == 0 || height < start {
+		return 0
+	}
+	token = strings.ToLower(token)
+	flags := gs.isAffiliateProgramActive[id]
+	var policy AffiliatePolicy
+	if flags[token] {
+		policy |= SplitAffiliate
+	}
+	if flags[gs.tokensMap[id][token]] {
+		policy |= VerifyAffiliate
+	}
+	return policy
 }
 
 func (gs *GlobalState) GetResignNetwork() (uint32, uint32) {
