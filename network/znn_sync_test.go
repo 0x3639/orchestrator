@@ -34,6 +34,7 @@ type startupLedger struct {
 	lookups    []types.Hash
 	syncStatus func() *protocol.SyncInfo
 	tip        func() *api.Momentum
+	bridgeInfo func() (*definition.BridgeInfoVariable, error)
 }
 
 func (l *startupLedger) GetAccountBlocksByHeight(ctx context.Context, _ types.Address, height, _ uint64) *api.AccountBlockListMarshal {
@@ -51,6 +52,9 @@ func (l *startupLedger) GetAccountBlockByHash(hash types.Hash) (*api.AccountBloc
 	return l.lookup(hash)
 }
 
+func (l *startupLedger) GetBridgeInfo() (*definition.BridgeInfoVariable, error) {
+	return l.bridgeInfo()
+}
 func (l *startupLedger) SyncInfo() *protocol.SyncInfo       { return l.syncStatus() }
 func (l *startupLedger) GetFrontierMomentum() *api.Momentum { return l.tip() }
 
@@ -66,7 +70,7 @@ func (rt startupTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 func startupNetwork(t *testing.T, ledger *startupLedger) *znnNetwork {
 	t.Helper()
 	srv := server.NewServer()
-	for _, name := range []string{"ledger", "stats"} {
+	for _, name := range []string{"ledger", "stats", "embedded.bridge"} {
 		if err := srv.RegisterName(name, ledger); err != nil {
 			t.Fatal(err)
 		}

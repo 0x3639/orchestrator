@@ -12,7 +12,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/zenon-network/go-zenon/chain/nom"
 	zdb "github.com/zenon-network/go-zenon/common/db"
+	"github.com/zenon-network/go-zenon/common/types"
+	"github.com/zenon-network/go-zenon/protocol"
+	"github.com/zenon-network/go-zenon/rpc/api"
 	"github.com/zenon-network/go-zenon/vm/embedded/definition"
 
 	"orchestrator/common/config"
@@ -50,6 +54,7 @@ func TestShutdownDuringSetNetwork(t *testing.T) {
 			store := &runtimeStores{unwrapTestStores: unwrapTestStores{znn: wrap.NewZnnStorage(zdb.NewMemDB(), stop)}}
 			n.dbManager = store
 			n.stopChan = stop
+			n.SetConfirmationsToFinality(5)
 			n.administrator = send.Address.String()
 			n.networkManager = &NetworksManager{znnNetwork: n, logger: n.logger}
 			n.networksInfo = map[string]config.BaseNetworkConfig{info.Name: {Urls: []string{"http://provisional.invalid"}}}
@@ -71,6 +76,10 @@ func TestShutdownDuringSetNetwork(t *testing.T) {
 					result = startupPage(receive)
 				case "ledger.getAccountBlockByHash":
 					result = send
+				case "stats.syncInfo":
+					result = &protocol.SyncInfo{State: protocol.SyncDone}
+				case "ledger.getFrontierMomentum":
+					result = &api.Momentum{Momentum: &nom.Momentum{Height: 100, Hash: types.Hash{1}}}
 				case "embedded.bridge.getNetworkInfo":
 					result = info
 				case "eth_syncing":

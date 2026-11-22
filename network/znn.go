@@ -310,11 +310,25 @@ func (rC *znnNetwork) readReceivePair(ctx context.Context, listed *api.AccountBl
 	return receive, send, nil
 }
 
+type receiveMode uint8
+
+const (
+	startupHistory receiveMode = iota
+	listenerHistory
+	liveReceive
+)
+
 func (rC *znnNetwork) syncReceive(ctx context.Context, listed *api.AccountBlock) error {
 	receive, send, err := rC.readReceivePair(ctx, listed)
 	if err != nil {
 		return err
 	}
+	return rC.interpretConfirmedReceive(ctx, receive, send, startupHistory, rC.refreshSettings)
+}
+
+// Startup and the listener must make the same live decision, even when an
+// earlier failed receive has held the listener behind for several momentums.
+func (rC *znnNetwork) interpretConfirmedReceive(ctx context.Context, receive, send *api.AccountBlock, history receiveMode, refresh func() error) error {
 	confirmed := receive.ConfirmationDetail.MomentumHeight
 	if confirmed == 0 {
 		return errors.Errorf("missing confirmation height for bridge receive %s", receive.Hash)
@@ -325,7 +339,7 @@ func (rC *znnNetwork) syncReceive(ctx context.Context, listed *api.AccountBlock)
 		return err
 	}
 	// Already-final receives cannot become live as the frontier advances.
-	live := false
+	mode := history
 	if frontier < confirmed || frontier-confirmed < finality {
 		read, cancel := context.WithTimeout(ctx, rpc.ZnnLedgerTimeout)
 		defer cancel()
@@ -350,20 +364,27 @@ func (rC *znnNetwork) syncReceive(ctx context.Context, listed *api.AccountBlock)
 		if err != nil {
 			return err
 		}
-		live = synced && max(frontier, tip.Height)-confirmed < finality
+		if synced && max(frontier, tip.Height)-confirmed < finality {
+			mode = liveReceive
+		}
 	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	return rC.interpretSendBlockData(ctx, send, live, receive.Height, rC.refreshSettings)
+	return rC.interpretSendBlockData(ctx, send, mode, receive.Height, refresh)
 }
 
 // InterpretSendBlockData We assume that if the receive acc block was created then it was no error
 func (rC *znnNetwork) InterpretSendBlockData(sendBlock *api.AccountBlock, live bool, receiveBlockHeight uint64) error {
-	return rC.interpretSendBlockData(rC.listenerCtx, sendBlock, live, receiveBlockHeight, rC.refreshSettings)
+	mode := startupHistory
+	if live {
+		mode = liveReceive
+	}
+	return rC.interpretSendBlockData(rC.listenerCtx, sendBlock, mode, receiveBlockHeight, rC.refreshSettings)
 }
 
-func (rC *znnNetwork) interpretSendBlockData(ctx context.Context, sendBlock *api.AccountBlock, live bool, receiveBlockHeight uint64, refreshSettings func() error) error {
+func (rC *znnNetwork) interpretSendBlockData(ctx context.Context, sendBlock *api.AccountBlock, mode receiveMode, receiveBlockHeight uint64, refreshSettings func() error) error {
+	live := mode == liveReceive
 	rC.logger.Debugf("InterpretSendBlockData, live: %v", live)
 	if len(sendBlock.Data) < 4 {
 		return errors.Errorf("bridge send %s has no complete method selector", sendBlock.Hash)
@@ -682,8 +703,10 @@ func (rC *znnNetwork) interpretSendBlockData(ctx context.Context, sendBlock *api
 				}
 			}
 		}
+	// A running listener also reconciles historical network changes against
+	// the current contract. Startup initialized its networks from that state.
 	case base64.StdEncoding.EncodeToString(definition.ABIBridge.Methods[definition.SetNetworkMethodName].Id()):
-		if !live || sendBlock.Address.String() != rC.administrator {
+		if mode == startupHistory || sendBlock.Address.String() != rC.administrator {
 			break
 		}
 		param := new(definition.NetworkInfoParam)
@@ -716,7 +739,7 @@ func (rC *znnNetwork) interpretSendBlockData(ctx context.Context, sendBlock *api
 			}
 		}
 	case base64.StdEncoding.EncodeToString(definition.ABIBridge.Methods[definition.RemoveNetworkMethodName].Id()):
-		if !live || sendBlock.Address.String() != rC.administrator {
+		if mode == startupHistory || sendBlock.Address.String() != rC.administrator {
 			break
 		}
 		param := new(definition.NetworkInfoParam)
@@ -764,7 +787,7 @@ func (rC *znnNetwork) interpretSendBlockData(ctx context.Context, sendBlock *api
 		common.AdministratorLogger.Infof("RemoveTokenPairMethodName NetworkClass: %d, ChainId: %d, TokenStandard: %s, TokenAddress: %s",
 			param.NetworkClass, param.ChainId, param.TokenStandard.String(), param.TokenAddress)
 	case base64.StdEncoding.EncodeToString(definition.ABIBridge.Methods[definition.HaltMethodName].Id()):
-		if !live {
+		if mode == startupHistory {
 			break
 		}
 		common.AdministratorLogger.Info("HaltMethodName")
@@ -809,7 +832,7 @@ func (rC *znnNetwork) interpretSendBlockData(ctx context.Context, sendBlock *api
 		}
 		common.AdministratorLogger.Infof("ProposeAdministratorMethodName %s", address.String())
 	case base64.StdEncoding.EncodeToString(definition.ABIBridge.Methods[definition.EmergencyMethodName].Id()):
-		if !live || sendBlock.Address.String() != rC.administrator {
+		if mode == startupHistory || sendBlock.Address.String() != rC.administrator {
 			break
 		}
 		common.AdministratorLogger.Info("EmergencyMethodName")
@@ -853,7 +876,7 @@ func (rC *znnNetwork) interpretSendBlockData(ctx context.Context, sendBlock *api
 			}
 		}
 	case base64.StdEncoding.EncodeToString(definition.ABIBridge.Methods[definition.ChangeAdministratorMethodName].Id()):
-		if !live || sendBlock.Address.String() != rC.administrator {
+		if mode == startupHistory || sendBlock.Address.String() != rC.administrator {
 			break
 		}
 		address := new(types.Address)
@@ -890,7 +913,7 @@ func (rC *znnNetwork) interpretSendBlockData(ctx context.Context, sendBlock *api
 			}
 		}
 	case base64.StdEncoding.EncodeToString(definition.ABIBridge.Methods[definition.SetOrchestratorInfoMethodName].Id()):
-		if !live || sendBlock.Address.String() != rC.administrator {
+		if mode == startupHistory || sendBlock.Address.String() != rC.administrator {
 			break
 		}
 
@@ -898,22 +921,29 @@ func (rC *znnNetwork) interpretSendBlockData(ctx context.Context, sendBlock *api
 			return err
 		}
 	case base64.StdEncoding.EncodeToString(definition.ABIBridge.Methods[definition.SetBridgeMetadataMethodName].Id()):
-		if !live || sendBlock.Address.String() != rC.administrator {
+		if mode == startupHistory || sendBlock.Address.String() != rC.administrator {
 			break
 		}
-		var param string
-		if err := definition.ABIBridge.UnpackMethod(&param, definition.SetBridgeMetadataMethodName, sendBlock.Data); err != nil {
+		var metadataJSON string
+		if mode == listenerHistory {
+			// The node is already running. Reconcile the current contract value
+			// without temporarily reinstating the settings in an old send.
+			read, cancel := context.WithTimeout(ctx, rpc.ZnnSettingsTimeout)
+			info, err := rC.ZnnRpc().GetBridgeInfoContext(read)
+			cancel()
+			if err != nil {
+				return err
+			}
+			metadataJSON = info.Metadata
+		} else if err := definition.ABIBridge.UnpackMethod(&metadataJSON, definition.SetBridgeMetadataMethodName, sendBlock.Data); err != nil {
 			return constants.ErrUnpackError
 		}
-		common.AdministratorLogger.Infof("SetBridgeMetadataMethodName %s", param)
-
-		metadata := &common.BridgeMetadata{}
-
-		if err := json.Unmarshal([]byte(param), metadata); err != nil {
+		common.AdministratorLogger.Infof("SetBridgeMetadataMethodName %s", metadataJSON)
+		var metadata common.BridgeMetadata
+		if err := json.Unmarshal([]byte(metadataJSON), &metadata); err != nil {
 			return err
-		} else {
-			rC.setBridgeMetadata(metadata)
 		}
+		rC.setBridgeMetadata(&metadata)
 	case base64.StdEncoding.EncodeToString(definition.ABIBridge.Methods[definition.SetNetworkMetadataMethodName].Id()):
 		if !live || sendBlock.Address.String() != rC.administrator {
 			break
@@ -926,6 +956,9 @@ func (rC *znnNetwork) interpretSendBlockData(ctx context.Context, sendBlock *api
 			param.NetworkClass, param.ChainId, param.Metadata)
 	}
 
+	if err := rC.state.FlushPendingEmergency(); err != nil {
+		return err
+	}
 	return rC.eventsStore().SetLastUpdateHeight(receiveBlockHeight)
 }
 
@@ -1159,7 +1192,7 @@ func (rC *znnNetwork) processBridgeAccountPage(ctx context.Context, height uint6
 			if err := ctx.Err(); err != nil {
 				return height, false, err
 			}
-			if err := rC.interpretSendBlockData(ctx, send, true, block.Height, refresh); err != nil {
+			if err := rC.interpretConfirmedReceive(ctx, block, send, listenerHistory, refresh); err != nil {
 				return height, false, err
 			}
 		}

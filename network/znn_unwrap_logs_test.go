@@ -3,10 +3,12 @@ package network
 import (
 	"context"
 	"encoding/json"
+	"github.com/syndtr/goleveldb/leveldb"
 	"math/big"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -46,16 +48,18 @@ func (s unwrapTestStores) AddEvmEventStore(uint32, string, uint64) (func(), erro
 // memory stores without connecting to a chain or starting a signer.
 func TestInterpretUnwrapSelectsLogByIdentity(t *testing.T) {
 	cases := []struct {
-		name       string
-		index      uint
-		affiliate  bool
-		historical bool
-		stallRPC   string
-		change     func(etypes.Log) []etypes.Log
-		valid      bool
+		name           string
+		index          uint
+		affiliate      bool
+		historical     bool
+		stallRPC       string
+		missingReceipt bool
+		change         func(etypes.Log) []etypes.Log
+		valid          bool
 	}{
 		{name: "shutdown during receipt", stallRPC: "eth_getTransactionReceipt"},
 		{name: "shutdown during log query", stallRPC: "eth_getLogs"},
+		{name: "missing receipt survives restart", missingReceipt: true},
 		{name: "first log", valid: true},
 		{name: "unrelated logs precede bridge log", index: 9, valid: true},
 		{name: "historical filtered block", index: 9, historical: true, valid: true},
@@ -164,6 +168,9 @@ func TestInterpretUnwrapSelectsLogByIdentity(t *testing.T) {
 				case "embedded.bridge.getUnwrapTokenRequestByHashAndLog":
 					result = request
 				case "eth_getTransactionReceipt":
+					if tc.missingReceipt {
+						break
+					}
 					result = &etypes.Receipt{
 						Status: etypes.ReceiptStatusSuccessful, TxHash: txHash,
 						BlockHash: blockHash, BlockNumber: big.NewInt(100),
@@ -222,6 +229,10 @@ func TestInterpretUnwrapSelectsLogByIdentity(t *testing.T) {
 				t.Fatal(err)
 			}
 			send := &api.AccountBlock{AccountBlock: nom.AccountBlock{Data: method}}
+			if tc.missingReceipt {
+				checkEmergencyRestart(t, network, send, stores)
+				return
+			}
 			if tc.stallRPC != "" {
 				initial, err := stores.znn.GetLastUpdateHeight()
 				if err != nil {
@@ -288,5 +299,74 @@ func TestInterpretUnwrapSelectsLogByIdentity(t *testing.T) {
 				t.Fatalf("unexpected receive cursor: %d, %v", height, err)
 			}
 		})
+	}
+}
+
+// Use the production config reader/writer and reopen the receive database.
+// No graceful shutdown or full config save runs between checkpoint and restart.
+func checkEmergencyRestart(t *testing.T, n *znnNetwork, send *api.AccountBlock, stores unwrapTestStores) {
+	t.Helper()
+	cfg := config.Config{DataPath: t.TempDir(), GlobalState: common.LiveState}
+	dbPath := filepath.Join(cfg.DataPath, "zenon")
+	open := func() *leveldb.DB {
+		ldb, err := leveldb.OpenFile(dbPath, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		stores.znn = wrap.NewZnnStorage(zdb.NewLevelDBWrapper(ldb), n.stopChan)
+		n.dbManager = stores
+		return ldb
+	}
+	ldb := open()
+	defer func() {
+		if ldb != nil {
+			_ = ldb.Close()
+		}
+	}()
+	n.state = common.NewPersistentGlobalState(&cfg.GlobalState, func(state uint8) error {
+		return config.WriteGlobalState(cfg.DataPath, state)
+	})
+	const height = 42
+	// No config file yet. A failed emergency write must hold the cursor even
+	// if the next replay sees the same receive outside the live window.
+	for _, live := range []bool{true, false} {
+		if err := n.InterpretSendBlockData(send, live, height); err == nil {
+			t.Fatal("checkpoint accepted without durable emergency state")
+		}
+		checkStartupCursor(t, n, 1)
+	}
+	original := config.Config{DataPath: cfg.DataPath, GlobalState: common.LiveState}
+	if err := config.WriteConfig(original); err != nil {
+		t.Fatal(err)
+	}
+	if err := n.InterpretSendBlockData(send, false, height); err != nil {
+		t.Fatal(err)
+	}
+	if err := ldb.Close(); err != nil {
+		t.Fatal(err)
+	}
+	ldb = nil
+	restarted := config.Config{DataPath: cfg.DataPath}
+	if found, err := config.ReadConfigFile(&restarted); err != nil || !found || restarted.GlobalState != common.EmergencyState {
+		t.Fatalf("restart: found=%v state=%d err=%v", found, restarted.GlobalState, err)
+	}
+	// A second startup could have read LiveState before the first one
+	// released the instance lock. Recheck on disk before writing its config.
+	if err := original.InitializeLocked(); err != nil || original.GlobalState != common.EmergencyState {
+		t.Fatalf("stale startup config: state=%d err=%v", original.GlobalState, err)
+	}
+	ldb = open()
+	checkStartupCursor(t, n, height)
+	n.state = common.NewPersistentGlobalState(&restarted.GlobalState, func(state uint8) error {
+		return config.WriteGlobalState(restarted.DataPath, state)
+	})
+	if err := n.state.SetState(common.ReSignState); err == nil {
+		t.Fatal("metadata displaced pending emergency")
+	}
+	if err := n.state.SetState(common.HaltedState); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := config.ReadConfigFile(&restarted); err != nil || restarted.GlobalState != common.HaltedState {
+		t.Fatalf("completed halt: state=%d err=%v", restarted.GlobalState, err)
 	}
 }

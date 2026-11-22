@@ -12,6 +12,7 @@ import (
 
 	"github.com/zenon-network/go-zenon/chain/nom"
 	"github.com/zenon-network/go-zenon/common/types"
+	"github.com/zenon-network/go-zenon/protocol"
 	"github.com/zenon-network/go-zenon/rpc/api"
 	"github.com/zenon-network/go-zenon/rpc/api/subscribe"
 	"github.com/zenon-network/go-zenon/rpc/server"
@@ -41,6 +42,9 @@ func (p *stalledSettingsEndpoint) GetOrchestratorInfo() *definition.Orchestrator
 	}
 	<-p.release
 	return &definition.OrchestratorInfo{WindowSize: 10, KeyGenThreshold: 1, ConfirmationsToFinality: 1, EstimatedMomentumTime: 1}
+}
+func (*stalledSettingsEndpoint) SyncInfo() *protocol.SyncInfo {
+	return &protocol.SyncInfo{State: protocol.SyncDone}
 }
 func (*stalledSettingsEndpoint) GetBridgeInfo() *definition.BridgeInfoVariable {
 	return &definition.BridgeInfoVariable{Halted: true}
@@ -104,7 +108,7 @@ func TestStalledSettingsCannotDelayHalt(t *testing.T) {
 		p.blocks[send] = &api.AccountBlockMarshal{AccountBlockMarshal: nom.AccountBlockMarshal{BlockType: nom.BlockTypeUserSend, ToAddress: types.BridgeContract, Hash: send, Address: types.ZeroAddress, Data: data, Amount: "0"}}
 	}
 	srv := server.NewServer()
-	for _, name := range []string{"ledger", "embedded.bridge"} {
+	for _, name := range []string{"ledger", "stats", "embedded.bridge"} {
 		if err := srv.RegisterName(name, p); err != nil {
 			t.Fatal(err)
 		}
@@ -121,6 +125,7 @@ func TestStalledSettingsCannotDelayHalt(t *testing.T) {
 	}
 	saved := make(chan uint64, 2)
 	n := &znnNetwork{listenerCtx: context.Background(), rpcManager: clients, state: state, administrator: types.ZeroAddress.String(), dbManager: settingsTestStores{store: checkpointStore{saved: saved}}, stopChan: stop, logger: zap.NewNop().Sugar()}
+	n.SetConfirmationsToFinality(1)
 	release := sync.OnceFunc(func() { close(p.release) })
 	var wg sync.WaitGroup
 	defer func() {

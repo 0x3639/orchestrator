@@ -9,8 +9,10 @@ import (
 
 	"github.com/zenon-network/go-zenon/chain/nom"
 	"github.com/zenon-network/go-zenon/common/types"
+	"github.com/zenon-network/go-zenon/protocol"
 	"github.com/zenon-network/go-zenon/rpc/api"
 	"github.com/zenon-network/go-zenon/vm/embedded/definition"
+	"orchestrator/common"
 )
 
 func TestBridgeListenerReplaysFailedReceiveInOrder(t *testing.T) {
@@ -156,4 +158,64 @@ func TestBridgeListenerCancelsWhileAwaitingConfirmation(t *testing.T) {
 		t.Fatal("listener remained blocked after cancellation")
 	}
 	checkStartupCursor(t, n, 1)
+}
+
+func TestBridgeListenerMetadataFinality(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		frontier    uint64
+		wantTimeout uint64
+	}{
+		{"one before finality", 104, 11},
+		{"at finality", 105, 22},
+		{"after finality", 110, 22},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			receive := startupReceive(2) // confirmed at momentum 100
+			send := startupSend(receive)
+			var err error
+			send.Data, err = definition.ABIBridge.PackMethod(definition.SetBridgeMetadataMethodName, `{"partyTimeout":11}`)
+			if err != nil {
+				t.Fatal(err)
+			}
+			available := false
+			ledger := &startupLedger{
+				page:       func(uint64) *api.AccountBlockListMarshal { return startupPage(receive) },
+				lookup:     func(types.Hash) (*api.AccountBlockMarshal, error) { return send, nil },
+				syncStatus: func() *protocol.SyncInfo { return &protocol.SyncInfo{State: protocol.SyncDone} },
+				tip: func() *api.Momentum {
+					return &api.Momentum{Momentum: &nom.Momentum{Height: tc.frontier, Hash: types.Hash{1}}}
+				},
+				bridgeInfo: func() (*definition.BridgeInfoVariable, error) {
+					if !available {
+						return nil, errors.New("bridge info temporarily unavailable")
+					}
+					return &definition.BridgeInfoVariable{Metadata: `{"partyTimeout":22}`}, nil
+				},
+			}
+			n := startupNetwork(t, ledger)
+			n.SetConfirmationsToFinality(5)
+			n.administrator = send.Address.String()
+			var applied []uint64
+			n.setBridgeMetadata = func(m *common.BridgeMetadata) { applied = append(applied, m.PartyTimeout) }
+			if err := n.state.SetFrontierMomentum(tc.frontier); err != nil {
+				t.Fatal(err)
+			}
+			if tc.frontier >= 105 {
+				height, _, err := n.processBridgeAccountPage(n.listenerCtx, 1, n.refreshSettings)
+				if err == nil || height != 1 || len(applied) != 0 {
+					t.Fatalf("failed reconciliation: height=%d applied=%v err=%v", height, applied, err)
+				}
+				checkStartupCursor(t, n, 1)
+			}
+			available = true
+			if _, _, err := n.processBridgeAccountPage(n.listenerCtx, 1, n.refreshSettings); err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(applied, []uint64{tc.wantTimeout}) {
+				t.Fatalf("applied timeouts %v, want only %d", applied, tc.wantTimeout)
+			}
+			checkStartupCursor(t, n, 2)
+		})
+	}
 }

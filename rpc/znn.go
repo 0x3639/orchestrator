@@ -164,6 +164,17 @@ func (r *ZnnRpc) GetBridgeInfo() (*definition.BridgeInfoVariable, error) {
 	return r.rpcClient.BridgeApi.GetBridgeInfo()
 }
 
+func (r *ZnnRpc) GetBridgeInfoContext(ctx context.Context) (*definition.BridgeInfoVariable, error) {
+	var info *definition.BridgeInfoVariable
+	if err := r.settingsClient.CallContext(ctx, &info, "embedded.bridge.getBridgeInfo"); err != nil {
+		return nil, err
+	}
+	if info == nil {
+		return nil, errors.New("missing Zenon bridge info")
+	}
+	return info, nil
+}
+
 func (r *ZnnRpc) GetSyncInfo() (*protocol.SyncInfo, error) {
 	return r.rpcClient.StatsApi.SyncInfo()
 }
