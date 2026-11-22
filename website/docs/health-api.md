@@ -95,8 +95,115 @@ Two token buckets, both configured under `HealthConfig`:
 
 A request is charged only after it passes validation and names a known method.
 
-## Exposing it remotely
+## Legacy remote monitoring
 
-Keep `Address` at `127.0.0.1` and put a reverse proxy in front for remote monitoring. The proxy provides authentication, TLS and connection limits, none of which the orchestrator has. Setting `Address` to `0.0.0.0` makes the endpoint reachable by anyone who can route to the machine.
+For existing remote scrapers, keep `Address` at `127.0.0.1` and put an authenticated reverse proxy in front. New deployments can use the local socket described below. The proxy provides authentication, TLS and connection limits, none of which the orchestrator has. Setting `Address` to `0.0.0.0` makes the endpoint reachable by anyone who can route to the machine.
 
 The listener has header, read, write and idle timeouts, so slow clients cannot pin connections.
+
+## Local v1 snapshot
+
+Set `HealthConfig.SnapshotSocket` to an absolute Unix socket path, for example
+`/run/orchestrator-health/health.sock`. An empty setting disables collection and
+the local listener. The orchestrator serves `getHealthSnapshot` on this socket
+during startup, before chain discovery or the wait for Zenon sync. A socket setup
+failure is logged and the bridge continues starting.
+
+Create the parent directory on each boot. It must be owned by the orchestrator
+account, with no access for other users and no group write permission. On Linux,
+a systemd tmpfiles entry like the following assigns a dedicated reporter group
+and makes new sockets inherit that group. Create the group first and add the
+reporter service account to it. The reporter needs no access to the signer’s
+data directory or keys.
+
+```text
+d /run/orchestrator-health 2750 orchestrator orchestrator-health -
+```
+
+The socket has mode `0660`. Query it locally with:
+
+```bash
+curl --unix-socket /run/orchestrator-health/health.sock \
+  -H 'Content-Type: application/json' \
+  -d '{"method":"getHealthSnapshot","params":[]}' http://localhost/
+```
+
+The response uses the existing `result` and `error` envelope. The
+[snapshot schema](https://github.com/0x3639/orchestrator/blob/dev/health/schemas/v1/snapshot.schema.json)
+describes the object in `result`. The TCP listener continues to serve the three
+legacy methods. Keep the Unix socket private when retiring public health RPC.
+
+- **Startup and sync.** Read `phase`, `bridgeState`, and build version and commit.
+  Zenon reports provider sync state, the observed frontier momentum, and the
+  processed bridge-account receive height. These heights have different units.
+  Each EVM chain reports provider sync state, observed head and the inclusive
+  scan cursor after a successful write. For an overall sync verdict the collector
+  needs independent chain references. A legacy Zenon cursor, a gap in the
+  current run, or a restart beyond the last verified checkpoint produces partial
+  receive coverage. An orderly shutdown saves a complete receive checkpoint
+  independently of the bridge cursor. Matching checkpoints retain coverage
+  across restarts.
+- **Pending work.** Each direction reports finality waits, unsigned observations,
+  the actual selection for a signing window, signed records awaiting submission,
+  and the last successfully persisted signing window. Each measurement carries
+  its own `asOf` and `quality`. The first page of 100 wraps can yield partial
+  counts, including zero. Pending age uses a bounded sample of locally observed
+  unsigned IDs and is partial. IDs stay in memory. Before a worker has read a
+  source, its observation is unknown.
+- **Cost.** The socket copies cached state under a read lock and releases the
+  lock before encoding the response. Reads cause no chain calls, database scans
+  or signing. Queue counts reuse work already read by the signing and submission
+  paths. With the feature enabled, a background worker checks each provider’s
+  sync status at most once a minute, with a two-second deadline. Zenon uses a
+  separate connection for this check. EVM sampling yields when the existing RPC
+  rate budget is busy and also samples the local confirmation queue depth.
+
+## Outbound heartbeat contract
+
+A separate reporter on the operator host will read the socket and send the
+`result` object to a collector on a monitoring host. The planned collector will accept the
+[heartbeat schema](https://github.com/0x3639/orchestrator/blob/dev/health/schemas/v1/heartbeat.schema.json)
+at `POST /v1/heartbeats`. The two schemas use stable URNs. Load both into the
+validator and enable format checks. The fixtures under `health/schemas/v1/testdata`
+can be shared with reporter and collector implementations. This release provides
+the local API and wire contracts. Sending and receiving heartbeats are separate
+service deliverables.
+
+**Enrollment.** For each reporter, generate a private key and a certificate
+signing request under its own OS account. Send the request to the monitoring
+administrator through an established operator contact. The administrator
+verifies the request fingerprint with that contact, assigns a node and stream,
+and signs a short-lived client certificate with the monitoring certificate
+authority (CA) and the TLS client-authentication usage. Return the certificate,
+collector URL, stream ID, and any required CA trust bundle over an authenticated
+channel. Keep the private key readable only by the reporter. For renewal, issue
+a replacement on the same stream. Disable the enrollment or revoke the leaf
+certificate immediately if the key is lost.
+
+**Ingestion.** Require mutual TLS and verify server identity at the reporter.
+At the collector, check the authenticated certificate’s active enrollment and
+its assigned stream on every request. A stream ID or a copied certificate alone
+cannot authenticate a sender. Where a reverse proxy terminates TLS, restrict
+the backend to that trusted proxy and strip any client-supplied certificate
+identity headers. Apply connection and handshake limits at the edge, then
+a 64 KiB body limit, per-stream and global rates, schema validation, timestamp
+and duplicate-key checks, and durable replay protection. An identical retry
+cannot extend liveness. A site-wide outage is a collector alert. Bridge
+signing has no dependency on this service.
+
+## Moving operators off public RPC
+
+1. Release the orchestrator with the socket, then deploy the collector and the
+   separate reporter. Pin both services' contract tests to a tagged orchestrator
+   schema version. Enroll one pilot operator and enable the socket on its host.
+2. Run heartbeats alongside the existing scrape. Check the node and stream
+   assignment, version, sync heights and queue counts. Stop the reporter to
+   confirm the collector marks the stream stale. Restart the reporter with the
+   orchestrator stopped to check that it reports a failed local read. Schedule
+   the orchestrator stop during a maintenance window or use a test node.
+3. After both paths agree on the pilot, enroll the remaining operators in
+   batches. Switch each operator's dashboard and alerts to its heartbeat stream
+   after successful delivery and freshness checks.
+4. For each migrated host, bind the legacy health listener to loopback, remove
+   its public proxy route and firewall rule, and retire that host's scrape job.
+   Verify the old address is unreachable externally and new heartbeats continue.

@@ -1,6 +1,7 @@
 package network
 
 import (
+	"context"
 	"crypto/ecdsa"
 	"fmt"
 	ecommon "github.com/ethereum/go-ethereum/common"
@@ -14,6 +15,7 @@ import (
 	"orchestrator/common/config"
 	"orchestrator/common/storage"
 	"orchestrator/db"
+	"orchestrator/health/snapshot"
 	"orchestrator/rpc"
 	"os"
 	"strings"
@@ -27,6 +29,8 @@ import (
 )
 
 type evmNetwork struct {
+	stopHealth func()
+	health     *snapshot.Store
 	config.EvmParams
 	unconfirmedQueue *dque.DQue
 	dbManager        networkEventStores
@@ -107,6 +111,7 @@ func NewEvmNetwork(network *definition.NetworkInfo, dbManager networkEventStores
 
 	newEvmNetwork := &evmNetwork{
 		EvmParams:        newConfig,
+		health:           state.Health,
 		dbManager:        dbManager,
 		rpcManager:       rpcManager,
 		unconfirmedQueue: newQueue,
@@ -152,12 +157,29 @@ func (eN *evmNetwork) requestStop() {
 	}
 }
 
-func (eN *evmNetwork) Start() error {
-	synced := eN.rpcManager.Evm(eN.ChainId()).IsSynced()
-	for synced == false {
-		eN.logger.Infof("evm node for network %d is not synced, will wait for it to sync\n", eN.ChainId())
-		time.Sleep(10 * time.Second)
-		synced = eN.rpcManager.Evm(eN.ChainId()).IsSynced()
+func (eN *evmNetwork) recordSync(synced bool, err error) bool {
+	eN.health.UpdateNetwork(eN.ChainId(), func(n *snapshot.Network) { n.NodeSync = snapshot.SyncResult(synced, err == nil) })
+	return synced
+}
+
+func (eN *evmNetwork) Start() (startErr error) {
+	client := eN.EvmRpc()
+	for !eN.recordSync(client.SyncState()) {
+		eN.logger.Infof("evm node for network %d is not synced, will wait for it to sync", eN.ChainId())
+		if !eN.sleep(10 * time.Second) {
+			return context.Canceled
+		}
+	}
+	if eN.health != nil {
+		eN.stopHealth = eN.health.Poll(func(ctx context.Context) {
+			eN.observeQueueDepth()
+			eN.recordSync(client.SampleSyncState(ctx))
+		})
+		defer func() {
+			if startErr != nil {
+				eN.stopHealth()
+			}
+		}()
 	}
 	if err := eN.FillEvmParamsRpc(); err != nil {
 		eN.logger.Debug(err)
@@ -197,6 +219,7 @@ func (eN *evmNetwork) Start() error {
 		return err
 	}
 
+	eN.observeQueueDepth()
 	go eN.SubscribeToEvents()
 	// todo defer unsub?
 
@@ -316,6 +339,7 @@ func (eN *evmNetwork) Sync() error {
 
 	for {
 		latestBlock, rpcErr := eN.EvmRpc().BlockNumber()
+		eN.health.UpdateNetwork(eN.ChainId(), func(n *snapshot.Network) { n.HeadHeight = snapshot.Reading(latestBlock, rpcErr) })
 		if rpcErr != nil {
 			if err := retryRange("reading chain head", rpcErr); err != nil {
 				return err
@@ -412,6 +436,10 @@ func (eN *evmNetwork) Sync() error {
 		if err := eN.eventsStore().SetLastUpdateHeight(rangeEnd); err != nil {
 			return err
 		}
+		eN.health.UpdateNetwork(eN.ChainId(), func(n *snapshot.Network) {
+			n.ScannedThrough = snapshot.Measure(rangeEnd)
+			n.LastRangeAt = n.ScannedThrough.AsOf
+		})
 		ranges++
 		if ranges%syncProgressEvery == 0 {
 			done := rangeEnd - startHeight
@@ -1084,7 +1112,18 @@ func (eN *evmNetwork) dropQueuedEvent() bool {
 	return true
 }
 
+func (eN *evmNetwork) observeQueueDepth() {
+	if eN.health == nil {
+		return
+	}
+	depth := eN.unconfirmedQueue.Size()
+	eN.health.UpdateNetwork(eN.ChainId(), func(n *snapshot.Network) { n.Unwrap.AwaitingFinality = snapshot.Measure(depth) })
+}
+
 func (eN *evmNetwork) Stop() {
+	if eN.stopHealth != nil {
+		eN.stopHealth()
+	}
 	eN.stopOnce.Do(func() { close(eN.done) })
 	eN.EvmRpc().Stop()
 	_ = eN.unconfirmedQueue.Close()
@@ -1098,7 +1137,9 @@ func (eN *evmNetwork) SignTx(tx *etypes.Transaction, ecdsaPrivateKey *ecdsa.Priv
 // Local storage
 
 func (eN *evmNetwork) GetUnsignedUnwrapRequests() ([]*events.UnwrapRequestEvm, error) {
-	return eN.eventsStore().GetUnsignedUnwrapRequests()
+	requests, err := eN.eventsStore().GetUnsignedUnwrapRequests()
+	observeUnwraps(eN.health, eN.ChainId(), requests, err)
+	return requests, err
 }
 
 func (eN *evmNetwork) AddUnwrapRequest(event events.UnwrapRequestEvm) error {
@@ -1126,7 +1167,9 @@ func (eN *evmNetwork) GetUnwrapRequestsByStatus(status uint32) ([]*events.Unwrap
 }
 
 func (eN *evmNetwork) GetUnsentSignedUnwrapRequests() ([]*events.UnwrapRequestEvm, error) {
-	return eN.eventsStore().GetUnsentSignedUnwrapRequests()
+	requests, err := eN.eventsStore().GetUnsentSignedUnwrapRequests()
+	eN.health.UpdateNetwork(eN.ChainId(), func(n *snapshot.Network) { n.Unwrap.SignedAwaitingSubmission = snapshot.Reading(len(requests), err) })
+	return requests, err
 }
 
 ///////// RPC

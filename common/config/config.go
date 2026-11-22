@@ -51,6 +51,8 @@ type TssManagerConfig struct {
 }
 
 type HealthRpcConfig struct {
+	// SnapshotSocket enables the private v1 API at this absolute Unix socket path.
+	SnapshotSocket string `json:",omitempty"`
 	// Address is the interface to listen on. Empty means DefaultHealthRpcAddress.
 	Address             string
 	Port                int

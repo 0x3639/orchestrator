@@ -215,23 +215,44 @@ func (r *EvmRpc) DeleteDirectories() {
 }
 
 func (r *EvmRpc) IsSynced() bool {
+	synced, err := r.SyncState()
+	if err != nil {
+		r.logger.Debug(err)
+	}
+	return synced
+}
+
+func (r *EvmRpc) SyncState() (bool, error) {
 	ctx, cancel, err := r.callContext(evmCallTimeout)
 	if err != nil {
-		r.logger.Debug(err)
-		return false
+		return false, err
 	}
 	defer cancel()
-	syncProgress, err := r.rpcClient.SyncProgress(ctx)
-	if err != nil {
-		r.logger.Debug(err)
-		return false
-	}
-	if syncProgress == nil {
-		return true
-	}
+	return r.syncState(ctx)
+}
 
-	// we consider that we are synced if we are at most 4 blocks behind
-	return syncProgress.HighestBlock-syncProgress.CurrentBlock < 4
+// SampleSyncState skips a monitoring poll when the provider budget is busy.
+func (r *EvmRpc) SampleSyncState(parent context.Context) (bool, error) {
+	if r.limiter != nil && !r.limiter.Allow() {
+		return false, errors.New("sync sample deferred")
+	}
+	ctx, cancel := context.WithTimeout(parent, evmCallTimeout)
+	defer cancel()
+	return r.syncState(ctx)
+}
+
+func (r *EvmRpc) syncState(ctx context.Context) (bool, error) {
+	progress, err := r.rpcClient.SyncProgress(ctx)
+	if err != nil {
+		return false, err
+	}
+	if progress == nil {
+		return true, nil
+	}
+	if progress.CurrentBlock > progress.HighestBlock {
+		return false, errors.New("sync progress exceeds provider target")
+	}
+	return progress.HighestBlock-progress.CurrentBlock < 4, nil
 }
 
 /// Subscribe
