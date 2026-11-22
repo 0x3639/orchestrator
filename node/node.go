@@ -143,7 +143,7 @@ func NewNode(config *oconfig.Config, logger *zap.Logger) (_ *Node, initErr error
 	node.evmAddress = crypto.PubkeyToAddress(node.ecdsaPrivateKey.PublicKey)
 	node.config.EvmAddress = node.evmAddress.String()
 
-	node.state.Health.SetPhase("waitingForZenon")
+	node.state.HealthStore().SetPhase("waitingForZenon")
 	for node.networksManager.Znn().IsSynced() == false {
 		node.logger.Info("node is syncing, will wait for it to finish")
 		time.Sleep(15 * time.Second)
@@ -184,7 +184,7 @@ func (node *Node) Start() (startErr error) {
 			node.closeSnapshot()
 		}
 	}()
-	node.state.Health.SetPhase("syncingBridge")
+	node.state.HealthStore().SetPhase("syncingBridge")
 	node.lock.Lock()
 	defer node.lock.Unlock()
 
@@ -305,14 +305,14 @@ func (node *Node) Start() (startErr error) {
 		}
 	}()
 
-	node.state.Health.SetPhase("running")
+	node.state.HealthStore().SetPhase("running")
 	go node.processSignatures()
 	go node.sendSignatures()
 	return nil
 }
 
 func (node *Node) closeSnapshot() {
-	node.state.Health.Close()
+	node.state.HealthStore().Close()
 	if node.snapshotServer != nil {
 		node.snapshotServer.Close()
 	}
@@ -324,7 +324,7 @@ func (node *Node) Stop() error {
 	defer close(node.stopChan)
 	node.logger.Info("stopping node ...")
 
-	node.state.Health.SetPhase("stopping")
+	node.state.HealthStore().SetPhase("stopping")
 	defer node.closeSnapshot()
 	if node.tssManager != nil {
 		node.tssManager.Stop()
@@ -1023,7 +1023,7 @@ func (node *Node) processSignatures() {
 // ok == true we had a signing ceremony
 // ok == false means that we had nothing to sign
 func (node *Node) processSignaturesWrap(window uint64) (error, bool) {
-	store := node.state.Health
+	store := node.state.HealthStore()
 	store.Selected(snapshot.Wrap, window, nil)
 	wrapRequestsIds, err := node.networksManager.GetUnsignedWrapRequests()
 	if err != nil {
@@ -1183,7 +1183,7 @@ func (node *Node) processSignaturesWrap(window uint64) (error, bool) {
 // ok == true means that we had a signing ceremony or at least we tried
 // ok == false means that we had nothing to sign
 func (node *Node) processSignaturesUnwrap(number, size uint64) (error, bool) {
-	store := node.state.Health
+	store := node.state.HealthStore()
 	store.Selected(snapshot.Unwrap, number, nil)
 	// todo discuss what requests should the orchestrator sign in a ceremony
 	requests, err := node.networksManager.GetUnsignedUnwrapRequests()
@@ -1379,7 +1379,7 @@ func (node *Node) sendSignatures() {
 		return
 	}
 
-	seenEventsCount := make(map[string]uint32)
+	sendPending := newSignatureSendPoll(node.sendSignaturesWrap, node.sendUnwrapRequests)
 	for {
 		currentState, err := node.state.GetState()
 		if err != nil {
@@ -1391,17 +1391,7 @@ func (node *Node) sendSignatures() {
 		switch currentState {
 		case common.LiveState:
 			if len(node.tssManager.GetPubKey()) != 0 {
-				var senders sync.WaitGroup
-				senders.Add(2)
-				go func() {
-					defer senders.Done()
-					node.sendSignaturesWrap(seenEventsCount)
-				}()
-				go func() {
-					defer senders.Done()
-					node.sendUnwrapRequests(seenEventsCount)
-				}()
-				senders.Wait()
+				sendPending()
 			}
 		}
 		// todo use constant for momentum duration

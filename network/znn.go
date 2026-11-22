@@ -124,8 +124,8 @@ func NewZnnNetwork(rpcManager *rpc.Manager, dbManager *manager.Manager, networkM
 /// Utils
 
 func (rC *znnNetwork) Start() error {
-	if rC.state.Health != nil {
-		rC.stopHealth = rC.state.Health.Poll(func(ctx context.Context) {
+	if rC.state.HealthStore() != nil {
+		rC.stopHealth = rC.state.HealthStore().Poll(func(ctx context.Context) {
 			info, err := rC.ZnnRpc().SampleSyncInfo(ctx)
 			rC.recordSync(info, err)
 		})
@@ -144,7 +144,7 @@ func (rC *znnNetwork) Start() error {
 func (rC *znnNetwork) Stop() error {
 	if rC.stopHealth != nil {
 		rC.stopHealth()
-		cursor := rC.state.Health.Read().Zenon.ProcessedReceiveHeight
+		cursor := rC.state.HealthStore().Read().Zenon.ProcessedReceiveHeight
 		if cursor.Quality == "complete" && cursor.Value != nil {
 			if err := rC.eventsStore().SaveReceiveCoverageCheckpoint(*cursor.Value); err != nil {
 				rC.logger.Warnf("Could not save health checkpoint: %v", err)
@@ -165,9 +165,9 @@ func (rC *znnNetwork) Sync() error {
 	if accountBlockHeight, err := rC.eventsStore().GetLastUpdateHeight(); err != nil {
 		return err
 	} else {
-		if rC.state.Health != nil {
+		if rC.state.HealthStore() != nil {
 			verified := accountBlockHeight > 1 && rC.eventsStore().HasReceiveCoverageCheckpoint(accountBlockHeight)
-			rC.coverage.start(rC.state.Health, accountBlockHeight, verified)
+			rC.coverage.start(rC.state.HealthStore(), accountBlockHeight, verified)
 		}
 		rC.logger.Debugf("last account block update height: %d", accountBlockHeight)
 		accountBlockList, errRpc := rC.ZnnRpc().GetAccountBlocksByHeight(types.BridgeContract, accountBlockHeight+1, 30)
@@ -213,7 +213,7 @@ func (rC *znnNetwork) Sync() error {
 						}
 					}
 				}
-				rC.coverage.block(rC.state.Health, accBlock.Height, accBlock.BlockType == nom.BlockTypeContractReceive, true)
+				rC.coverage.block(rC.state.HealthStore(), accBlock.Height, accBlock.BlockType == nom.BlockTypeContractReceive, true)
 			}
 			accountBlockHeight += uint64(len(accountBlockList.List))
 			accountBlockList, err = rC.ZnnRpc().GetAccountBlocksByHeight(types.BridgeContract, accountBlockHeight+1, 30)
@@ -589,7 +589,7 @@ func (rC *znnNetwork) interpretSendBlockData(sendBlock *api.AccountBlock, live b
 				return err
 			}
 			rC.logger.Debug("add evm client ok")
-			rC.state.Health.AddNetwork(network.NetworkClass, network.Id)
+			rC.state.HealthStore().AddNetwork(network.NetworkClass, network.Id)
 			if err := newEvmNetwork.Start(); err != nil {
 				rC.logger.Error(err)
 				rC.stopChan <- syscall.SIGINT
@@ -928,7 +928,7 @@ func (rC *znnNetwork) ListenForEmbeddedBridgeAccountBlocks() {
 			// these accountBlocks are seen before being inserted in a momentum
 			for _, accBlock := range accBlocks {
 				if accBlock.BlockType != nom.BlockTypeContractReceive {
-					rC.coverage.block(rC.state.Health, accBlock.Height, false, true)
+					rC.coverage.block(rC.state.HealthStore(), accBlock.Height, false, true)
 					continue
 				}
 				// we wait for the acc block to be inserted in a momentum
@@ -964,7 +964,7 @@ func (rC *znnNetwork) ListenForEmbeddedBridgeAccountBlocks() {
 					}
 					processed = newErr == nil
 				}
-				rC.coverage.block(rC.state.Health, accBlock.Height, true, processed)
+				rC.coverage.block(rC.state.HealthStore(), accBlock.Height, true, processed)
 			}
 		}
 	}
@@ -1091,7 +1091,7 @@ func (rC *znnNetwork) IsSynced() bool {
 
 func (rC *znnNetwork) recordSync(syncInfo *protocol.SyncInfo, err error) bool {
 	synced := err == nil && syncInfo != nil && syncInfo.State == protocol.SyncDone
-	rC.state.Health.UpdateZenon(func(z *snapshot.Zenon) { z.NodeSync = snapshot.SyncResult(synced, err == nil && syncInfo != nil) })
+	rC.state.HealthStore().UpdateZenon(func(z *snapshot.Zenon) { z.NodeSync = snapshot.SyncResult(synced, err == nil && syncInfo != nil) })
 	return synced
 }
 

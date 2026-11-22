@@ -350,7 +350,8 @@ func (s *Handler) method(name string) func([]interface{}) (interface{}, error) {
 // allow charges the per-client bucket first so a throttled source does not
 // drain the shared budget, then the aggregate cap.
 func (s *Handler) allow(r *http.Request) bool {
-	if s.clientLimiters != nil && !s.clientLimiters.allow(clientKey(r)) {
+	// Socket clients have no distinct remote IP. They share only the aggregate limit.
+	if s.snapshot == nil && s.clientLimiters != nil && !s.clientLimiters.allow(clientKey(r)) {
 		return false
 	}
 	return s.limiter.Allow()

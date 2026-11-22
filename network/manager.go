@@ -49,7 +49,7 @@ func NewNetworksManager(stopChan chan os.Signal) (*NetworksManager, error) {
 }
 
 func (m *NetworksManager) Init(networksInfo map[string]config.BaseNetworkConfig, dbManager *manager.Manager, state *common.GlobalState, setBridgeMetadata func(metadata *common.BridgeMetadata)) error {
-	m.health = state.Health
+	m.health = state.HealthStore()
 	if len(networksInfo) < 2 {
 		return errors.New("wrong network initializers 1")
 	}

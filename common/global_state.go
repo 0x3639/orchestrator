@@ -5,6 +5,7 @@ import (
 	"github.com/zenon-network/go-zenon/common/types"
 	"golang.org/x/sync/semaphore"
 	"math/big"
+
 	"orchestrator/health/snapshot"
 )
 
@@ -206,4 +207,12 @@ func (gs *GlobalState) GetResignNetwork() (uint32, uint32) {
 func (gs *GlobalState) SetResignNetwork(networkClass, chainId uint32) {
 	gs.resignNetworkClass = networkClass
 	gs.resignNetworkChainId = chainId
+}
+
+// HealthStore returns the optional observer for callers that run without node state.
+func (gs *GlobalState) HealthStore() *snapshot.Store {
+	if gs == nil {
+		return nil
+	}
+	return gs.Health
 }

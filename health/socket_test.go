@@ -128,6 +128,29 @@ func TestSocketSnapshotContract(t *testing.T) {
 	}
 }
 
+func TestSnapshotRejectsUncleanSocketPath(t *testing.T) {
+	dir := t.TempDir()
+	for _, suffix := range []string{"/./health.sock", "//health.sock", "/child/../health.sock"} {
+		if _, err := ListenSnapshot(dir+suffix, snapshot.New("v1", ""), generousConfig()); err == nil || !strings.Contains(err.Error(), "must be clean") {
+			t.Fatalf("unclean path %q: %v", suffix, err)
+		}
+	}
+}
+
+func TestSnapshotUsesAggregateRateLimit(t *testing.T) {
+	cfg := generousConfig()
+	cfg.ResponsesPerSecond, cfg.Burst = 0, 2
+	cfg.PerClientResponsesPerSecond, cfg.PerClientBurst = 1, 1
+	h := newTestHandler(t, cfg)
+	h.snapshot = snapshot.New("v1", "")
+	for i, want := range []int{http.StatusOK, http.StatusOK, http.StatusTooManyRequests} {
+		got := doRequest(h, http.MethodPost, "application/json", "@", strings.NewReader(`{"method":"getHealthSnapshot","params":[]}`))
+		if got.Code != want {
+			t.Fatalf("socket request %d returned %d, want %d", i+1, got.Code, want)
+		}
+	}
+}
+
 func TestSocketRefusesUnsafePathsAndRecoversAfterCrash(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "health.sock")

@@ -103,7 +103,7 @@ The listener has header, read, write and idle timeouts, so slow clients cannot p
 
 ## Local v1 snapshot
 
-Set `HealthConfig.SnapshotSocket` to an absolute Unix socket path, for example
+Set `HealthConfig.SnapshotSocket` to a clean absolute Unix socket path, for example
 `/run/orchestrator-health/health.sock`. An empty setting disables collection and
 the local listener. The orchestrator serves `getHealthSnapshot` on this socket
 during startup, before chain discovery or the wait for Zenon sync. A socket setup
@@ -120,7 +120,7 @@ data directory or keys.
 d /run/orchestrator-health 2750 orchestrator orchestrator-health -
 ```
 
-The socket has mode `0660`. Query it locally with:
+The socket has mode `0660`. Local readers share the aggregate request limit. The per-IP limit applies to TCP clients. Query it locally with:
 
 ```bash
 curl --unix-socket /run/orchestrator-health/health.sock \

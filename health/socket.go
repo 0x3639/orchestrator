@@ -1,3 +1,5 @@
+//go:build darwin || dragonfly || freebsd || linux || netbsd || openbsd || illumos
+
 package health
 
 import (
@@ -20,6 +22,9 @@ import (
 func ListenSnapshot(path string, store *snapshot.Store, cfg config.HealthRpcConfig) (*http.Server, error) {
 	if store == nil || !filepath.IsAbs(path) {
 		return nil, errors.New("snapshot requires a store and absolute socket path")
+	}
+	if filepath.Clean(path) != path {
+		return nil, errors.New("snapshot socket path must be clean")
 	}
 	dir := filepath.Dir(path)
 	info, err := os.Lstat(dir)

@@ -111,7 +111,7 @@ func NewEvmNetwork(network *definition.NetworkInfo, dbManager networkEventStores
 
 	newEvmNetwork := &evmNetwork{
 		EvmParams:        newConfig,
-		health:           state.Health,
+		health:           state.HealthStore(),
 		dbManager:        dbManager,
 		rpcManager:       rpcManager,
 		unconfirmedQueue: newQueue,
