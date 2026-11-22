@@ -114,6 +114,18 @@ func replayServer(t *testing.T, answer func(method string) interface{}) string {
 
 func replayServerWithParams(t *testing.T, answer func(method string, params []json.RawMessage) interface{}) string {
 	t.Helper()
+	return replayServerWithErrors(t, func(method string, params []json.RawMessage) (interface{}, *replayRPCError) {
+		return answer(method, params), nil
+	})
+}
+
+type replayRPCError struct {
+	Code    int    `json:"code"`
+	Message string `json:"message"`
+}
+
+func replayServerWithErrors(t *testing.T, answer func(method string, params []json.RawMessage) (interface{}, *replayRPCError)) string {
+	t.Helper()
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var call struct {
 			ID     json.RawMessage   `json:"id"`
@@ -125,7 +137,13 @@ func replayServerWithParams(t *testing.T, answer func(method string, params []js
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]interface{}{"jsonrpc": "2.0", "id": call.ID, "result": answer(call.Method, call.Params)})
+		reply := map[string]interface{}{"jsonrpc": "2.0", "id": call.ID}
+		if result, rpcErr := answer(call.Method, call.Params); rpcErr != nil {
+			reply["error"] = rpcErr
+		} else {
+			reply["result"] = result
+		}
+		_ = json.NewEncoder(w).Encode(reply)
 	}))
 	t.Cleanup(server.Close)
 	return server.URL
@@ -239,13 +257,28 @@ func TestUnwrapRegisteredOnAnotherNetworkClassIsNotCheckedOnEvm(t *testing.T) {
 
 // Redeem and revoke look the request up on Zenon and then update the EVM store
 // by chain ID. A request on another network class must not touch the row an
-// EVM network holds under the same transaction hash and log index.
-func TestRedeemAndRevokeIgnoreARequestOnAnotherNetworkClass(t *testing.T) {
-	for _, method := range []string{definition.RedeemUnwrapMethodName, definition.RevokeUnwrapRequestMethodName} {
-		t.Run(method, func(t *testing.T) {
+// EVM network holds under the same transaction hash and log index, and a
+// request on that EVM network must still be recorded.
+func TestRedeemAndRevokeRecordOnlyRequestsOnTheEvmNetwork(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		method   string
+		class    uint32
+		redeemed uint8
+		revoked  uint8
+		want     uint32
+	}{
+		{"redeem registered, EVM", definition.RedeemUnwrapMethodName, definition.EvmClass, 0, 0, common.PendingRedeemStatus},
+		{"redeem completed, EVM", definition.RedeemUnwrapMethodName, definition.EvmClass, 1, 0, common.RedeemedStatus},
+		{"redeem attempted on a revoked request, EVM", definition.RedeemUnwrapMethodName, definition.EvmClass, 0, 1, common.RevokedStatus},
+		{"revoke, EVM", definition.RevokeUnwrapRequestMethodName, definition.EvmClass, 0, 1, common.RevokedStatus},
+		{"redeem, another class", definition.RedeemUnwrapMethodName, definition.EvmClass + 1, 1, 0, common.UnredeemedStatus},
+		{"revoke, another class", definition.RevokeUnwrapRequestMethodName, definition.EvmClass + 1, 0, 1, common.UnredeemedStatus},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
 			b := newReplayBridge(t)
-			b.request.NetworkClass = definition.EvmClass + 1
-			b.request.Redeemed, b.request.Revoked = 1, 1
+			b.request.NetworkClass = tc.class
+			b.request.Redeemed, b.request.Revoked = tc.redeemed, tc.revoked
 			url := replayServer(t, func(rpcMethod string) interface{} {
 				if rpcMethod == "embedded.bridge.getUnwrapTokenRequestByHashAndLog" {
 					return b.request
@@ -263,7 +296,7 @@ func TestRedeemAndRevokeIgnoreARequestOnAnotherNetworkClass(t *testing.T) {
 			if err := stores.evm[1].AddUnwrapRequest(local); err != nil {
 				t.Fatal(err)
 			}
-			data, err := definition.ABIBridge.PackMethod(method, b.request.TransactionHash, b.request.LogIndex)
+			data, err := definition.ABIBridge.PackMethod(tc.method, b.request.TransactionHash, b.request.LogIndex)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -276,8 +309,66 @@ func TestRedeemAndRevokeIgnoreARequestOnAnotherNetworkClass(t *testing.T) {
 			if err != nil || row == nil {
 				t.Fatalf("stored row: %v, err %v", row, err)
 			}
-			if row.RedeemStatus != common.UnredeemedStatus {
-				t.Fatalf("a request on another network class changed the EVM row's status to %d", row.RedeemStatus)
+			if row.RedeemStatus != tc.want {
+				t.Fatalf("EVM row status %d, want %d", row.RedeemStatus, tc.want)
+			}
+		})
+	}
+}
+
+// The receive registered the request, so an endpoint that reports none is
+// behind the ledger the receive was read from. While the receive is live the
+// listener waits for it; dropping it would drop the source check with it.
+func TestAcceptedLiveUnwrapWaitsForTheRegisteredRequest(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		live bool
+		// answer is the Zenon endpoint's reply to the request lookup.
+		answer func() (interface{}, *replayRPCError)
+		held   bool
+	}{
+		{"live, no data", true, func() (interface{}, *replayRPCError) { return nil, &replayRPCError{-32000, "data non existent"} }, true},
+		{"live, null result", true, func() (interface{}, *replayRPCError) { return nil, nil }, true},
+		{"live, network removed", true, func() (interface{}, *replayRPCError) { return nil, &replayRPCError{-32000, "unknown network"} }, false},
+		{"history, no data", false, func() (interface{}, *replayRPCError) { return nil, &replayRPCError{-32000, "data non existent"} }, false},
+		{"history, null result", false, func() (interface{}, *replayRPCError) { return nil, nil }, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			b := newReplayBridge(t)
+			frontier := uint64(104)
+			if !tc.live {
+				frontier = 1000
+			}
+			ledger := newReplayLedger(t, b, frontier, receiveStatus(vmResultSuccess))
+			url := replayServerWithErrors(t, func(method string, params []json.RawMessage) (interface{}, *replayRPCError) {
+				if result, ok := ledger.answer(t, method, params); ok {
+					return result, nil
+				}
+				if method == "embedded.bridge.getUnwrapTokenRequestByHashAndLog" {
+					return tc.answer()
+				}
+				t.Errorf("unexpected method %s", method)
+				return nil, nil
+			})
+			n, stores := replayNetwork(t, b, url, map[uint32]string{1: url})
+			n.SetConfirmationsToFinality(5)
+			if err := n.state.SetFrontierMomentum(frontier); err != nil {
+				t.Fatal(err)
+			}
+			height, _, err := n.processBridgeAccountPage(n.listenerCtx, 1, n.refreshSettings)
+			wantHeight := uint64(2)
+			if tc.held {
+				wantHeight = 1
+			}
+			if (err != nil) != tc.held || height != wantHeight {
+				t.Fatalf("height %d, err %v; want height %d, held %v", height, err, wantHeight, tc.held)
+			}
+			if got := replayState(t, n); got != common.LiveState {
+				t.Fatalf("state %s", common.StateToText(got))
+			}
+			cursor, err := stores.znn.GetLastUpdateHeight()
+			if err != nil || cursor != wantHeight {
+				t.Fatalf("checkpoint %d, err %v, want %d", cursor, err, wantHeight)
 			}
 		})
 	}
@@ -555,36 +646,39 @@ func TestUnwrapRecipientIsComparedByValue(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	embeddedAffiliate := types.BridgeContract.String()
 	upper := strings.ToUpper
 	for _, tc := range []struct {
 		name string
-		// to is the recipient string in the EVM log, given the registered address.
-		to func(registered string) string
-		// program enables the affiliate split, which registers 101% for the
-		// beneficiary and 2% for the affiliate at a derived log index.
-		program   bool
+		// to is the recipient string in the EVM log, given the registered
+		// beneficiary. The log always carries an amount of 100.
+		to func(beneficiary string) string
+		// program enables the affiliate split, under which signers register
+		// 101 for the beneficiary and 2 for the affiliate at a derived index.
+		program bool
+		// rewardRow registers the affiliate's row instead of the beneficiary's.
 		rewardRow bool
-		want      uint8
+		// amount is the registered amount.
+		amount int64
+		want   uint8
 	}{
-		{"lowercase", func(a string) string { return a }, false, false, common.LiveState},
-		{"uppercase", upper, false, false, common.LiveState},
-		{"another address", func(string) string { return affiliate }, false, false, common.EmergencyState},
-		{"another address in uppercase", func(string) string { return upper(affiliate) }, false, false, common.EmergencyState},
-		{"affiliate split, uppercase beneficiary", func(a string) string { return upper(a) + "&" + affiliate }, true, false, common.LiveState},
-		{"affiliate split, uppercase affiliate", func(a string) string { return a + "&" + upper(affiliate) }, true, true, common.LiveState},
-		{"affiliate split, another beneficiary", func(string) string { return upper(affiliate) + "&" + affiliate }, true, false, common.EmergencyState},
-		{"embedded affiliate leaves the plain row", func(a string) string { return upper(a) + "&" + types.BridgeContract.String() }, true, false, common.LiveState},
+		{"lowercase", func(a string) string { return a }, false, false, 100, common.LiveState},
+		{"uppercase", upper, false, false, 100, common.LiveState},
+		{"another address", func(string) string { return affiliate }, false, false, 100, common.EmergencyState},
+		{"another address in uppercase", func(string) string { return upper(affiliate) }, false, false, 100, common.EmergencyState},
+		{"affiliate split, uppercase beneficiary", func(a string) string { return upper(a) + "&" + affiliate }, true, false, 101, common.LiveState},
+		{"affiliate split, uppercase affiliate", func(a string) string { return a + "&" + upper(affiliate) }, true, true, 2, common.LiveState},
+		{"affiliate split, another beneficiary", func(string) string { return upper(affiliate) + "&" + affiliate }, true, false, 101, common.EmergencyState},
+		{"embedded affiliate leaves the plain row", func(a string) string { return upper(a) + "&" + embeddedAffiliate }, true, false, 100, common.LiveState},
+		{"embedded affiliate earns the beneficiary no bonus", func(a string) string { return a + "&" + embeddedAffiliate }, true, false, 101, common.EmergencyState},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			b := newReplayBridge(t)
 			log := b.sourceLog(t, tc.to(b.recipient.String()))
-			if tc.program && !strings.HasPrefix(tc.name, "embedded affiliate") {
-				b.request.Amount = big.NewInt(101)
-			}
+			b.request.Amount = big.NewInt(tc.amount)
 			if tc.rewardRow {
 				b.request.LogIndex = common.AffiliateLogIndexAddition
 				b.request.ToAddress = affiliateAddress
-				b.request.Amount = big.NewInt(2)
 			}
 			url := replayServer(t, func(method string) interface{} {
 				switch method {
@@ -617,34 +711,38 @@ func TestUnwrapRecipientIsComparedByValue(t *testing.T) {
 
 // Signers create no request for an unwrap whose beneficiary is an embedded
 // contract address, so a registration paying one was not signed from this
-// source event, however the log spells it.
+// source event, however the log spells it. The same holds for the affiliate
+// reward derived from such an event.
 func TestRegistrationPayingAnEmbeddedBeneficiaryIsNotASourceMatch(t *testing.T) {
 	embedded := types.BridgeContract
 	if !types.IsEmbeddedAddress(embedded) {
 		t.Fatal("fixture address is not embedded")
 	}
-	for name, to := range map[string]string{
-		"lowercase":                  embedded.String(),
-		"uppercase":                  strings.ToUpper(embedded.String()),
-		"with affiliate":             embedded.String() + "&" + testRecipient,
-		"with affiliate, program on": embedded.String() + "&" + testRecipient,
-		"reward row, program on":     embedded.String() + "&" + testRecipient,
+	for _, tc := range []struct {
+		name string
+		// to is the recipient string in the EVM log, which carries amount 100.
+		to        string
+		program   bool
+		rewardRow bool
+		amount    int64
+	}{
+		{"lowercase", embedded.String(), false, false, 100},
+		{"uppercase", strings.ToUpper(embedded.String()), false, false, 100},
+		{"with affiliate", embedded.String() + "&" + testRecipient, false, false, 100},
+		{"with affiliate, program on", embedded.String() + "&" + testRecipient, true, false, 101},
+		{"reward row, program on", embedded.String() + "&" + testRecipient, true, true, 2},
 	} {
-		t.Run(name, func(t *testing.T) {
+		t.Run(tc.name, func(t *testing.T) {
 			b := newReplayBridge(t)
 			b.request.ToAddress = embedded
-			program := strings.HasSuffix(name, "program on")
-			if program {
-				b.request.Amount = big.NewInt(101)
-			}
-			if strings.HasPrefix(name, "reward row") {
-				// The 2% reward for an ordinary affiliate address, derived
-				// from an event whose beneficiary signers refuse.
+			b.request.Amount = big.NewInt(tc.amount)
+			if tc.rewardRow {
+				// The reward for an ordinary affiliate address, derived from
+				// an event whose beneficiary signers refuse.
 				b.request.LogIndex = common.AffiliateLogIndexAddition
 				b.request.ToAddress = b.recipient
-				b.request.Amount = big.NewInt(2)
 			}
-			log := b.sourceLog(t, to)
+			log := b.sourceLog(t, tc.to)
 			url := replayServer(t, func(method string) interface{} {
 				switch method {
 				case "embedded.bridge.getUnwrapTokenRequestByHashAndLog":
@@ -658,7 +756,7 @@ func TestRegistrationPayingAnEmbeddedBeneficiaryIsNotASourceMatch(t *testing.T) 
 				return nil
 			})
 			n, _ := replayNetwork(t, b, url, map[uint32]string{1: url})
-			if program {
+			if tc.program {
 				n.state.SetTokensMap(1, types.ZnnTokenStandard.String(), b.token.Hex())
 				n.state.SetIsAffiliateProgram(common.AffiliateProgram{Networks: map[uint32]common.AffiliateNetwork{
 					1: {StartingHeight: 1, ZNN: true, WZNN: true},
