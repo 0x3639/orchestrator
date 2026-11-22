@@ -51,6 +51,15 @@ func (*stalledSettingsEndpoint) GetFrontierMomentum() *api.Momentum {
 func (p *stalledSettingsEndpoint) GetAccountBlockByHash(hash types.Hash) *api.AccountBlockMarshal {
 	return p.blocks[hash]
 }
+func (p *stalledSettingsEndpoint) GetAccountBlocksByHeight(_ types.Address, height, count uint64) *api.AccountBlockListMarshal {
+	page := &api.AccountBlockListMarshal{List: []*api.AccountBlockMarshal{}}
+	for _, receipt := range p.receipts {
+		if receipt.Height >= height && uint64(len(page.List)) < count {
+			page.List = append(page.List, p.blocks[receipt.Hash])
+		}
+	}
+	return page
+}
 func (p *stalledSettingsEndpoint) AccountBlocksByAddress(ctx context.Context, address types.Address) (*server.Subscription, error) {
 	notifier, ok := server.NotifierFromContext(ctx)
 	if !ok || address != types.BridgeContract {
@@ -68,7 +77,8 @@ type checkpointStore struct {
 	saved chan uint64
 }
 
-func (s checkpointStore) SetLastUpdateHeight(h uint64) error { s.saved <- h; return nil }
+func (s checkpointStore) GetLastUpdateHeight() (uint64, error) { return 0, nil }
+func (s checkpointStore) SetLastUpdateHeight(h uint64) error   { s.saved <- h; return nil }
 
 type settingsTestStores struct {
 	networkEventStores
@@ -90,7 +100,7 @@ func TestStalledSettingsCannotDelayHalt(t *testing.T) {
 	for i, data := range [][]byte{resize, halt} {
 		recv, send := types.Hash{byte(2*i + 1)}, types.Hash{byte(2*i + 2)}
 		p.receipts = append(p.receipts, subscribe.AccountBlock{Address: types.BridgeContract, Height: uint64(i + 1), BlockType: nom.BlockTypeContractReceive, Hash: recv, FromHash: send})
-		p.blocks[recv] = &api.AccountBlockMarshal{AccountBlockMarshal: nom.AccountBlockMarshal{Hash: recv, Address: types.BridgeContract, FromBlockHash: send, Amount: "0"}}
+		p.blocks[recv] = &api.AccountBlockMarshal{AccountBlockMarshal: nom.AccountBlockMarshal{Height: uint64(i + 1), BlockType: nom.BlockTypeContractReceive, Hash: recv, Address: types.BridgeContract, FromBlockHash: send, Amount: "0"}, ConfirmationDetail: &api.AccountBlockConfirmationDetail{MomentumHeight: 170}}
 		p.blocks[send] = &api.AccountBlockMarshal{AccountBlockMarshal: nom.AccountBlockMarshal{Hash: send, Address: types.ZeroAddress, Data: data, Amount: "0"}}
 	}
 	srv := server.NewServer()
@@ -110,7 +120,7 @@ func TestStalledSettingsCannotDelayHalt(t *testing.T) {
 		t.Fatal(err)
 	}
 	saved := make(chan uint64, 2)
-	n := &znnNetwork{rpcManager: clients, state: state, administrator: types.ZeroAddress.String(), dbManager: settingsTestStores{store: checkpointStore{saved: saved}}, stopChan: stop, logger: zap.NewNop().Sugar()}
+	n := &znnNetwork{listenerCtx: context.Background(), rpcManager: clients, state: state, administrator: types.ZeroAddress.String(), dbManager: settingsTestStores{store: checkpointStore{saved: saved}}, stopChan: stop, logger: zap.NewNop().Sugar()}
 	release := sync.OnceFunc(func() { close(p.release) })
 	var wg sync.WaitGroup
 	defer func() {
@@ -136,7 +146,7 @@ func TestStalledSettingsCannotDelayHalt(t *testing.T) {
 	}
 	wg.Add(1)
 	go func() { defer wg.Done(); n.ListenForEmbeddedBridgeAccountBlocks() }()
-	// The real listener waits four seconds for each of the two receive blocks.
+	// The listener can advance both receipts while the signing read is stalled.
 	deadline := time.After(14 * time.Second)
 	for want := uint64(1); want <= 2; want++ {
 		select {
@@ -156,7 +166,7 @@ func TestStalledSettingsCannotDelayHalt(t *testing.T) {
 		if !errors.Is(err, context.DeadlineExceeded) {
 			t.Fatalf("signer returned %v, want deadline exceeded", err)
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(rpc.ZnnSettingsTimeout + time.Second):
 		t.Fatal("signer still waiting for settings after the halt")
 	}
 	release()
