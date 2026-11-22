@@ -8,6 +8,8 @@ import (
 	"github.com/zenon-network/go-zenon/common/types"
 	"golang.org/x/sync/semaphore"
 	"math/big"
+
+	"orchestrator/health/snapshot"
 )
 
 const (
@@ -25,6 +27,8 @@ type CeremonyWindow struct {
 }
 
 type GlobalState struct {
+	// Health is assigned once before any network workers start.
+	Health                 *snapshot.Store
 	state                  *uint8
 	stateSemaphore         *semaphore.Weighted
 	frontierMomentumHeight uint64
@@ -61,6 +65,7 @@ func (gs *GlobalState) SetState(newState uint8) error {
 	}
 	GlobalLogger.Infof("Old state: %s, New state: %s\n", StateToText(*gs.state), StateToText(newState))
 	*gs.state = newState
+	gs.Health.SetBridgeState(StateToText(newState))
 	gs.stateSemaphore.Release(1)
 	return nil
 }
@@ -80,6 +85,7 @@ func (gs *GlobalState) SetFrontierMomentum(frMom uint64) error {
 		return err
 	}
 	gs.frontierMomentumHeight = frMom
+	gs.Health.UpdateZenon(func(z *snapshot.Zenon) { z.FrontierMomentum = snapshot.Measure(frMom) })
 	gs.frontierMomSemaphore.Release(1)
 	return nil
 }
@@ -202,4 +208,12 @@ func (gs *GlobalState) GetResignNetwork() (uint32, uint32) {
 func (gs *GlobalState) SetResignNetwork(networkClass, chainId uint32) {
 	gs.resignNetworkClass = networkClass
 	gs.resignNetworkChainId = chainId
+}
+
+// HealthStore returns the optional observer for callers that run without node state.
+func (gs *GlobalState) HealthStore() *snapshot.Store {
+	if gs == nil {
+		return nil
+	}
+	return gs.Health
 }

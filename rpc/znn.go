@@ -165,6 +165,19 @@ func (r *ZnnRpc) GetSyncInfo() (*protocol.SyncInfo, error) {
 	return r.rpcClient.StatsApi.SyncInfo()
 }
 
+// SampleSyncInfo uses a context-bound connection because the SDK's StatsApi
+// does not expose a deadline. A slow monitoring probe cannot hold up signing.
+func (r *ZnnRpc) SampleSyncInfo(ctx context.Context) (*protocol.SyncInfo, error) {
+	client, err := server.DialContext(ctx, r.Urls.GetCurrentUrl())
+	if err != nil {
+		return nil, err
+	}
+	defer client.Close()
+	var info *protocol.SyncInfo
+	err = client.CallContext(ctx, &info, "stats.syncInfo")
+	return info, err
+}
+
 func (r *ZnnRpc) GetOrchestratorInfo() (*definition.OrchestratorInfo, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), ZnnSettingsTimeout)
 	defer cancel()

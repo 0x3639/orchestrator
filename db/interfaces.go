@@ -57,6 +57,8 @@ type ZnnStorage interface {
 	GetUnsignedWrapRequests() ([]*events.WrapRequestZnn, error)
 
 	GetLastUpdateHeight() (uint64, error)
+	HasReceiveCoverageCheckpoint(uint64) bool
+	SaveReceiveCoverageCheckpoint(uint64) error
 	SetLastUpdateHeight(uint64) error
 
 	GetResignStatus(types.Hash) (bool, error)

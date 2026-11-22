@@ -21,12 +21,14 @@ import (
 	"orchestrator/common/config"
 	"orchestrator/common/events"
 	"orchestrator/db/manager"
+	"orchestrator/health/snapshot"
 	"orchestrator/rpc"
 	"os"
 	"slices"
 )
 
 type NetworksManager struct {
+	health      *snapshot.Store
 	znnNetwork  *znnNetwork
 	evmNetworks []*evmNetwork
 	stopChan    chan os.Signal
@@ -48,6 +50,7 @@ func NewNetworksManager(stopChan chan os.Signal) (*NetworksManager, error) {
 }
 
 func (m *NetworksManager) Init(networksInfo map[string]config.BaseNetworkConfig, dbManager *manager.Manager, state *common.GlobalState, setBridgeMetadata func(metadata *common.BridgeMetadata)) error {
+	m.health = state.HealthStore()
 	if len(networksInfo) < 2 {
 		return errors.New("wrong network initializers 1")
 	}
@@ -73,6 +76,12 @@ func (m *NetworksManager) Init(networksInfo map[string]config.BaseNetworkConfig,
 		return err
 	}
 
+	for _, n := range networks {
+		if n.NetworkClass == definition.EvmClass {
+			m.health.AddNetwork(n.NetworkClass, n.Id)
+		}
+	}
+	m.health.SetNetworksKnown()
 	newEvmNetworks := make([]*evmNetwork, 0)
 	for _, network := range networks {
 		switch network.NetworkClass {
@@ -132,9 +141,15 @@ func (m *NetworksManager) AddEvmNetwork(network *evmNetwork) {
 }
 
 func (m *NetworksManager) RemoveEvmNetwork(chainId uint32) {
+	m.health.RemoveNetwork(chainId)
 	for idx, network := range m.evmNetworks {
 		if network.ChainId() == chainId {
+			if network.stopHealth != nil {
+				network.stopHealth()
+			}
+			network.stopOnce.Do(func() { close(network.done) })
 			m.evmNetworks = append(m.evmNetworks[:idx], m.evmNetworks[idx+1:]...)
+			return
 		}
 	}
 }
@@ -308,7 +323,15 @@ func (m *NetworksManager) GetWrapEventById(id types.Hash) (*events.WrapRequestZn
 }
 
 func (m *NetworksManager) GetUnsentSignedWrapRequests() ([]*events.WrapRequestZnn, error) {
-	return m.Znn().GetUnsentSignedWrapRequests()
+	requests, err := m.Znn().GetUnsentSignedWrapRequests()
+	if m.health != nil {
+		counts := make(map[uint32]int)
+		for _, req := range requests {
+			counts[req.ChainId]++
+		}
+		m.health.UpdateNetworks(func(n *snapshot.Network) { n.Wrap.SignedAwaitingSubmission = snapshot.Reading(counts[n.ChainID], err) })
+	}
+	return requests, err
 }
 
 func (m *NetworksManager) GetUnredeemedWrapRequests() ([]*events.WrapRequestZnn, error) {
@@ -318,19 +341,7 @@ func (m *NetworksManager) GetUnredeemedWrapRequests() ([]*events.WrapRequestZnn,
 func (m *NetworksManager) GetUnsignedWrapRequests() ([]*definition.WrapTokenRequest, error) {
 	// todo how many to get for signing?
 	requests, err := m.Znn().GetUnsignedWrapRequestsRpc(0, 100)
-	if err != nil {
-		return nil, err
-	}
-	if requests == nil || len(requests.List) == 0 {
-		return nil, nil
-	}
-	ans := make([]*definition.WrapTokenRequest, 0)
-	for _, request := range requests.List {
-		if request.ConfirmationsToFinality == 0 {
-			ans = append(ans, request.WrapTokenRequest)
-		}
-	}
-	return ans, nil
+	return filterWrapPage(m.health, requests, err)
 }
 
 // / Evm

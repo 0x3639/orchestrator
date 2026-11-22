@@ -8,4 +8,7 @@ var (
 
 	// We store the resigned status on wraps
 	resignedStatusPrefix = []byte{2}
+
+	// Private monitoring checkpoint, outside the wrap event iterator.
+	receiveCoverageKey = []byte{3}
 )

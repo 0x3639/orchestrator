@@ -12,6 +12,7 @@ require (
 	github.com/multiformats/go-multiaddr v0.3.1
 	github.com/pkg/errors v0.9.1
 	github.com/prometheus/tsdb v0.10.0
+	github.com/santhosh-tekuri/jsonschema/v5 v5.3.1
 	github.com/syndtr/goleveldb v1.0.1-0.20220721030215-126854af5e6d
 	github.com/zenon-network/go-zenon v0.0.7-alphanet
 	go.uber.org/zap v1.27.0
