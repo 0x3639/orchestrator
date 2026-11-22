@@ -24,6 +24,24 @@ The strongest configuration is a full node you run yourself for each bridged net
 
 `RpcRequestsPerSecond` and `RpcBurst` cap requests **per endpoint** with a token bucket. The cap covers every read the orchestrator makes to that endpoint: the sync's `eth_getLogs` and head reads, receipts and headers during event confirmation, canonical-block checks, and the bridge contract reads. It does not cover the log subscription, which is server-pushed, or the rare transaction sends.
 
+### Low-rate configuration
+
+Set these fields in the existing `Networks.Ethereum` entry of `config.json` and restart the orchestrator. For example, for a plan that permits 10 blocks per log query and one request every two seconds, keep your provider URLs and use these values.
+
+```json
+{
+    "FilterQuerySize": 10,
+    "RpcRequestsPerSecond": 0.5,
+    "RpcBurst": 1
+}
+```
+
+`RpcBurst: 1` spaces requests even after idle time. Lowering the rate also slows retries and other reads that share the endpoint. Local waits happen before the RPC timeout starts. A missing or zero `RpcRequestsPerSecond` leaves an existing network entry uncapped.
+
+Choose a rate that fits both throughput and total quota. For example, a continuously busy endpoint at 0.5 requests per second can use about 43,200 requests per day. If the provider bills compute units, allow for the most expensive calls the sync makes. Divide shared account allowances among all active endpoints, networks and other clients using the same key. The orchestrator does not track the provider's remaining credits.
+
+`FilterQuerySize` counts both ends of the query. With a ceiling of 10, a query starting at block 100 ends no later than block 109, even near the chain head. If your plan publishes a maximum range, setting it here avoids probing above it.
+
 ### Sizing against a free tier
 
 The limits below are [dRPC's](https://drpc.org/docs/howitworks/ratelimiting) free tier as published in September 2026, in its compute units (CU). Providers differ and change their terms; check yours and redo the arithmetic.
@@ -54,10 +72,10 @@ Tuning:
 - **Provider rejects the window width or result size**: the sync narrows its `eth_getLogs` window automatically. When the provider's message names the width it accepts, as Alchemy's does, the window drops straight to it; otherwise it halves on each rejection down to 8 blocks. It widens again after 50 consecutive successes, and logs each change. `FilterQuerySize` is the ceiling it starts from.
 - **Provider times out**: lower `FilterQuerySize`. A range that always times out never completes.
 
-:::caution Free provider plans cannot do the initial scan
+:::caution Historical access and first-sync time on free plans
 Measured in September 2026: **Alchemy's** free tier limits `eth_getLogs` to a 10-block window, and **dRPC's** free plan rejects windows wider than roughly 100 blocks (its message quotes 10,000) and often cannot route queries far behind the head at all. The sync narrows its window and keeps going, but a first scan of Ethereum from the bridge's deployment block at 10-block windows is close to a million queries, days at any sane request rate.
 
-For the initial scan, in order of preference: copy `~/.orchestrator/events` from a healthy signer (all signers hold the same event set, and the copy carries the sync cursor, so only the tail needs scanning); run your own full node; or use a provider whose free tier allows wide historical windows, such as Infura's 10,000 blocks, for the scan alone. Once the cursor is near the head, the 3-minute catch-ups cover a handful of blocks and any of these plans serves them.
+For a signer with a known-good [local checkpoint](operations/sync-checkpoints.md), restore its event stores and pending queues together so only the tail needs scanning. An events-only copy can carry a cursor past an unwrap that is still waiting in the donor's queue. A new signer without a checkpoint needs an endpoint that serves the bridge's historical blocks within its rate and range limits. Once the cursor is near the head, the three-minute catch-ups usually cover only a handful of blocks.
 :::
 - **Several networks or URLs share one API key**: the caps add up per endpoint. Set each low enough that the sum fits the account.
 

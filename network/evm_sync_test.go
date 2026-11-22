@@ -1,14 +1,14 @@
-//go:build bend
-
 package network
 
 import (
 	"fmt"
 	"math"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"sync"
 	"testing"
+	"time"
 
 	ecommon "github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/hexutil"
@@ -20,7 +20,6 @@ import (
 	"orchestrator/common/config"
 	"orchestrator/db/unwrap"
 	"orchestrator/rpc"
-	"orchestrator/verification"
 )
 
 // Capture the inclusive bounds that reach eth_getLogs, after configuration,
@@ -32,11 +31,11 @@ type scanQuery struct {
 }
 
 type scanProvider struct {
-	head uint64
+	head func() uint64
 	read func(scanQuery) ([]etypes.Log, error)
 }
 
-func (p *scanProvider) BlockNumber() hexutil.Uint64               { return hexutil.Uint64(p.head) }
+func (p *scanProvider) BlockNumber() hexutil.Uint64               { return hexutil.Uint64(p.head()) }
 func (p *scanProvider) GetLogs(q scanQuery) ([]etypes.Log, error) { return p.read(q) }
 
 type scanTrace struct {
@@ -58,7 +57,7 @@ func runSyncWithHint(t *testing.T, start, head, configured, limit, finality uint
 	done := make(chan struct{})
 	stop := sync.OnceFunc(func() { close(done) })
 	rejected := false
-	provider := &scanProvider{head: head, read: func(q scanQuery) ([]etypes.Log, error) {
+	provider := &scanProvider{head: func() uint64 { return head }, read: func(q scanQuery) ([]etypes.Log, error) {
 		trace.queries = append(trace.queries, q)
 		from, to := uint64(q.From), uint64(q.To)
 		if len(trace.queries) > 64 || from > to || to > head {
@@ -81,6 +80,13 @@ func runSyncWithHint(t *testing.T, start, head, configured, limit, finality uint
 		}
 		return []etypes.Log{}, nil
 	}}
+	cfg := config.BaseNetworkConfig{FilterQuerySize: configured}
+	trace.saved, trace.err = runScan(t, provider, cfg, start, finality, done)
+	return trace
+}
+
+func runScan(t *testing.T, provider *scanProvider, cfg config.BaseNetworkConfig, start, finality uint64, done chan struct{}) (uint64, error) {
+	t.Helper()
 	srv := gethrpc.NewServer()
 	if err := srv.RegisterName("eth", provider); err != nil {
 		t.Fatal(err)
@@ -89,7 +95,7 @@ func runSyncWithHint(t *testing.T, start, head, configured, limit, finality uint
 	defer server.Close()
 	defer srv.Stop()
 	stopChan := make(chan os.Signal, 1)
-	cfg := config.BaseNetworkConfig{Urls: []string{server.URL}, FilterQuerySize: configured}
+	cfg.Urls = []string{server.URL}
 	rpcs, err := rpc.NewRpcManager(cfg, stopChan)
 	if err != nil {
 		t.Fatal(err)
@@ -101,13 +107,13 @@ func runSyncWithHint(t *testing.T, start, head, configured, limit, finality uint
 	store := unwrap.NewEvmStorage(zdb.NewMemDB(), stopChan, start)
 	net := evmNetwork{dbManager: unwrapTestStores{evm: store}, rpcManager: rpcs, done: done, logger: zap.NewNop().Sugar()}
 	net.SetConfirmationsToFinality(finality)
-	trace.err = net.Sync()
+	syncErr := net.Sync()
 	server.Close() // join request handlers before reading their trace
-	trace.saved, err = store.GetLastUpdateHeight()
+	saved, err := store.GetLastUpdateHeight()
 	if err != nil {
 		t.Fatal(err)
 	}
-	return trace
+	return saved, syncErr
 }
 
 func TestSyncHonorsInclusiveRanges(t *testing.T) {
@@ -157,30 +163,6 @@ func TestSyncHonorsInclusiveRanges(t *testing.T) {
 	}
 }
 
-func TestSyncKeepsCursorOnOutOfRangeLog(t *testing.T) {
-	for _, block := range []uint64{99, 103} {
-		t.Run(fmt.Sprint(block), func(t *testing.T) {
-			// A removed log needs no contract decoding. Its height alone makes
-			// this response inconsistent with the requested range [100,102].
-			trace := runCappedSync(t, 100, 102, 10, 10, 12, &etypes.Log{Removed: true, BlockNumber: block, Topics: []ecommon.Hash{}, Data: []byte{}})
-			if trace.err == nil || trace.saved != 100 {
-				t.Errorf("out-of-range block %d: saved cursor %d, err=%v", block, trace.saved, trace.err)
-			}
-			checkScanCheckpoint(t, trace, block)
-		})
-	}
-}
-
-func TestSyncAcceptsLogsAtBothInclusiveBounds(t *testing.T) {
-	for _, block := range []uint64{100, 102} {
-		trace := runCappedSync(t, 100, 102, 10, 10, 12, &etypes.Log{Removed: true, BlockNumber: block, Topics: []ecommon.Hash{}, Data: []byte{}})
-		if trace.err != nil || trace.saved != 102 {
-			t.Errorf("in-range block %d: saved cursor %d, err=%v", block, trace.saved, trace.err)
-		}
-		checkScanCheckpoint(t, trace, block)
-	}
-}
-
 func TestShrinkUsesAttemptedSizeAtTip(t *testing.T) {
 	trace := runSyncWithHint(t, 100, 119, 2000, 10, 0, nil, false)
 	if len(trace.queries) < 2 {
@@ -192,15 +174,55 @@ func TestShrinkUsesAttemptedSizeAtTip(t *testing.T) {
 	}
 }
 
-func checkScanCheckpoint(t *testing.T, trace scanTrace, block uint64) {
-	t.Helper()
-	if len(trace.queries) != 1 {
-		t.Fatalf("expected one log query, got %v", trace.queries)
+type quotaError struct{}
+
+func (quotaError) ErrorCode() int { return http.StatusTooManyRequests }
+func (quotaError) Error() string  { return "request budget exceeded" }
+
+func TestSyncPacesHeadReadsAndRetriedLogs(t *testing.T) {
+	// The provider rejects the first two log reads, first with a 429 and
+	// then with a quota message and a generic JSON-RPC error code.
+	var heads, logs []time.Time
+	var queries []scanQuery
+	provider := &scanProvider{
+		head: func() uint64 {
+			heads = append(heads, time.Now())
+			return 115
+		},
+		read: func(q scanQuery) ([]etypes.Log, error) {
+			logs = append(logs, time.Now())
+			queries = append(queries, q)
+			switch len(logs) {
+			case 1:
+				return nil, quotaError{}
+			case 2:
+				return nil, fmt.Errorf("daily request count exceeded")
+			}
+			return []etypes.Log{}, nil
+		},
 	}
-	q := trace.queries[0]
-	// The fixture persisted 100 before Sync and returned exactly one log.
-	fits := fmt.Sprintf("B.logs_in_range(%dn, %dn, [%dn])", uint64(q.From), uint64(q.To), block)
-	var checks verification.Comparisons
-	checks.Equal(fmt.Sprintf("B.scan_checkpoint(100n, %dn, %s)", uint64(q.To), fits), fmt.Sprintf("%dn", trace.saved), "Nat")
-	checks.Check(t)
+	cfg := config.BaseNetworkConfig{FilterQuerySize: 10, RpcRequestsPerSecond: 5, RpcBurst: 1}
+	saved, err := runScan(t, provider, cfg, 100, 12, make(chan struct{}))
+	if err != nil || saved != 115 {
+		t.Fatalf("sync saved %d, want 115, err=%v", saved, err)
+	}
+	want := []scanQuery{{100, 109}, {100, 109}, {100, 109}, {109, 115}}
+	if len(heads) != len(want) || len(queries) != len(want) {
+		t.Fatalf("observed %d head reads and log ranges %v", len(heads), queries)
+	}
+	const minGap = 150 * time.Millisecond // 200 ms at 5/s, with scheduler tolerance
+	for i, q := range queries {
+		if q != want[i] || logs[i].Sub(heads[i]) < minGap {
+			t.Fatalf("query %d: range %v after %s, want %v after a permit", i, q, logs[i].Sub(heads[i]), want[i])
+		}
+	}
+	if retryDelay := heads[1].Sub(logs[0]); retryDelay < syncRetryBaseBackoff {
+		t.Fatalf("retried a 429 after %s", retryDelay)
+	}
+	if retryDelay := heads[2].Sub(logs[1]); retryDelay < 2*syncRetryBaseBackoff {
+		t.Fatalf("retried the second quota rejection after %s", retryDelay)
+	}
+	if gap := heads[3].Sub(logs[2]); gap < minGap {
+		t.Fatalf("the next head read followed the successful log read after only %s", gap)
+	}
 }

@@ -11,7 +11,7 @@ On first start, and after a [backfill](backfill.md), the orchestrator scans ever
 ## Before you start
 
 1. Configure two or more independent, full-history endpoints per network. See [EVM networks](../networks.md).
-2. Set `RpcRequestsPerSecond` and `RpcBurst` under the provider's degraded limit. The sizing table in [EVM networks](../networks.md#rate-limits) covers a typical free tier.
+2. Set `RpcRequestsPerSecond` and `RpcBurst` under the provider's degraded limit. See the [free-tier configuration example](../networks.md#low-rate-configuration) for fractional request rates and per-query block limits.
 3. Make sure the Zenon node is synced. The orchestrator waits for it before doing anything else.
 
 ## What you will see
@@ -32,7 +32,7 @@ Ethereum mainnet from an 18M-block deployment to a 26M head, at 2,000 blocks per
 When the provider rejects or times out a query:
 
 ```
-Sync for chainId 1: eth_getLogs for blocks [18004000, 18006000] failed at block 18004000 (attempt 3/12), retrying in 8s: 429 Too Many Requests
+Sync for chainId 1: eth_getLogs for blocks [18004000, 18005999] failed at block 18004000 (attempt 3/12), retrying in 8s: 429 Too Many Requests
 ```
 
 The same range is retried with backoff from 2 seconds to 2 minutes. After 12 consecutive failures the pass stops. What happens next depends on when it failed:

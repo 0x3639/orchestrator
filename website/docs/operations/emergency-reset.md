@@ -8,6 +8,8 @@ description: "Rebuilding a signer's event stores from chain history as a last re
 
 A full rebuild of this signer's event stores from chain history. Use it for corruption of `events/` or `queues/`, or divergence that a [backfill](backfill.md) cannot reach. It is not the normal fix for a [signing stall](signing-stalls.md); try backfill first.
 
+If this signer has a healthy [local sync checkpoint](sync-checkpoints.md) from before the first missing event, restore it first. The signer can replay from that height. The procedure below is for a full rebuild when no suitable checkpoint is available.
+
 :::danger
 This rescans every EVM network from the bridge contract's deployment block. Set `RpcRequestsPerSecond` first, or the provider will throttle the scan and it can take hours. See [EVM networks](../networks.md).
 :::

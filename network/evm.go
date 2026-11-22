@@ -278,13 +278,13 @@ const (
 func (eN *evmNetwork) Sync() error {
 	eN.logger.Info("In sync evm")
 	eN.resetCanonicalCache()
-	updateHeight, err := eN.eventsStore().GetLastUpdateHeight()
+	startHeight, err := eN.eventsStore().GetLastUpdateHeight()
 	if err != nil {
 		return err
 	}
-	eN.logger.Info("updateHeight: ", updateHeight)
+	eN.logger.Info("updateHeight: ", startHeight)
 
-	startHeight := updateHeight
+	fromBlock := startHeight
 	startedAt := time.Now()
 	ranges := 0
 	attempts := 0
@@ -294,17 +294,16 @@ func (eN *evmNetwork) Sync() error {
 	// than growing toward a newer head.
 	var rangeEnd uint64
 	rangeFrozen := false
-	rangeIsTip := false
 
 	// retryRange pauses before the same range is attempted again. It
 	// returns an error once the attempt budget is spent or the node stops.
 	retryRange := func(what string, cause error) error {
 		attempts++
 		if attempts >= syncMaxRangeAttempts {
-			return fmt.Errorf("sync for chainId %d: %s failed %d times at block %d, giving up until the next refresh: %w", eN.ChainId(), what, attempts, updateHeight, cause)
+			return fmt.Errorf("sync for chainId %d: %s failed %d times at block %d, giving up until the next refresh: %w", eN.ChainId(), what, attempts, fromBlock, cause)
 		}
 		eN.logger.Warnf("Sync for chainId %d: %s failed at block %d (attempt %d/%d), retrying in %s: %v",
-			eN.ChainId(), what, updateHeight, attempts, syncMaxRangeAttempts, backoff, cause)
+			eN.ChainId(), what, fromBlock, attempts, syncMaxRangeAttempts, backoff, cause)
 		if !eN.sleep(backoff) {
 			return errors.New("sync interrupted by shutdown")
 		}
@@ -324,7 +323,7 @@ func (eN *evmNetwork) Sync() error {
 			continue
 		}
 
-		if updateHeight > latestBlock {
+		if fromBlock > latestBlock {
 			// todo this can happen if we have a fork
 			return errors.Errorf("sync evm problem for network: %s, chainId: %d", eN.NetworkName(), eN.ChainId())
 		}
@@ -333,21 +332,9 @@ func (eN *evmNetwork) Sync() error {
 			eN.queryRange = newQueryRangeAdapter(eN.rpcManager.Evm(eN.ChainId()).FilterQuerySize())
 		}
 		if !rangeFrozen {
-			distance := latestBlock - updateHeight
-			filterQuerySize := eN.queryRange.size()
-			rangeIsTip = false
-			if distance < eN.ConfirmationsToFinality() || distance == 0 {
-				// The range reaches the head. A zero distance still queries
-				// the cursor block once: on first start the cursor is the
-				// deployment height, which has not been scanned yet, and the
-				// query is idempotent otherwise. rangeIsTip ends the pass so
-				// it cannot spin on the same block.
-				filterQuerySize = distance
-				rangeIsTip = true
-			} else if distance < filterQuerySize {
-				filterQuerySize = distance
-			}
-			rangeEnd = updateHeight + filterQuerySize
+			// Both RPC bounds are inclusive. Limit the offset before adding so a
+			// scan near MaxUint64 cannot wrap past the head.
+			rangeEnd = fromBlock + min(latestBlock-fromBlock, eN.queryRange.size()-1)
 			rangeFrozen = true
 		}
 		if latestBlock < rangeEnd {
@@ -360,24 +347,20 @@ func (eN *evmNetwork) Sync() error {
 			}
 			continue
 		}
-		filterQuerySize := rangeEnd - updateHeight
-		// Only stop when the covered range still reaches the current head;
-		// if the head moved on during retries there is more to fetch.
-		end := rangeIsTip && latestBlock == rangeEnd
+		blockCount := rangeEnd - fromBlock + 1
 
-		logs, err := eN.EvmRpc().FilterLogs(updateHeight, rangeEnd)
+		logs, err := eN.EvmRpc().FilterLogs(fromBlock, rangeEnd)
 		if err != nil {
-			if isRangeLimitError(err) && filterQuerySize > 1 {
+			if isRangeLimitError(err) {
 				// The provider rejected the window's width or result size.
 				// Narrow the window, to the width the message suggests when
 				// it gives one, and retry at once; this is not a transient
 				// failure, so it does not spend the retry budget. The reduced
 				// width is kept for the following ranges.
 				hint, _ := suggestedRange(err)
-				newSize, _ := eN.queryRange.shrink(hint)
-				if newSize < filterQuerySize {
+				if newSize, changed := eN.queryRange.shrink(blockCount, hint); changed {
 					eN.logger.Warnf("Sync for chainId %d: provider rejected an eth_getLogs window of %d blocks (%v); narrowing to %d blocks",
-						eN.ChainId(), filterQuerySize, err, newSize)
+						eN.ChainId(), blockCount, err, newSize)
 					rangeFrozen = false
 					if !eN.sleep(time.Second) {
 						return errors.New("sync interrupted by shutdown")
@@ -385,20 +368,28 @@ func (eN *evmNetwork) Sync() error {
 					continue
 				}
 			}
-			if err := retryRange(fmt.Sprintf("eth_getLogs for blocks [%d, %d]", updateHeight, rangeEnd), err); err != nil {
+			if err := retryRange(fmt.Sprintf("eth_getLogs for blocks [%d, %d]", fromBlock, rangeEnd), err); err != nil {
+				return err
+			}
+			continue
+		}
+		// Check the entire reply before applying any event. In particular a
+		// future block must never underflow the unsigned finality calculation.
+		if err := validateLogHeights(logs, fromBlock, rangeEnd); err != nil {
+			if err := retryRange("validating returned log heights", err); err != nil {
 				return err
 			}
 			continue
 		}
 		interpretFailed := false
 		for _, log := range logs {
-			// if we have confirmations then we are live, otherwise we are not
+			// Recent events enter the live confirmation queue.
 			if err := eN.InterpretLog(log, latestBlock-log.BlockNumber < eN.ConfirmationsToFinality()); err != nil {
 				// Do not advance the cursor past a range with an unprocessed
 				// log; the same range is retried. Skipping it would silently
 				// lose the event on this signer only.
 				eN.logger.Errorf("Sync: failed to interpret log tx %s logIndex %d in block %d, range [%d, %d] will be retried: %v",
-					log.TxHash.String(), log.Index, log.BlockNumber, updateHeight, updateHeight+filterQuerySize, err)
+					log.TxHash.String(), log.Index, log.BlockNumber, fromBlock, rangeEnd, err)
 				if err := retryRange("interpreting logs", err); err != nil {
 					return err
 				}
@@ -418,28 +409,43 @@ func (eN *evmNetwork) Sync() error {
 			eN.logger.Infof("Sync for chainId %d: %d consecutive ranges succeeded, widening the eth_getLogs window to %d blocks", eN.ChainId(), growAfterRanges, newSize)
 		}
 
-		updateHeight += filterQuerySize
-		if err := eN.eventsStore().SetLastUpdateHeight(updateHeight); err != nil {
+		if err := eN.eventsStore().SetLastUpdateHeight(rangeEnd); err != nil {
 			return err
 		}
 		ranges++
 		if ranges%syncProgressEvery == 0 {
-			done := updateHeight - startHeight
+			done := rangeEnd - startHeight
 			total := latestBlock - startHeight
 			pct := float64(0)
 			if total > 0 {
 				pct = 100 * float64(done) / float64(total)
 			}
 			eN.logger.Infof("Sync progress for chainId %d: block %d of %d (%.1f%%), %d ranges in %s",
-				eN.ChainId(), updateHeight, latestBlock, pct, ranges, time.Since(startedAt).Round(time.Second))
+				eN.ChainId(), rangeEnd, latestBlock, pct, ranges, time.Since(startedAt).Round(time.Second))
 		}
-		if end {
+		if rangeEnd == latestBlock {
 			break
+		}
+		// Keep the existing boundary overlap for multi-block queries. A
+		// one-block query covered its entire interval, so move past it.
+		if fromBlock == rangeEnd {
+			fromBlock++
+		} else {
+			fromBlock = rangeEnd
 		}
 	}
 	if ranges >= syncProgressEvery {
 		eN.logger.Infof("Sync complete for chainId %d: blocks %d to %d in %d ranges, %s",
-			eN.ChainId(), startHeight, updateHeight, ranges, time.Since(startedAt).Round(time.Second))
+			eN.ChainId(), startHeight, rangeEnd, ranges, time.Since(startedAt).Round(time.Second))
+	}
+	return nil
+}
+
+func validateLogHeights(logs []etypes.Log, from, to uint64) error {
+	for _, log := range logs {
+		if log.BlockNumber < from || log.BlockNumber > to {
+			return fmt.Errorf("provider returned log at block %d outside requested interval [%d,%d]", log.BlockNumber, from, to)
+		}
 	}
 	return nil
 }
@@ -981,8 +987,8 @@ func (eN *evmNetwork) ProcessEvents() {
 			discardVotes = 0
 			if decision.err != nil {
 				attempts++
-				eN.logger.Warnf("Event %s not confirmable yet (%s): %v; attempt %d, retrying in %s, queue size %d",
-					key, decision.reason, decision.err, attempts, backoff, eN.unconfirmedQueue.Size())
+				eN.logger.Warnf("Event %s not confirmable yet (%s): %v; attempt %d, retrying in %s",
+					key, decision.reason, decision.err, attempts, backoff)
 				if attempts%processEventsWarnEvery == 0 {
 					eN.logger.Errorf("Event %s has failed confirmation %d times in a row; the unconfirmed queue is blocked until the EVM node answers consistently", key, attempts)
 				}
