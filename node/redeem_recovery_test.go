@@ -32,12 +32,16 @@ func TestRestartAfterRedeemAcknowledgment(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				initState := cfg.GlobalState
-				n := &Node{config: &cfg, state: common.NewGlobalState(&initState)}
+				n := &Node{config: &cfg, state: common.NewPersistentGlobalState(&cfg.GlobalState, func(state uint8) error {
+					return config.WriteGlobalState(dir, state)
+				})}
 				if err := n.state.RestoreRedeemIncidents(wrap.NewRedeemIncidentStore(db)); err != nil {
 					t.Fatal(err)
 				}
 				return n, db
+			}
+			if err := cfg.InitializeLocked(); err != nil {
+				t.Fatal(err)
 			}
 			n, db := open()
 			if err := n.state.ReportRedeemIncident(common.RedeemIncident{ChainID: 1}); err != nil {
@@ -56,10 +60,10 @@ func TestRestartAfterRedeemAcknowledgment(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			if err := config.WriteConfig(*n.GetConfig()); err != nil {
+			if err := n.SaveConfig(); err != nil {
 				t.Fatal(err)
 			}
-			if err := n.state.CompleteEmergencyHalt(n.state.RedeemHaltGeneration()); err != nil {
+			if err := n.state.CompleteEmergencyHalt(n.state.RedeemHaltGeneration(), map[uint32]bool{1: true}); err != nil {
 				t.Fatal(err)
 			}
 			if err := db.Close(); err != nil {

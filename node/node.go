@@ -8,7 +8,6 @@ import (
 	"encoding/json"
 	"fmt"
 	wallet2 "github.com/MoonBaZZe/znn-sdk-go/wallet"
-	zcommon "github.com/zenon-network/go-zenon/common"
 	"io"
 	"math/big"
 	"net/http"
@@ -74,12 +73,13 @@ type Node struct {
 func NewNode(config *oconfig.Config, logger *zap.Logger) (_ *Node, initErr error) {
 	var err error
 
-	initialState := config.GlobalState
 	node := &Node{
 		config:   config,
 		logger:   logger.Sugar(),
 		stopChan: make(chan os.Signal, 1),
-		state:    common.NewGlobalState(&initialState),
+		state: common.NewPersistentGlobalState(&config.GlobalState, func(state uint8) error {
+			return oconfig.WriteGlobalState(config.DataPath, state)
+		}),
 	}
 
 	// prepare node
@@ -93,6 +93,9 @@ func NewNode(config *oconfig.Config, logger *zap.Logger) (_ *Node, initErr error
 			node.closeDataDir()
 		}
 	}()
+	if err := config.InitializeLocked(); err != nil {
+		return nil, err
+	}
 	if config.HealthConfig.SnapshotSocket != "" {
 		store := snapshot.New(metadata.Version, metadata.GitCommit)
 		server, listenErr := health.ListenSnapshot(config.HealthConfig.SnapshotSocket, store, config.HealthConfig)
@@ -168,7 +171,7 @@ func NewNode(config *oconfig.Config, logger *zap.Logger) (_ *Node, initErr error
 		node.state.SetIsAdministratorActive(true)
 	}
 
-	if err := oconfig.WriteConfig(*node.GetConfig()); err != nil {
+	if err := node.SaveConfig(); err != nil {
 		node.logger.Info(err.Error())
 	}
 
@@ -323,6 +326,9 @@ func (node *Node) closeSnapshot() {
 }
 
 func (node *Node) Stop() error {
+	// Start holds the lock during bridge sync. Interrupt pending ledger
+	// reads and backoff before waiting for the startup path to unwind.
+	node.networksManager.Znn().CancelAccountBlockReads()
 	node.lock.Lock()
 	defer node.lock.Unlock()
 	defer close(node.stopChan)
@@ -365,15 +371,13 @@ func (node *Node) processSignatures() {
 		}
 
 		if generation := node.state.RedeemHaltGeneration(); generation != 0 {
+			currentState = common.EmergencyState
 			// The durable incident can outlive the process that submitted the
 			// halt transactions. Verify the actual flags before clearing it.
-			halted, err := node.networksManager.AllBridgeHaltFlagsSet()
+			halted, err := node.networksManager.ConfirmRedeemHalt(node.state, generation)
 			if err != nil {
 				node.logger.Warnf("Cannot confirm bridge halt: %v", err)
 			} else if halted {
-				if err := node.state.CompleteEmergencyHalt(generation); err != nil {
-					node.logger.Errorf("Cannot persist confirmed bridge halt: %v", err)
-				}
 				continue
 			}
 		}
@@ -761,7 +765,7 @@ func (node *Node) processSignatures() {
 			//	}
 			//}
 
-			if err := oconfig.WriteConfig(*node.GetConfig()); err != nil {
+			if err := node.SaveConfig(); err != nil {
 				node.logger.Info(err.Error())
 			}
 		case common.LiveState:
@@ -1014,18 +1018,9 @@ func (node *Node) processSignatures() {
 								continue
 							}
 							//node.logger.Debugf("Set wrap %s status as true", wrap.Id.String())
-						} else {
-							status := common.PendingRedeemStatus
-							if redeemStatus.BlockNumber.Cmp(zcommon.BigP256) == 0 {
-								status = common.RedeemedStatus
-							}
-
-							if errStorage := node.networksManager.Znn().SetWrapEventStatus(event.Id, status); errStorage != nil {
-								node.logger.Error(errGetWrap)
-								node.stopChan <- syscall.SIGINT
-								continue
-							}
 						}
+						// A positive latest-state lookup suppresses re-signing. Only the
+						// finalized EVM events distinguish redemption from revocation.
 					}
 				}
 				pageIndex++
@@ -1577,13 +1572,12 @@ func (node *Node) haltNetworksAdministrator() {
 
 // Getters
 
+func (node *Node) SaveConfig() error {
+	return node.state.SaveConfig(func() error { return oconfig.WriteConfig(*node.config) })
+}
+
 func (node *Node) GetConfig() *oconfig.Config {
-	if node.config == nil {
-		return nil
-	}
-	cfg := *node.config
-	cfg.GlobalState = node.state.ConfigState()
-	return &cfg
+	return node.config
 }
 
 func (node *Node) getParticipantsLength() uint32 {

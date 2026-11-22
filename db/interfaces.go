@@ -36,6 +36,8 @@ type EvmStorage interface {
 	GetUnsentSignedUnwrapRequests() ([]*events.UnwrapRequestEvm, error)
 	SetUnsentUnwrapRequestAsUnsigned(ecommon.Hash, uint32) error
 
+	GetScanHeights(depth uint64) (through, redeem uint64, legacy bool, err error)
+	SetScanHeights(through, redeem uint64) error
 	GetLastUpdateHeight() (uint64, error)
 	SetLastUpdateHeight(uint64) error
 }
@@ -46,6 +48,7 @@ type ZnnStorage interface {
 	SendSigInt()
 
 	AddWrapRequest(events.WrapRequestZnn) error
+	HasLegacyRedeemStatuses(chainID uint32) (bool, error)
 	ApplyRedeemLog(chainID uint32, id types.Hash, block uint64, index uint, status uint32) error
 	SetWrapRequestStatus(types.Hash, uint32) error
 	SetWrapRequestSignature(types.Hash, string) error

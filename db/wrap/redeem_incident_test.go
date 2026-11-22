@@ -27,7 +27,7 @@ func TestRedeemIncidentEvidenceAfterHaltAndStorageFailure(t *testing.T) {
 	if pending, err := s.RecordRedeemIncident(observation); err != nil || !pending {
 		t.Fatalf("new incident pending=%t err=%v", pending, err)
 	}
-	if err := s.ConfirmRedeemHalt(); err != nil {
+	if err := s.ConfirmRedeemHalt(map[uint32]bool{1: true}); err != nil {
 		t.Fatal(err)
 	}
 	if pending, err := s.RecordRedeemIncident(observation); err != nil || pending {
@@ -55,7 +55,7 @@ func TestRedeemIncidentEvidenceAfterHaltAndStorageFailure(t *testing.T) {
 	if state.RedeemHaltGeneration() == 0 {
 		t.Fatal("storage failure allowed normal signing")
 	}
-	if err := state.CompleteEmergencyHalt(state.RedeemHaltGeneration()); err == nil || state.RedeemHaltGeneration() == 0 {
+	if err := state.CompleteEmergencyHalt(state.RedeemHaltGeneration(), map[uint32]bool{1: true}); err == nil || state.RedeemHaltGeneration() == 0 {
 		t.Fatalf("storage error released halt: %v", err)
 	}
 }

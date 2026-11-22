@@ -12,11 +12,20 @@ import (
 )
 
 // One record holds the latest EVM log position and status, independent of
-// the Zenon wrap and its signature. A live log can arrive before the wrap.
+// the Zenon wrap and its signature. A finalized log can arrive before the wrap.
 type redeemStatus struct {
 	block  uint64
 	index  uint64
 	status uint32
+}
+
+// The earlier draft retained only the latest provisional event per nonce.
+// Its registration may predate that record, so replay from deployment.
+func (es *eventStore) HasLegacyRedeemStatuses(chainID uint32) (bool, error) {
+	it := es.DB.NewIterator(binary.BigEndian.AppendUint32([]byte{legacyRedeemStatusPrefix}, chainID))
+	defer it.Release()
+	found := it.Next()
+	return found, it.Error()
 }
 
 func redeemStatusKey(chainID uint32, id types.Hash) []byte {

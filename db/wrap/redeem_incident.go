@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"errors"
+	"fmt"
 	etypes "github.com/ethereum/go-ethereum/core/types"
 	"slices"
 
@@ -89,12 +90,28 @@ func (s *RedeemIncidentStore) HasPendingRedeemIncident() (bool, error) {
 	return false, it.Error()
 }
 
-func (s *RedeemIncidentStore) ConfirmRedeemHalt() error {
+func (s *RedeemIncidentStore) ConfirmRedeemHalt(checkedChains map[uint32]bool) error {
 	it := s.db.NewIterator(util.BytesPrefix([]byte{redeemEvidencePrefix}), nil)
 	defer it.Release()
 	batch := new(leveldb.Batch)
 	for it.Next() {
-		batch.Put(confirmedKey(it.Key()), []byte{1})
+		key := it.Key()
+		if len(key) < 5 {
+			return errors.New("invalid redeem incident key")
+		}
+		marker := confirmedKey(key)
+		confirmed, err := s.db.Has(marker, nil)
+		if err != nil {
+			return err
+		}
+		if confirmed {
+			continue
+		}
+		chainID := binary.BigEndian.Uint32(key[1:5])
+		if !checkedChains[chainID] {
+			return fmt.Errorf("pending redeem incident on chain %d has no confirmed halt flag", chainID)
+		}
+		batch.Put(marker, []byte{1})
 	}
 	if err := it.Error(); err != nil {
 		return err

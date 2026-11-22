@@ -1,13 +1,16 @@
 package network
 
 import (
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"math/big"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"sync"
 	"testing"
+	"time"
 
 	ecommon "github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/hexutil"
@@ -29,8 +32,31 @@ import (
 )
 
 type redeemProvider struct {
+	primary *redeemProvider // companion endpoint for advancing the fixture chain
 	*unwrapProvider
-	halted *bool
+	halted     *bool
+	afterRange func()
+}
+
+func (p *redeemProvider) setChain(head uint64, logs ...etypes.Log) {
+	p.set(nil, logs, head)
+	p.primary.set(nil, logs, head)
+}
+
+// Filter inclusive ranges just like eth_getLogs, including receipt fallback.
+func (p *redeemProvider) GetLogs(q scanQuery) []etypes.Log {
+	if p.afterRange != nil {
+		p.afterRange()
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	result := make([]etypes.Log, 0)
+	for _, log := range p.filtered {
+		if log.BlockNumber >= uint64(q.From) && log.BlockNumber <= uint64(q.To) {
+			result = append(result, log)
+		}
+	}
+	return result
 }
 
 func (p *redeemProvider) Call(call map[string]any, _ string) (hexutil.Bytes, error) {
@@ -121,7 +147,7 @@ func redeemFixture(t *testing.T, sources ...*redeemSource) (*evmNetwork, etypes.
 		Data:   ecommon.LeftPadBytes([]byte{19}, 32)}
 	flag := new(bool)
 	primary := &redeemProvider{halted: flag, unwrapProvider: &unwrapProvider{head: 140, receipt: evidenceReceipt(log), filtered: []etypes.Log{log}}}
-	secondary := &redeemProvider{halted: flag, unwrapProvider: &unwrapProvider{head: 140, receipt: evidenceReceipt(log), filtered: []etypes.Log{log}}}
+	secondary := &redeemProvider{primary: primary, halted: flag, unwrapProvider: &unwrapProvider{head: 140, receipt: evidenceReceipt(log), filtered: []etypes.Log{log}}}
 	evmCfg := evidenceEndpoints(t, primary, secondary)
 	saved := http.DefaultTransport
 	handlers := map[string]*redeemSource{}
@@ -214,10 +240,10 @@ func TestHistoricalRedeemHaltSurvivesRestartAndResumes(t *testing.T) {
 	if err := net.state.ReportRedeemIncident(common.RedeemIncident{ChainID: 1, Log: newLog}); err != nil {
 		t.Fatal(err)
 	}
-	if err := net.state.CompleteEmergencyHalt(generation); err != nil || net.state.RedeemHaltGeneration() == 0 {
+	if err := net.state.CompleteEmergencyHalt(generation, map[uint32]bool{1: true}); err != nil || net.state.RedeemHaltGeneration() == 0 {
 		t.Fatalf("stale halt observation released newer incident: %v", err)
 	}
-	if err := net.state.CompleteEmergencyHalt(net.state.RedeemHaltGeneration()); err != nil {
+	if err := net.state.CompleteEmergencyHalt(net.state.RedeemHaltGeneration(), map[uint32]bool{1: true}); err != nil {
 		t.Fatal(err)
 	}
 	if err := net.state.SetState(common.LiveState); err != nil {
@@ -285,11 +311,11 @@ func TestRedeemHaltNeedsExplicitNetworkFlags(t *testing.T) {
 	src := &redeemSource{synced: true}
 	n, _, evm := redeemFixture(t, src)
 	m := &NetworksManager{znnNetwork: &znnNetwork{rpcManager: n.rpcManager}, evmNetworks: []*evmNetwork{n}}
-	if halted, err := m.AllBridgeHaltFlagsSet(); err != nil || halted {
+	if halted, err := m.ConfirmRedeemHalt(n.state, n.state.RedeemHaltGeneration()); err != nil || halted {
 		t.Fatalf("Zenon unhalted: %t %v", halted, err)
 	}
 	src.bridgeErr = "temporarily unavailable"
-	if halted, err := m.AllBridgeHaltFlagsSet(); err == nil || halted {
+	if halted, err := m.ConfirmRedeemHalt(n.state, n.state.RedeemHaltGeneration()); err == nil || halted {
 		t.Fatalf("Zenon unavailable: %t %v", halted, err)
 	}
 	src.bridgeErr = ""
@@ -297,16 +323,16 @@ func TestRedeemHaltNeedsExplicitNetworkFlags(t *testing.T) {
 	if halted, unhalted, err := m.CountNetworksHaltState(); err != nil || halted != 1 || unhalted != 0 {
 		t.Fatalf("ordinary halt check during delay: %d/%d %v", halted, unhalted, err)
 	}
-	if halted, err := m.AllBridgeHaltFlagsSet(); err != nil || halted {
+	if halted, err := m.ConfirmRedeemHalt(n.state, n.state.RedeemHaltGeneration()); err != nil || halted {
 		t.Fatalf("EVM unhalted: %t %v", halted, err)
 	}
 	*evm.halted = true
-	if halted, err := m.AllBridgeHaltFlagsSet(); err != nil || !halted {
+	if halted, err := m.ConfirmRedeemHalt(n.state, n.state.RedeemHaltGeneration()); err != nil || !halted {
 		t.Fatalf("confirmed halt: %t %v", halted, err)
 	}
 }
 
-func TestRedeemReplayKeepsLaterLiveStatus(t *testing.T) {
+func TestRedeemReplayKeepsLaterFinalizedStatus(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
 		topic ecommon.Hash
@@ -317,7 +343,7 @@ func TestRedeemReplayKeepsLaterLiveStatus(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			source := &redeemSource{synced: true}
-			n, registration, _ := redeemFixture(t, source)
+			n, registration, chain := redeemFixture(t, source)
 			id := types.Hash(registration.Topics[1])
 			source.wrap = &definition.WrapTokenRequest{Id: id, NetworkClass: definition.EvmClass, ChainId: 1,
 				ToAddress: ecommon.BytesToAddress(registration.Topics[2][:]).Hex(), TokenAddress: ecommon.BytesToAddress(registration.Topics[3][:]).Hex(), Amount: big.NewInt(20), Fee: big.NewInt(1)}
@@ -329,8 +355,9 @@ func TestRedeemReplayKeepsLaterLiveStatus(t *testing.T) {
 				later.Topics = later.Topics[:2]
 				later.Data = nil
 			}
-			// Live terminal event arrives before Zenon backfill creates the row.
-			if err := n.InterpretLog(later, true); err != nil {
+			// The finalized outcome can precede replay of the older registration.
+			chain.setChain(140, registration, later)
+			if err := n.InterpretLog(later, false); err != nil {
 				t.Fatal(err)
 			}
 			if err := n.InterpretLog(registration, false); err != nil {
@@ -352,5 +379,206 @@ func TestRedeemReplayKeepsLaterLiveStatus(t *testing.T) {
 				t.Fatalf("after replay row=%+v err=%v", row, err)
 			}
 		})
+	}
+}
+
+func TestCatchupRedeemWaitsForFinalityAcrossRestart(t *testing.T) {
+	src := &redeemSource{synced: true, err: constants.ErrDataNonExistent.Error()}
+	n, reg, chain := redeemFixture(t, src)
+	stores := n.dbManager.(unwrapTestStores)
+	dir := t.TempDir()
+	open := func() *leveldb.DB {
+		db, err := leveldb.OpenFile(dir, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		stores.evm = unwrap.NewEvmStorage(zdb.NewLevelDBWrapper(db), n.stopChan, reg.BlockNumber)
+		n.dbManager = stores
+		return db
+	}
+	db := open()
+	head := reg.BlockNumber + n.ConfirmationsToFinality() - 1
+	chain.setChain(head, reg)
+	if err := n.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	if src.calls != 0 || n.state.RedeemHaltGeneration() != 0 {
+		t.Fatal("unfinalized range opened a halt")
+	}
+	through, from, _, err := stores.evm.GetScanHeights(n.ConfirmationsToFinality())
+	if err != nil || through != head || from != reg.BlockNumber {
+		t.Fatalf("through=%d redeem=%d err=%v", through, from, err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db = open()
+	defer db.Close()
+	chain.setChain(head+1, reg)
+	if err := n.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	if n.state.RedeemHaltGeneration() == 0 {
+		t.Fatal("finalized discrepancy was lost at restart")
+	}
+}
+
+func TestRedeemHaltWaitsForRuntimeNetworkPublication(t *testing.T) {
+	n, reg, chain := redeemFixture(t, &redeemSource{synced: true, halted: true, err: constants.ErrDataNonExistent.Error()})
+	manager := &NetworksManager{znnNetwork: &znnNetwork{rpcManager: n.rpcManager}}
+	if err := n.InterpretLog(reg, false); err != nil {
+		t.Fatal(err)
+	}
+	generation := n.state.RedeemHaltGeneration()
+	if generation == 0 {
+		t.Fatal("expected incident during startup")
+	}
+	if ok, err := manager.ConfirmRedeemHalt(n.state, generation); err == nil || ok || n.state.RedeemHaltGeneration() == 0 {
+		t.Fatalf("incident on unpublished chain was released: confirmed=%t err=%v", ok, err)
+	}
+	manager.AddEvmNetwork(n)
+	if ok, err := manager.ConfirmRedeemHalt(n.state, generation); err != nil || ok || n.state.RedeemHaltGeneration() == 0 {
+		t.Fatalf("unhalted chain was released: confirmed=%t err=%v", ok, err)
+	}
+	*chain.halted = true
+	if ok, err := manager.ConfirmRedeemHalt(n.state, generation); err != nil || !ok || n.state.RedeemHaltGeneration() != 0 {
+		t.Fatalf("confirmed incident was not released: confirmed=%t err=%v", ok, err)
+	}
+}
+
+func TestCatchupRedeemRetainsGapWhenHeadAdvances(t *testing.T) {
+	src := &redeemSource{synced: true, err: constants.ErrDataNonExistent.Error()}
+	n, reg, chain := redeemFixture(t, src)
+	reg.BlockNumber++
+	reg.BlockHash = canonicalHeader(reg.BlockNumber).Hash()
+	chain.setChain(reg.BlockNumber+n.ConfirmationsToFinality()-1, reg)
+	n.queryRange = newQueryRangeAdapter(5)
+	chain.primary.afterRange = sync.OnceFunc(func() { chain.setChain(140, reg) })
+	if err := n.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	through, from, _, err := n.eventsStore().GetScanHeights(n.ConfirmationsToFinality())
+	if err != nil || through != 140 || from >= reg.BlockNumber || src.calls != 0 {
+		t.Fatalf("through=%d redeem=%d lookups=%d err=%v", through, from, src.calls, err)
+	}
+	if err := n.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	if n.state.RedeemHaltGeneration() == 0 {
+		t.Fatal("scan skipped the block deferred in the earlier range")
+	}
+}
+
+func TestRedeemReorgUsesCanonicalReplacement(t *testing.T) {
+	src := &redeemSource{synced: true}
+	n, reg, chain := redeemFixture(t, src)
+	id := types.Hash(reg.Topics[1])
+	src.wrap = &definition.WrapTokenRequest{Id: id, NetworkClass: definition.EvmClass, ChainId: 1,
+		ToAddress: ecommon.BytesToAddress(reg.Topics[2][:]).Hex(), TokenAddress: ecommon.BytesToAddress(reg.Topics[3][:]).Hex(), Amount: big.NewInt(20), Fee: big.NewInt(1)}
+	// Seed a finalized registration; its outcome will be delivered live at the tip.
+	if err := n.InterpretLog(reg, false); err != nil {
+		t.Fatal(err)
+	}
+	orphan := reg
+	orphan.BlockNumber = 140
+	orphan.BlockHash = ecommon.HexToHash("0xfeed")
+	orphan.Topics = append([]ecommon.Hash(nil), reg.Topics...)
+	orphan.Topics[0] = common.RedeemedSigHash
+	chain.setChain(140, reg, orphan)
+	if err := n.InterpretLog(orphan, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := n.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	state := func(want uint32) {
+		t.Helper()
+		row, err := n.dbManager.ZnnStorage().GetWrapRequestById(id)
+		if err != nil || row == nil || row.RedeemStatus != want {
+			t.Fatalf("wrap=%+v want=%d err=%v", row, want, err)
+		}
+	}
+	state(common.PendingRedeemStatus)
+	orphan.Removed = true
+	if err := n.InterpretLog(orphan, true); err != nil {
+		t.Fatal(err)
+	}
+	replacement := orphan
+	replacement.Removed = false
+	replacement.BlockHash = canonicalHeader(140).Hash()
+	replacement.TxHash = ecommon.HexToHash("0xcafe")
+	replacement.Topics = []ecommon.Hash{common.RevokedRedeemSigHash, reg.Topics[1]}
+	replacement.Data = nil
+	chain.setChain(140+n.ConfirmationsToFinality(), replacement)
+	if err := n.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	state(common.RevokedStatus)
+}
+
+func TestLegacyRedeemReplayFindsRegistrationBeforeLastProvisionalEvent(t *testing.T) {
+	src := &redeemSource{synced: true}
+	n, reg, chain := redeemFixture(t, src)
+	id := types.Hash(reg.Topics[1])
+	src.wrap = &definition.WrapTokenRequest{Id: id, NetworkClass: definition.EvmClass, ChainId: 1,
+		ToAddress: ecommon.BytesToAddress(reg.Topics[2][:]).Hex(), TokenAddress: ecommon.BytesToAddress(reg.Topics[3][:]).Hex(), Amount: big.NewInt(20), Fee: big.NewInt(1)}
+	zenonDB, evmDB := zdb.NewMemDB(), zdb.NewMemDB()
+	stores := n.dbManager.(unwrapTestStores)
+	stores.znn = wrap.NewZnnStorage(zenonDB, n.stopChan)
+	n.SetContractDeploymentHeight(90)
+	stores.evm = unwrap.NewEvmStorage(evmDB, n.stopChan, 90)
+	n.dbManager = stores
+	row := common.ZnnWrapToOrchestratorWrap(src.wrap)
+	row.Signature = "preserve"
+	if err := stores.znn.AddWrapRequest(row); err != nil {
+		t.Fatal(err)
+	}
+	// Seed the prior release's single-height cursor and the earlier draft's
+	// hashless terminal status. Only a registration survived on the chain.
+	if err := evmDB.Put([]byte{1}, binary.LittleEndian.AppendUint64(nil, 170)); err != nil {
+		t.Fatal(err)
+	}
+	key := append(binary.BigEndian.AppendUint32([]byte{6}, 1), id.Bytes()...)
+	data := binary.BigEndian.AppendUint64(nil, reg.BlockNumber+30)
+	data = binary.BigEndian.AppendUint64(data, uint64(reg.Index))
+	if err := zenonDB.Put(key, binary.BigEndian.AppendUint32(data, common.RedeemedStatus)); err != nil {
+		t.Fatal(err)
+	}
+	chain.setChain(182, reg)
+	if err := n.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	got, err := stores.znn.GetWrapRequestById(id)
+	if err != nil || got == nil || got.RedeemStatus != common.PendingRedeemStatus || got.Signature != "preserve" {
+		t.Fatalf("migrated wrap=%+v err=%v", got, err)
+	}
+	through, from, legacy, err := stores.evm.GetScanHeights(n.ConfirmationsToFinality())
+	if err != nil || legacy || through != 182 || from != 170 {
+		t.Fatalf("migrated checkpoint %d/%d legacy=%t err=%v", through, from, legacy, err)
+	}
+}
+
+func TestRedeemFinalizesWhileSubscriptionIsUnavailable(t *testing.T) {
+	src := &redeemSource{synced: true, err: constants.ErrDataNonExistent.Error()}
+	n, reg, chain := redeemFixture(t, src)
+	head := reg.BlockNumber + n.ConfirmationsToFinality()
+	chain.setChain(head-1, reg)
+	if err := n.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	if n.state.RedeemHaltGeneration() != 0 {
+		t.Fatal("unfinalized registration halted bridge")
+	}
+	chain.setChain(head, reg)
+	// Both HTTP endpoints support range scans, but no log subscriptions.
+	stopped := make(chan struct{})
+	go func() { defer close(stopped); n.SubscribeToEvents() }()
+	defer func() { close(n.done); <-stopped }()
+	deadline := time.Now().Add(5 * time.Second)
+	for n.state.RedeemHaltGeneration() == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("finalized registration missed during subscription outage")
+		}
+		time.Sleep(time.Millisecond * 10)
 	}
 }

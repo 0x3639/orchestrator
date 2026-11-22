@@ -40,6 +40,12 @@ func (eN *evmNetwork) registerRedeem(log etypes.Log, live bool) error {
 		if wrap.ChainId == eN.ChainId() && wrap.NetworkClass == eN.NetworkClass() &&
 			netAmount.Cmp(redeem.Amount) == 0 && strings.EqualFold(wrap.ToAddress, redeem.To.Hex()) &&
 			strings.EqualFold(wrap.TokenAddress, redeem.Token.Hex()) {
+			if live {
+				return nil // The finalized scan owns durable wrap status.
+			}
+			if _, err := eN.verifyRedeemLog(log, eN.ConfirmationsToFinality()); err != nil {
+				return err
+			}
 			store := eN.dbManager.ZnnStorage()
 			if err := store.ApplyRedeemLog(eN.ChainId(), id, log.BlockNumber, log.Index, common.PendingRedeemStatus); err != nil {
 				return err
@@ -54,22 +60,12 @@ func (eN *evmNetwork) registerRedeem(log etypes.Log, live bool) error {
 	if live {
 		confirmations = 0
 	}
-	confirmed, err := eN.EvmRpc().AgreedRedeemLog(log, confirmations)
-	if err != nil {
-		return err
-	}
-	if !slices.Equal(confirmed.Topics, log.Topics) || !slices.Equal(confirmed.Data, log.Data) {
-		return errors.New("registered redeem differs from agreed EVM log")
-	}
 	if err := eN.rpcManager.Znn().ConfirmRedeemWrap(id, wrap); err != nil {
 		return err
 	}
-	canonical, err := eN.EvmRpc().CanonicalHash(log.BlockNumber)
+	confirmed, err := eN.verifyRedeemLog(log, confirmations)
 	if err != nil {
 		return err
-	}
-	if canonical != log.BlockHash {
-		return errors.New("registered redeem block is not canonical")
 	}
 	if err := eN.state.ReportRedeemIncident(common.RedeemIncident{ChainID: eN.ChainId(), Log: confirmed, Wrap: wrap}); err != nil {
 		eN.requestStop()
@@ -78,4 +74,54 @@ func (eN *evmNetwork) registerRedeem(log etypes.Log, live bool) error {
 	eN.logger.Warnf("Verified unmatched redeem: chain %d, block %d (%s), transaction %s, log %d, wrap %s, halt pending %v",
 		eN.ChainId(), log.BlockNumber, log.BlockHash, log.TxHash, log.Index, id, eN.state.RedeemHaltGeneration() != 0)
 	return nil
+}
+
+func isRedeemTopic(topic ecommon.Hash) bool {
+	return topic == common.RegisteredRedeemSigHash || topic == common.RedeemedSigHash || topic == common.RevokedRedeemSigHash
+}
+
+func (eN *evmNetwork) verifyRedeemLog(log etypes.Log, depth uint64) (etypes.Log, error) {
+	source, err := eN.EvmRpc().AgreedRedeemLog(log, depth)
+	if err != nil {
+		return etypes.Log{}, err
+	}
+	if !slices.Equal(source.Topics, log.Topics) || !slices.Equal(source.Data, log.Data) {
+		return etypes.Log{}, errors.New("redeem log differs from endpoint evidence")
+	}
+	canonical, err := eN.EvmRpc().CanonicalHash(log.BlockNumber)
+	if err != nil {
+		return etypes.Log{}, err
+	}
+	if canonical != log.BlockHash {
+		return etypes.Log{}, errors.New("redeem block is not canonical")
+	}
+	return source, nil
+}
+
+func (eN *evmNetwork) applyRedeemOutcome(log etypes.Log, live bool) error {
+	status := common.RedeemedStatus
+	var nonce *big.Int
+	if log.Topics[0] == common.RevokedRedeemSigHash {
+		event, err := eN.EvmRpc().Bridge().ParseRevokedRedeem(log)
+		if err != nil {
+			return err
+		}
+		nonce, status = event.Nonce, common.RevokedStatus
+		if live {
+			common.AdministratorLogger.Infof("RevokedRedeemSigHash %s", ecommon.BigToHash(nonce))
+		}
+	} else {
+		event, err := eN.EvmRpc().Bridge().ParseRedeemed(log)
+		if err != nil {
+			return err
+		}
+		nonce = event.Nonce
+	}
+	if live {
+		return nil
+	}
+	if _, err := eN.verifyRedeemLog(log, eN.ConfirmationsToFinality()); err != nil {
+		return err
+	}
+	return eN.dbManager.ZnnStorage().ApplyRedeemLog(eN.ChainId(), types.Hash(ecommon.BigToHash(nonce)), log.BlockNumber, log.Index, status)
 }

@@ -26,10 +26,20 @@ func (r *EvmRpc) AgreedUnwrapLog(height uint64, block, tx ecommon.Hash, index ui
 	return r.agreedBridgeLog(height, block, tx, uint64(index), confirmations, common.UnwrapSigHash, 3)
 }
 
-// AgreedRedeemLog verifies the exact RegisteredRedeem receipt or single-height
-// fallback log on every EVM endpoint. Callers separately verify the block hash.
+// AgreedRedeemLog checks the receipt or single-block log on each endpoint.
 func (r *EvmRpc) AgreedRedeemLog(log etypes.Log, confirmations uint64) (etypes.Log, error) {
-	return r.agreedBridgeLog(log.BlockNumber, log.BlockHash, log.TxHash, uint64(log.Index), confirmations, common.RegisteredRedeemSigHash, 4)
+	if len(log.Topics) == 0 {
+		return etypes.Log{}, errors.New("missing redeem log topic")
+	}
+	count := 4
+	switch log.Topics[0] {
+	case common.RegisteredRedeemSigHash, common.RedeemedSigHash:
+	case common.RevokedRedeemSigHash:
+		count = 2
+	default:
+		return etypes.Log{}, errors.New("unexpected redeem log topic")
+	}
+	return r.agreedBridgeLog(log.BlockNumber, log.BlockHash, log.TxHash, uint64(log.Index), confirmations, log.Topics[0], count)
 }
 
 func (r *EvmRpc) agreedBridgeLog(height uint64, block, tx ecommon.Hash, index, confirmations uint64, topic ecommon.Hash, topicCount int) (etypes.Log, error) {

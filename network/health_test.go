@@ -203,6 +203,6 @@ func TestEvmSnapshotUsesCommittedRangesAndStoredWork(t *testing.T) {
 
 type failCursorWrite struct{ db.EvmStorage }
 
-func (f failCursorWrite) SetLastUpdateHeight(uint64) error {
+func (f failCursorWrite) SetScanHeights(uint64, uint64) error {
 	return errors.New("test cursor write failed")
 }

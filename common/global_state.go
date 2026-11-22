@@ -2,6 +2,7 @@ package common
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -31,11 +32,13 @@ type GlobalState struct {
 	// Health is assigned once before any network workers start.
 	Health                 *snapshot.Store
 	state                  *uint8
-	stateSemaphore         *semaphore.Weighted
+	stateMu                sync.Mutex
+	persistEmergency       func(uint8) error
+	emergencyWritePending  bool
 	redeemIncidents        RedeemIncidentStore
 	redeemHaltPending      atomic.Uint64
 	redeemWriteFailed      bool
-	redeemGeneration       uint64 // guarded by stateSemaphore
+	redeemGeneration       uint64 // guarded by stateMu
 	frontierMomentumHeight uint64
 	frontierMomSemaphore   *semaphore.Weighted
 	lastCeremony           CeremonyWindow
@@ -51,10 +54,15 @@ type GlobalState struct {
 }
 
 func NewGlobalState(state *uint8) *GlobalState {
+	return NewPersistentGlobalState(state, nil)
+}
+
+// NewPersistentGlobalState orders emergency persistence and receive processing.
+func NewPersistentGlobalState(state *uint8, persistEmergency func(uint8) error) *GlobalState {
 	return &GlobalState{
+		persistEmergency:         persistEmergency,
 		state:                    state,
 		frontierMomentumHeight:   0,
-		stateSemaphore:           semaphore.NewWeighted(1),
 		frontierMomSemaphore:     semaphore.NewWeighted(1),
 		isAdministratorActive:    false,
 		tokensMap:                make(map[uint32]map[string]string),
@@ -64,37 +72,34 @@ func NewGlobalState(state *uint8) *GlobalState {
 }
 
 func (gs *GlobalState) SetState(newState uint8) error {
-	err := gs.stateSemaphore.Acquire(context.Background(), 1)
-	if err != nil {
-		return err
-	}
-	defer gs.stateSemaphore.Release(1)
+	gs.stateMu.Lock()
+	defer gs.stateMu.Unlock()
 	if gs.RedeemHaltGeneration() != 0 && newState != EmergencyState {
-		return nil // Only the completed halt procedure can release the incident.
+		return nil // The incident owns the halt until all explicit flags are set.
 	}
-	gs.setStateLocked(newState)
-	return nil
+	return gs.setStateLocked(newState)
 }
 
-func (gs *GlobalState) setStateLocked(newState uint8) {
-	oldState := gs.effectiveStateLocked()
+func (gs *GlobalState) setStateLocked(newState uint8) error {
+	oldEffective := gs.effectiveStateLocked()
+	previous := *gs.state
+	if previous == EmergencyState && newState != EmergencyState && newState != HaltedState {
+		return errors.New("emergency halt is still pending")
+	}
+	// A failed write must stop signing in this process and prevent the caller
+	// from checkpointing the receive. A repeated emergency retries persistence.
+	var persistErr error
+	if gs.persistEmergency != nil && (newState == EmergencyState || previous == EmergencyState) {
+		persistErr = gs.persistEmergency(newState)
+
+		if persistErr != nil && newState != EmergencyState {
+			return persistErr
+		}
+	}
+	gs.emergencyWritePending = persistErr != nil
 	*gs.state = newState
-	gs.publishStateLocked(oldState)
-}
-
-func (gs *GlobalState) publishStateLocked(oldState uint8) {
-	current := StateToText(gs.effectiveStateLocked())
-	GlobalLogger.Infof("Old state: %s, New state: %s", StateToText(oldState), current)
-	gs.Health.SetBridgeState(current)
-}
-
-func (gs *GlobalState) GetState() (uint8, error) {
-	err := gs.stateSemaphore.Acquire(context.Background(), 1)
-	if err != nil {
-		return 0, err
-	}
-	defer gs.stateSemaphore.Release(1)
-	return gs.effectiveStateLocked(), nil
+	gs.publishStateLocked(oldEffective)
+	return persistErr
 }
 
 func (gs *GlobalState) effectiveStateLocked() uint8 {
@@ -104,11 +109,38 @@ func (gs *GlobalState) effectiveStateLocked() uint8 {
 	return *gs.state
 }
 
-// ConfigState excludes the emergency supplied by an unacknowledged LevelDB incident.
-func (gs *GlobalState) ConfigState() uint8 {
-	gs.stateSemaphore.Acquire(context.Background(), 1)
-	defer gs.stateSemaphore.Release(1)
-	return *gs.state
+func (gs *GlobalState) publishStateLocked(oldState uint8) {
+	current := StateToText(gs.effectiveStateLocked())
+	GlobalLogger.Infof("Old state: %s, New state: %s", StateToText(oldState), current)
+	gs.Health.SetBridgeState(current)
+}
+
+// A receive retried after a storage error may by then be historical. Even
+// if it no longer triggers a live transition, its checkpoint must wait.
+func (gs *GlobalState) FlushPendingEmergency() error {
+	gs.stateMu.Lock()
+	defer gs.stateMu.Unlock()
+	if gs.emergencyWritePending {
+		if err := gs.persistEmergency(EmergencyState); err != nil {
+			return err
+		}
+		gs.emergencyWritePending = false
+	}
+	return nil
+}
+
+// SaveConfig serializes full config saves with emergency transitions. The
+// callback reads the config containing the state pointer supplied at startup.
+func (gs *GlobalState) SaveConfig(save func() error) error {
+	gs.stateMu.Lock()
+	defer gs.stateMu.Unlock()
+	return save()
+}
+
+func (gs *GlobalState) GetState() (uint8, error) {
+	gs.stateMu.Lock()
+	defer gs.stateMu.Unlock()
+	return gs.effectiveStateLocked(), nil
 }
 
 func (gs *GlobalState) SetFrontierMomentum(frMom uint64) error {

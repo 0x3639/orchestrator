@@ -9,13 +9,14 @@ import (
 	"orchestrator/db/unwrap"
 	"orchestrator/db/wrap"
 	"os"
-	"syscall"
+	"sync"
 )
 
 type Manager struct {
 	znnStorage      db.ZnnStorage
 	redeemIncidents *wrap.RedeemIncidentStore
 	// key is the chainId of the network
+	evmMu      sync.RWMutex
 	evmStorage map[uint32]db.EvmStorage
 	stopChan   chan os.Signal
 	logger     *zap.SugaredLogger
@@ -41,15 +42,32 @@ func NewDbManager(stop chan os.Signal) (*Manager, error) {
 	return newDbManager, nil
 }
 
-func (m *Manager) AddEvmEventStore(chainId uint32, name string, contractDeploymentHeight uint64) {
-	newLdb, err := storage.CreateOrOpenLevelDb(name)
+// AddEvmEventStore returns a rollback for a network that fails to start.
+// Closing a provisional handle leaves previously checkpointed events on disk.
+func (m *Manager) AddEvmEventStore(chainId uint32, name string, contractDeploymentHeight uint64) (func(), error) {
+	ldb, err := storage.CreateOrOpenLevelDb(name)
 	if err != nil {
-		m.logger.Info("sent SIGINT from here 1")
-		m.stopChan <- syscall.SIGINT
-		m.logger.Error(err)
-		return
+		return nil, err
 	}
-	m.evmStorage[chainId] = unwrap.NewEvmStorage(zdb.NewLevelDBWrapper(newLdb), m.stopChan, contractDeploymentHeight)
+	store := unwrap.NewEvmStorage(zdb.NewLevelDBWrapper(ldb), m.stopChan, contractDeploymentHeight)
+	m.evmMu.Lock()
+	previous := m.evmStorage[chainId]
+	m.evmStorage[chainId] = store
+	m.evmMu.Unlock()
+	return func() {
+		m.evmMu.Lock()
+		if m.evmStorage[chainId] == store {
+			if previous != nil {
+				m.evmStorage[chainId] = previous
+			} else {
+				delete(m.evmStorage, chainId)
+			}
+		}
+		m.evmMu.Unlock()
+		if err := ldb.Close(); err != nil {
+			m.logger.Error(err)
+		}
+	}, nil
 }
 
 func (m *Manager) RedeemIncidents() *wrap.RedeemIncidentStore {
@@ -64,14 +82,18 @@ func (m *Manager) ZnnStorage() db.ZnnStorage {
 // before EvmStorage when the chain id comes from chain data rather than from
 // configuration, since EvmStorage treats a missing store as fatal.
 func (m *Manager) HasEvmStorage(chainId uint32) bool {
+	m.evmMu.RLock()
+	defer m.evmMu.RUnlock()
 	_, ok := m.evmStorage[chainId]
 	return ok
 }
 
 func (m *Manager) EvmStorage(chainId uint32) db.EvmStorage {
+	m.evmMu.RLock()
 	store, ok := m.evmStorage[chainId]
+	m.evmMu.RUnlock()
 	if !ok {
-		m.stopChan <- syscall.SIGINT
+		common.RequestStop(m.stopChan)
 		m.logger.Error("evm network storage non existent")
 	}
 	return store

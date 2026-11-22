@@ -2,10 +2,10 @@ package wrap
 
 import (
 	zdb "github.com/zenon-network/go-zenon/common/db"
+	"orchestrator/common"
 	"orchestrator/db"
 	"os"
 	"sync"
-	"syscall"
 )
 
 func getStorageIterator() []byte {
@@ -27,11 +27,7 @@ func (es *eventStore) Snapshot() db.ZnnStorage {
 }
 
 func (es *eventStore) SendSigInt() {
-	defer func() { _ = recover() }()
-	select {
-	case es.stopChan <- syscall.SIGINT:
-	default:
-	}
+	common.RequestStop(es.stopChan)
 }
 
 func NewZnnStorage(db zdb.DB, stopChan chan os.Signal) db.ZnnStorage {

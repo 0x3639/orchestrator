@@ -70,6 +70,45 @@ func TestThrottlePacesRequests(t *testing.T) {
 	}
 }
 
+func TestUnwrapLookupsCancelWhileWaitingForPermit(t *testing.T) {
+	for _, stopping := range []string{"listener", "client"} {
+		t.Run(stopping, func(t *testing.T) {
+			clientCtx, stopClient := context.WithCancel(context.Background())
+			listenerCtx, stopListener := context.WithCancel(context.Background())
+			defer stopClient()
+			defer stopListener()
+			client := &EvmRpc{ctx: clientCtx, limiter: rate.NewLimiter(rate.Every(time.Hour), 1)}
+			client.limiter.Allow() // consume the only token
+			finished := make(chan error, 2)
+			go func() { _, err := client.TransactionReceiptContext(listenerCtx, ecommon.Hash{}); finished <- err }()
+			go func() { _, err := client.FilterBlockLogsContext(listenerCtx, ecommon.Hash{}); finished <- err }()
+			// Each pending waiter reserves a future token.
+			until := time.Now().Add(time.Second)
+			for client.limiter.Tokens() > -1.5 {
+				if time.Now().After(until) {
+					t.Fatal("lookups did not both reach the rate limiter")
+				}
+				time.Sleep(time.Millisecond)
+			}
+			if stopping == "client" {
+				stopClient()
+			} else {
+				stopListener()
+			}
+			for i := 0; i < 2; i++ {
+				select {
+				case err := <-finished:
+					if !errors.Is(err, context.Canceled) {
+						t.Fatalf("lookup returned %v", err)
+					}
+				case <-time.After(time.Second):
+					t.Fatal("lookup remained blocked after cancellation")
+				}
+			}
+		})
+	}
+}
+
 func TestRateSettingsRejectsNegativeInConstructor(t *testing.T) {
 	// NewEvmRpcClient validates before dialling; rateSettings itself treats
 	// negative as uncapped so the constructor is the only gate.

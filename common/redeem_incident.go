@@ -1,7 +1,6 @@
 package common
 
 import (
-	"context"
 	"errors"
 
 	etypes "github.com/ethereum/go-ethereum/core/types"
@@ -19,7 +18,7 @@ type RedeemIncidentStore interface {
 	RecordRedeemIncident(RedeemIncident) (pending bool, err error)
 	HandledRedeemLog(uint32, etypes.Log) (bool, error)
 	HasPendingRedeemIncident() (bool, error)
-	ConfirmRedeemHalt() error
+	ConfirmRedeemHalt(checkedChains map[uint32]bool) error
 }
 
 // RestoreRedeemIncidents runs before starting network workers or signing.
@@ -66,10 +65,8 @@ func (gs *GlobalState) HandledRedeemLog(chainID uint32, log etypes.Log) (bool, e
 }
 
 func (gs *GlobalState) ReportRedeemIncident(ev RedeemIncident) error {
-	if err := gs.stateSemaphore.Acquire(context.Background(), 1); err != nil {
-		return err
-	}
-	defer gs.stateSemaphore.Release(1)
+	gs.stateMu.Lock()
+	defer gs.stateMu.Unlock()
 	if gs.redeemIncidents == nil {
 		return errors.New("missing redeem incident store")
 	}
@@ -81,7 +78,7 @@ func (gs *GlobalState) ReportRedeemIncident(ev RedeemIncident) error {
 		gs.beginRedeemHaltLocked()
 		if err != nil {
 			// Without durable evidence a restart must still see an emergency.
-			gs.setStateLocked(EmergencyState)
+			return errors.Join(err, gs.setStateLocked(EmergencyState))
 		}
 	}
 	return err
@@ -89,18 +86,16 @@ func (gs *GlobalState) ReportRedeemIncident(ev RedeemIncident) error {
 
 // CompleteEmergencyHalt records that Zenon and all EVM halt flags were set
 // for this generation. Other state transitions cannot clear a pending halt.
-func (gs *GlobalState) CompleteEmergencyHalt(generation uint64) error {
-	if err := gs.stateSemaphore.Acquire(context.Background(), 1); err != nil {
-		return err
-	}
-	defer gs.stateSemaphore.Release(1)
+func (gs *GlobalState) CompleteEmergencyHalt(generation uint64, checkedChains map[uint32]bool) error {
+	gs.stateMu.Lock()
+	defer gs.stateMu.Unlock()
 	if generation == 0 || generation != gs.RedeemHaltGeneration() {
 		return nil
 	}
 	if gs.redeemWriteFailed {
 		return errors.New("redeem evidence write failed; restart from the saved scan cursor")
 	}
-	if err := gs.redeemIncidents.ConfirmRedeemHalt(); err != nil {
+	if err := gs.redeemIncidents.ConfirmRedeemHalt(checkedChains); err != nil {
 		return err
 	}
 	gs.redeemHaltPending.Store(0)
