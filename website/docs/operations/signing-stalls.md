@@ -35,7 +35,7 @@ The development branch also checks the event set locally.
 - **Events are never dropped on transport errors.** A queued unwrap event is discarded only when every configured endpoint agrees the block it was seen in was reorged out, confirmed across three checks 30 seconds apart. RPC errors, missing receipts and lagging backends retry with backoff instead.
 - **Stored records are never reset by duplicates.** The same event arrives more than once (subscription and periodic sync); adding it is idempotent, and a ceremony writes only the signature.
 - **The sync cursor only moves forward**, and only after a whole block range has been processed. A failed range is retried; it is never skipped.
-- **Historical events are validated** against the canonical block, agreed by every endpoint, before they are stored.
+- **Source transfers are checked before signing.** Each configured endpoint must corroborate the final block and exact unwrap event. If an older unsigned record differs from that evidence, the signer keeps the batch pending. Compare the transaction receipt and bridge log across your endpoints when investigating a stalled batch.
 - **The pool is reconciled against Zenon before each ceremony.** Events Zenon already knows about, because other signers reached the threshold without this one, are marked with Zenon's status and excluded. A signer that missed a ceremony therefore rejoins at its next window without intervention.
 
 What these guards cannot fix is a signer that has genuinely lost events from its store, or holds records from a fork. For that, [backfill](backfill.md) re-scans a bounded range.

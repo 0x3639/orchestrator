@@ -8,13 +8,10 @@ def Laws.wrap_waits_for_all_confirmations(remaining):
 def Laws.final_wrap_is_eligible():
   {==}
 
-def Laws.immature_event_waits(receipt, block):
+def Laws.immature_event_waits(block):
   {==}
 
-def Laws.receipt_error_waits(block):
-  {==}
-
-def Laws.successful_final_receipt_confirms(block):
+def Laws.mismatched_transfer_waits():
   {==}
 
 def Laws.uncertain_canonical_block_waits():

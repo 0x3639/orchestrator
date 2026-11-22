@@ -6,6 +6,7 @@ import (
 	"crypto/ecdsa"
 	"encoding/base64"
 	"encoding/hex"
+	"fmt"
 	ecommon "github.com/ethereum/go-ethereum/common"
 	etypes "github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
@@ -618,6 +619,34 @@ func (m *NetworksManager) GetUnsignedUnwrapRequests() ([]*events.UnwrapRequestEv
 		return cmp.Compare(a.LogIndex, b.LogIndex)
 	})
 	return ans, nil
+}
+
+// VerifyUnwrapsForSigning checks exactly the rows used to construct this
+// ceremony's messages. Unavailable evidence postpones the entire batch.
+func (m *NetworksManager) VerifyUnwrapsForSigning(requests []*events.UnwrapRequestEvm) error {
+	for _, req := range requests {
+		var source *evmNetwork
+		for _, network := range m.evmNetworks {
+			if network.ChainId() == req.ChainId && network.NetworkClass() == req.NetworkClass {
+				source = network
+				break
+			}
+		}
+		if source == nil {
+			return fmt.Errorf("no source network for unwrap %s/%d", req.TransactionHash, req.LogIndex)
+		}
+		canonical, err := source.EvmRpc().CanonicalHash(req.BlockNumber)
+		if err != nil {
+			return fmt.Errorf("unwrap %s/%d cannot be signed: %w", req.TransactionHash, req.LogIndex, err)
+		}
+		if canonical != req.BlockHash {
+			return fmt.Errorf("unwrap %s/%d cannot be signed: its block was replaced", req.TransactionHash, req.LogIndex)
+		}
+		if err := source.verifyUnwrapTransfer(req); err != nil {
+			return fmt.Errorf("unwrap %s/%d cannot be signed: %w", req.TransactionHash, req.LogIndex, err)
+		}
+	}
+	return nil
 }
 
 func (m *NetworksManager) GetUnsentSignedUnwrapRequests() ([]*events.UnwrapRequestEvm, error) {

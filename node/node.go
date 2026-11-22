@@ -1148,6 +1148,12 @@ func (node *Node) processSignaturesUnwrap(number, size uint64) (error, bool) {
 		return nil, false
 	}
 
+	// Includes unsigned rows created by earlier binaries or restored from local
+	// checkpoints. Check only the bounded pool selected by reconciliation.
+	if err := node.networksManager.VerifyUnwrapsForSigning(requests); err != nil {
+		return err, true
+	}
+
 	msgsIndexes := make(map[string]int)
 	// arr for signing
 	messagesToSign := make([][]byte, 0)

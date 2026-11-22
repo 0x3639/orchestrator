@@ -5,6 +5,7 @@ import (
 	"github.com/zenon-network/go-zenon/common/types"
 	"golang.org/x/sync/semaphore"
 	"math/big"
+	"sync"
 )
 
 const (
@@ -29,6 +30,7 @@ type GlobalState struct {
 	lastCeremony           CeremonyWindow
 	isAdministratorActive  bool
 	tokensMap              map[uint32]map[string]string
+	affiliateMu            sync.RWMutex
 	// [chainId][token] -> bool
 	isAffiliateProgramActive map[uint32]map[string]bool
 	// [chainId] -> height
@@ -123,13 +125,15 @@ func (gs *GlobalState) GetIsAdministratorActive() bool {
 }
 
 func (gs *GlobalState) SetIsAffiliateProgram(program AffiliateProgram) {
+	gs.affiliateMu.Lock()
+	defer gs.affiliateMu.Unlock()
 	for chainId, networkValues := range program.Networks {
 		GlobalLogger.Infof("Set affiliate program values for network: %d", chainId)
 		if _, foundNetwork := gs.isAffiliateProgramActive[chainId]; !foundNetwork {
 			gs.isAffiliateProgramActive = make(map[uint32]map[string]bool)
 		}
 
-		gs.SetAffiliateStartingHeight(chainId, networkValues.StartingHeight)
+		gs.setAffiliateStartingHeight(chainId, networkValues.StartingHeight)
 		GlobalLogger.Infof("SetAffiliateStartingHeight: %d", networkValues.StartingHeight)
 
 		if tokenInfo, found := gs.isAffiliateProgramActive[chainId]; found {
@@ -172,6 +176,8 @@ func (gs *GlobalState) SetIsAffiliateProgram(program AffiliateProgram) {
 }
 
 func (gs *GlobalState) GetIsAffiliateProgramActive(chainId uint32, token string) bool {
+	gs.affiliateMu.RLock()
+	defer gs.affiliateMu.RUnlock()
 	if networkInfo, foundNetwork := gs.isAffiliateProgramActive[chainId]; foundNetwork {
 		if value, foundToken := networkInfo[token]; foundToken {
 			return value
@@ -181,6 +187,12 @@ func (gs *GlobalState) GetIsAffiliateProgramActive(chainId uint32, token string)
 }
 
 func (gs *GlobalState) SetAffiliateStartingHeight(chainId uint32, value uint64) {
+	gs.affiliateMu.Lock()
+	defer gs.affiliateMu.Unlock()
+	gs.setAffiliateStartingHeight(chainId, value)
+}
+
+func (gs *GlobalState) setAffiliateStartingHeight(chainId uint32, value uint64) {
 	if _, foundNetwork := gs.isAffiliateProgramActive[chainId]; !foundNetwork {
 		gs.affiliateStartingHeight = make(map[uint32]*big.Int)
 	}
@@ -188,10 +200,20 @@ func (gs *GlobalState) SetAffiliateStartingHeight(chainId uint32, value uint64) 
 }
 
 func (gs *GlobalState) GetAffiliateStartingHeight(chainId uint32) *big.Int {
+	gs.affiliateMu.RLock()
+	defer gs.affiliateMu.RUnlock()
 	if value, found := gs.affiliateStartingHeight[chainId]; found {
 		return value
 	}
 	return big.NewInt(0)
+}
+
+// AffiliateActiveAt reads both fields from the same bridge metadata update.
+func (gs *GlobalState) AffiliateActiveAt(chainID uint32, token string, height uint64) bool {
+	gs.affiliateMu.RLock()
+	defer gs.affiliateMu.RUnlock()
+	start := gs.affiliateStartingHeight[chainID]
+	return start != nil && start.Sign() > 0 && height >= start.Uint64() && gs.isAffiliateProgramActive[chainID][token]
 }
 
 func (gs *GlobalState) GetResignNetwork() (uint32, uint32) {

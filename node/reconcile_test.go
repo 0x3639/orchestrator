@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"slices"
@@ -37,6 +38,7 @@ import (
 type signerLookup func(uint32) (*definition.UnwrapTokenRequest, error)
 
 type reconciliationChain struct {
+	inProcess  bool
 	ceremony   *fixtureCeremony
 	signingKey string
 	lookup     signerLookup
@@ -190,6 +192,17 @@ type fixtureNetwork struct {
 	store db.EvmStorage
 }
 
+// localSignerTransport preserves the SDK and JSON-RPC wire behavior for a
+// signing-path test without needing network listeners or peer connections.
+type localSignerTransport struct{ handler http.Handler }
+
+func (s localSignerTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	defer req.Body.Close()
+	w := httptest.NewRecorder()
+	s.handler.ServeHTTP(w, req)
+	return w.Result(), nil
+}
+
 func (c reconciliationChain) openNetworks(t *testing.T, state *common.GlobalState, ordered ...fixtureNetwork) (*network.NetworksManager, func()) {
 	t.Helper()
 	t.Setenv("HOME", t.TempDir()) // isolate the EVM network's disk queue
@@ -200,15 +213,24 @@ func (c reconciliationChain) openNetworks(t *testing.T, state *common.GlobalStat
 	if err := srv.RegisterName("ledger", fixtureLedger{frontier: c.head, ceremony: c.ceremony}); err != nil {
 		t.Fatal(err)
 	}
-	endpoint := httptest.NewServer(srv)
-	closeEndpoint := sync.OnceFunc(func() { endpoint.Close(); srv.Stop() })
+	url := "http://source-evidence.invalid"
+	var stopHTTP func()
+	if c.inProcess {
+		saved := http.DefaultTransport
+		http.DefaultTransport = localSignerTransport{srv}
+		stopHTTP = func() { http.DefaultTransport = saved }
+	} else {
+		endpoint := httptest.NewServer(srv)
+		url, stopHTTP = endpoint.URL, endpoint.Close
+	}
+	closeEndpoint := sync.OnceFunc(func() { stopHTTP(); srv.Stop() })
 	t.Cleanup(closeEndpoint)
 	stop := make(chan os.Signal, 1)
 	manager, err := network.NewNetworksManager(stop)
 	if err != nil {
 		t.Fatal(err)
 	}
-	cfg := config.BaseNetworkConfig{Urls: []string{endpoint.URL}}
+	cfg := config.BaseNetworkConfig{Urls: []string{url}}
 	var stores *dbmanager.Manager
 	if c.signingKey != "" {
 		stores, err = dbmanager.NewDbManager(stop)
@@ -336,4 +358,28 @@ func frontierBlock(address types.Address, hash types.Hash, height uint64) *api.A
 	block := new(api.AccountBlockMarshal)
 	block.Address, block.Hash, block.Height = address, hash, height
 	return block
+}
+
+// A legacy unsigned row may already be within the bounded, reconciled pool on
+// startup. Verify that the normal signing entry point still asks for source
+// evidence before passing that row to TSS.
+func TestUnwrapSigningDefersStoredRowWithoutEvmEvidence(t *testing.T) {
+	rows := candidates(1)
+	rows[0].To = "z1qqjnwjjpnue8xmmpanz6csze6tcmtzzdtfsww7"
+	chain := signerWithEvents(t, rows)
+	chain.inProcess = true
+	chain.lookup = func(uint32) (*definition.UnwrapTokenRequest, error) {
+		return nil, constants.ErrDataNonExistent
+	}
+	networks, closeNetworks := chain.openNetworks(t, nil)
+	defer closeNetworks()
+	n := &Node{networksManager: networks, logger: zap.NewNop().Sugar()}
+	err, _ := n.processSignaturesUnwrap(1, 10)
+	if err == nil || !strings.Contains(err.Error(), "cannot be signed") {
+		t.Fatalf("signing without source evidence returned %v", err)
+	}
+	pending, err := chain.GetUnsignedUnwrapRequests()
+	if err != nil || len(pending) != 1 || pending[0].Signature != "" {
+		t.Fatalf("after deferral, pending rows %v, err %v", pending, err)
+	}
 }

@@ -12,7 +12,7 @@ Each EVM network entry in `config.json` names the endpoints the orchestrator tal
 
 The orchestrator only discards an unwrap event, or removes a stored record during a [backfill](operations/backfill.md), when **every configured endpoint agrees** that the block the event was seen in is no longer canonical. With a single URL that is one provider's word. Behind a load balancer the same URL can answer from a lagging or forked backend, and three samples through one balancer are not independent.
 
-List two providers operated by different parties. The first reachable one becomes the connected endpoint; the others are consulted only for canonical-block agreement, so their request volume is small. Listing the same URL twice adds nothing and is warned about at startup.
+List two providers operated by different parties. The first reachable endpoint supplies subscriptions and range scans. Every configured endpoint serves canonical block checks and source-event evidence during sync, queue confirmation, and signing. A signer configured with one endpoint trusts that provider for the transfer evidence. Listing the same URL twice adds nothing and is warned about at startup.
 
 For historical sync every endpoint must serve full history: headers at any height and complete `eth_getLogs` results. A provider that returns an empty result for pruned ranges cannot be detected and would silently skip events.
 

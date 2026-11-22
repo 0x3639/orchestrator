@@ -31,7 +31,7 @@ The rest of this guide describes the orchestrator as it behaves in the 0x3639 bu
 - Queued unwrap events are never dropped on transport errors; a discard needs every endpoint to agree the block was reorged out, three times over.
 - Duplicate event deliveries cannot reset a signed or sent record; the sync cursor only moves forward.
 - The signing pool is reconciled against Zenon before each ceremony, so a signer that fell out of sync usually recovers by itself within a few ceremony windows, and a rebuilt event store does not re-sign history.
-- Historical unwrap logs are validated against the endpoint-agreed canonical block before being stored.
+- Live and historical unwraps require evidence of the exact finalized transfer from every configured EVM endpoint. The signer rechecks its selected unsigned records before each ceremony, including records saved before the upgrade. Configure providers that serve historical receipts or single-height log queries.
 - Every EVM read, including the bridge-contract reads, shares the per-endpoint request cap and carries a 30-second deadline (2 minutes for `eth_getLogs`).
 - The health listener has header, read, write and idle deadlines.
 - `config.json` must be a regular file, not a symlink, and at most 1 MiB; anything else is refused at startup.

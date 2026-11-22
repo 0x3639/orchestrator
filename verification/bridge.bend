@@ -7,32 +7,27 @@ def wrap_is_final(remaining: Nat) -> Bool:
     case 0n: True{}
     case 1n+r: False{}
 
-# network/evm_confirm.go. Depth is checked before interpreting any receipt.
-# Canonical evidence is used when a receipt is missing or contradicts the log.
-type Receipt is Data:
-  SuccessfulInBlock{}
-  ReadError{}
-  NeedsBlockCheck{}
-
+# The bridge requires a source-side lock or burn for every redeem:
+# https://hypercore-team.github.io/security.html. ObservedWithLog means the
+# canonical bridge log identifies this transfer and yields its exact signed fields.
 type Canonical is Data:
   Uncertain{}
   Replacement{}
   ObservedWithLog{}
   ObservedWithoutLog{}
+  ObservedMismatch{}
 
 type Decision is Data:
   Retry{}
   Confirm{}
   RecheckReplacement{}
 
-def confirm(mature: Bool, receipt: Receipt, block: Canonical) -> Decision:
-  match mature receipt block:
-    case False{} _ _: Retry{}
-    case True{} SuccessfulInBlock{} _: Confirm{}
-    case True{} ReadError{} _: Retry{}
-    case True{} NeedsBlockCheck{} Replacement{}: RecheckReplacement{}
-    case True{} NeedsBlockCheck{} ObservedWithLog{}: Confirm{}
-    case True{} NeedsBlockCheck{} _: Retry{}
+def confirm(mature: Bool, block: Canonical) -> Decision:
+  match mature block:
+    case False{} _: Retry{}
+    case True{} Replacement{}: RecheckReplacement{}
+    case True{} ObservedWithLog{}: Confirm{}
+    case True{} _: Retry{}
 
 # db/unwrap/entries.go re-reads these three predicates under the storage lock
 # after the caller establishes that the previously observed block was replaced.
