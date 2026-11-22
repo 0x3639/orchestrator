@@ -21,6 +21,7 @@ const sidebars = {
         'operations/first-sync',
         'operations/signing-stalls',
         'operations/backfill',
+        'operations/sync-checkpoints',
         'operations/emergency-reset',
         'operations/troubleshooting',
       ],

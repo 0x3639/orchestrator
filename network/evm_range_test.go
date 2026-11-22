@@ -9,10 +9,14 @@ func TestIsRangeLimitError(t *testing.T) {
 	yes := []string{
 		"ranges over 10000 blocks are not supported on free plan",
 		"query returned more than 10000 results",
+		"logs matched by query exceeds limit of 10000",
+		"query exceeds max results 20000",
+		"logs matched by the query exceed the limit of 10000",
 		"Log response size exceeded. You can make eth_getLogs requests with up to a 2K block range",
 		"eth_getLogs is limited to a 10,000 range",
 		"block range is too large",
 		"exceed maximum block range: 5000",
+		"block range too large; supported range [0x1429, 0x1432]",
 	}
 	for _, m := range yes {
 		if !isRangeLimitError(errors.New(m)) {
@@ -25,6 +29,12 @@ func TestIsRangeLimitError(t *testing.T) {
 		"Can't route your request to suitable provider, if you specified certain providers revise the list",
 		"429 Too Many Requests",
 		"rate limit exceeded",
+		"daily request count exceeded",
+		"query exceeds max requests per minute",
+		"account exceeds max results per day",
+		"rate limit exceeded: query exceeds max results 20000",
+		"more than 100 requests per second",
+		"eth_getLogs is limited to 50 requests per minute",
 		"connection refused",
 		"context deadline exceeded",
 	}
@@ -61,23 +71,23 @@ func TestQueryRangeAdapterShrinksAndRegrows(t *testing.T) {
 	}
 
 	// A provider hint jumps straight to the accepted width.
-	if got, changed := a.shrink(10); !changed || got != 10 {
+	if got, changed := a.shrink(a.size(), 10); !changed || got != 10 {
 		t.Fatalf("hint: got %d changed=%v", got, changed)
 	}
 	a = newQueryRangeAdapter(2000)
 
 	want := []uint64{1000, 500, 250, 125, 62, 31, 15, 8}
 	for _, w := range want {
-		got, changed := a.shrink(0)
+		got, changed := a.shrink(a.size(), 0)
 		if !changed || got != w {
 			t.Fatalf("shrink: got %d changed=%v, want %d", got, changed, w)
 		}
 	}
-	if got, changed := a.shrink(0); changed || got != minQueryRange {
+	if got, changed := a.shrink(a.size(), 0); changed || got != minQueryRange {
 		t.Fatalf("floor must hold: got %d changed=%v", got, changed)
 	}
 	// A hint below the halving floor is still honoured, down to one block.
-	if got, changed := a.shrink(3); !changed || got != 3 {
+	if got, changed := a.shrink(a.size(), 3); !changed || got != 3 {
 		t.Fatalf("small hint: got %d changed=%v", got, changed)
 	}
 	a.current = 8
@@ -93,7 +103,7 @@ func TestQueryRangeAdapterShrinksAndRegrows(t *testing.T) {
 		t.Fatalf("expected growth to 16, got %d grew=%v", got, grew)
 	}
 	// A rejection after growth drops back and resets the run.
-	if got, _ := a.shrink(0); got != 8 {
+	if got, _ := a.shrink(a.size(), 0); got != 8 {
 		t.Fatalf("expected 8 after shrink, got %d", got)
 	}
 	a.current = 1500
@@ -105,7 +115,7 @@ func TestQueryRangeAdapterShrinksAndRegrows(t *testing.T) {
 		t.Fatal("no growth beyond configured")
 	}
 
-	if newQueryRangeAdapter(1).size() != minQueryRange {
-		t.Fatal("configured size below the floor should be raised to it")
+	if newQueryRangeAdapter(1).size() != 1 {
+		t.Fatal("explicit one-block ceiling must be honored")
 	}
 }

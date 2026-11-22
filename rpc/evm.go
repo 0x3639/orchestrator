@@ -43,6 +43,9 @@ type EvmRpc struct {
 	logChan chan etypes.Log
 	logger  *zap.SugaredLogger
 
+	ctx    context.Context
+	cancel context.CancelFunc
+
 	// limiter caps requests to the connected endpoint; nil means uncapped.
 	limiter *rate.Limiter
 	// limit and burst are kept to build limiters for secondary endpoints.
@@ -107,12 +110,12 @@ func NewEvmRpcClient(networkConfig config.BaseNetworkConfig, networkName string,
 	var limiter *rate.Limiter
 	if limit > 0 {
 		limiter = rate.NewLimiter(limit, burst)
-		logger.Infof("network %s: EVM RPC requests capped at %.2f/s per endpoint, burst %d", networkName, float64(limit), burst)
+		logger.Infof("network %s: EVM RPC requests capped at %g/s per endpoint, burst %d", networkName, limit, burst)
 	} else {
 		logger.Warnf("network %s: EVM RPC requests are not rate limited; set RpcRequestsPerSecond in config.json if the provider throttles the initial sync", networkName)
 	}
 
-	newBridgeContract, err := bridge.NewBridge(address, newRpcClient)
+	newBridgeContract, err := bridge.NewBridge(address, bridgeReadBackend{newRpcClient, limiter})
 	if err != nil {
 		return nil, err
 	}
@@ -122,7 +125,10 @@ func NewEvmRpcClient(networkConfig config.BaseNetworkConfig, networkName string,
 		Topics:    common.Topics,
 	}
 
+	ctx, cancel := context.WithCancel(context.Background())
 	return &EvmRpc{
+		ctx:             ctx,
+		cancel:          cancel,
 		rpcClient:       newRpcClient,
 		Urls:            *newUrls,
 		networkName:     networkName,
@@ -150,15 +156,6 @@ func rateSettings(networkConfig config.BaseNetworkConfig) (rate.Limit, int) {
 		burst = 1
 	}
 	return rate.Limit(networkConfig.RpcRequestsPerSecond), burst
-}
-
-// throttle blocks until the connected endpoint's request budget allows one
-// more call, or the context expires.
-func (r *EvmRpc) throttle(ctx context.Context) error {
-	if r.limiter == nil {
-		return nil
-	}
-	return r.limiter.Wait(ctx)
 }
 
 /// Utils
@@ -195,6 +192,7 @@ func (r *EvmRpc) FilterQuerySize() uint64 {
 }
 
 func (r *EvmRpc) Stop() {
+	r.cancel()
 	r.subMu.Lock()
 	sub := r.logSub
 	r.logSub = nil
@@ -217,12 +215,12 @@ func (r *EvmRpc) DeleteDirectories() {
 }
 
 func (r *EvmRpc) IsSynced() bool {
-	ctx, cancel := callContext(evmCallTimeout)
-	defer cancel()
-	if err := r.throttle(ctx); err != nil {
+	ctx, cancel, err := r.callContext(evmCallTimeout)
+	if err != nil {
 		r.logger.Debug(err)
 		return false
 	}
+	defer cancel()
 	syncProgress, err := r.rpcClient.SyncProgress(ctx)
 	if err != nil {
 		r.logger.Debug(err)
@@ -432,23 +430,32 @@ const (
 	defaultFilterQuerySize = 2000
 )
 
-func callContext(timeout time.Duration) (context.Context, context.CancelFunc) {
-	return context.WithTimeout(context.Background(), timeout)
+func (r *EvmRpc) callContext(timeout time.Duration) (context.Context, context.CancelFunc, error) {
+	return limitedCallContext(r.ctx, r.limiter, timeout)
+}
+
+// Waiting for a local permit can take longer than the provider's call timeout,
+// especially with a fractional request rate. Shutdown cancels both waits.
+func limitedCallContext(parent context.Context, limiter *rate.Limiter, timeout time.Duration) (context.Context, context.CancelFunc, error) {
+	if limiter != nil {
+		if err := limiter.Wait(parent); err != nil {
+			return nil, nil, err
+		}
+	}
+	ctx, cancel := context.WithTimeout(parent, timeout)
+	return ctx, cancel, nil
 }
 
 func (r *EvmRpc) FilterLogs(left, right uint64) ([]etypes.Log, error) {
-	r.filterQuery.FromBlock = big.NewInt(0).SetUint64(left)
-	r.filterQuery.ToBlock = big.NewInt(0).SetUint64(right)
-	defer func() {
-		r.filterQuery.FromBlock = nil
-		r.filterQuery.ToBlock = nil
-	}()
-	ctx, cancel := callContext(evmFilterLogsTimeout)
-	defer cancel()
-	if err := r.throttle(ctx); err != nil {
+	query := r.filterQuery
+	query.FromBlock = new(big.Int).SetUint64(left)
+	query.ToBlock = new(big.Int).SetUint64(right)
+	ctx, cancel, err := r.callContext(evmFilterLogsTimeout)
+	if err != nil {
 		return nil, err
 	}
-	return r.rpcClient.FilterLogs(ctx, r.filterQuery)
+	defer cancel()
+	return r.rpcClient.FilterLogs(ctx, query)
 }
 
 // FilterBlockLogs returns the bridge contract's logs in the given block.
@@ -457,76 +464,76 @@ func (r *EvmRpc) FilterBlockLogs(blockHash ecommon.Hash) ([]etypes.Log, error) {
 		BlockHash: &blockHash,
 		Addresses: r.filterQuery.Addresses,
 	}
-	ctx, cancel := callContext(evmCallTimeout)
-	defer cancel()
-	if err := r.throttle(ctx); err != nil {
+	ctx, cancel, err := r.callContext(evmCallTimeout)
+	if err != nil {
 		return nil, err
 	}
+	defer cancel()
 	return r.rpcClient.FilterLogs(ctx, newFilterQuery)
 }
 
 func (r *EvmRpc) TransactionReceipt(txHash ecommon.Hash) (*etypes.Receipt, error) {
-	ctx, cancel := callContext(evmCallTimeout)
-	defer cancel()
-	if err := r.throttle(ctx); err != nil {
+	ctx, cancel, err := r.callContext(evmCallTimeout)
+	if err != nil {
 		return nil, err
 	}
+	defer cancel()
 	return r.rpcClient.TransactionReceipt(ctx, txHash)
 }
 
 func (r *EvmRpc) EstimateGas(msg ethereum.CallMsg) (uint64, error) {
-	ctx, cancel := callContext(evmCallTimeout)
-	defer cancel()
-	if err := r.throttle(ctx); err != nil {
+	ctx, cancel, err := r.callContext(evmCallTimeout)
+	if err != nil {
 		return 0, err
 	}
+	defer cancel()
 	return r.rpcClient.EstimateGas(ctx, msg)
 }
 
 func (r *EvmRpc) SuggestGasPrice() (*big.Int, error) {
-	ctx, cancel := callContext(evmCallTimeout)
-	defer cancel()
-	if err := r.throttle(ctx); err != nil {
+	ctx, cancel, err := r.callContext(evmCallTimeout)
+	if err != nil {
 		return nil, err
 	}
+	defer cancel()
 	return r.rpcClient.SuggestGasPrice(ctx)
 }
 
 func (r *EvmRpc) NonceAt(address ecommon.Address, blockNumber uint64) (uint64, error) {
-	ctx, cancel := callContext(evmCallTimeout)
-	defer cancel()
-	if err := r.throttle(ctx); err != nil {
+	ctx, cancel, err := r.callContext(evmCallTimeout)
+	if err != nil {
 		return 0, err
 	}
+	defer cancel()
 	return r.rpcClient.NonceAt(ctx, address, big.NewInt(0).SetUint64(blockNumber))
 }
 
 func (r *EvmRpc) BalanceAt(address ecommon.Address, blockNumber uint64) (*big.Int, error) {
-	ctx, cancel := callContext(evmCallTimeout)
-	defer cancel()
-	if err := r.throttle(ctx); err != nil {
+	ctx, cancel, err := r.callContext(evmCallTimeout)
+	if err != nil {
 		return nil, err
 	}
+	defer cancel()
 	return r.rpcClient.BalanceAt(ctx, address, big.NewInt(0).SetUint64(blockNumber))
 }
 
 func (r *EvmRpc) BlockNumber() (uint64, error) {
-	ctx, cancel := callContext(evmCallTimeout)
-	defer cancel()
-	if err := r.throttle(ctx); err != nil {
+	ctx, cancel, err := r.callContext(evmCallTimeout)
+	if err != nil {
 		return 0, err
 	}
+	defer cancel()
 	return r.rpcClient.BlockNumber(ctx)
 }
 
 // HeaderByNumber returns the canonical header at the given height from the
 // currently connected endpoint.
 func (r *EvmRpc) HeaderByNumber(number uint64) (*etypes.Header, error) {
-	ctx, cancel := callContext(evmCallTimeout)
-	defer cancel()
-	if err := r.throttle(ctx); err != nil {
+	ctx, cancel, err := r.callContext(evmCallTimeout)
+	if err != nil {
 		return nil, err
 	}
+	defer cancel()
 	return r.rpcClient.HeaderByNumber(ctx, new(big.Int).SetUint64(number))
 }
 
@@ -563,10 +570,10 @@ func blockHashByNumber(ctx context.Context, client *ethclient.Client, number uin
 // CanonicalHash returns the hash of the canonical block at number as agreed
 // by every configured endpoint. The connected endpoint is asked through the
 // existing client; every other configured URL is asked through a retained
-// secondary client. All endpoints are queried concurrently under one
-// deadline. The answer is only definitive when every endpoint responds and
-// all responses match; a missing or disagreeing endpoint yields an error,
-// so a split or partially unreachable provider can never justify dropping
+// secondary client. Each endpoint waits for its own permit and is then
+// queried with a bounded timeout. The answer is only definitive when every
+// endpoint responds and all responses match. Missing or disagreeing answers
+// yield an error, so a split or partially unreachable provider cannot justify dropping
 // an event. With a single configured URL this is that endpoint's answer.
 func (r *EvmRpc) CanonicalHash(number uint64) (ecommon.Hash, error) {
 	urls := r.Urls.Urls
@@ -594,11 +601,11 @@ func (r *EvmRpc) CanonicalHash(number uint64) (ecommon.Hash, error) {
 
 // blockHash asks the connected endpoint for the canonical block hash at number.
 func (r *EvmRpc) blockHash(number uint64) (ecommon.Hash, error) {
-	ctx, cancel := callContext(evmCallTimeout)
-	defer cancel()
-	if err := r.throttle(ctx); err != nil {
+	ctx, cancel, err := r.callContext(evmCallTimeout)
+	if err != nil {
 		return ecommon.Hash{}, err
 	}
+	defer cancel()
 	return blockHashByNumber(ctx, r.rpcClient, number)
 }
 
@@ -650,6 +657,11 @@ func (r *EvmRpc) blockHashFromSecondary(url string, number uint64) (ecommon.Hash
 			r.secondary = make(map[string]*secondaryClient)
 		}
 		entry = &secondaryClient{}
+		if url == r.Urls.GetCurrentUrl() {
+			entry.limiter = r.limiter
+		} else if r.limit > 0 {
+			entry.limiter = rate.NewLimiter(r.limit, r.burst)
+		}
 		r.secondary[url] = entry
 	}
 	r.secondaryMu.Unlock()
@@ -664,16 +676,11 @@ func (r *EvmRpc) blockHashFromSecondary(url string, number uint64) (ecommon.Hash
 	if stopped {
 		return ecommon.Hash{}, errors.New("evm rpc stopped")
 	}
-	ctx, cancel := callContext(evmCallTimeout)
-	defer cancel()
-	if r.limit > 0 {
-		if entry.limiter == nil {
-			entry.limiter = rate.NewLimiter(r.limit, r.burst)
-		}
-		if err := entry.limiter.Wait(ctx); err != nil {
-			return ecommon.Hash{}, err
-		}
+	ctx, cancel, err := limitedCallContext(r.ctx, entry.limiter, evmCallTimeout)
+	if err != nil {
+		return ecommon.Hash{}, err
 	}
+	defer cancel()
 	if entry.client == nil {
 		client, err := ethclient.DialContext(ctx, url)
 		if err != nil {
@@ -711,93 +718,68 @@ func (r *EvmRpc) closeSecondaryClients() {
 }
 
 func (r *EvmRpc) BlockByHash(hash ecommon.Hash) (*etypes.Block, error) {
-	ctx, cancel := callContext(evmCallTimeout)
-	defer cancel()
-	if err := r.throttle(ctx); err != nil {
+	ctx, cancel, err := r.callContext(evmCallTimeout)
+	if err != nil {
 		return nil, err
 	}
+	defer cancel()
 	return r.rpcClient.BlockByHash(ctx, hash)
 }
 
-// contractCallOpts acquires a request permit and returns CallOpts carrying
-// a deadline for a generated contract read. Contract reads go to the same
-// provider as every other call and must count against the same cap.
-func (r *EvmRpc) contractCallOpts() (*bind.CallOpts, context.CancelFunc, error) {
-	ctx, cancel := callContext(evmCallTimeout)
-	if err := r.throttle(ctx); err != nil {
-		cancel()
-		return nil, nil, err
-	}
-	return &bind.CallOpts{Context: ctx}, cancel, nil
+// The generated bridge binding can follow an empty eth_call result with
+// eth_getCode. Charge each request where the binding dispatches it.
+type bridgeReadBackend struct {
+	*ethclient.Client
+	limiter *rate.Limiter
 }
 
-func (r *EvmRpc) GetCurrentTss() (ecommon.Address, error) {
-	opts, cancel, err := r.contractCallOpts()
-	if err != nil {
-		return ecommon.Address{}, err
-	}
-	defer cancel()
-	return r.bridgeContract.Tss(opts)
-}
-
-func (r *EvmRpc) IsHalted() (bool, error) {
-	opts, cancel, err := r.contractCallOpts()
-	if err != nil {
-		return false, err
-	}
-	defer cancel()
-	return r.bridgeContract.IsHalted(opts)
-}
-
-func (r *EvmRpc) GetActionNonce() (*big.Int, error) {
-	opts, cancel, err := r.contractCallOpts()
+func (b bridgeReadBackend) CallContract(ctx context.Context, msg ethereum.CallMsg, block *big.Int) ([]byte, error) {
+	ctx, cancel, err := limitedCallContext(ctx, b.limiter, evmCallTimeout)
 	if err != nil {
 		return nil, err
 	}
 	defer cancel()
-	return r.bridgeContract.ActionsNonce(opts)
+	return b.Client.CallContract(ctx, msg, block)
+}
+
+func (b bridgeReadBackend) CodeAt(ctx context.Context, address ecommon.Address, block *big.Int) ([]byte, error) {
+	ctx, cancel, err := limitedCallContext(ctx, b.limiter, evmCallTimeout)
+	if err != nil {
+		return nil, err
+	}
+	defer cancel()
+	return b.Client.CodeAt(ctx, address, block)
+}
+
+func (r *EvmRpc) GetCurrentTss() (ecommon.Address, error) {
+	return r.bridgeContract.Tss(&bind.CallOpts{Context: r.ctx})
+}
+
+func (r *EvmRpc) IsHalted() (bool, error) {
+	return r.bridgeContract.IsHalted(&bind.CallOpts{Context: r.ctx})
+}
+
+func (r *EvmRpc) GetActionNonce() (*big.Int, error) {
+	return r.bridgeContract.ActionsNonce(&bind.CallOpts{Context: r.ctx})
 }
 
 func (r *EvmRpc) EstimatedBlockTime() (uint64, error) {
-	opts, cancel, err := r.contractCallOpts()
-	if err != nil {
-		return 0, err
-	}
-	defer cancel()
-	return r.bridgeContract.EstimatedBlockTime(opts)
+	return r.bridgeContract.EstimatedBlockTime(&bind.CallOpts{Context: r.ctx})
 }
 
 func (r *EvmRpc) ConfirmationsToFinality() (uint64, error) {
-	opts, cancel, err := r.contractCallOpts()
-	if err != nil {
-		return 0, err
-	}
-	defer cancel()
-	return r.bridgeContract.ConfirmationsToFinality(opts)
+	return r.bridgeContract.ConfirmationsToFinality(&bind.CallOpts{Context: r.ctx})
 }
 
 func (r *EvmRpc) RedeemsInfo(hash types.Hash) (struct {
 	BlockNumber *big.Int
 	ParamsHash  [32]byte
 }, error) {
-	opts, cancel, err := r.contractCallOpts()
-	if err != nil {
-		return struct {
-			BlockNumber *big.Int
-			ParamsHash  [32]byte
-		}{}, err
-	}
-	defer cancel()
-	return r.bridgeContract.RedeemsInfo(opts, big.NewInt(0).SetBytes(hash.Bytes()))
+	return r.bridgeContract.RedeemsInfo(&bind.CallOpts{Context: r.ctx}, big.NewInt(0).SetBytes(hash.Bytes()))
 }
 
 func (r *EvmRpc) ContractDeploymentHeight() (uint64, error) {
-	opts, cancel, err := r.contractCallOpts()
-	if err != nil {
-		return 0, err
-	}
-	defer cancel()
-	ans, err := r.bridgeContract.ContractDeploymentHeight(opts)
+	ans, err := r.bridgeContract.ContractDeploymentHeight(&bind.CallOpts{Context: r.ctx})
 	if err != nil {
 		return 0, err
 	}
@@ -805,10 +787,10 @@ func (r *EvmRpc) ContractDeploymentHeight() (uint64, error) {
 }
 
 func (r *EvmRpc) TransactionByHash(hash ecommon.Hash) (*etypes.Transaction, bool, error) {
-	ctx, cancel := callContext(evmCallTimeout)
-	defer cancel()
-	if err := r.throttle(ctx); err != nil {
+	ctx, cancel, err := r.callContext(evmCallTimeout)
+	if err != nil {
 		return nil, false, err
 	}
+	defer cancel()
 	return r.rpcClient.TransactionByHash(ctx, hash)
 }
