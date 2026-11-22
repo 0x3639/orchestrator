@@ -29,6 +29,9 @@ import (
 // ZnnSettingsTimeout bounds a settings refresh or an entire signing-window read.
 const ZnnSettingsTimeout = 10 * time.Second
 
+// ZnnLedgerTimeout bounds an individual block or page read.
+const ZnnLedgerTimeout = 10 * time.Second
+
 type ZnnRpc struct {
 	settingsClient *server.Client
 	rpcClient      *sdk_rpc_client.RpcClient
@@ -216,11 +219,42 @@ func (r *ZnnRpc) GetAllWrapTokenRequests(pageIndex, pageSize uint32) (*embedded.
 }
 
 func (r *ZnnRpc) GetAccountBlockByHash(hash types.Hash) (*api.AccountBlock, error) {
-	return r.rpcClient.LedgerApi.GetAccountBlockByHash(hash)
+	ctx, cancel := context.WithTimeout(context.Background(), ZnnLedgerTimeout)
+	defer cancel()
+	return r.GetAccountBlockByHashContext(ctx, hash)
+}
+
+func (r *ZnnRpc) GetAccountBlockByHashContext(ctx context.Context, hash types.Hash) (*api.AccountBlock, error) {
+	var block *api.AccountBlock
+	if err := r.settingsClient.CallContext(ctx, &block, "ledger.getAccountBlockByHash", hash); err != nil {
+		return nil, err
+	}
+	return block, nil
 }
 
 func (r *ZnnRpc) GetAccountBlocksByHeight(address types.Address, height, count uint64) (*api.AccountBlockList, error) {
-	return r.rpcClient.LedgerApi.GetAccountBlocksByHeight(address, height, count)
+	ctx, cancel := context.WithTimeout(context.Background(), ZnnLedgerTimeout)
+	defer cancel()
+	return r.GetAccountBlocksByHeightContext(ctx, address, height, count)
+}
+
+func (r *ZnnRpc) GetAccountBlocksByHeightContext(ctx context.Context, address types.Address, height, count uint64) (*api.AccountBlockList, error) {
+	// The SDK list decoder dereferences each entry. Decode the RPC fields
+	// directly so a null page or entry can be reported at its own height.
+	var page *api.AccountBlockListMarshal
+	if err := r.settingsClient.CallContext(ctx, &page, "ledger.getAccountBlocksByHeight", address, height, count); err != nil {
+		return nil, err
+	}
+	if page == nil || page.List == nil {
+		return nil, errors.Errorf("missing Zenon account block page at height %d", height)
+	}
+	blocks := make([]*api.AccountBlock, len(page.List))
+	for i, entry := range page.List {
+		if entry != nil {
+			blocks[i] = entry.FromApiMarshalJson()
+		}
+	}
+	return &api.AccountBlockList{List: blocks, Count: page.Count, More: page.More}, nil
 }
 
 func (r *ZnnRpc) GetMomentumsByHeight(height, count uint64) (*api.MomentumList, error) {

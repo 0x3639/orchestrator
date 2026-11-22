@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
-	"fmt"
 	"github.com/ethereum/go-ethereum"
 	ecommon "github.com/ethereum/go-ethereum/common"
 	"github.com/pkg/errors"
@@ -161,68 +160,79 @@ func (rC *znnNetwork) ZnnRpc() *rpc.ZnnRpc {
 }
 
 func (rC *znnNetwork) Sync() error {
-	rC.logger.Debug("In sync znn")
-	if accountBlockHeight, err := rC.eventsStore().GetLastUpdateHeight(); err != nil {
+	height, err := rC.eventsStore().GetLastUpdateHeight()
+	if err != nil {
 		return err
-	} else {
-		if rC.state.HealthStore() != nil {
-			verified := accountBlockHeight > 1 && rC.eventsStore().HasReceiveCoverageCheckpoint(accountBlockHeight)
-			rC.coverage.start(rC.state.HealthStore(), accountBlockHeight, verified)
+	}
+	if store := rC.state.HealthStore(); store != nil {
+		verified := height > 1 && rC.eventsStore().HasReceiveCoverageCheckpoint(height)
+		rC.coverage.start(store, height, verified)
+	}
+	rC.logger.Debugf("last account block update height: %d", height)
+	for {
+		page, err := rC.ZnnRpc().GetAccountBlocksByHeight(types.BridgeContract, height+1, 30)
+		if err != nil {
+			return err
 		}
-		rC.logger.Debugf("last account block update height: %d", accountBlockHeight)
-		accountBlockList, errRpc := rC.ZnnRpc().GetAccountBlocksByHeight(types.BridgeContract, accountBlockHeight+1, 30)
-		if errRpc != nil {
-			return errRpc
+		if len(page.List) == 0 {
+			if page.Count > 0 && uint64(page.Count) > height {
+				return errors.Errorf("empty bridge account block page at height %d below frontier %d", height+1, page.Count)
+			}
+			return nil
 		}
-		for len(accountBlockList.List) > 0 {
-			for _, accBlock := range accountBlockList.List {
-				if accBlock.BlockType == nom.BlockTypeContractReceive {
-					rC.logger.Debug("found receive block")
-					hash := accBlock.Hash
-					for {
-						rC.logger.Debugf("confDetail is nil: %v for %s", accBlock.ConfirmationDetail == nil, hash.String())
-						accBlock, errRpc = rC.ZnnRpc().GetAccountBlockByHash(hash)
-						if errRpc != nil {
-							rC.logger.Debug(err)
-						} else if accBlock == nil {
-
-						} else if accBlock.ConfirmationDetail != nil {
-							break
-						}
-						time.Sleep(5 * time.Second)
-						continue
-					}
-
-					if sendBlock, errRpc := rC.ZnnRpc().GetAccountBlockByHash(accBlock.FromBlockHash); err != nil {
-						return errRpc
-					} else if sendBlock == nil {
-						return errors.Errorf("Send block %s for associated receive %s is non existent", accBlock.Hash.String(), accBlock.FromBlockHash.String())
-					} else {
-						var live bool
-						frMomHeight, errFrMom := rC.state.GetFrontierMomentum()
-						if errFrMom != nil {
-							return errFrMom
-						}
-						if frMomHeight < accBlock.ConfirmationDetail.MomentumHeight {
-							return errors.New(fmt.Sprintf("frMomHeight %d cannot be less than the height of the momentum %d in which was included the acc block we process", frMomHeight, accBlock.ConfirmationDetail.MomentumHeight))
-						}
-						live = (frMomHeight - accBlock.ConfirmationDetail.MomentumHeight) < uint64(rC.ConfirmationsToFinality())
-						live = live && rC.IsSynced()
-						if newErr := rC.InterpretSendBlockData(sendBlock, live, accBlock.Height); newErr != nil {
-							return newErr
-						}
-					}
+		for _, block := range page.List {
+			if block == nil || block.Address != types.BridgeContract || block.Height != height+1 {
+				return errors.Errorf("missing or unexpected bridge account block at height %d", height+1)
+			}
+			receive := block.BlockType == nom.BlockTypeContractReceive
+			if receive {
+				if err := rC.syncReceive(block); err != nil {
+					return err
 				}
-				rC.coverage.block(rC.state.HealthStore(), accBlock.Height, accBlock.BlockType == nom.BlockTypeContractReceive, true)
 			}
-			accountBlockHeight += uint64(len(accountBlockList.List))
-			accountBlockList, err = rC.ZnnRpc().GetAccountBlocksByHeight(types.BridgeContract, accountBlockHeight+1, 30)
-			if err != nil {
-				return err
-			}
+			height = block.Height
+			rC.coverage.block(rC.state.HealthStore(), height, receive, true)
 		}
 	}
-	return nil
+}
+
+func (rC *znnNetwork) syncReceive(listed *api.AccountBlock) error {
+	var receive *api.AccountBlock
+	for {
+		block, err := rC.ZnnRpc().GetAccountBlockByHash(listed.Hash)
+		if err != nil {
+			rC.logger.Warnf("reading bridge receive %s: %v", listed.Hash, err)
+		} else if block != nil {
+			if block.Hash != listed.Hash || block.Height != listed.Height || block.Address != listed.Address ||
+				block.BlockType != listed.BlockType || block.FromBlockHash != listed.FromBlockHash {
+				return errors.Errorf("bridge receive lookup does not match listed block %s at height %d", listed.Hash, listed.Height)
+			}
+			if block.ConfirmationDetail != nil {
+				receive = block
+				break
+			}
+		}
+		time.Sleep(5 * time.Second)
+	}
+
+	send, err := rC.ZnnRpc().GetAccountBlockByHash(receive.FromBlockHash)
+	if err != nil {
+		return errors.Wrapf(err, "reading send %s for bridge receive %s", receive.FromBlockHash, receive.Hash)
+	}
+	if send == nil || send.Hash != receive.FromBlockHash {
+		return errors.Errorf("missing or mismatched send %s for bridge receive %s", receive.FromBlockHash, receive.Hash)
+	}
+
+	frontier, err := rC.state.GetFrontierMomentum()
+	if err != nil {
+		return err
+	}
+	confirmed := receive.ConfirmationDetail.MomentumHeight
+	if frontier < confirmed {
+		return errors.Errorf("frontier momentum %d precedes confirmation momentum %d for bridge receive %s", frontier, confirmed, receive.Hash)
+	}
+	live := frontier-confirmed < uint64(rC.ConfirmationsToFinality()) && rC.IsSynced()
+	return rC.InterpretSendBlockData(send, live, receive.Height)
 }
 
 // InterpretSendBlockData We assume that if the receive acc block was created then it was no error
@@ -232,7 +242,10 @@ func (rC *znnNetwork) InterpretSendBlockData(sendBlock *api.AccountBlock, live b
 
 func (rC *znnNetwork) interpretSendBlockData(sendBlock *api.AccountBlock, live bool, receiveBlockHeight uint64, refreshSettings func() error) error {
 	rC.logger.Debugf("InterpretSendBlockData, live: %v", live)
-	methodSig := base64.StdEncoding.EncodeToString(sendBlock.Data[0:4])
+	if len(sendBlock.Data) < 4 {
+		return errors.Errorf("bridge send %s has no complete method selector", sendBlock.Hash)
+	}
+	methodSig := base64.StdEncoding.EncodeToString(sendBlock.Data[:4])
 	switch methodSig {
 	case base64.StdEncoding.EncodeToString(definition.ABIBridge.Methods[definition.WrapTokenMethodName].Id()):
 		rC.logger.Debug("found WrapTokenMethodName")
