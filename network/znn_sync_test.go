@@ -1,6 +1,7 @@
 package network
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -8,12 +9,16 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/zenon-network/go-zenon/chain/nom"
 	zdb "github.com/zenon-network/go-zenon/common/db"
 	"github.com/zenon-network/go-zenon/common/types"
+	"github.com/zenon-network/go-zenon/protocol"
 	"github.com/zenon-network/go-zenon/rpc/api"
+	"github.com/zenon-network/go-zenon/rpc/api/subscribe"
 	"github.com/zenon-network/go-zenon/rpc/server"
+	"github.com/zenon-network/go-zenon/vm/embedded/definition"
 	"go.uber.org/zap"
 
 	"orchestrator/common"
@@ -23,14 +28,22 @@ import (
 )
 
 type startupLedger struct {
-	page    func(uint64) *api.AccountBlockListMarshal
-	lookup  func(types.Hash) (*api.AccountBlockMarshal, error)
-	starts  []uint64
-	lookups []types.Hash
+	stallPage  chan struct{}
+	page       func(uint64) *api.AccountBlockListMarshal
+	lookup     func(types.Hash) (*api.AccountBlockMarshal, error)
+	starts     []uint64
+	lookups    []types.Hash
+	syncStatus func() *protocol.SyncInfo
+	tip        func() *api.Momentum
 }
 
-func (l *startupLedger) GetAccountBlocksByHeight(_ types.Address, height, _ uint64) *api.AccountBlockListMarshal {
+func (l *startupLedger) GetAccountBlocksByHeight(ctx context.Context, _ types.Address, height, _ uint64) *api.AccountBlockListMarshal {
 	l.starts = append(l.starts, height)
+	if l.stallPage != nil {
+		close(l.stallPage)
+		<-ctx.Done()
+		return nil
+	}
 	return l.page(height)
 }
 
@@ -38,6 +51,9 @@ func (l *startupLedger) GetAccountBlockByHash(hash types.Hash) (*api.AccountBloc
 	l.lookups = append(l.lookups, hash)
 	return l.lookup(hash)
 }
+
+func (l *startupLedger) SyncInfo() *protocol.SyncInfo       { return l.syncStatus() }
+func (l *startupLedger) GetFrontierMomentum() *api.Momentum { return l.tip() }
 
 type startupTransport struct{ handler http.Handler }
 
@@ -51,8 +67,10 @@ func (rt startupTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 func startupNetwork(t *testing.T, ledger *startupLedger) *znnNetwork {
 	t.Helper()
 	srv := server.NewServer()
-	if err := srv.RegisterName("ledger", ledger); err != nil {
-		t.Fatal(err)
+	for _, name := range []string{"ledger", "stats"} {
+		if err := srv.RegisterName(name, ledger); err != nil {
+			t.Fatal(err)
+		}
 	}
 	t.Cleanup(srv.Stop)
 	previous := http.DefaultTransport
@@ -68,7 +86,9 @@ func startupNetwork(t *testing.T, ledger *startupLedger) *znnNetwork {
 	if err := state.SetFrontierMomentum(100); err != nil {
 		t.Fatal(err)
 	}
-	return &znnNetwork{rpcManager: rpcs, dbManager: unwrapTestStores{znn: wrap.NewZnnStorage(zdb.NewMemDB(), stop)}, state: state, logger: zap.NewNop().Sugar()}
+	listenerCtx, cancelListener := context.WithCancel(context.Background())
+	t.Cleanup(cancelListener)
+	return &znnNetwork{listenerCtx: listenerCtx, cancelListener: cancelListener, rpcManager: rpcs, dbManager: unwrapTestStores{znn: wrap.NewZnnStorage(zdb.NewMemDB(), stop)}, state: state, logger: zap.NewNop().Sugar()}
 }
 
 func startupReceive(height byte) *api.AccountBlockMarshal {
@@ -101,7 +121,7 @@ func TestStartupSyncRetriesReceiveBeforeReadingSend(t *testing.T) {
 	receive := startupReceive(2)
 	pending := *receive
 	pending.ConfirmationDetail = nil
-	attempts := 0
+	attempts, sendAttempts := 0, 0
 	l := &startupLedger{
 		page: func(start uint64) *api.AccountBlockListMarshal {
 			if start == receive.Height {
@@ -111,6 +131,10 @@ func TestStartupSyncRetriesReceiveBeforeReadingSend(t *testing.T) {
 		},
 		lookup: func(hash types.Hash) (*api.AccountBlockMarshal, error) {
 			if hash == receive.FromBlockHash {
+				sendAttempts++
+				if sendAttempts == 1 {
+					return nil, errors.New("temporary paired-send failure")
+				}
 				return startupSend(receive), nil
 			}
 			attempts++
@@ -130,7 +154,7 @@ func TestStartupSyncRetriesReceiveBeforeReadingSend(t *testing.T) {
 	if err := n.Sync(); err != nil {
 		t.Fatal(err)
 	}
-	want := []types.Hash{receive.Hash, receive.Hash, receive.Hash, receive.Hash, receive.FromBlockHash}
+	want := []types.Hash{receive.Hash, receive.Hash, receive.Hash, receive.Hash, receive.FromBlockHash, receive.FromBlockHash}
 	if !reflect.DeepEqual(l.lookups, want) {
 		t.Fatalf("lookups %v, want %v", l.lookups, want)
 	}
@@ -139,6 +163,10 @@ func TestStartupSyncRetriesReceiveBeforeReadingSend(t *testing.T) {
 
 func TestStartupSyncSendReadPreservesCheckpoint(t *testing.T) {
 	first, second := startupReceive(2), startupReceive(3)
+	wrongType, wrongDestination, short := startupSend(second), startupSend(second), startupSend(second)
+	wrongType.BlockType = nom.BlockTypeUserReceive
+	wrongDestination.ToAddress = types.ZeroAddress
+	short.Data = nil
 	for _, tc := range []struct {
 		name string
 		send *api.AccountBlockMarshal
@@ -146,9 +174,11 @@ func TestStartupSyncSendReadPreservesCheckpoint(t *testing.T) {
 		want string
 	}{
 		{"RPC error", nil, errors.New("ledger temporarily unavailable"), "ledger temporarily unavailable"},
-		{"missing send", nil, nil, "missing or mismatched send"},
-		{"different send", startupSend(first), nil, "missing or mismatched send"},
-		{"incomplete send data", &api.AccountBlockMarshal{AccountBlockMarshal: nom.AccountBlockMarshal{Hash: second.FromBlockHash, Amount: "0"}}, nil, "method selector"},
+		{"missing send", nil, nil, "block is missing"},
+		{"different send", startupSend(first), nil, "block hash differs"},
+		{"paired block is a receive", wrongType, nil, "invalid paired send"},
+		{"send to another address", wrongDestination, nil, "invalid paired send"},
+		{"incomplete send data", short, nil, "method selector"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			recovered := false
@@ -217,4 +247,202 @@ func TestStartupSyncRejectsIncompletePages(t *testing.T) {
 			checkStartupCursor(t, n, 1)
 		})
 	}
+}
+
+// A recognized, adjacent non-receive must not mask a malformed entry.
+// A valid later receive would persist a checkpoint over the bad height.
+func TestStartupSyncRejectsUnknownTypeBeforeLaterReceive(t *testing.T) {
+	for _, kind := range []uint64{0, 99, nom.BlockTypeUserReceive, nom.BlockTypeGenesisReceive} {
+		first, bad, later := startupReceive(2), startupReceive(3), startupReceive(4)
+		first.BlockType = nom.BlockTypeContractSend
+		bad.BlockType = kind
+		l := &startupLedger{page: func(uint64) *api.AccountBlockListMarshal { return startupPage(first, bad, later) }}
+		n := startupNetwork(t, l)
+		if err := n.Sync(); err == nil || !strings.Contains(err.Error(), "height 3") {
+			t.Fatalf("type %d: got %v", kind, err)
+		}
+		checkStartupCursor(t, n, 1)
+		if len(l.lookups) != 0 {
+			t.Fatalf("type %d: unexpected lookups %v", kind, l.lookups)
+		}
+	}
+}
+
+func TestStartupSyncReceiveBudgetAndShutdown(t *testing.T) {
+	for _, cancel := range []bool{true, false} {
+		t.Run(map[bool]string{true: "shutdown", false: "exhaustion"}[cancel], func(t *testing.T) {
+			receive := startupReceive(2)
+			started := make(chan struct{}, 1)
+			l := &startupLedger{
+				page: func(uint64) *api.AccountBlockListMarshal { return startupPage(receive) },
+				lookup: func(types.Hash) (*api.AccountBlockMarshal, error) {
+					select {
+					case started <- struct{}{}:
+					default:
+					}
+					return nil, errors.New("receive temporarily unavailable")
+				},
+			}
+			n := startupNetwork(t, l)
+			result := make(chan error, 1)
+			go func() { result <- n.Sync() }()
+			<-started
+			timeout := 20 * time.Second
+			if cancel {
+				if err := n.Stop(); err != nil {
+					t.Fatal(err)
+				}
+				timeout = time.Second
+			}
+			select {
+			case err := <-result:
+				if err == nil || !strings.Contains(err.Error(), receive.Hash.String()) {
+					t.Fatalf("error omitted receive identity: %v", err)
+				}
+				if cancel && !errors.Is(err, context.Canceled) {
+					t.Fatal(err)
+				}
+				if !cancel && (len(l.lookups) != 4 || !strings.Contains(err.Error(), "receive temporarily unavailable")) {
+					t.Fatalf("expected four reads and last RPC failure, got %d, %v", len(l.lookups), err)
+				}
+			case <-time.After(timeout):
+				t.Fatal("startup did not return within the retry budget")
+			}
+			checkStartupCursor(t, n, 1)
+		})
+	}
+}
+
+func TestStartupSyncObservesFinalityAfterSyncStatus(t *testing.T) {
+	for _, tc := range []struct {
+		name                   string
+		cached, tip, afterSync uint64
+		live, fail             bool
+	}{
+		{"subscription behind", 99, 101, 99, true, false},
+		{"authoritative frontier behind", 99, 99, 99, false, true},
+		{"one below finality", 100, 104, 104, true, false},
+		{"exactly at finality", 100, 105, 105, false, false},
+		{"subscription advances during sync read", 100, 104, 105, false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			receive := startupReceive(2)
+			send := startupSend(receive)
+			var err error
+			send.Data, err = definition.ABIBridge.PackMethod(definition.SetBridgeMetadataMethodName, "{}")
+			if err != nil {
+				t.Fatal(err)
+			}
+			l := &startupLedger{
+				page: func(h uint64) *api.AccountBlockListMarshal {
+					if h == receive.Height {
+						return startupPage(receive)
+					}
+					return startupPage()
+				},
+				lookup: func(hash types.Hash) (*api.AccountBlockMarshal, error) {
+					if hash == receive.Hash {
+						return receive, nil
+					}
+					return send, nil
+				},
+			}
+			n := startupNetwork(t, l)
+			n.SetConfirmationsToFinality(5)
+			if err := n.state.SetFrontierMomentum(tc.cached); err != nil {
+				t.Fatal(err)
+			}
+			n.administrator = send.Address.String()
+			dispatched := false
+			n.setBridgeMetadata = func(*common.BridgeMetadata) { dispatched = true }
+			var reads []string
+			l.syncStatus = func() *protocol.SyncInfo {
+				reads = append(reads, "sync")
+				if err := n.state.SetFrontierMomentum(tc.afterSync); err != nil {
+					t.Error(err)
+				}
+				return &protocol.SyncInfo{State: protocol.SyncDone}
+			}
+			l.tip = func() *api.Momentum {
+				reads = append(reads, "frontier")
+				return &api.Momentum{Momentum: &nom.Momentum{Height: tc.tip, Hash: types.Hash{1}}}
+			}
+			if err := n.Sync(); (err != nil) != tc.fail {
+				t.Fatalf("sync error %v", err)
+			}
+			if !reflect.DeepEqual(reads, []string{"sync", "frontier"}) || dispatched != tc.live {
+				t.Fatalf("read order %v, dispatched live=%v, want %v", reads, dispatched, tc.live)
+			}
+			if tc.fail {
+				checkStartupCursor(t, n, 1)
+			} else {
+				checkStartupCursor(t, n, 2)
+			}
+		})
+	}
+}
+
+func TestLiveBridgeSendFailurePreservesEarlierCheckpoint(t *testing.T) {
+	receives := map[types.Hash]*api.AccountBlockMarshal{}
+	var hints []subscribe.AccountBlock
+	for i := byte(2); i <= 4; i++ {
+		r := startupReceive(i)
+		receives[r.Hash] = r
+		receives[r.FromBlockHash] = startupSend(r)
+		hints = append(hints, subscribe.AccountBlock{BlockType: r.BlockType, Height: r.Height, Hash: r.Hash, FromHash: r.FromBlockHash, Address: r.Address})
+	}
+	failed := hints[1].FromHash
+	calls := 0
+	l := &startupLedger{lookup: func(hash types.Hash) (*api.AccountBlockMarshal, error) {
+		if hash == failed {
+			calls++
+			return nil, context.DeadlineExceeded
+		}
+		return receives[hash], nil
+	}}
+	n := startupNetwork(t, l)
+	if err := n.processLiveBridgeBlocks(n.listenerCtx, hints, nil); err == nil || !strings.Contains(err.Error(), "deadline exceeded") {
+		t.Fatal(err)
+	}
+	checkStartupCursor(t, n, 2)
+	if calls != 4 || l.lookups[len(l.lookups)-1] != failed {
+		t.Fatalf("unexpected lookup sequence %v", l.lookups)
+	}
+	l.page = func(height uint64) *api.AccountBlockListMarshal {
+		if height == 3 {
+			return startupPage(receives[hints[1].Hash], receives[hints[2].Hash])
+		}
+		return startupPage()
+	}
+	l.lookup = func(hash types.Hash) (*api.AccountBlockMarshal, error) { return receives[hash], nil }
+	if err := n.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(l.starts, []uint64{3, 5}) {
+		t.Fatalf("restarted pages %v", l.starts)
+	}
+	checkStartupCursor(t, n, 4)
+}
+
+func TestStartupStopInterruptsLedgerRead(t *testing.T) {
+	l := &startupLedger{stallPage: make(chan struct{})}
+	n := startupNetwork(t, l)
+	result := make(chan error, 1)
+	go func() { result <- n.Sync() }()
+	select {
+	case <-l.stallPage:
+	case <-time.After(time.Second):
+		t.Fatal("did not reach ledger read")
+	}
+	// Node.Stop calls this before acquiring the startup lock.
+	n.CancelAccountBlockReads()
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("canceled ledger read returned %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("read outlived shutdown")
+	}
+	checkStartupCursor(t, n, 1)
 }

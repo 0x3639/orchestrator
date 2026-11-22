@@ -168,6 +168,14 @@ func (r *ZnnRpc) GetSyncInfo() (*protocol.SyncInfo, error) {
 	return r.rpcClient.StatsApi.SyncInfo()
 }
 
+func (r *ZnnRpc) GetSyncInfoContext(ctx context.Context) (*protocol.SyncInfo, error) {
+	var info *protocol.SyncInfo
+	if err := r.settingsClient.CallContext(ctx, &info, "stats.syncInfo"); err != nil {
+		return nil, err
+	}
+	return info, nil
+}
+
 // SampleSyncInfo uses a context-bound connection because the SDK's StatsApi
 // does not expose a deadline. A slow monitoring probe cannot hold up signing.
 func (r *ZnnRpc) SampleSyncInfo(ctx context.Context) (*protocol.SyncInfo, error) {

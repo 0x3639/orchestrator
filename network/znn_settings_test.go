@@ -90,8 +90,8 @@ func TestStalledSettingsCannotDelayHalt(t *testing.T) {
 	for i, data := range [][]byte{resize, halt} {
 		recv, send := types.Hash{byte(2*i + 1)}, types.Hash{byte(2*i + 2)}
 		p.receipts = append(p.receipts, subscribe.AccountBlock{Address: types.BridgeContract, Height: uint64(i + 1), BlockType: nom.BlockTypeContractReceive, Hash: recv, FromHash: send})
-		p.blocks[recv] = &api.AccountBlockMarshal{AccountBlockMarshal: nom.AccountBlockMarshal{Hash: recv, Address: types.BridgeContract, FromBlockHash: send, Amount: "0"}}
-		p.blocks[send] = &api.AccountBlockMarshal{AccountBlockMarshal: nom.AccountBlockMarshal{Hash: send, Address: types.ZeroAddress, Data: data, Amount: "0"}}
+		p.blocks[recv] = &api.AccountBlockMarshal{AccountBlockMarshal: nom.AccountBlockMarshal{BlockType: nom.BlockTypeContractReceive, Height: uint64(i + 1), Hash: recv, Address: types.BridgeContract, FromBlockHash: send, Amount: "0"}, ConfirmationDetail: &api.AccountBlockConfirmationDetail{MomentumHeight: 170}}
+		p.blocks[send] = &api.AccountBlockMarshal{AccountBlockMarshal: nom.AccountBlockMarshal{BlockType: nom.BlockTypeUserSend, ToAddress: types.BridgeContract, Hash: send, Address: types.ZeroAddress, Data: data, Amount: "0"}}
 	}
 	srv := server.NewServer()
 	for _, name := range []string{"ledger", "embedded.bridge"} {
@@ -110,7 +110,9 @@ func TestStalledSettingsCannotDelayHalt(t *testing.T) {
 		t.Fatal(err)
 	}
 	saved := make(chan uint64, 2)
-	n := &znnNetwork{rpcManager: clients, state: state, administrator: types.ZeroAddress.String(), dbManager: settingsTestStores{store: checkpointStore{saved: saved}}, stopChan: stop, logger: zap.NewNop().Sugar()}
+	listenerCtx, cancelListener := context.WithCancel(context.Background())
+	defer cancelListener()
+	n := &znnNetwork{listenerCtx: listenerCtx, cancelListener: cancelListener, rpcManager: clients, state: state, administrator: types.ZeroAddress.String(), dbManager: settingsTestStores{store: checkpointStore{saved: saved}}, stopChan: stop, logger: zap.NewNop().Sugar()}
 	release := sync.OnceFunc(func() { close(p.release) })
 	var wg sync.WaitGroup
 	defer func() {
@@ -136,7 +138,7 @@ func TestStalledSettingsCannotDelayHalt(t *testing.T) {
 	}
 	wg.Add(1)
 	go func() { defer wg.Done(); n.ListenForEmbeddedBridgeAccountBlocks() }()
-	// The real listener waits four seconds for each of the two receive blocks.
+	// Both checkpoints must remain independent of the stalled settings read.
 	deadline := time.After(14 * time.Second)
 	for want := uint64(1); want <= 2; want++ {
 		select {
@@ -156,7 +158,7 @@ func TestStalledSettingsCannotDelayHalt(t *testing.T) {
 		if !errors.Is(err, context.DeadlineExceeded) {
 			t.Fatalf("signer returned %v, want deadline exceeded", err)
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(rpc.ZnnSettingsTimeout + time.Second):
 		t.Fatal("signer still waiting for settings after the halt")
 	}
 	release()
