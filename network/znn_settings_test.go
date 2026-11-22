@@ -101,7 +101,7 @@ func TestStalledSettingsCannotDelayHalt(t *testing.T) {
 		recv, send := types.Hash{byte(2*i + 1)}, types.Hash{byte(2*i + 2)}
 		p.receipts = append(p.receipts, subscribe.AccountBlock{Address: types.BridgeContract, Height: uint64(i + 1), BlockType: nom.BlockTypeContractReceive, Hash: recv, FromHash: send})
 		p.blocks[recv] = &api.AccountBlockMarshal{AccountBlockMarshal: nom.AccountBlockMarshal{Height: uint64(i + 1), BlockType: nom.BlockTypeContractReceive, Hash: recv, Address: types.BridgeContract, FromBlockHash: send, Amount: "0"}, ConfirmationDetail: &api.AccountBlockConfirmationDetail{MomentumHeight: 170}}
-		p.blocks[send] = &api.AccountBlockMarshal{AccountBlockMarshal: nom.AccountBlockMarshal{Hash: send, Address: types.ZeroAddress, Data: data, Amount: "0"}}
+		p.blocks[send] = &api.AccountBlockMarshal{AccountBlockMarshal: nom.AccountBlockMarshal{BlockType: nom.BlockTypeUserSend, ToAddress: types.BridgeContract, Hash: send, Address: types.ZeroAddress, Data: data, Amount: "0"}}
 	}
 	srv := server.NewServer()
 	for _, name := range []string{"ledger", "embedded.bridge"} {

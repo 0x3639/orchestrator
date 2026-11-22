@@ -68,6 +68,10 @@ type secondaryClient struct {
 }
 
 func NewEvmRpcClient(networkConfig config.BaseNetworkConfig, networkName string, address ecommon.Address) (*EvmRpc, error) {
+	return NewEvmRpcClientContext(context.Background(), networkConfig, networkName, address)
+}
+
+func NewEvmRpcClientContext(parent context.Context, networkConfig config.BaseNetworkConfig, networkName string, address ecommon.Address) (*EvmRpc, error) {
 	logger, errLog := common.CreateSugarLogger()
 	if errLog != nil {
 		return nil, errLog
@@ -87,7 +91,10 @@ func NewEvmRpcClient(networkConfig config.BaseNetworkConfig, networkName string,
 	var newRpcClient *ethclient.Client
 	currentUrl := newUrls.GetCurrentUrl()
 	for {
-		newRpcClient, err = ethclient.Dial(currentUrl)
+		if err := parent.Err(); err != nil {
+			return nil, err
+		}
+		newRpcClient, err = ethclient.DialContext(parent, currentUrl)
 		if err != nil {
 			logger.Infof("Error when dialing %s, got: %s\n", config.RedactURL(currentUrl), config.RedactErrorForURL(err, currentUrl))
 		} else {
@@ -117,6 +124,7 @@ func NewEvmRpcClient(networkConfig config.BaseNetworkConfig, networkName string,
 
 	newBridgeContract, err := bridge.NewBridge(address, bridgeReadBackend{newRpcClient, limiter})
 	if err != nil {
+		newRpcClient.Close()
 		return nil, err
 	}
 
@@ -125,7 +133,7 @@ func NewEvmRpcClient(networkConfig config.BaseNetworkConfig, networkName string,
 		Topics:    common.Topics,
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(parent)
 	return &EvmRpc{
 		ctx:             ctx,
 		cancel:          cancel,

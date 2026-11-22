@@ -36,7 +36,7 @@ type unwrapTestStores struct {
 func (s unwrapTestStores) ZnnStorage() db.ZnnStorage         { return s.znn }
 func (s unwrapTestStores) EvmStorage(uint32) db.EvmStorage   { return s.evm }
 func (s unwrapTestStores) HasEvmStorage(chainID uint32) bool { return chainID == 1 }
-func (s unwrapTestStores) AddEvmEventStore(uint32, string, uint64) {
+func (s unwrapTestStores) AddEvmEventStore(uint32, string, uint64) (func(), error) {
 	panic("unexpected network creation in unwrap test")
 }
 

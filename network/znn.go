@@ -28,7 +28,6 @@ import (
 	"os"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 )
 
@@ -36,7 +35,7 @@ type networkEventStores interface {
 	ZnnStorage() db.ZnnStorage
 	EvmStorage(uint32) db.EvmStorage
 	HasEvmStorage(uint32) bool
-	AddEvmEventStore(uint32, string, uint64)
+	AddEvmEventStore(uint32, string, uint64) (func(), error)
 }
 
 type znnNetwork struct {
@@ -151,8 +150,13 @@ func (rC *znnNetwork) Start() error {
 	return nil
 }
 
-func (rC *znnNetwork) Stop() error {
+// CancelAccountBlockReads interrupts startup even while Node.Start holds its lock.
+func (rC *znnNetwork) CancelAccountBlockReads() {
 	rC.cancelListener()
+}
+
+func (rC *znnNetwork) Stop() error {
+	rC.CancelAccountBlockReads()
 	err := rC.ZnnRpc().Stop()
 	rC.listenerWorker.Wait()
 	if rC.stopHealth != nil {
@@ -174,6 +178,7 @@ func (rC *znnNetwork) ZnnRpc() *rpc.ZnnRpc {
 }
 
 func (rC *znnNetwork) Sync() error {
+	ctx := rC.listenerCtx
 	height, err := rC.eventsStore().GetLastUpdateHeight()
 	if err != nil {
 		return err
@@ -184,7 +189,12 @@ func (rC *znnNetwork) Sync() error {
 	}
 	rC.logger.Debugf("last account block update height: %d", height)
 	for {
-		page, err := rC.ZnnRpc().GetAccountBlocksByHeight(types.BridgeContract, height+1, 30)
+		read, cancel := context.WithTimeout(ctx, rpc.ZnnLedgerTimeout)
+		page, err := rC.ZnnRpc().GetAccountBlocksByHeightContext(read, types.BridgeContract, height+1, 30)
+		cancel()
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 		if err != nil {
 			return err
 		}
@@ -195,12 +205,18 @@ func (rC *znnNetwork) Sync() error {
 			return nil
 		}
 		for _, block := range page.List {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
 			if block == nil || block.Address != types.BridgeContract || block.Height != height+1 {
 				return errors.Errorf("missing or unexpected bridge account block at height %d", height+1)
 			}
-			receive := block.BlockType == nom.BlockTypeContractReceive
+			receive, err := bridgeAccountReceive(block.BlockType, block.Height)
+			if err != nil {
+				return err
+			}
 			if receive {
-				if err := rC.syncReceive(block); err != nil {
+				if err := rC.syncReceive(ctx, block); err != nil {
 					return err
 				}
 			}
@@ -210,42 +226,135 @@ func (rC *znnNetwork) Sync() error {
 	}
 }
 
-func (rC *znnNetwork) syncReceive(listed *api.AccountBlock) error {
-	var receive *api.AccountBlock
-	for {
-		block, err := rC.ZnnRpc().GetAccountBlockByHash(listed.Hash)
-		if err != nil {
-			rC.logger.Warnf("reading bridge receive %s: %v", listed.Hash, err)
-		} else if block != nil {
-			if block.Hash != listed.Hash || block.Height != listed.Height || block.Address != listed.Address ||
-				block.BlockType != listed.BlockType || block.FromBlockHash != listed.FromBlockHash {
-				return errors.Errorf("bridge receive lookup does not match listed block %s at height %d", listed.Hash, listed.Height)
-			}
-			if block.ConfirmationDetail != nil {
-				receive = block
-				break
+func bridgeAccountReceive(blockType, height uint64) (bool, error) {
+	switch blockType {
+	case nom.BlockTypeContractReceive:
+		return true, nil
+	case nom.BlockTypeContractSend:
+		return false, nil
+	case nom.BlockTypeGenesisReceive:
+		if height == 1 {
+			return false, nil
+		}
+	}
+	return false, errors.Errorf("unexpected bridge account block type %d at height %d", blockType, height)
+}
+
+// Read failures, a missing block and a receive awaiting confirmation can
+// recover. Bound both RPC calls and the total attempts on a single block.
+func (rC *znnNetwork) readBridgeBlock(ctx context.Context, hash types.Hash, waitForConfirmation bool) (*api.AccountBlock, error) {
+	if hash == types.ZeroHash {
+		return nil, errors.New("missing block hash")
+	}
+	const attempts = 4
+	delay := time.Second
+	if waitForConfirmation {
+		delay = 5 * time.Second
+	}
+	var err error
+	for attempt := 0; attempt < attempts; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(delay):
 			}
 		}
-		time.Sleep(5 * time.Second)
+		read, cancel := context.WithTimeout(ctx, rpc.ZnnLedgerTimeout)
+		var block *api.AccountBlock
+		block, err = rC.ZnnRpc().GetAccountBlockByHashContext(read, hash)
+		cancel()
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		if err == nil {
+			switch {
+			case block == nil:
+				err = errors.New("block is missing")
+			case block.Hash != hash:
+				return nil, errors.New("block hash differs from request")
+			case waitForConfirmation && block.ConfirmationDetail == nil:
+				err = errors.New("receive is awaiting confirmation")
+			default:
+				return block, nil
+			}
+		}
 	}
+	return nil, errors.Wrapf(err, "block %s after %d attempts", hash, attempts)
+}
 
-	send, err := rC.ZnnRpc().GetAccountBlockByHash(receive.FromBlockHash)
+func checkPairedSend(receive, send *api.AccountBlock) error {
+	if receive.FromBlockHash == types.ZeroHash || send == nil || send.Hash != receive.FromBlockHash ||
+		!send.IsSendBlock() || send.ToAddress != types.BridgeContract {
+		return errors.Errorf("invalid paired send %s for bridge receive %s", receive.FromBlockHash, receive.Hash)
+	}
+	return nil
+}
+
+func (rC *znnNetwork) readReceivePair(ctx context.Context, listed *api.AccountBlock) (*api.AccountBlock, *api.AccountBlock, error) {
+	receive, err := rC.readBridgeBlock(ctx, listed.Hash, true)
 	if err != nil {
-		return errors.Wrapf(err, "reading send %s for bridge receive %s", receive.FromBlockHash, receive.Hash)
+		return nil, nil, errors.Wrapf(err, "reading bridge receive %s at height %d", listed.Hash, listed.Height)
 	}
-	if send == nil || send.Hash != receive.FromBlockHash {
-		return errors.Errorf("missing or mismatched send %s for bridge receive %s", receive.FromBlockHash, receive.Hash)
+	if receive.Height != listed.Height || receive.Address != types.BridgeContract ||
+		receive.BlockType != nom.BlockTypeContractReceive || receive.FromBlockHash != listed.FromBlockHash {
+		return nil, nil, errors.Errorf("bridge receive lookup does not match listed block %s at height %d", listed.Hash, listed.Height)
 	}
+	send, err := rC.readBridgeBlock(ctx, receive.FromBlockHash, false)
+	if err != nil {
+		return nil, nil, errors.Wrapf(err, "reading send %s for bridge receive %s", receive.FromBlockHash, receive.Hash)
+	}
+	if err := checkPairedSend(receive, send); err != nil {
+		return nil, nil, err
+	}
+	return receive, send, nil
+}
 
-	frontier, err := rC.state.GetFrontierMomentum()
+func (rC *znnNetwork) syncReceive(ctx context.Context, listed *api.AccountBlock) error {
+	receive, send, err := rC.readReceivePair(ctx, listed)
 	if err != nil {
 		return err
 	}
 	confirmed := receive.ConfirmationDetail.MomentumHeight
-	if frontier < confirmed {
-		return errors.Errorf("frontier momentum %d precedes confirmation momentum %d for bridge receive %s", frontier, confirmed, receive.Hash)
+	if confirmed == 0 {
+		return errors.Errorf("missing confirmation height for bridge receive %s", receive.Hash)
 	}
-	live := frontier-confirmed < uint64(rC.ConfirmationsToFinality()) && rC.IsSynced()
+	finality := uint64(rC.ConfirmationsToFinality())
+	frontier, err := rC.state.GetFrontierMomentum()
+	if err != nil {
+		return err
+	}
+	// Already-final receives cannot become live as the frontier advances.
+	live := false
+	if frontier < confirmed || frontier-confirmed < finality {
+		read, cancel := context.WithTimeout(ctx, rpc.ZnnLedgerTimeout)
+		defer cancel()
+		info, syncErr := rC.ZnnRpc().GetSyncInfoContext(read)
+		synced := rC.recordSync(info, syncErr)
+		if syncErr != nil {
+			return syncErr
+		}
+		if info == nil {
+			return errors.New("missing Zenon sync status")
+		}
+		// Sample the same endpoint after observing sync status. A subscription
+		// may lag or advance while those RPCs are in flight.
+		tip, err := rC.frontierTip(read)
+		if err != nil {
+			return err
+		}
+		if tip.Height < confirmed {
+			return errors.Errorf("ledger frontier %d precedes confirmation momentum %d for bridge receive %s", tip.Height, confirmed, receive.Hash)
+		}
+		frontier, err = rC.state.GetFrontierMomentum()
+		if err != nil {
+			return err
+		}
+		live = synced && max(frontier, tip.Height)-confirmed < finality
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	return rC.InterpretSendBlockData(send, live, receive.Height)
 }
 
@@ -399,8 +508,7 @@ func (rC *znnNetwork) interpretSendBlockData(sendBlock *api.AccountBlock, live b
 					if live {
 						if stateErr := rC.state.SetState(common.EmergencyState); stateErr != nil {
 							rC.logger.Info("error setting emergency state")
-							rC.logger.Info(stateErr)
-							rC.stopChan <- syscall.SIGINT
+							rC.stopBridgeListener(rC.listenerCtx, stateErr)
 							return stateErr
 						}
 						break
@@ -519,8 +627,7 @@ func (rC *znnNetwork) interpretSendBlockData(sendBlock *api.AccountBlock, live b
 				rC.logger.Infof("found: %t", found)
 				if !found && live {
 					if stateErr := rC.state.SetState(common.EmergencyState); stateErr != nil {
-						rC.logger.Info(stateErr)
-						rC.stopChan <- syscall.SIGINT
+						rC.stopBridgeListener(rC.listenerCtx, stateErr)
 						return stateErr
 					}
 					break
@@ -603,34 +710,10 @@ func (rC *znnNetwork) interpretSendBlockData(sendBlock *api.AccountBlock, live b
 				break
 			}
 			rC.logger.Debug("network non existent")
-			configData, ok := rC.networksInfo[network.Name]
-			if ok == false {
-				rC.logger.Infof("network url non existent for network: %s chainId: %d", network.Name, network.Id)
-				rC.stopChan <- syscall.SIGINT
-				return errors.New("network url non existent")
-			}
-			rC.logger.Infof("configData for network %s: urls=%v filterQuerySize=%d", network.Name, config.RedactURLs(configData.Urls), configData.FilterQuerySize)
-			newEvmNetwork, err := NewEvmNetwork(network, rC.dbManager, rC.rpcManager, rC.state, rC.stopChan)
-			if err != nil {
-				rC.logger.Error(err)
-				rC.stopChan <- syscall.SIGINT
+			if err := rC.startRuntimeEvmNetwork(network); err != nil {
+				rC.stopBridgeListener(rC.listenerCtx, err)
 				return err
 			}
-			err = rC.rpcManager.AddEvmClient(configData, network.Id, newEvmNetwork.NetworkName(), *newEvmNetwork.ContractAddress())
-			if err != nil {
-				rC.logger.Error(err)
-				rC.stopChan <- syscall.SIGINT
-				return err
-			}
-			rC.logger.Debug("add evm client ok")
-			rC.state.HealthStore().AddNetwork(network.NetworkClass, network.Id)
-			if err := newEvmNetwork.Start(); err != nil {
-				rC.logger.Error(err)
-				rC.stopChan <- syscall.SIGINT
-				return err
-			}
-			rC.logger.Debug("network start ok")
-			rC.networkManager.AddEvmNetwork(newEvmNetwork)
 		}
 	case base64.StdEncoding.EncodeToString(definition.ABIBridge.Methods[definition.RemoveNetworkMethodName].Id()):
 		if !live || sendBlock.Address.String() != rC.administrator {
@@ -687,8 +770,7 @@ func (rC *znnNetwork) interpretSendBlockData(sendBlock *api.AccountBlock, live b
 		common.AdministratorLogger.Info("HaltMethodName")
 		currentState, err := rC.state.GetState()
 		if err != nil {
-			rC.logger.Debug(err)
-			rC.stopChan <- syscall.SIGINT
+			rC.stopBridgeListener(rC.listenerCtx, err)
 			return err
 		}
 		// if the node is in emergency, it will set the state to halted after all txs, we don't need to do it after we see one
@@ -696,8 +778,7 @@ func (rC *znnNetwork) interpretSendBlockData(sendBlock *api.AccountBlock, live b
 			halted := rC.IsHalted()
 			if halted {
 				if err := rC.state.SetState(common.HaltedState); err != nil {
-					rC.logger.Error(err)
-					rC.stopChan <- syscall.SIGINT
+					rC.stopBridgeListener(rC.listenerCtx, err)
 					return err
 				}
 			}
@@ -735,8 +816,7 @@ func (rC *znnNetwork) interpretSendBlockData(sendBlock *api.AccountBlock, live b
 		halted := rC.IsHalted()
 		if halted {
 			if err := rC.state.SetState(common.HaltedState); err != nil {
-				rC.logger.Error(err)
-				rC.stopChan <- syscall.SIGINT
+				rC.stopBridgeListener(rC.listenerCtx, err)
 				return err
 			}
 		}
@@ -762,14 +842,12 @@ func (rC *znnNetwork) interpretSendBlockData(sendBlock *api.AccountBlock, live b
 		if bridgeInfo.CompressedTssECDSAPubKey == param.PubKey {
 			currentState, err := rC.state.GetState()
 			if err != nil {
-				rC.logger.Debug(err)
-				rC.stopChan <- syscall.SIGINT
+				rC.stopBridgeListener(rC.listenerCtx, err)
 				return err
 			}
 			if currentState == common.KeyGenState {
 				if err := rC.state.SetState(common.LiveState); err != nil {
-					rC.logger.Error(err)
-					rC.stopChan <- syscall.SIGINT
+					rC.stopBridgeListener(rC.listenerCtx, err)
 					return err
 				}
 			}
@@ -801,14 +879,12 @@ func (rC *znnNetwork) interpretSendBlockData(sendBlock *api.AccountBlock, live b
 		if value == false {
 			currentState, err := rC.state.GetState()
 			if err != nil {
-				rC.logger.Debug(err)
-				rC.stopChan <- syscall.SIGINT
+				rC.stopBridgeListener(rC.listenerCtx, err)
 				return err
 			}
 			if currentState == common.KeyGenState {
 				if err := rC.state.SetState(common.LiveState); err != nil {
-					rC.logger.Error(err)
-					rC.stopChan <- syscall.SIGINT
+					rC.stopBridgeListener(rC.listenerCtx, err)
 					return err
 				}
 			}
@@ -859,18 +935,16 @@ func (rC *znnNetwork) ListenForMomentumHeight() {
 	rC.logger.Debug("func (rC *znnNetwork) ListenForMomentumHeight() {")
 	momSub, momChan, err := rC.ZnnRpc().SubscribeToMomentums()
 	if err != nil {
-		rC.logger.Error(err)
-		rC.stopChan <- syscall.SIGINT
+		rC.stopBridgeListener(rC.listenerCtx, err)
 		return
 	}
 	rC.logger.Debug("Successfully started to listen for momentums")
 	for {
 		select {
-		case errSub := <-momSub.Err():
-			if errSub != nil {
-				rC.logger.Debugf("listen mom err: %s", errSub.Error())
-				rC.stopChan <- syscall.SIGINT
-			}
+		case <-rC.listenerCtx.Done():
+			return
+		case err := <-momSub.Err():
+			rC.stopBridgeListener(rC.listenerCtx, err)
 			return
 		case momentums := <-momChan:
 			for _, mom := range momentums {
@@ -952,15 +1026,48 @@ func (rC *znnNetwork) ListenForEmbeddedBridgeAccountBlocks() {
 	rC.followBridgeAccount(rC.listenerCtx, accBlCh, accBlSub.Err(), requestRefresh)
 }
 
+// Publish a runtime network only after the initial sync completes. Its RPC
+// calls and retry sleeps share the listener's shutdown signal during startup.
+func (rC *znnNetwork) startRuntimeEvmNetwork(network *definition.NetworkInfo) error {
+	cfg, ok := rC.networksInfo[network.Name]
+	if !ok {
+		return errors.Errorf("missing RPC configuration for network %s (%d)", network.Name, network.Id)
+	}
+	ctx := rC.listenerCtx
+	client, err := rpc.NewEvmRpcClientContext(ctx, cfg, network.Name, ecommon.HexToAddress(network.ContractAddress))
+	if err != nil {
+		return err
+	}
+	net, err := NewEvmNetwork(network, rC.dbManager, rC.rpcManager, rC.state, rC.stopChan)
+	if err != nil {
+		client.Stop()
+		return err
+	}
+	net.client = client
+	net.startupDone = ctx.Done()
+	net.health.AddNetwork(network.NetworkClass, network.Id)
+	if err := net.Start(); err != nil {
+		client.Stop()
+		net.health.RemoveNetwork(network.Id)
+		_ = net.unconfirmedQueue.Close()
+		net.rollbackStore()
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		return err
+	}
+	net.rollbackStore = nil
+	rC.rpcManager.RegisterEvmClient(network.Id, client)
+	rC.networkManager.AddEvmNetwork(net)
+	return nil
+}
+
 func (rC *znnNetwork) stopBridgeListener(ctx context.Context, err error) {
-	if err == nil || ctx.Err() != nil {
+	if err == nil || (ctx != nil && ctx.Err() != nil) {
 		return
 	}
 	rC.logger.Error(err)
-	select {
-	case rC.stopChan <- syscall.SIGINT:
-	case <-ctx.Done():
-	}
+	common.RequestStop(rC.stopChan)
 }
 
 func (rC *znnNetwork) followBridgeAccount(ctx context.Context, hints <-chan []subscribe.AccountBlock, subscriptionErrors <-chan error, refresh func() error) {
@@ -1035,25 +1142,26 @@ func (rC *znnNetwork) processBridgeAccountPage(ctx context.Context, height uint6
 		if block.ConfirmationDetail == nil {
 			return height, false, errors.Errorf("bridge account block %d awaits confirmation", block.Height)
 		}
-		receive := block.BlockType == nom.BlockTypeContractReceive
-		switch block.BlockType {
-		case nom.BlockTypeContractReceive:
+		receive, err := bridgeAccountReceive(block.BlockType, block.Height)
+		if err != nil {
+			return height, false, err
+		}
+		if receive {
 			read, cancel := context.WithTimeout(ctx, rpc.ZnnLedgerTimeout)
 			send, err := rC.ZnnRpc().GetAccountBlockByHashContext(read, block.FromBlockHash)
 			cancel()
 			if err != nil {
 				return height, false, err
 			}
-			if send == nil || send.Hash != block.FromBlockHash || block.FromBlockHash == types.ZeroHash {
-				return height, false, errors.Errorf("missing paired send %s for receive %d", block.FromBlockHash, block.Height)
+			if err := checkPairedSend(block, send); err != nil {
+				return height, false, err
+			}
+			if err := ctx.Err(); err != nil {
+				return height, false, err
 			}
 			if err := rC.interpretSendBlockData(send, true, block.Height, refresh); err != nil {
 				return height, false, err
 			}
-		case nom.BlockTypeContractSend, nom.BlockTypeGenesisReceive:
-			// There is no bridge call to interpret.
-		default:
-			return height, false, errors.Errorf("unexpected bridge account block type %d at height %d", block.BlockType, block.Height)
 		}
 		height = block.Height
 		rC.coverage.block(rC.state.HealthStore(), height, receive, true)
@@ -1086,7 +1194,7 @@ func (rC *znnNetwork) CurrentCeremony() (common.CeremonyWindow, error) {
 	defer rC.settingsMu.Unlock()
 	ctx, cancel := context.WithTimeout(context.Background(), rpc.ZnnSettingsTimeout)
 	defer cancel()
-	tip, err := rC.signingTip(ctx)
+	tip, err := rC.frontierTip(ctx)
 	if err != nil {
 		return common.CeremonyWindow{}, err
 	}
@@ -1095,7 +1203,7 @@ func (rC *znnNetwork) CurrentCeremony() (common.CeremonyWindow, error) {
 		if err != nil {
 			return common.CeremonyWindow{}, err
 		}
-		next, err := rC.signingTip(ctx)
+		next, err := rC.frontierTip(ctx)
 		if err != nil {
 			return common.CeremonyWindow{}, err
 		}
@@ -1118,13 +1226,13 @@ func (rC *znnNetwork) CurrentCeremony() (common.CeremonyWindow, error) {
 	return common.CeremonyWindow{}, errors.New("frontier changed while reading the signing window")
 }
 
-func (rC *znnNetwork) signingTip(ctx context.Context) (types.HashHeight, error) {
+func (rC *znnNetwork) frontierTip(ctx context.Context) (types.HashHeight, error) {
 	m, err := rC.ZnnRpc().GetFrontierMomentumContext(ctx)
 	if err != nil {
 		return types.HashHeight{}, err
 	}
 	if m == nil || m.Momentum == nil || m.Height == 0 || m.Hash == types.ZeroHash {
-		return types.HashHeight{}, errors.New("invalid signing frontier")
+		return types.HashHeight{}, errors.New("invalid Zenon frontier momentum")
 	}
 	return m.Identifier(), nil
 }
@@ -1190,14 +1298,12 @@ func (rC *znnNetwork) recordSync(syncInfo *protocol.SyncInfo, err error) bool {
 func (rC *znnNetwork) IsHalted() bool {
 	bridgeInfo, err := rC.GetBridgeInfo()
 	if err != nil {
-		rC.logger.Error(err)
-		rC.stopChan <- syscall.SIGINT
+		rC.stopBridgeListener(rC.listenerCtx, err)
 		return true
 	}
 	frMom, frMomErr := rC.state.GetFrontierMomentum()
 	if frMomErr != nil {
-		rC.logger.Error(err)
-		rC.stopChan <- syscall.SIGINT
+		rC.stopBridgeListener(rC.listenerCtx, frMomErr)
 		return true
 	}
 

@@ -2,10 +2,10 @@ package unwrap
 
 import (
 	zdb "github.com/zenon-network/go-zenon/common/db"
+	"orchestrator/common"
 	"orchestrator/db"
 	"os"
 	"sync"
-	"syscall"
 )
 
 func getStorageIterator() []byte {
@@ -40,11 +40,7 @@ func (es *evmStorage) Snapshot() db.EvmStorage {
 // methods that hold the record mutex; blocking here would wedge every other
 // storage user behind the lock.
 func (es *evmStorage) SendSigInt() {
-	defer func() { _ = recover() }()
-	select {
-	case es.stopChan <- syscall.SIGINT:
-	default:
-	}
+	common.RequestStop(es.stopChan)
 }
 
 func NewEvmStorage(db zdb.DB, stopChan chan os.Signal, contractDeploymentHeight uint64) db.EvmStorage {

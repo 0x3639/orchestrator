@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/zenon-network/go-zenon/chain/nom"
 	"github.com/zenon-network/go-zenon/common/types"
 	"github.com/zenon-network/go-zenon/rpc/api"
 	"github.com/zenon-network/go-zenon/vm/embedded/definition"
@@ -14,7 +15,7 @@ import (
 
 func TestBridgeListenerReplaysFailedReceiveInOrder(t *testing.T) {
 	first, missed, last := startupReceive(2), startupReceive(3), startupReceive(4)
-	for _, failure := range []string{"lookup", "interpretation", "missing height", "unconfirmed"} {
+	for _, failure := range []string{"lookup", "interpretation", "missing height", "unconfirmed", "wrong send type", "wrong destination", "send timeout"} {
 		t.Run(failure, func(t *testing.T) {
 			recovered := false
 			ledger := &startupLedger{page: func(height uint64) *api.AccountBlockListMarshal {
@@ -43,6 +44,12 @@ func TestBridgeListenerReplaysFailedReceiveInOrder(t *testing.T) {
 						send := startupSend(b)
 						if b == missed && !recovered {
 							switch failure {
+							case "wrong send type":
+								send.BlockType = nom.BlockTypeUserReceive
+							case "wrong destination":
+								send.ToAddress = types.ZeroAddress
+							case "send timeout":
+								return nil, context.DeadlineExceeded
 							case "lookup":
 								return nil, errors.New("temporary RPC failure")
 							case "interpretation":
