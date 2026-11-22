@@ -170,11 +170,13 @@ func TestResentUnwrapNamingAnotherChainIsCheckedOnTheRegisteredChain(t *testing.
 	b := newReplayBridge(t)
 	b.request.Redeemed = 1
 	log := b.sourceLog(t, b.recipient.String())
+	var chain1Receipts atomic.Int32
 	chain1 := replayServer(t, func(method string) interface{} {
 		switch method {
 		case "embedded.bridge.getUnwrapTokenRequestByHashAndLog":
 			return b.request
 		case "eth_getTransactionReceipt":
+			chain1Receipts.Add(1)
 			return b.receipt()
 		case "eth_getLogs":
 			return []etypes.Log{log}
@@ -195,6 +197,38 @@ func TestResentUnwrapNamingAnotherChainIsCheckedOnTheRegisteredChain(t *testing.
 	if calls := chain2Calls.Load(); calls != 0 {
 		t.Fatalf("the check queried chain 2 %d times for a request registered on chain 1", calls)
 	}
+	if chain1Receipts.Load() == 0 {
+		t.Fatal("the source event was never looked up on chain 1, where the request is registered")
+	}
+}
+
+// Bridge networks are keyed by class and chain ID. A request registered on
+// another class that shares a chain ID with a configured EVM network says
+// nothing about that EVM network.
+func TestUnwrapRegisteredOnAnotherNetworkClassIsNotCheckedOnEvm(t *testing.T) {
+	b := newReplayBridge(t)
+	b.request.NetworkClass = definition.EvmClass + 1
+	var evmCalls atomic.Int32
+	url := replayServer(t, func(method string) interface{} {
+		if method == "embedded.bridge.getUnwrapTokenRequestByHashAndLog" {
+			return b.request
+		}
+		evmCalls.Add(1)
+		return nil
+	})
+	n, stores := replayNetwork(t, b, url, map[uint32]string{1: url})
+	if err := n.InterpretSendBlockData(b.send(t, 1, b.request.Amount, b.request.Signature), true, 42); err != nil {
+		t.Fatal(err)
+	}
+	if got := replayState(t, n); got != common.LiveState {
+		t.Fatalf("state %s", common.StateToText(got))
+	}
+	if evmCalls.Load() != 0 {
+		t.Fatalf("%d EVM calls for a request on another network class", evmCalls.Load())
+	}
+	if row, err := stores.evm[1].GetUnwrapRequestByHashAndLog(b.txHash, 0); err != nil || row != nil {
+		t.Fatalf("stored a row on the EVM network: %v, err %v", row, err)
+	}
 }
 
 // go-zenon's VM result codes for an embedded receive (vm/vm.go).
@@ -208,20 +242,27 @@ func receiveStatus(status uint64) []byte {
 	return binary.BigEndian.AppendUint64(nil, status)
 }
 
-// replayLedger serves one bridge receive at account height 2 and its paired
-// UnwrapToken send, the way a Zenon node returns them.
+// replayLedger serves consecutive bridge receives from account height 2, each
+// paired with its own copy of the UnwrapToken send, the way a Zenon node
+// returns them.
 type replayLedger struct {
-	receive, send *api.AccountBlockMarshal
-	frontier      uint64
+	blocks   map[types.Hash]*api.AccountBlockMarshal
+	receives []*api.AccountBlockMarshal
+	frontier uint64
 }
 
-func newReplayLedger(t *testing.T, b *replayBridge, status []byte, frontier uint64) *replayLedger {
+func newReplayLedger(t *testing.T, b *replayBridge, frontier uint64, statuses ...[]byte) *replayLedger {
 	t.Helper()
-	receive := startupReceive(2)
-	receive.Data = status
-	send := startupSend(receive)
-	send.Data = b.send(t, b.request.ChainId, b.request.Amount, b.request.Signature).Data
-	return &replayLedger{receive: receive, send: send, frontier: frontier}
+	l := &replayLedger{blocks: map[types.Hash]*api.AccountBlockMarshal{}, frontier: frontier}
+	for i, status := range statuses {
+		receive := startupReceive(byte(2 + i))
+		receive.Data = status
+		send := startupSend(receive)
+		send.Data = b.send(t, b.request.ChainId, b.request.Amount, b.request.Signature).Data
+		l.receives = append(l.receives, receive)
+		l.blocks[receive.Hash], l.blocks[send.Hash] = receive, send
+	}
+	return l
 }
 
 func (l *replayLedger) answer(t *testing.T, method string, params []json.RawMessage) (interface{}, bool) {
@@ -231,19 +272,19 @@ func (l *replayLedger) answer(t *testing.T, method string, params []json.RawMess
 		if len(params) < 2 || json.Unmarshal(params[1], &height) != nil {
 			t.Errorf("unexpected page request %s", params)
 		}
-		if height == l.receive.Height {
-			return startupPage(l.receive), true
+		var page []*api.AccountBlockMarshal
+		for _, receive := range l.receives {
+			if receive.Height >= height {
+				page = append(page, receive)
+			}
 		}
-		return startupPage(), true
+		return startupPage(page...), true
 	case "ledger.getAccountBlockByHash":
 		var hash types.Hash
 		if len(params) < 1 || json.Unmarshal(params[0], &hash) != nil {
 			t.Errorf("unexpected block request %s", params)
 		}
-		if hash == l.receive.Hash {
-			return l.receive, true
-		}
-		return l.send, true
+		return l.blocks[hash], true
 	case "stats.syncInfo":
 		return &protocol.SyncInfo{State: protocol.SyncDone}, true
 	case "ledger.getFrontierMomentum":
@@ -254,26 +295,28 @@ func (l *replayLedger) answer(t *testing.T, method string, params []json.RawMess
 
 // The bridge rejects a duplicate UnwrapToken and still produces a receive
 // block. That receive registered nothing, so a missing source receipt is not
-// evidence of a forged request. Every other status is checked: a successful
-// receive with the same missing receipt is exactly what a forged registration
-// looks like.
-func TestLiveListenerChecksEveryUnwrapReceiveExceptARejectedOne(t *testing.T) {
+// evidence of a forged request. An accepted receive with the same missing
+// receipt is exactly what a forged registration looks like. Without a
+// readable status the listener can tell neither apart and must wait.
+func TestLiveListenerActsOnTheBridgeReceiveStatus(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
 		status []byte
 		want   uint8
+		held   bool
 	}{
-		{"bridge rejected the send", receiveStatus(vmResultFail), common.LiveState},
-		{"bridge accepted the send", receiveStatus(vmResultSuccess), common.EmergencyState},
-		{"invalid status", receiveStatus(vmResultInvalid), common.EmergencyState},
-		{"unknown status", receiveStatus(3), common.EmergencyState},
-		{"no status", nil, common.EmergencyState},
-		{"short status", []byte{2}, common.EmergencyState},
+		{"bridge rejected the send", receiveStatus(vmResultFail), common.LiveState, false},
+		{"bridge accepted the send", receiveStatus(vmResultSuccess), common.EmergencyState, false},
+		{"invalid status", receiveStatus(vmResultInvalid), common.LiveState, true},
+		{"unknown status", receiveStatus(3), common.LiveState, true},
+		{"no status", nil, common.LiveState, true},
+		{"short status", []byte{2}, common.LiveState, true},
+		{"oversized status", append(receiveStatus(vmResultFail), 0), common.LiveState, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			b := newReplayBridge(t)
 			b.request.Redeemed = 1
-			ledger := newReplayLedger(t, b, tc.status, 104)
+			ledger := newReplayLedger(t, b, 104, tc.status)
 			url := replayServerWithParams(t, func(method string, params []json.RawMessage) interface{} {
 				if result, ok := ledger.answer(t, method, params); ok {
 					return result
@@ -302,15 +345,19 @@ func TestLiveListenerChecksEveryUnwrapReceiveExceptARejectedOne(t *testing.T) {
 			}
 
 			height, _, err := n.processBridgeAccountPage(n.listenerCtx, 1, n.refreshSettings)
-			if err != nil || height != 2 {
-				t.Fatalf("height %d, err %v", height, err)
+			wantHeight := uint64(2)
+			if tc.held {
+				wantHeight = 1
+			}
+			if (err != nil) != tc.held || height != wantHeight {
+				t.Fatalf("height %d, err %v; want height %d, held %v", height, err, wantHeight, tc.held)
 			}
 			if got := replayState(t, n); got != tc.want {
 				t.Fatalf("state %s, want %s", common.StateToText(got), common.StateToText(tc.want))
 			}
 			cursor, err := stores.znn.GetLastUpdateHeight()
-			if err != nil || cursor != 2 {
-				t.Fatalf("cursor %d, err %v; the receive must still be checkpointed", cursor, err)
+			if err != nil || cursor != wantHeight {
+				t.Fatalf("checkpoint %d, err %v, want %d", cursor, err, wantHeight)
 			}
 			row, err := stores.evm[1].GetUnwrapRequestByHashAndLog(b.txHash, 0)
 			if err != nil || row == nil {
@@ -318,6 +365,52 @@ func TestLiveListenerChecksEveryUnwrapReceiveExceptARejectedOne(t *testing.T) {
 			}
 			if row.RedeemStatus != common.RedeemedStatus || row.BlockHash != b.blockHash || row.From != sender {
 				t.Fatalf("the receive rewrote the stored row: status %d, block %s, sender %s", row.RedeemStatus, row.BlockHash, row.From)
+			}
+		})
+	}
+}
+
+// Each receive carries its own status. Rejected duplicates around an accepted
+// registration that has no source event must not hide it.
+func TestRejectedDuplicatesDoNotHideAForgedRegistration(t *testing.T) {
+	rejected, accepted := receiveStatus(vmResultFail), receiveStatus(vmResultSuccess)
+	for name, statuses := range map[string][][]byte{
+		"duplicate, then registration":          {rejected, accepted},
+		"registration, then duplicate":          {accepted, rejected},
+		"duplicates before and after":           {rejected, accepted, rejected},
+		"only duplicates (control, stays live)": {rejected, rejected},
+	} {
+		t.Run(name, func(t *testing.T) {
+			b := newReplayBridge(t)
+			ledger := newReplayLedger(t, b, 104, statuses...)
+			url := replayServerWithParams(t, func(method string, params []json.RawMessage) interface{} {
+				if result, ok := ledger.answer(t, method, params); ok {
+					return result
+				}
+				switch method {
+				case "embedded.bridge.getUnwrapTokenRequestByHashAndLog":
+					return b.request
+				case "eth_getTransactionReceipt":
+					return nil // no such transaction on the source chain
+				}
+				t.Errorf("unexpected method %s", method)
+				return nil
+			})
+			n, _ := replayNetwork(t, b, url, map[uint32]string{1: url})
+			n.SetConfirmationsToFinality(5)
+			if err := n.state.SetFrontierMomentum(104); err != nil {
+				t.Fatal(err)
+			}
+			height, _, err := n.processBridgeAccountPage(n.listenerCtx, 1, n.refreshSettings)
+			if want := uint64(1 + len(statuses)); err != nil || height != want {
+				t.Fatalf("height %d, err %v, want %d", height, err, want)
+			}
+			want := common.EmergencyState
+			if strings.HasPrefix(name, "only duplicates") {
+				want = common.LiveState
+			}
+			if got := replayState(t, n); got != want {
+				t.Fatalf("state %s, want %s", common.StateToText(got), common.StateToText(want))
 			}
 		})
 	}
@@ -339,7 +432,7 @@ func TestStartupSyncRecordsAnAcceptedUnwrapAndSkipsARejectedOne(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			b := newReplayBridge(t)
 			log := b.sourceLog(t, b.recipient.String())
-			ledger := newReplayLedger(t, b, tc.status, 1000)
+			ledger := newReplayLedger(t, b, 1000, tc.status)
 			url := replayServerWithParams(t, func(method string, params []json.RawMessage) interface{} {
 				if result, ok := ledger.answer(t, method, params); ok {
 					return result
@@ -453,6 +546,46 @@ func TestUnwrapRecipientIsComparedByValue(t *testing.T) {
 			}
 			if got := replayState(t, n); got != tc.want {
 				t.Fatalf("state %s, want %s", common.StateToText(got), common.StateToText(tc.want))
+			}
+		})
+	}
+}
+
+// Signers create no request for an unwrap whose beneficiary is an embedded
+// contract address, so a registration paying one was not signed from this
+// source event, however the log spells it.
+func TestRegistrationPayingAnEmbeddedBeneficiaryIsNotASourceMatch(t *testing.T) {
+	embedded := types.BridgeContract
+	if !types.IsEmbeddedAddress(embedded) {
+		t.Fatal("fixture address is not embedded")
+	}
+	for name, to := range map[string]string{
+		"lowercase":      embedded.String(),
+		"uppercase":      strings.ToUpper(embedded.String()),
+		"with affiliate": embedded.String() + "&" + testRecipient,
+	} {
+		t.Run(name, func(t *testing.T) {
+			b := newReplayBridge(t)
+			b.request.ToAddress = embedded
+			log := b.sourceLog(t, to)
+			url := replayServer(t, func(method string) interface{} {
+				switch method {
+				case "embedded.bridge.getUnwrapTokenRequestByHashAndLog":
+					return b.request
+				case "eth_getTransactionReceipt":
+					return b.receipt()
+				case "eth_getLogs":
+					return []etypes.Log{log}
+				}
+				t.Errorf("unexpected method %s", method)
+				return nil
+			})
+			n, _ := replayNetwork(t, b, url, map[uint32]string{1: url})
+			if err := n.InterpretSendBlockData(b.send(t, 1, b.request.Amount, b.request.Signature), true, 42); err != nil {
+				t.Fatal(err)
+			}
+			if got := replayState(t, n); got != common.EmergencyState {
+				t.Fatalf("state %s, want %s", common.StateToText(got), common.StateToText(common.EmergencyState))
 			}
 		})
 	}

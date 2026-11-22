@@ -372,19 +372,33 @@ func (rC *znnNetwork) interpretConfirmedReceive(ctx context.Context, receive, se
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	return rC.interpretSendBlockData(ctx, send, mode, embeddedReceiveFailed(receive), receive.Height, refresh)
+	return rC.interpretSendBlockData(ctx, send, mode, embeddedReceiveOutcome(receive), receive.Height, refresh)
 }
 
-// go-zenon's VM writes the result of an embedded method into the receive
-// block's data as a big-endian uint64: 1 when the method succeeded and 2 when
-// it returned an error and its contract changes were rolled back (vm/vm.go).
-const embeddedReceiveRejected uint64 = 2
+type receiveOutcome uint8
+
+const (
+	receiveOutcomeUnknown receiveOutcome = iota
+	receiveAccepted
+	receiveRejected
+)
 
 // The bridge creates a receive block for every send, including one whose
-// method returned an error. Only the explicit failure status counts: a
-// success, a missing status and an unknown status are all checked as accepted.
-func embeddedReceiveFailed(receive *api.AccountBlock) bool {
-	return len(receive.Data) == 8 && binary.BigEndian.Uint64(receive.Data) == embeddedReceiveRejected
+// method returned an error. go-zenon's VM writes the result into the receive
+// block's data as a big-endian uint64: 1 when the method succeeded and 2 when
+// it returned an error and its contract changes were rolled back (vm/vm.go).
+// Every bridge receive on the ledger carries one of the two.
+func embeddedReceiveOutcome(receive *api.AccountBlock) receiveOutcome {
+	if len(receive.Data) != 8 {
+		return receiveOutcomeUnknown
+	}
+	switch binary.BigEndian.Uint64(receive.Data) {
+	case 1:
+		return receiveAccepted
+	case 2:
+		return receiveRejected
+	}
+	return receiveOutcomeUnknown
 }
 
 // Bech32 also accepts an all-uppercase spelling, and the EVM contract emits
@@ -394,17 +408,17 @@ func sameZenonAddress(source string, registered types.Address) bool {
 	return err == nil && parsed == registered
 }
 
-// InterpretSendBlockData interprets a send without its receive block, so it
-// cannot tell whether the bridge accepted the send.
+// InterpretSendBlockData interprets a send as one the bridge accepted. The
+// listener and startup sync read the outcome from the receive block instead.
 func (rC *znnNetwork) InterpretSendBlockData(sendBlock *api.AccountBlock, live bool, receiveBlockHeight uint64) error {
 	mode := startupHistory
 	if live {
 		mode = liveReceive
 	}
-	return rC.interpretSendBlockData(rC.listenerCtx, sendBlock, mode, false, receiveBlockHeight, rC.refreshSettings)
+	return rC.interpretSendBlockData(rC.listenerCtx, sendBlock, mode, receiveAccepted, receiveBlockHeight, rC.refreshSettings)
 }
 
-func (rC *znnNetwork) interpretSendBlockData(ctx context.Context, sendBlock *api.AccountBlock, mode receiveMode, receiveFailed bool, receiveBlockHeight uint64, refreshSettings func() error) error {
+func (rC *znnNetwork) interpretSendBlockData(ctx context.Context, sendBlock *api.AccountBlock, mode receiveMode, outcome receiveOutcome, receiveBlockHeight uint64, refreshSettings func() error) error {
 	live := mode == liveReceive
 	rC.logger.Debugf("InterpretSendBlockData, live: %v", live)
 	if len(sendBlock.Data) < 4 {
@@ -524,10 +538,16 @@ func (rC *znnNetwork) interpretSendBlockData(ctx context.Context, sendBlock *api
 		// Anyone can resend UnwrapToken for a transaction and log index that
 		// are already registered. The bridge rejects the duplicate, so that
 		// send describes no request and must not be checked as if it did.
-		if receiveFailed {
+		if outcome == receiveRejected {
 			rC.logger.Infof("ignoring UnwrapToken send %s for %s/%d: the bridge rejected it and registered nothing",
 				sendBlock.Hash, param.TransactionHash.String(), param.LogIndex)
 			break
+		}
+		// Without the outcome a rejected duplicate looks like a registration
+		// with no source event, and an accepted one would rewrite the stored
+		// row. Hold the checkpoint until the endpoint returns the status.
+		if outcome != receiveAccepted {
+			return errors.Errorf("bridge receive at height %d for UnwrapToken send %s has no readable execution status", receiveBlockHeight, sendBlock.Hash)
 		}
 
 		// The registered request names the source chain. The send's own
@@ -594,8 +614,12 @@ func (rC *znnNetwork) interpretSendBlockData(ctx context.Context, sendBlock *api
 								rC.logger.Debugf("Could not parse unwrapped event with error: %s", parseErr.Error())
 							} else {
 								addresses := strings.Split(unwrapRequest.To, common.AffiliateProgramAddressSeparator)
-								if _, errParse := common.ParseAddressString(addresses[0], definition.NoMClass); errParse != nil {
+								if beneficiary, errParse := types.ParseAddress(addresses[0]); errParse != nil {
 									rC.logger.Debugf("Could not parse zenon address: %s with error: %s", addresses[0], errParse.Error())
+								} else if types.IsEmbeddedAddress(beneficiary) {
+									// Ingestion creates no request for an embedded
+									// beneficiary, so no signer registers one.
+									rC.logger.Debugf("Source beneficiary %s is an embedded address", addresses[0])
 								} else {
 									// We have to check the proper amounts for the initiator or the affiliate amount
 									parseOk := false
