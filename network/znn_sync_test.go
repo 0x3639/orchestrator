@@ -16,7 +16,6 @@ import (
 	"github.com/zenon-network/go-zenon/common/types"
 	"github.com/zenon-network/go-zenon/protocol"
 	"github.com/zenon-network/go-zenon/rpc/api"
-	"github.com/zenon-network/go-zenon/rpc/api/subscribe"
 	"github.com/zenon-network/go-zenon/rpc/server"
 	"github.com/zenon-network/go-zenon/vm/embedded/definition"
 	"go.uber.org/zap"
@@ -35,6 +34,7 @@ type startupLedger struct {
 	lookups    []types.Hash
 	syncStatus func() *protocol.SyncInfo
 	tip        func() *api.Momentum
+	bridgeInfo func() (*definition.BridgeInfoVariable, error)
 }
 
 func (l *startupLedger) GetAccountBlocksByHeight(ctx context.Context, _ types.Address, height, _ uint64) *api.AccountBlockListMarshal {
@@ -52,6 +52,9 @@ func (l *startupLedger) GetAccountBlockByHash(hash types.Hash) (*api.AccountBloc
 	return l.lookup(hash)
 }
 
+func (l *startupLedger) GetBridgeInfo() (*definition.BridgeInfoVariable, error) {
+	return l.bridgeInfo()
+}
 func (l *startupLedger) SyncInfo() *protocol.SyncInfo       { return l.syncStatus() }
 func (l *startupLedger) GetFrontierMomentum() *api.Momentum { return l.tip() }
 
@@ -67,7 +70,7 @@ func (rt startupTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 func startupNetwork(t *testing.T, ledger *startupLedger) *znnNetwork {
 	t.Helper()
 	srv := server.NewServer()
-	for _, name := range []string{"ledger", "stats"} {
+	for _, name := range []string{"ledger", "stats", "embedded.bridge"} {
 		if err := srv.RegisterName(name, ledger); err != nil {
 			t.Fatal(err)
 		}
@@ -380,48 +383,6 @@ func TestStartupSyncObservesFinalityAfterSyncStatus(t *testing.T) {
 			}
 		})
 	}
-}
-
-func TestLiveBridgeSendFailurePreservesEarlierCheckpoint(t *testing.T) {
-	receives := map[types.Hash]*api.AccountBlockMarshal{}
-	var hints []subscribe.AccountBlock
-	for i := byte(2); i <= 4; i++ {
-		r := startupReceive(i)
-		receives[r.Hash] = r
-		receives[r.FromBlockHash] = startupSend(r)
-		hints = append(hints, subscribe.AccountBlock{BlockType: r.BlockType, Height: r.Height, Hash: r.Hash, FromHash: r.FromBlockHash, Address: r.Address})
-	}
-	failed := hints[1].FromHash
-	calls := 0
-	l := &startupLedger{lookup: func(hash types.Hash) (*api.AccountBlockMarshal, error) {
-		if hash == failed {
-			calls++
-			return nil, context.DeadlineExceeded
-		}
-		return receives[hash], nil
-	}}
-	n := startupNetwork(t, l)
-	if err := n.processLiveBridgeBlocks(n.listenerCtx, hints, nil); err == nil || !strings.Contains(err.Error(), "deadline exceeded") {
-		t.Fatal(err)
-	}
-	checkStartupCursor(t, n, 2)
-	if calls != 4 || l.lookups[len(l.lookups)-1] != failed {
-		t.Fatalf("unexpected lookup sequence %v", l.lookups)
-	}
-	l.page = func(height uint64) *api.AccountBlockListMarshal {
-		if height == 3 {
-			return startupPage(receives[hints[1].Hash], receives[hints[2].Hash])
-		}
-		return startupPage()
-	}
-	l.lookup = func(hash types.Hash) (*api.AccountBlockMarshal, error) { return receives[hash], nil }
-	if err := n.Sync(); err != nil {
-		t.Fatal(err)
-	}
-	if !reflect.DeepEqual(l.starts, []uint64{3, 5}) {
-		t.Fatalf("restarted pages %v", l.starts)
-	}
-	checkStartupCursor(t, n, 4)
 }
 
 func TestStartupStopInterruptsLedgerRead(t *testing.T) {

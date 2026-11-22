@@ -61,7 +61,7 @@ func CreateOrOpenLevelDb(name string) (*leveldb.DB, error) {
 		}
 	}
 
-	return ldb, nil
+	return ldb, err
 }
 
 func DeleteLvlDb(name string) error {

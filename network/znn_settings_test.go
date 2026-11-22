@@ -12,6 +12,7 @@ import (
 
 	"github.com/zenon-network/go-zenon/chain/nom"
 	"github.com/zenon-network/go-zenon/common/types"
+	"github.com/zenon-network/go-zenon/protocol"
 	"github.com/zenon-network/go-zenon/rpc/api"
 	"github.com/zenon-network/go-zenon/rpc/api/subscribe"
 	"github.com/zenon-network/go-zenon/rpc/server"
@@ -42,6 +43,9 @@ func (p *stalledSettingsEndpoint) GetOrchestratorInfo() *definition.Orchestrator
 	<-p.release
 	return &definition.OrchestratorInfo{WindowSize: 10, KeyGenThreshold: 1, ConfirmationsToFinality: 1, EstimatedMomentumTime: 1}
 }
+func (*stalledSettingsEndpoint) SyncInfo() *protocol.SyncInfo {
+	return &protocol.SyncInfo{State: protocol.SyncDone}
+}
 func (*stalledSettingsEndpoint) GetBridgeInfo() *definition.BridgeInfoVariable {
 	return &definition.BridgeInfoVariable{Halted: true}
 }
@@ -50,6 +54,15 @@ func (*stalledSettingsEndpoint) GetFrontierMomentum() *api.Momentum {
 }
 func (p *stalledSettingsEndpoint) GetAccountBlockByHash(hash types.Hash) *api.AccountBlockMarshal {
 	return p.blocks[hash]
+}
+func (p *stalledSettingsEndpoint) GetAccountBlocksByHeight(_ types.Address, height, count uint64) *api.AccountBlockListMarshal {
+	page := &api.AccountBlockListMarshal{List: []*api.AccountBlockMarshal{}}
+	for _, receipt := range p.receipts {
+		if receipt.Height >= height && uint64(len(page.List)) < count {
+			page.List = append(page.List, p.blocks[receipt.Hash])
+		}
+	}
+	return page
 }
 func (p *stalledSettingsEndpoint) AccountBlocksByAddress(ctx context.Context, address types.Address) (*server.Subscription, error) {
 	notifier, ok := server.NotifierFromContext(ctx)
@@ -68,7 +81,8 @@ type checkpointStore struct {
 	saved chan uint64
 }
 
-func (s checkpointStore) SetLastUpdateHeight(h uint64) error { s.saved <- h; return nil }
+func (s checkpointStore) GetLastUpdateHeight() (uint64, error) { return 0, nil }
+func (s checkpointStore) SetLastUpdateHeight(h uint64) error   { s.saved <- h; return nil }
 
 type settingsTestStores struct {
 	networkEventStores
@@ -90,11 +104,11 @@ func TestStalledSettingsCannotDelayHalt(t *testing.T) {
 	for i, data := range [][]byte{resize, halt} {
 		recv, send := types.Hash{byte(2*i + 1)}, types.Hash{byte(2*i + 2)}
 		p.receipts = append(p.receipts, subscribe.AccountBlock{Address: types.BridgeContract, Height: uint64(i + 1), BlockType: nom.BlockTypeContractReceive, Hash: recv, FromHash: send})
-		p.blocks[recv] = &api.AccountBlockMarshal{AccountBlockMarshal: nom.AccountBlockMarshal{BlockType: nom.BlockTypeContractReceive, Height: uint64(i + 1), Hash: recv, Address: types.BridgeContract, FromBlockHash: send, Amount: "0"}, ConfirmationDetail: &api.AccountBlockConfirmationDetail{MomentumHeight: 170}}
+		p.blocks[recv] = &api.AccountBlockMarshal{AccountBlockMarshal: nom.AccountBlockMarshal{Height: uint64(i + 1), BlockType: nom.BlockTypeContractReceive, Hash: recv, Address: types.BridgeContract, FromBlockHash: send, Amount: "0"}, ConfirmationDetail: &api.AccountBlockConfirmationDetail{MomentumHeight: 170}}
 		p.blocks[send] = &api.AccountBlockMarshal{AccountBlockMarshal: nom.AccountBlockMarshal{BlockType: nom.BlockTypeUserSend, ToAddress: types.BridgeContract, Hash: send, Address: types.ZeroAddress, Data: data, Amount: "0"}}
 	}
 	srv := server.NewServer()
-	for _, name := range []string{"ledger", "embedded.bridge"} {
+	for _, name := range []string{"ledger", "stats", "embedded.bridge"} {
 		if err := srv.RegisterName(name, p); err != nil {
 			t.Fatal(err)
 		}
@@ -110,9 +124,8 @@ func TestStalledSettingsCannotDelayHalt(t *testing.T) {
 		t.Fatal(err)
 	}
 	saved := make(chan uint64, 2)
-	listenerCtx, cancelListener := context.WithCancel(context.Background())
-	defer cancelListener()
-	n := &znnNetwork{listenerCtx: listenerCtx, cancelListener: cancelListener, rpcManager: clients, state: state, administrator: types.ZeroAddress.String(), dbManager: settingsTestStores{store: checkpointStore{saved: saved}}, stopChan: stop, logger: zap.NewNop().Sugar()}
+	n := &znnNetwork{listenerCtx: context.Background(), rpcManager: clients, state: state, administrator: types.ZeroAddress.String(), dbManager: settingsTestStores{store: checkpointStore{saved: saved}}, stopChan: stop, logger: zap.NewNop().Sugar()}
+	n.SetConfirmationsToFinality(1)
 	release := sync.OnceFunc(func() { close(p.release) })
 	var wg sync.WaitGroup
 	defer func() {
@@ -138,7 +151,7 @@ func TestStalledSettingsCannotDelayHalt(t *testing.T) {
 	}
 	wg.Add(1)
 	go func() { defer wg.Done(); n.ListenForEmbeddedBridgeAccountBlocks() }()
-	// Both checkpoints must remain independent of the stalled settings read.
+	// The listener can advance both receipts while the signing read is stalled.
 	deadline := time.After(14 * time.Second)
 	for want := uint64(1); want <= 2; want++ {
 		select {

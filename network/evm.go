@@ -30,8 +30,12 @@ import (
 )
 
 type evmNetwork struct {
-	stopHealth func()
-	health     *snapshot.Store
+	// A runtime addition uses its own client until startup succeeds.
+	client        *rpc.EvmRpc
+	startupDone   <-chan struct{}
+	rollbackStore func()
+	stopHealth    func()
+	health        *snapshot.Store
 	config.EvmParams
 	unconfirmedQueue *dque.DQue
 	dbManager        networkEventStores
@@ -103,14 +107,19 @@ func NewEvmNetwork(network *definition.NetworkInfo, dbManager networkEventStores
 		return nil, err
 	}
 
-	dbManager.AddEvmEventStore(network.Id, network.Name, newConfig.ContractDeploymentHeight())
-
 	newLogger, errLog := common.CreateSugarLogger()
 	if errLog != nil {
+		_ = newQueue.Close()
 		return nil, errLog
+	}
+	rollback, err := dbManager.AddEvmEventStore(network.Id, network.Name, newConfig.ContractDeploymentHeight())
+	if err != nil {
+		_ = newQueue.Close()
+		return nil, err
 	}
 
 	newEvmNetwork := &evmNetwork{
+		rollbackStore:    rollback,
 		EvmParams:        newConfig,
 		health:           state.HealthStore(),
 		dbManager:        dbManager,
@@ -139,6 +148,8 @@ func (eN *evmNetwork) sleep(d time.Duration) bool {
 	select {
 	case <-timer.C:
 		return true
+	case <-eN.startupDone:
+		return false
 	case <-eN.done:
 		return false
 	}
@@ -220,6 +231,11 @@ func (eN *evmNetwork) Start() (startErr error) {
 		return err
 	}
 
+	select {
+	case <-eN.startupDone:
+		return context.Canceled
+	default:
+	}
 	eN.observeQueueDepth()
 	go eN.SubscribeToEvents()
 	// todo defer unsub?
@@ -233,6 +249,9 @@ func (eN *evmNetwork) eventsStore() db.EvmStorage {
 }
 
 func (eN *evmNetwork) EvmRpc() *rpc.EvmRpc {
+	if eN.client != nil {
+		return eN.client
+	}
 	return eN.rpcManager.Evm(eN.ChainId())
 }
 
@@ -354,7 +373,7 @@ func (eN *evmNetwork) Sync() error {
 		}
 
 		if eN.queryRange == nil {
-			eN.queryRange = newQueryRangeAdapter(eN.rpcManager.Evm(eN.ChainId()).FilterQuerySize())
+			eN.queryRange = newQueryRangeAdapter(eN.EvmRpc().FilterQuerySize())
 		}
 		if !rangeFrozen {
 			// Both RPC bounds are inclusive. Limit the offset before adding so a
@@ -560,7 +579,7 @@ func (eN *evmNetwork) InterpretLog(log etypes.Log, live bool) error {
 				if live {
 					if stateErr := eN.state.SetState(common.EmergencyState); stateErr != nil {
 						eN.logger.Info("sent SIGINT from here 4")
-						eN.stopChan <- syscall.SIGINT
+						eN.requestStop()
 						return stateErr
 					}
 				}
@@ -571,7 +590,7 @@ func (eN *evmNetwork) InterpretLog(log etypes.Log, live bool) error {
 			if live {
 				if stateErr := eN.state.SetState(common.EmergencyState); stateErr != nil {
 					eN.logger.Info("sent SIGINT from here 5")
-					eN.stopChan <- syscall.SIGINT
+					eN.requestStop()
 					return stateErr
 				}
 			}
@@ -585,7 +604,7 @@ func (eN *evmNetwork) InterpretLog(log etypes.Log, live bool) error {
 				if live {
 					if stateErr := eN.state.SetState(common.EmergencyState); stateErr != nil {
 						eN.logger.Info("sent SIGINT from here 8")
-						eN.stopChan <- syscall.SIGINT
+						eN.requestStop()
 						return stateErr
 					}
 				}
@@ -655,14 +674,14 @@ func (eN *evmNetwork) InterpretLog(log etypes.Log, live bool) error {
 			currentState, err := eN.state.GetState()
 			if err != nil {
 				eN.logger.Debug(err)
-				eN.stopChan <- syscall.SIGINT
+				eN.requestStop()
 				return err
 			}
 			// if the node is in emergency, it will set the state to halted after all txs, we don't need to do it after we see one
 			if currentState != common.EmergencyState {
 				if err := eN.state.SetState(common.HaltedState); err != nil {
 					eN.logger.Debug(err)
-					eN.stopChan <- syscall.SIGINT
+					eN.requestStop()
 					return err
 				}
 			}

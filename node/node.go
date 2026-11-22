@@ -78,7 +78,9 @@ func NewNode(config *oconfig.Config, logger *zap.Logger) (_ *Node, initErr error
 		config:   config,
 		logger:   logger.Sugar(),
 		stopChan: make(chan os.Signal, 1),
-		state:    common.NewGlobalState(&config.GlobalState),
+		state: common.NewPersistentGlobalState(&config.GlobalState, func(state uint8) error {
+			return oconfig.WriteGlobalState(config.DataPath, state)
+		}),
 	}
 
 	// prepare node
@@ -92,6 +94,9 @@ func NewNode(config *oconfig.Config, logger *zap.Logger) (_ *Node, initErr error
 			node.closeDataDir()
 		}
 	}()
+	if err := config.InitializeLocked(); err != nil {
+		return nil, err
+	}
 	if config.HealthConfig.SnapshotSocket != "" {
 		store := snapshot.New(metadata.Version, metadata.GitCommit)
 		server, listenErr := health.ListenSnapshot(config.HealthConfig.SnapshotSocket, store, config.HealthConfig)
@@ -164,7 +169,7 @@ func NewNode(config *oconfig.Config, logger *zap.Logger) (_ *Node, initErr error
 		node.state.SetIsAdministratorActive(true)
 	}
 
-	if err := oconfig.WriteConfig(*node.config); err != nil {
+	if err := node.SaveConfig(); err != nil {
 		node.logger.Info(err.Error())
 	}
 
@@ -746,7 +751,7 @@ func (node *Node) processSignatures() {
 			//	}
 			//}
 
-			if err := oconfig.WriteConfig(*node.config); err != nil {
+			if err := node.SaveConfig(); err != nil {
 				node.logger.Info(err.Error())
 			}
 		case common.LiveState:
@@ -1541,6 +1546,10 @@ func (node *Node) haltNetworksAdministrator() {
 }
 
 // Getters
+
+func (node *Node) SaveConfig() error {
+	return node.state.SaveConfig(func() error { return oconfig.WriteConfig(*node.config) })
+}
 
 func (node *Node) GetConfig() *oconfig.Config {
 	return node.config

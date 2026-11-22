@@ -1,11 +1,9 @@
 package app
 
 import (
-	"github.com/pkg/errors"
 	"go.uber.org/zap"
 	"gopkg.in/urfave/cli.v1"
 	"orchestrator/common"
-	"orchestrator/common/config"
 	"orchestrator/node"
 	"os"
 	"os/signal"
@@ -108,10 +106,5 @@ func (nodeManager *Manager) Stop() error {
 
 func (nodeManager *Manager) SaveConfig() error {
 	nodeManager.logger.Info("Write config to file")
-	conf := nodeManager.node.GetConfig()
-	if conf != nil {
-		nodeManager.logger.Info("wrote config at the end")
-		return config.WriteConfig(*conf)
-	}
-	return errors.New("Invalid config")
+	return nodeManager.node.SaveConfig()
 }

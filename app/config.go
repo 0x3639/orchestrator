@@ -35,11 +35,6 @@ func MakeConfig() (*config.Config, error) {
 		common.GlobalLogger.Info("Using the following orchestrator config: \n", string(j))
 	}
 
-	// 6: Write it so a default one is created after the first run
-	if err := config.WriteConfig(cfg); err != nil {
-		return nil, err
-	}
-
 	return &cfg, nil
 }
 
