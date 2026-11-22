@@ -16,6 +16,7 @@ import (
 	"orchestrator/db"
 	"orchestrator/rpc"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -459,89 +460,37 @@ func (eN *evmNetwork) InterpretLog(log etypes.Log, live bool) error {
 		eN.logger.Infof("InterpretLog - ignoring removed log tx: %s logIndex: %d block: %d", log.TxHash.String(), log.Index, log.BlockNumber)
 		return nil
 	}
+	if log.Address != *eN.ContractAddress() || len(log.Topics) == 0 {
+		return fmt.Errorf("unexpected EVM log emitter or missing event topic in block %d", log.BlockNumber)
+	}
 	eN.logger.Infof("InterpretLog - tx: %s and log topic: %s - live: %v", log.TxHash.String(), log.Topics[0].Hex(), live)
 
 	switch log.Topics[0].Hex() {
 	case common.UnwrapSigHash.Hex():
-		unwrapped, errParse := eN.EvmRpc().Bridge().ParseUnwrapped(log)
-		if errParse != nil {
-			return errParse
+		if uint64(log.Index) >= uint64(common.AffiliateLogIndexAddition) {
+			return fmt.Errorf("source log index %d overlaps the reserved affiliate range", log.Index)
 		}
-		eN.logger.Debug("Found unwrap event evm")
-
-		if len(unwrapped.To) == 0 {
-			eN.logger.Debugf("Could not parse zenon address: %s", unwrapped.To)
-			break
-		}
-		addresses := strings.Split(unwrapped.To, common.AffiliateProgramAddressSeparator)
-		// only process events that have valid addresses
-		if beneficiaryZnn, errParseBeneficiary := common.ParseAddressString(addresses[0], definition.NoMClass); errParseBeneficiary != nil {
-			eN.logger.Debugf("Could not parse zenon address: %s", addresses[0])
-			break
-		} else if types.IsEmbeddedAddress(beneficiaryZnn.(types.Address)) {
-			eN.logger.Debugf("Beneficiary cannot be an embedded: %s for hash: %s, logIndex: %d",
-				addresses[0], log.TxHash.String(), log.Index)
-			break
-		}
-
-		var eventsToProcess []*events.UnwrapRequestEvm
-
-		event := &events.UnwrapRequestEvm{
-			NetworkClass:    eN.NetworkClass(),
-			ChainId:         eN.ChainId(),
-			BlockNumber:     log.BlockNumber,
-			BlockHash:       log.BlockHash,
-			TransactionHash: log.TxHash,
-			LogIndex:        uint32(log.Index),
-			From:            unwrapped.From,
-			To:              addresses[0], // this element will always exist even if unwrapped.To is the empty string and we know that it is a valid address
-			Token:           unwrapped.Token,
-			Amount:          big.NewInt(0).Set(unwrapped.Amount),
-			Signature:       "",
-			RedeemStatus:    common.UnredeemedStatus,
-		}
-		eventsToProcess = append(eventsToProcess, event)
-
-		token := strings.ToLower(unwrapped.Token.String())
-		affiliateStartingHeight := eN.state.GetAffiliateStartingHeight(eN.ChainId()).Uint64()
-		isAffiliateProgramActive := eN.state.GetIsAffiliateProgramActive(eN.ChainId(), token)
-		isAffiliateProgramActive = isAffiliateProgramActive && (log.BlockNumber >= affiliateStartingHeight)
-		isAffiliateProgramActive = isAffiliateProgramActive && (affiliateStartingHeight > 0)
-
-		// Add affiliate event if: affiliate is active for that token, affiliate program has started, the affiliate address exists and is correct
-		if isAffiliateProgramActive && len(addresses) > 1 {
-			if affiliateAddress, errParseAffiliate := common.ParseAddressString(addresses[1], definition.NoMClass); errParseAffiliate != nil {
-				eN.logger.Debugf("Could not parse zenon address '%s' for affiliate with error: %s", addresses[1], errParseAffiliate.Error())
-			} else if types.IsEmbeddedAddress(affiliateAddress.(types.Address)) {
-				eN.logger.Debugf("Affiliate address cannot be an embedded: %s for hash: %s, logIndex: %d",
-					addresses[1], log.TxHash.String(), log.Index)
-			} else {
-				initiatorAmount := big.NewInt(0).Set(unwrapped.Amount)
-				initiatorAmount.Div(initiatorAmount, big.NewInt(100))                     // 1%
-				eventsToProcess[0].Amount.Add(eventsToProcess[0].Amount, initiatorAmount) // 101%
-
-				affiliateAmount := big.NewInt(0).Set(unwrapped.Amount)
-				affiliateAmount.Mul(affiliateAmount, big.NewInt(2))
-				affiliateAmount.Div(affiliateAmount, big.NewInt(100)) // 2%
-
-				affiliateEvent := &events.UnwrapRequestEvm{
-					NetworkClass:    eN.NetworkClass(),
-					ChainId:         eN.ChainId(),
-					BlockNumber:     log.BlockNumber,
-					BlockHash:       log.BlockHash,
-					TransactionHash: log.TxHash,
-					LogIndex:        uint32(log.Index) + common.AffiliateLogIndexAddition,
-					From:            unwrapped.From,
-					To:              addresses[1], // we checked this exists
-					Token:           unwrapped.Token,
-					Amount:          affiliateAmount,
-					Signature:       "",
-					RedeemStatus:    common.UnredeemedStatus,
-				}
-				eventsToProcess = append(eventsToProcess, affiliateEvent)
+		if !live {
+			canonical, err := eN.agreedHashForLog(log.BlockNumber, log.BlockHash)
+			if err != nil {
+				return fmt.Errorf("cannot validate historical unwrap %s/%d against the canonical chain: %w", log.TxHash, log.Index, err)
+			}
+			if canonical != log.BlockHash {
+				eN.logger.Warnf("Skipping historical unwrap %s/%d from block %d (%s): every endpoint agrees the canonical block is %s", log.TxHash, log.Index, log.BlockNumber, log.BlockHash, canonical)
+				break
+			}
+			source, err := eN.EvmRpc().AgreedUnwrapLog(log.BlockNumber, log.BlockHash, log.TxHash, uint32(log.Index), eN.ConfirmationsToFinality())
+			if err != nil {
+				return err
+			}
+			if !slices.Equal(source.Topics, log.Topics) || !slices.Equal(source.Data, log.Data) {
+				return errors.New("historical range log differs from the agreed unwrap evidence")
 			}
 		}
-
+		eventsToProcess, err := eN.unwrapRequestsFromLog(log, nil)
+		if err != nil {
+			return err
+		}
 		for _, ev := range eventsToProcess {
 			// we enqueue the event only if we are live or we don't have confirmations
 			if live {
@@ -555,26 +504,9 @@ func (eN *evmNetwork) InterpretLog(log etypes.Log, live bool) error {
 				}
 				eN.logger.Info("Successfully enqueued event")
 			} else {
-				// Historical logs bypass the unconfirmed queue, so a backend on
-				// a minority fork must not be able to plant a fork-only record.
-				// The range log itself is the presence evidence: it is stored
-				// when every endpoint agrees its block is canonical, skipped
-				// when every endpoint agrees on a different block (an orphan
-				// log), and the range is retried when endpoints disagree or
-				// fail. This never pins on a provider that cannot serve
-				// block-hash log queries.
-				canonical, err := eN.agreedHashForLog(ev.BlockNumber, ev.BlockHash)
-				if err != nil {
-					return fmt.Errorf("cannot validate historical unwrap %s/%d against the canonical chain: %w", ev.TransactionHash.String(), ev.LogIndex, err)
-				}
-				if canonical != ev.BlockHash {
-					eN.logger.Warnf("Skipping historical unwrap %s/%d from block %d (%s): every endpoint agrees the canonical block is %s",
-						ev.TransactionHash.String(), ev.LogIndex, ev.BlockNumber, ev.BlockHash.Hex(), canonical.Hex())
-					continue
-				}
 				// Present already when the znn sync or a previous pass stored it;
 				// UpdateUnwrapRequestBlockNumber inserts when missing and otherwise
-				// only refreshes the block fields, never the signature or status.
+				// refreshes the block fields and missing sender, preserving signature and status.
 				if err := eN.eventsStore().UpdateUnwrapRequestBlockNumber(*ev); err != nil {
 					return err
 				}
@@ -980,7 +912,7 @@ func (eN *evmNetwork) ProcessEvents() {
 		}
 		eN.logger.Debugf("Processing evm event %s", key)
 
-		decision := confirmQueuedEvent(eN.EvmRpc(), frontEvent, *eN.ContractAddress(), eN.EvmParams.ConfirmationsToFinality(), eN.EvmParams.EstimatedBlockTime())
+		decision := eN.confirmUnwrap(frontEvent)
 
 		switch decision.outcome {
 		case outcomeRetry:

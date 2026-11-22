@@ -8,31 +8,25 @@ law wrap_waits_for_all_confirmations:
 law final_wrap_is_eligible:
   {Bridge.wrap_is_final(0n) == True{} : Bool}
 
-# Queued EVM events wait for the required depth, even with a good receipt.
+# Both live and historical unwraps require finality and an exact source event.
 law immature_event_waits:
-  for receipt: Bridge.Receipt
   for block: Bridge.Canonical
-  {Bridge.confirm(False{}, receipt, block) == Bridge.Retry{} : Bridge.Decision}
-
-law receipt_error_waits:
-  for block: Bridge.Canonical
-  {Bridge.confirm(True{}, Bridge.ReadError{}, block) == Bridge.Retry{} : Bridge.Decision}
-
-law successful_final_receipt_confirms:
-  for block: Bridge.Canonical
-  {Bridge.confirm(True{}, Bridge.SuccessfulInBlock{}, block) == Bridge.Confirm{} : Bridge.Decision}
+  {Bridge.confirm(False{}, block) == Bridge.Retry{} : Bridge.Decision}
 
 law uncertain_canonical_block_waits:
-  {Bridge.confirm(True{}, Bridge.NeedsBlockCheck{}, Bridge.Uncertain{}) == Bridge.Retry{} : Bridge.Decision}
+  {Bridge.confirm(True{}, Bridge.Uncertain{}) == Bridge.Retry{} : Bridge.Decision}
 
 law missing_canonical_log_waits:
-  {Bridge.confirm(True{}, Bridge.NeedsBlockCheck{}, Bridge.ObservedWithoutLog{}) == Bridge.Retry{} : Bridge.Decision}
+  {Bridge.confirm(True{}, Bridge.ObservedWithoutLog{}) == Bridge.Retry{} : Bridge.Decision}
+
+law mismatched_transfer_waits:
+  {Bridge.confirm(True{}, Bridge.ObservedMismatch{}) == Bridge.Retry{} : Bridge.Decision}
 
 law matching_canonical_log_confirms:
-  {Bridge.confirm(True{}, Bridge.NeedsBlockCheck{}, Bridge.ObservedWithLog{}) == Bridge.Confirm{} : Bridge.Decision}
+  {Bridge.confirm(True{}, Bridge.ObservedWithLog{}) == Bridge.Confirm{} : Bridge.Decision}
 
 law agreed_replacement_requires_recheck:
-  {Bridge.confirm(True{}, Bridge.NeedsBlockCheck{}, Bridge.Replacement{}) == Bridge.RecheckReplacement{} : Bridge.Decision}
+  {Bridge.confirm(True{}, Bridge.Replacement{}) == Bridge.RecheckReplacement{} : Bridge.Decision}
 
 # Backfill must preserve records signed, reconciled or refreshed since inspection.
 law signed_survives_backfill:

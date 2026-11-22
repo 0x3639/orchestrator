@@ -14,7 +14,7 @@ Log lines you will meet, what they mean, and what to do.
 | `… is owned by uid X but the orchestrator runs as uid Y` | Ownership check failed on the data dir, config, key or passphrase file | Fix ownership, or run as the owning user. |
 | `passphrase file … must not be readable by group or others` | Passphrase file mode too wide | `chmod 0600` it. |
 | `data directory … had mode 0755; restricted it to 0700` | The data directory was wider than owner-only and has been tightened | None; informational. |
-| `network Ethereum has a single EVM endpoint` | Canonical-block agreement relies on one provider | Add a second independent endpoint. |
+| `network Ethereum has a single EVM endpoint` | Canonical blocks and unwrap evidence rely on one provider | Add a second independent endpoint. |
 | `EVM RPC requests are not rate limited` | `RpcRequestsPerSecond` missing from this network | Add it; see [EVM networks](../networks.md). |
 | `Sync … failed at block N (attempt k/12), retrying in …` | Provider rejected or timed out a query | Normal under throttling. Persistent: lower the rate or `FilterQuerySize`. |
 | `provider rejected an eth_getLogs window of W blocks (…); narrowing to N blocks` | The provider's plan allows narrower log queries than `FilterQuerySize` | None; the sync adapts. If it narrows all the way to 8, the provider is unsuitable for a full scan; see [EVM networks](../networks.md). |

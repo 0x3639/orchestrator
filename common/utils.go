@@ -113,12 +113,14 @@ func ZnnUnwrapToOrchestatorUnwrap(event *definition.UnwrapTokenRequest) events.U
 		BlockNumber:     0,
 		TransactionHash: common.Hash(event.TransactionHash),
 		LogIndex:        event.LogIndex,
-		From:            common.Address{},
-		To:              event.ToAddress.String(),
-		Token:           common.HexToAddress(event.TokenAddress),
-		Amount:          event.Amount,
-		Signature:       event.Signature,
-		RedeemStatus:    status,
+		// The Zenon request does not contain the EVM sender or block.
+		// Finalized EVM evidence fills these fields before an unsigned row can sign.
+		From:         common.Address{},
+		To:           event.ToAddress.String(),
+		Token:        common.HexToAddress(event.TokenAddress),
+		Amount:       event.Amount,
+		Signature:    event.Signature,
+		RedeemStatus: status,
 	}
 }
 

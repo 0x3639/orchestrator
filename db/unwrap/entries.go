@@ -2,6 +2,7 @@ package unwrap
 
 import (
 	"encoding/binary"
+	"errors"
 	ecommon "github.com/ethereum/go-ethereum/common"
 	"github.com/syndtr/goleveldb/leveldb"
 	zcommon "github.com/zenon-network/go-zenon/common"
@@ -87,16 +88,56 @@ func (es *evmStorage) UpdateUnwrapRequestBlockNumber(event events.UnwrapRequestE
 	}
 	localEvent.BlockNumber = event.BlockNumber
 	localEvent.BlockHash = event.BlockHash
-	localEventBytes, err := localEvent.Serialize()
+	if localEvent.From == (ecommon.Address{}) && localEvent.SameTransfer(&event) {
+		localEvent.From = event.From
+	}
+	return es.putUnwrapRequest(*localEvent)
+}
+
+// Fill a legacy row only if it is still the unsigned candidate that was checked.
+func (es *evmStorage) HydrateUnsignedUnwrap(before, verified events.UnwrapRequestEvm) error {
+	es.mu.Lock()
+	defer es.mu.Unlock()
+	current, err := es.GetUnwrapRequestByHashAndLog(before.TransactionHash, before.LogIndex)
 	if err != nil {
-		es.SendSigInt()
 		return err
 	}
-	if err := es.DB.Put(getUnwrapRequestKey(event.TransactionHash, event.LogIndex), localEventBytes); err != nil {
-		es.SendSigInt()
+	if current == nil || current.Signature != "" || current.RedeemStatus != common.UnredeemedStatus ||
+		!current.SameTransfer(&verified) || current.From != before.From || current.BlockHash != before.BlockHash || current.BlockNumber != before.BlockNumber {
+		return errors.New("stored unwrap changed during source verification")
+	}
+	current.From, current.BlockHash, current.BlockNumber = verified.From, verified.BlockHash, verified.BlockNumber
+	return es.putUnwrapRequest(*current)
+}
+
+func (es *evmStorage) UnwrapAffiliatePolicy(key ecommon.Hash) (common.AffiliatePolicy, bool, error) {
+	value, err := es.DB.Get(zcommon.JoinBytes(affiliatePolicyPrefix, key.Bytes()))
+	if errors.Is(err, leveldb.ErrNotFound) {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, err
+	}
+	if len(value) != 1 || value[0] > byte(common.SplitAffiliate|common.VerifyAffiliate) {
+		return 0, false, errors.New("invalid stored unwrap affiliate policy")
+	}
+	return common.AffiliatePolicy(value[0]), true, nil
+}
+
+func (es *evmStorage) PinUnwrapAffiliatePolicy(key ecommon.Hash, policy common.AffiliatePolicy) error {
+	es.mu.Lock()
+	defer es.mu.Unlock()
+	stored, exists, err := es.UnwrapAffiliatePolicy(key)
+	if err != nil {
 		return err
 	}
-	return nil
+	if exists {
+		if policy != stored {
+			return errors.New("unwrap affiliate policy changed during observation; retry")
+		}
+		return nil
+	}
+	return es.DB.Put(zcommon.JoinBytes(affiliatePolicyPrefix, key.Bytes()), []byte{byte(policy)})
 }
 
 func (es *evmStorage) GetUnwrapRequestByHashAndLog(txHash ecommon.Hash, logIndex uint32) (*events.UnwrapRequestEvm, error) {

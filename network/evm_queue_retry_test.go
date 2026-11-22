@@ -3,7 +3,6 @@ package network
 import (
 	"errors"
 	"math/big"
-	"net/http/httptest"
 	"os"
 	"sync"
 	"sync/atomic"
@@ -13,18 +12,18 @@ import (
 	ecommon "github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/hexutil"
 	etypes "github.com/ethereum/go-ethereum/core/types"
-	gethrpc "github.com/ethereum/go-ethereum/rpc"
 	"github.com/joncrlsn/dque"
 	zdb "github.com/zenon-network/go-zenon/common/db"
 	"go.uber.org/zap"
 
-	"orchestrator/common/config"
 	"orchestrator/common/events"
 	"orchestrator/db/unwrap"
 	"orchestrator/rpc"
 )
 
 type recoveringReceiptProvider struct {
+	unwrapProvider
+	log       etypes.Log
 	event     *events.UnwrapRequestEvm
 	attempts  atomic.Int32
 	twoErrors chan struct{}
@@ -45,7 +44,7 @@ func (p *recoveringReceiptProvider) GetTransactionReceipt(tx ecommon.Hash) (*ety
 	}
 	return &etypes.Receipt{
 		TxHash: tx, BlockHash: p.event.BlockHash, BlockNumber: big.NewInt(105),
-		Status: etypes.ReceiptStatusSuccessful, Logs: []*etypes.Log{},
+		Status: etypes.ReceiptStatusSuccessful, Logs: []*etypes.Log{&p.log},
 	}, nil
 }
 
@@ -55,15 +54,11 @@ func (p *recoveringReceiptProvider) GetTransactionReceipt(tx ecommon.Hash) (*ety
 func TestQueuedUnwrapSurvivesTwoReceiptErrorsAndRestart(t *testing.T) {
 	event := testEvent(105, canonicalHeader(105))
 	event.To = "z1qqjnwjjpnue8xmmpanz6csze6tcmtzzdtfsww7"
-	provider := &recoveringReceiptProvider{event: event, twoErrors: make(chan struct{})}
-	srv := gethrpc.NewServer()
-	if err := srv.RegisterName("eth", provider); err != nil {
-		t.Fatal(err)
-	}
-	server := httptest.NewServer(srv)
-	t.Cleanup(srv.Stop)
-	t.Cleanup(server.Close)
-	cfg := config.BaseNetworkConfig{Urls: []string{server.URL}}
+	event.ChainId = 1
+	params := fixtureParams(t)
+	event.NetworkClass = params.NetworkClass()
+	provider := &recoveringReceiptProvider{event: event, twoErrors: make(chan struct{}), log: transferLog(t, event, event.To, 1), unwrapProvider: unwrapProvider{head: 150}}
+	cfg := evidenceEndpoints(t, provider)
 	stopChan := make(chan os.Signal, 1)
 	store := unwrap.NewEvmStorage(zdb.NewMemDB(), stopChan, 0)
 	if err := store.SetLastUpdateHeight(150); err != nil {
@@ -82,10 +77,10 @@ func TestQueuedUnwrapSurvivesTwoReceiptErrorsAndRestart(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := rpcs.AddEvmClient(cfg, 0, "queue-test", testContract); err != nil {
+		if err := rpcs.AddEvmClient(cfg, 1, "queue-test", testContract); err != nil {
 			t.Fatal(err)
 		}
-		net := &evmNetwork{
+		net := &evmNetwork{EvmParams: params,
 			unconfirmedQueue: q, dbManager: unwrapTestStores{evm: store}, rpcManager: rpcs,
 			stopChan: stopChan, done: make(chan struct{}), logger: zap.NewNop().Sugar(),
 		}

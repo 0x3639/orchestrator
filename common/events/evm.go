@@ -59,6 +59,13 @@ func (e *UnwrapRequestEvm) Hash() (string, error) {
 	return hash.String(), nil
 }
 
+// SameTransfer compares the fields shared by Zenon registrations and EVM logs.
+func (e *UnwrapRequestEvm) SameTransfer(other *UnwrapRequestEvm) bool {
+	return e.NetworkClass == other.NetworkClass && e.ChainId == other.ChainId &&
+		e.TransactionHash == other.TransactionHash && e.LogIndex == other.LogIndex &&
+		e.To == other.To && e.Token == other.Token && e.Amount != nil && other.Amount != nil && e.Amount.Cmp(other.Amount) == 0
+}
+
 func (e *UnwrapRequestEvm) GetMessage() ([]byte, error) {
 	toAddress, err := types.ParseAddress(e.To)
 	if err != nil {

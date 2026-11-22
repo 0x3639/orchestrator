@@ -4,7 +4,7 @@ Use `--ldflags '-extldflags "-Wl,--allow-multiple-definition"` as build argument
 
 ## Checking the bridge laws
 
-The 34 laws cover wrap finality, EVM event confirmation, deletion of stale
+The 33 laws cover wrap finality, EVM source-event confirmation, deletion of stale
 unwrap records, terminal status updates, signing-pool selection and agreement,
 inclusive EVM scan limits, and checkpoint advancement. Bend checks the laws against the decision model. The Go tests compare
 those decisions with the orchestrator using local RPC fixtures and event stores.

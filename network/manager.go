@@ -6,6 +6,7 @@ import (
 	"crypto/ecdsa"
 	"encoding/base64"
 	"encoding/hex"
+	"fmt"
 	ecommon "github.com/ethereum/go-ethereum/common"
 	etypes "github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
@@ -618,6 +619,54 @@ func (m *NetworksManager) GetUnsignedUnwrapRequests() ([]*events.UnwrapRequestEv
 		return cmp.Compare(a.LogIndex, b.LogIndex)
 	})
 	return ans, nil
+}
+
+// VerifyUnwrapsForSigning checks exactly the rows used to construct this
+// ceremony's messages. Unavailable evidence postpones the entire batch.
+func (m *NetworksManager) VerifyUnwrapsForSigning(requests []*events.UnwrapRequestEvm) error {
+	for _, req := range requests {
+		var source *evmNetwork
+		for _, network := range m.evmNetworks {
+			if network.ChainId() == req.ChainId && network.NetworkClass() == req.NetworkClass {
+				source = network
+				break
+			}
+		}
+		if source == nil {
+			return fmt.Errorf("no source network for unwrap %s/%d", req.TransactionHash, req.LogIndex)
+		}
+		candidate := *req
+		if candidate.BlockHash == (ecommon.Hash{}) {
+			// A receipt is a locator only. The canonical hash, finality depth and
+			// transfer below still require agreement from all configured endpoints.
+			receipt, err := source.EvmRpc().TransactionReceipt(candidate.TransactionHash)
+			if err != nil {
+				return fmt.Errorf("unwrap %s/%d cannot be signed: locating its source block: %w", req.TransactionHash, req.LogIndex, err)
+			}
+			if receipt == nil || receipt.TxHash != candidate.TransactionHash || receipt.BlockNumber == nil || !receipt.BlockNumber.IsUint64() ||
+				receipt.BlockHash == (ecommon.Hash{}) || (candidate.BlockNumber != 0 && candidate.BlockNumber != receipt.BlockNumber.Uint64()) {
+				return fmt.Errorf("unwrap %s/%d cannot be signed: no matching source block", req.TransactionHash, req.LogIndex)
+			}
+			candidate.BlockNumber, candidate.BlockHash = receipt.BlockNumber.Uint64(), receipt.BlockHash
+		}
+		canonical, err := source.EvmRpc().CanonicalHash(candidate.BlockNumber)
+		if err != nil {
+			return fmt.Errorf("unwrap %s/%d cannot be signed: %w", req.TransactionHash, req.LogIndex, err)
+		}
+		if canonical != candidate.BlockHash {
+			return fmt.Errorf("unwrap %s/%d cannot be signed: its block was replaced", req.TransactionHash, req.LogIndex)
+		}
+		if err := source.verifyUnwrapTransfer(&candidate, true); err != nil {
+			return fmt.Errorf("unwrap %s/%d cannot be signed: %w", req.TransactionHash, req.LogIndex, err)
+		}
+		if candidate.BlockHash != req.BlockHash || candidate.From != req.From {
+			if err := source.eventsStore().HydrateUnsignedUnwrap(*req, candidate); err != nil {
+				return err
+			}
+			*req = candidate
+		}
+	}
+	return nil
 }
 
 func (m *NetworksManager) GetUnsentSignedUnwrapRequests() ([]*events.UnwrapRequestEvm, error) {

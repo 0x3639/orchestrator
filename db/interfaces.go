@@ -4,6 +4,7 @@ import (
 	ecommon "github.com/ethereum/go-ethereum/common"
 	zdb "github.com/zenon-network/go-zenon/common/db"
 	"github.com/zenon-network/go-zenon/common/types"
+	"orchestrator/common"
 	"orchestrator/common/events"
 )
 
@@ -16,6 +17,9 @@ type EvmStorage interface {
 
 	AddUnwrapRequest(events.UnwrapRequestEvm) error
 	UpdateUnwrapRequestBlockNumber(events.UnwrapRequestEvm) error
+	HydrateUnsignedUnwrap(before, verified events.UnwrapRequestEvm) error
+	UnwrapAffiliatePolicy(ecommon.Hash) (common.AffiliatePolicy, bool, error)
+	PinUnwrapAffiliatePolicy(ecommon.Hash, common.AffiliatePolicy) error
 	GetUnwrapRequestByHashAndLog(ecommon.Hash, uint32) (*events.UnwrapRequestEvm, error)
 	// AddUnwrapRequestIfMissing stores the event only when no record exists
 	// for its hash and log index, so a duplicate delivery can never reset a
