@@ -66,8 +66,8 @@ func (e *UnwrapRequestEvm) SameTransfer(other *UnwrapRequestEvm) bool {
 		sameRecipient(e.To, other.To) && e.Token == other.Token && e.Amount != nil && other.Amount != nil && e.Amount.Cmp(other.Amount) == 0
 }
 
-// Rows stored by earlier binaries keep the recipient as the EVM log spelled
-// it, which may be the all-uppercase form of the address Zenon registered.
+// A row from an EVM log keeps the recipient as the log spelled it, which may
+// be the all-uppercase form of the address a Zenon registration holds.
 func sameRecipient(a, b string) bool {
 	if a == b {
 		return true

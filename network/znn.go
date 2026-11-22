@@ -375,11 +375,16 @@ func (rC *znnNetwork) interpretConfirmedReceive(ctx context.Context, receive, se
 	return rC.interpretSendBlockData(ctx, send, mode, embeddedReceiveFailed(receive), receive.Height, refresh)
 }
 
+// go-zenon's VM writes the result of an embedded method into the receive
+// block's data as a big-endian uint64: 1 when the method succeeded and 2 when
+// it returned an error and its contract changes were rolled back (vm/vm.go).
+const embeddedReceiveRejected uint64 = 2
+
 // The bridge creates a receive block for every send, including one whose
-// method returned an error. go-zenon then rolls the contract state back and
-// writes a non-zero status into the receive block's data.
+// method returned an error. Only the explicit failure status counts: a
+// success, a missing status and an unknown status are all checked as accepted.
 func embeddedReceiveFailed(receive *api.AccountBlock) bool {
-	return len(receive.Data) == 8 && binary.BigEndian.Uint64(receive.Data) != 0
+	return len(receive.Data) == 8 && binary.BigEndian.Uint64(receive.Data) == embeddedReceiveRejected
 }
 
 // Bech32 also accepts an all-uppercase spelling, and the EVM contract emits
@@ -542,9 +547,10 @@ func (rC *znnNetwork) interpretSendBlockData(ctx context.Context, sendBlock *api
 			// We don't care if it the rpc does not return it, it means the tx returned an error
 			rC.logger.Infof("unwrap event non existent: %s", param.TransactionHash.String())
 			break
-		} else if !rC.rpcManager.HasEvmNetwork(rpcZnnEvent.ChainId) || !rC.dbManager.HasEvmStorage(rpcZnnEvent.ChainId) {
+		} else if rpcZnnEvent.NetworkClass != definition.EvmClass || !rC.rpcManager.HasEvmNetwork(rpcZnnEvent.ChainId) || !rC.dbManager.HasEvmStorage(rpcZnnEvent.ChainId) {
 			// The bridge still knows the request but this node has no client
 			// or store for its chain; looking either up would stop the node.
+			// Networks are keyed by class and chain ID, and only EVM is served.
 			rC.logger.Infof("skipping unwrap request %s/%d: chainId %d is not a configured network on this node",
 				param.TransactionHash.String(), param.LogIndex, rpcZnnEvent.ChainId)
 			break

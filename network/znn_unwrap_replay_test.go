@@ -25,6 +25,7 @@ import (
 	"orchestrator/common"
 	"orchestrator/common/bridge"
 	"orchestrator/common/config"
+	"orchestrator/common/events"
 	"orchestrator/db"
 	"orchestrator/db/unwrap"
 	"orchestrator/db/wrap"
@@ -108,17 +109,23 @@ func (b *replayBridge) send(t *testing.T, chainID uint32, amount *big.Int, signa
 
 func replayServer(t *testing.T, answer func(method string) interface{}) string {
 	t.Helper()
+	return replayServerWithParams(t, func(method string, _ []json.RawMessage) interface{} { return answer(method) })
+}
+
+func replayServerWithParams(t *testing.T, answer func(method string, params []json.RawMessage) interface{}) string {
+	t.Helper()
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var call struct {
-			ID     json.RawMessage `json:"id"`
-			Method string          `json:"method"`
+			ID     json.RawMessage   `json:"id"`
+			Method string            `json:"method"`
+			Params []json.RawMessage `json:"params"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&call); err != nil {
 			http.Error(w, "invalid request", http.StatusBadRequest)
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]interface{}{"jsonrpc": "2.0", "id": call.ID, "result": answer(call.Method)})
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"jsonrpc": "2.0", "id": call.ID, "result": answer(call.Method, call.Params)})
 	}))
 	t.Cleanup(server.Close)
 	return server.URL
@@ -190,37 +197,92 @@ func TestResentUnwrapNamingAnotherChainIsCheckedOnTheRegisteredChain(t *testing.
 	}
 }
 
+// go-zenon's VM result codes for an embedded receive (vm/vm.go).
+const (
+	vmResultInvalid uint64 = iota
+	vmResultSuccess
+	vmResultFail
+)
+
 func receiveStatus(status uint64) []byte {
 	return binary.BigEndian.AppendUint64(nil, status)
 }
 
+// replayLedger serves one bridge receive at account height 2 and its paired
+// UnwrapToken send, the way a Zenon node returns them.
+type replayLedger struct {
+	receive, send *api.AccountBlockMarshal
+	frontier      uint64
+}
+
+func newReplayLedger(t *testing.T, b *replayBridge, status []byte, frontier uint64) *replayLedger {
+	t.Helper()
+	receive := startupReceive(2)
+	receive.Data = status
+	send := startupSend(receive)
+	send.Data = b.send(t, b.request.ChainId, b.request.Amount, b.request.Signature).Data
+	return &replayLedger{receive: receive, send: send, frontier: frontier}
+}
+
+func (l *replayLedger) answer(t *testing.T, method string, params []json.RawMessage) (interface{}, bool) {
+	switch method {
+	case "ledger.getAccountBlocksByHeight":
+		var height uint64
+		if len(params) < 2 || json.Unmarshal(params[1], &height) != nil {
+			t.Errorf("unexpected page request %s", params)
+		}
+		if height == l.receive.Height {
+			return startupPage(l.receive), true
+		}
+		return startupPage(), true
+	case "ledger.getAccountBlockByHash":
+		var hash types.Hash
+		if len(params) < 1 || json.Unmarshal(params[0], &hash) != nil {
+			t.Errorf("unexpected block request %s", params)
+		}
+		if hash == l.receive.Hash {
+			return l.receive, true
+		}
+		return l.send, true
+	case "stats.syncInfo":
+		return &protocol.SyncInfo{State: protocol.SyncDone}, true
+	case "ledger.getFrontierMomentum":
+		return &api.Momentum{Momentum: &nom.Momentum{Height: l.frontier, Hash: types.Hash{1}}}, true
+	}
+	return nil, false
+}
+
 // The bridge rejects a duplicate UnwrapToken and still produces a receive
 // block. That receive registered nothing, so a missing source receipt is not
-// evidence of a forged request. A successful receive with the same missing
-// receipt still is.
-func TestRejectedUnwrapReceiveIsIgnored(t *testing.T) {
+// evidence of a forged request. Every other status is checked: a successful
+// receive with the same missing receipt is exactly what a forged registration
+// looks like.
+func TestLiveListenerChecksEveryUnwrapReceiveExceptARejectedOne(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
 		status []byte
 		want   uint8
 	}{
-		{"bridge rejected the send", receiveStatus(1), common.LiveState},
-		{"bridge accepted the send", receiveStatus(0), common.EmergencyState},
-		{"receive without a status", nil, common.EmergencyState},
+		{"bridge rejected the send", receiveStatus(vmResultFail), common.LiveState},
+		{"bridge accepted the send", receiveStatus(vmResultSuccess), common.EmergencyState},
+		{"invalid status", receiveStatus(vmResultInvalid), common.EmergencyState},
+		{"unknown status", receiveStatus(3), common.EmergencyState},
+		{"no status", nil, common.EmergencyState},
+		{"short status", []byte{2}, common.EmergencyState},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			b := newReplayBridge(t)
 			b.request.Redeemed = 1
-			url := replayServer(t, func(method string) interface{} {
+			ledger := newReplayLedger(t, b, tc.status, 104)
+			url := replayServerWithParams(t, func(method string, params []json.RawMessage) interface{} {
+				if result, ok := ledger.answer(t, method, params); ok {
+					return result
+				}
 				switch method {
 				case "embedded.bridge.getUnwrapTokenRequestByHashAndLog":
 					return b.request
 				case "eth_getTransactionReceipt":
 					return nil // the endpoint no longer serves this old receipt
-				case "stats.syncInfo":
-					return &protocol.SyncInfo{State: protocol.SyncDone}
-				case "ledger.getFrontierMomentum":
-					return &api.Momentum{Momentum: &nom.Momentum{Height: 104, Hash: types.Hash{1}}}
 				}
 				t.Errorf("unexpected method %s", method)
 				return nil
@@ -239,14 +301,9 @@ func TestRejectedUnwrapReceiveIsIgnored(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			receive := &api.AccountBlock{
-				AccountBlock: nom.AccountBlock{BlockType: nom.BlockTypeContractReceive, Height: 2, Hash: types.Hash{2},
-					Address: types.BridgeContract, Data: tc.status},
-				ConfirmationDetail: &api.AccountBlockConfirmationDetail{MomentumHeight: 100},
-			}
-			send := b.send(t, 1, b.request.Amount, b.request.Signature)
-			if err := n.interpretConfirmedReceive(n.listenerCtx, receive, send, listenerHistory, n.refreshSettings); err != nil {
-				t.Fatal(err)
+			height, _, err := n.processBridgeAccountPage(n.listenerCtx, 1, n.refreshSettings)
+			if err != nil || height != 2 {
+				t.Fatalf("height %d, err %v", height, err)
 			}
 			if got := replayState(t, n); got != tc.want {
 				t.Fatalf("state %s, want %s", common.StateToText(got), common.StateToText(tc.want))
@@ -266,26 +323,112 @@ func TestRejectedUnwrapReceiveIsIgnored(t *testing.T) {
 	}
 }
 
-// The EVM contract emits the recipient as typed, and bech32 accepts an
-// all-uppercase spelling. Zenon registers the parsed address.
-func TestUnwrapRecipientIsComparedByValue(t *testing.T) {
-	other, err := types.ParseAddress("z1qpp8g8v4hrd5ernfrgsn86jmv09ra6zrvhvmr7")
-	if err != nil {
-		t.Fatal(err)
-	}
+// Startup reads each receive by hash. An accepted registration is recorded
+// against the local row. A rejected duplicate, whose source event does exist,
+// must leave that row alone.
+func TestStartupSyncRecordsAnAcceptedUnwrapAndSkipsARejectedOne(t *testing.T) {
 	for _, tc := range []struct {
-		name string
-		to   func(types.Address) string
-		want uint8
+		name          string
+		status        []byte
+		wantStatus    uint32
+		wantSignature string
 	}{
-		{"lowercase", func(a types.Address) string { return a.String() }, common.LiveState},
-		{"uppercase", func(a types.Address) string { return strings.ToUpper(a.String()) }, common.LiveState},
-		{"another address", func(types.Address) string { return other.String() }, common.EmergencyState},
-		{"another address in uppercase", func(types.Address) string { return strings.ToUpper(other.String()) }, common.EmergencyState},
+		{"bridge accepted the send", receiveStatus(vmResultSuccess), common.PendingRedeemStatus, "test-signature"},
+		{"bridge rejected the send", receiveStatus(vmResultFail), common.UnredeemedStatus, ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			b := newReplayBridge(t)
-			log := b.sourceLog(t, tc.to(b.recipient))
+			log := b.sourceLog(t, b.recipient.String())
+			ledger := newReplayLedger(t, b, tc.status, 1000)
+			url := replayServerWithParams(t, func(method string, params []json.RawMessage) interface{} {
+				if result, ok := ledger.answer(t, method, params); ok {
+					return result
+				}
+				switch method {
+				case "embedded.bridge.getUnwrapTokenRequestByHashAndLog":
+					return b.request
+				case "eth_getTransactionReceipt":
+					return b.receipt()
+				case "eth_getLogs":
+					return []etypes.Log{log}
+				}
+				t.Errorf("unexpected method %s", method)
+				return nil
+			})
+			n, stores := replayNetwork(t, b, url, map[uint32]string{1: url})
+			n.SetConfirmationsToFinality(5)
+			if err := n.state.SetFrontierMomentum(1000); err != nil {
+				t.Fatal(err)
+			}
+			// The unsigned row this signer ingested from the EVM log.
+			sender := ecommon.HexToAddress("0x03")
+			if err := stores.evm[1].AddUnwrapRequest(events.UnwrapRequestEvm{
+				NetworkClass: definition.EvmClass, ChainId: 1, BlockNumber: 100, BlockHash: b.blockHash,
+				TransactionHash: b.txHash, LogIndex: 0, From: sender, To: b.recipient.String(), Token: b.token,
+				Amount: big.NewInt(100), RedeemStatus: common.UnredeemedStatus,
+			}); err != nil {
+				t.Fatal(err)
+			}
+
+			if err := n.Sync(); err != nil {
+				t.Fatal(err)
+			}
+			if got := replayState(t, n); got != common.LiveState {
+				t.Fatalf("state %s after a historical receive", common.StateToText(got))
+			}
+			cursor, err := stores.znn.GetLastUpdateHeight()
+			if err != nil || cursor != 2 {
+				t.Fatalf("cursor %d, err %v", cursor, err)
+			}
+			row, err := stores.evm[1].GetUnwrapRequestByHashAndLog(b.txHash, 0)
+			if err != nil || row == nil {
+				t.Fatalf("stored row: %v, err %v", row, err)
+			}
+			if row.RedeemStatus != tc.wantStatus || row.Signature != tc.wantSignature {
+				t.Fatalf("row status %d signature %q, want status %d signature %q", row.RedeemStatus, row.Signature, tc.wantStatus, tc.wantSignature)
+			}
+		})
+	}
+}
+
+// The EVM contract emits the recipient as typed, and bech32 accepts an
+// all-uppercase spelling. Zenon registers the parsed address.
+func TestUnwrapRecipientIsComparedByValue(t *testing.T) {
+	const affiliate = "z1qpp8g8v4hrd5ernfrgsn86jmv09ra6zrvhvmr7"
+	affiliateAddress, err := types.ParseAddress(affiliate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	upper := strings.ToUpper
+	for _, tc := range []struct {
+		name string
+		// to is the recipient string in the EVM log, given the registered address.
+		to func(registered string) string
+		// program enables the affiliate split, which registers 101% for the
+		// beneficiary and 2% for the affiliate at a derived log index.
+		program   bool
+		rewardRow bool
+		want      uint8
+	}{
+		{"lowercase", func(a string) string { return a }, false, false, common.LiveState},
+		{"uppercase", upper, false, false, common.LiveState},
+		{"another address", func(string) string { return affiliate }, false, false, common.EmergencyState},
+		{"another address in uppercase", func(string) string { return upper(affiliate) }, false, false, common.EmergencyState},
+		{"affiliate split, uppercase beneficiary", func(a string) string { return upper(a) + "&" + affiliate }, true, false, common.LiveState},
+		{"affiliate split, uppercase affiliate", func(a string) string { return a + "&" + upper(affiliate) }, true, true, common.LiveState},
+		{"affiliate split, another beneficiary", func(string) string { return upper(affiliate) + "&" + affiliate }, true, false, common.EmergencyState},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			b := newReplayBridge(t)
+			log := b.sourceLog(t, tc.to(b.recipient.String()))
+			if tc.program {
+				b.request.Amount = big.NewInt(101)
+			}
+			if tc.rewardRow {
+				b.request.LogIndex = common.AffiliateLogIndexAddition
+				b.request.ToAddress = affiliateAddress
+				b.request.Amount = big.NewInt(2)
+			}
 			url := replayServer(t, func(method string) interface{} {
 				switch method {
 				case "embedded.bridge.getUnwrapTokenRequestByHashAndLog":
@@ -299,6 +442,12 @@ func TestUnwrapRecipientIsComparedByValue(t *testing.T) {
 				return nil
 			})
 			n, _ := replayNetwork(t, b, url, map[uint32]string{1: url})
+			if tc.program {
+				n.state.SetTokensMap(1, types.ZnnTokenStandard.String(), b.token.Hex())
+				n.state.SetIsAffiliateProgram(common.AffiliateProgram{Networks: map[uint32]common.AffiliateNetwork{
+					1: {StartingHeight: 1, ZNN: true, WZNN: true},
+				}})
+			}
 			if err := n.InterpretSendBlockData(b.send(t, 1, b.request.Amount, b.request.Signature), true, 42); err != nil {
 				t.Fatal(err)
 			}

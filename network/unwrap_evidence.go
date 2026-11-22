@@ -64,12 +64,12 @@ func (eN *evmNetwork) unwrapRequestsFromLog(log etypes.Log, expected *events.Unw
 		}
 		return nil, nil
 	}
-	// Store the canonical spelling. The contract emits the recipient as typed,
-	// and bech32 also accepts all-uppercase.
+	// Keep the recipient as the log spelled it. Earlier builds compare the
+	// stored string with the log literally, and every reader parses it.
 	transfer := &events.UnwrapRequestEvm{
 		NetworkClass: eN.NetworkClass(), ChainId: eN.ChainId(),
 		BlockNumber: log.BlockNumber, BlockHash: log.BlockHash, TransactionHash: log.TxHash, LogIndex: uint32(log.Index),
-		From: decoded.From, Token: decoded.Token, To: beneficiary.String(), Amount: new(big.Int).Set(decoded.Amount), RedeemStatus: common.UnredeemedStatus,
+		From: decoded.From, Token: decoded.Token, To: addresses[0], Amount: new(big.Int).Set(decoded.Amount), RedeemStatus: common.UnredeemedStatus,
 	}
 	transfers := []*events.UnwrapRequestEvm{transfer}
 	var key ecommon.Hash
@@ -89,7 +89,7 @@ func (eN *evmNetwork) unwrapRequestsFromLog(log etypes.Log, expected *events.Unw
 				pin = true
 			}
 			if policy&common.SplitAffiliate != 0 {
-				reward, err := affiliateTransfer(transfer, affiliate.String(), decoded.Amount)
+				reward, err := affiliateTransfer(transfer, addresses[1], decoded.Amount)
 				if err != nil {
 					return nil, err
 				}
