@@ -1310,7 +1310,7 @@ func (node *Node) sendSignatures() {
 		return
 	}
 
-	seenEventsCount := make(map[string]uint32)
+	sendPending := newSignatureSendPoll(node.sendSignaturesWrap, node.sendUnwrapRequests)
 	for {
 		currentState, err := node.state.GetState()
 		if err != nil {
@@ -1322,17 +1322,7 @@ func (node *Node) sendSignatures() {
 		switch currentState {
 		case common.LiveState:
 			if len(node.tssManager.GetPubKey()) != 0 {
-				var senders sync.WaitGroup
-				senders.Add(2)
-				go func() {
-					defer senders.Done()
-					node.sendSignaturesWrap(seenEventsCount)
-				}()
-				go func() {
-					defer senders.Done()
-					node.sendUnwrapRequests(seenEventsCount)
-				}()
-				senders.Wait()
+				sendPending()
 			}
 		}
 		// todo use constant for momentum duration
