@@ -33,12 +33,19 @@ type redeemProvider struct {
 	halted *bool
 }
 
-func (p *redeemProvider) Call(map[string]any, string) hexutil.Bytes {
+func (p *redeemProvider) Call(call map[string]any, _ string) (hexutil.Bytes, error) {
 	result := make([]byte, 32)
-	if *p.halted {
+	switch call["input"] {
+	case "0xc7ff1584": // isHalted() includes the unhalt delay.
 		result[31] = 1
+	case "0xb9b8af0b": // halted() is the explicit flag.
+		if *p.halted {
+			result[31] = 1
+		}
+	default:
+		return nil, fmt.Errorf("unexpected contract call %v", call["input"])
 	}
-	return result
+	return result, nil
 }
 
 type redeemSource struct {
@@ -287,11 +294,63 @@ func TestRedeemHaltNeedsExplicitNetworkFlags(t *testing.T) {
 	}
 	src.bridgeErr = ""
 	src.halted = true
+	if halted, unhalted, err := m.CountNetworksHaltState(); err != nil || halted != 1 || unhalted != 0 {
+		t.Fatalf("ordinary halt check during delay: %d/%d %v", halted, unhalted, err)
+	}
 	if halted, err := m.AllBridgeHaltFlagsSet(); err != nil || halted {
 		t.Fatalf("EVM unhalted: %t %v", halted, err)
 	}
 	*evm.halted = true
 	if halted, err := m.AllBridgeHaltFlagsSet(); err != nil || !halted {
 		t.Fatalf("confirmed halt: %t %v", halted, err)
+	}
+}
+
+func TestRedeemReplayKeepsLaterLiveStatus(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		topic ecommon.Hash
+		want  uint32
+	}{
+		{"redeemed", common.RedeemedSigHash, common.RedeemedStatus},
+		{"revoked", common.RevokedRedeemSigHash, common.RevokedStatus},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			source := &redeemSource{synced: true}
+			n, registration, _ := redeemFixture(t, source)
+			id := types.Hash(registration.Topics[1])
+			source.wrap = &definition.WrapTokenRequest{Id: id, NetworkClass: definition.EvmClass, ChainId: 1,
+				ToAddress: ecommon.BytesToAddress(registration.Topics[2][:]).Hex(), TokenAddress: ecommon.BytesToAddress(registration.Topics[3][:]).Hex(), Amount: big.NewInt(20), Fee: big.NewInt(1)}
+			later := registration
+			later.Index++
+			later.Topics = append([]ecommon.Hash(nil), registration.Topics...)
+			later.Topics[0] = tc.topic
+			if tc.want == common.RevokedStatus {
+				later.Topics = later.Topics[:2]
+				later.Data = nil
+			}
+			// Live terminal event arrives before Zenon backfill creates the row.
+			if err := n.InterpretLog(later, true); err != nil {
+				t.Fatal(err)
+			}
+			if err := n.InterpretLog(registration, false); err != nil {
+				t.Fatal(err)
+			}
+			store := n.dbManager.ZnnStorage()
+			if err := store.SetWrapRequestSignature(id, "saved"); err != nil {
+				t.Fatal(err)
+			}
+			if err := store.SetWrapRequestSentSignature(id, true); err != nil {
+				t.Fatal(err)
+			}
+			// Historical retry stops here, before it sees the later event again.
+			if err := n.InterpretLog(registration, false); err != nil {
+				t.Fatal(err)
+			}
+			row, err := store.GetWrapRequestById(id)
+			if err != nil || row == nil || row.RedeemStatus != tc.want || row.Signature != "saved" || !row.SentSignature {
+				t.Fatalf("after replay row=%+v err=%v", row, err)
+			}
+		})
 	}
 }

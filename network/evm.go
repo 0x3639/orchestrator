@@ -560,15 +560,7 @@ func (eN *evmNetwork) InterpretLog(log etypes.Log, live bool) error {
 			return err
 		}
 
-		if event, storageErr := eN.dbManager.ZnnStorage().GetWrapRequestById(id); storageErr != nil {
-			return storageErr
-		} else if event == nil {
-			// todo check if event exists on znn otherwise in this case there is not much we can do
-		} else {
-			if err = eN.dbManager.ZnnStorage().SetWrapRequestStatus(id, common.RedeemedStatus); err != nil {
-				return err
-			}
-		}
+		return eN.dbManager.ZnnStorage().ApplyRedeemLog(eN.ChainId(), id, log.BlockNumber, log.Index, common.RedeemedStatus)
 	case common.RevokedRedeemSigHash.Hex():
 		revokedRedeem, errParse := eN.EvmRpc().Bridge().ParseRevokedRedeem(log)
 		if errParse != nil {
@@ -586,15 +578,7 @@ func (eN *evmNetwork) InterpretLog(log etypes.Log, live bool) error {
 			common.AdministratorLogger.Infof("RevokedRedeemSigHash %s", id.String())
 		}
 
-		if event, storageErr := eN.dbManager.ZnnStorage().GetWrapRequestById(id); storageErr != nil {
-			return storageErr
-		} else if event == nil {
-			// todo check if event exists on znn otherwise in this case there is not much we can do
-		} else {
-			if err = eN.dbManager.ZnnStorage().SetWrapRequestStatus(id, common.RevokedStatus); err != nil {
-				return err
-			}
-		}
+		return eN.dbManager.ZnnStorage().ApplyRedeemLog(eN.ChainId(), id, log.BlockNumber, log.Index, common.RevokedStatus)
 	case common.HaltedSigHash.Hex():
 		if live {
 			common.AdministratorLogger.Info("HaltedSigHash")

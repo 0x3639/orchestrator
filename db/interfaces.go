@@ -46,6 +46,7 @@ type ZnnStorage interface {
 	SendSigInt()
 
 	AddWrapRequest(events.WrapRequestZnn) error
+	ApplyRedeemLog(chainID uint32, id types.Hash, block uint64, index uint, status uint32) error
 	SetWrapRequestStatus(types.Hash, uint32) error
 	SetWrapRequestSignature(types.Hash, string) error
 	SetWrapRequestSentSignature(types.Hash, bool) error

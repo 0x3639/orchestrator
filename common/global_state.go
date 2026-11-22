@@ -77,9 +77,15 @@ func (gs *GlobalState) SetState(newState uint8) error {
 }
 
 func (gs *GlobalState) setStateLocked(newState uint8) {
-	GlobalLogger.Infof("Old state: %s, New state: %s\n", StateToText(*gs.state), StateToText(newState))
+	oldState := gs.effectiveStateLocked()
 	*gs.state = newState
-	gs.Health.SetBridgeState(StateToText(newState))
+	gs.publishStateLocked(oldState)
+}
+
+func (gs *GlobalState) publishStateLocked(oldState uint8) {
+	current := StateToText(gs.effectiveStateLocked())
+	GlobalLogger.Infof("Old state: %s, New state: %s", StateToText(oldState), current)
+	gs.Health.SetBridgeState(current)
 }
 
 func (gs *GlobalState) GetState() (uint8, error) {
@@ -88,7 +94,21 @@ func (gs *GlobalState) GetState() (uint8, error) {
 		return 0, err
 	}
 	defer gs.stateSemaphore.Release(1)
-	return *gs.state, nil
+	return gs.effectiveStateLocked(), nil
+}
+
+func (gs *GlobalState) effectiveStateLocked() uint8 {
+	if gs.RedeemHaltGeneration() != 0 {
+		return EmergencyState
+	}
+	return *gs.state
+}
+
+// ConfigState excludes the emergency supplied by an unacknowledged LevelDB incident.
+func (gs *GlobalState) ConfigState() uint8 {
+	gs.stateSemaphore.Acquire(context.Background(), 1)
+	defer gs.stateSemaphore.Release(1)
+	return *gs.state
 }
 
 func (gs *GlobalState) SetFrontierMomentum(frMom uint64) error {

@@ -191,8 +191,12 @@ func (m *NetworksManager) AllBridgeHaltFlagsSet() (bool, error) {
 	if info == nil || !info.Halted {
 		return false, nil
 	}
-	_, unhalted, err := m.CountNetworksHaltState()
-	return err == nil && unhalted == 0, err
+	for _, network := range m.evmNetworks {
+		if halted, err := network.EvmRpc().HaltFlagSet(); err != nil || !halted {
+			return false, err
+		}
+	}
+	return true, nil
 }
 
 func (m *NetworksManager) CountNetworksHaltState() (int, int, error) {
@@ -456,7 +460,7 @@ func (m *NetworksManager) SendHaltEvm(signatures [][]byte, ecdsaPrivateKey *ecds
 	// true means that all evm networks are halted
 	ok := true
 	for idx, network := range m.evmNetworks {
-		halted, err := network.IsHalted()
+		halted, err := network.EvmRpc().HaltFlagSet()
 		if err != nil {
 			return false, err
 		}
@@ -514,7 +518,7 @@ func (m *NetworksManager) SendHaltEvmAdministrator(idx int, ecdsaPrivateKey *ecd
 		return false, errors.New("network index non existent")
 	}
 	network := m.evmNetworks[idx]
-	halted, err := network.IsHalted()
+	halted, err := network.EvmRpc().HaltFlagSet()
 	if err != nil {
 		return false, err
 	}

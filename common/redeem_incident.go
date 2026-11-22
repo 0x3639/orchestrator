@@ -30,11 +30,22 @@ func (gs *GlobalState) RestoreRedeemIncidents(store RedeemIncidentStore) error {
 	}
 	gs.redeemIncidents = store
 	if pending {
-		gs.redeemGeneration++
-		gs.redeemHaltPending.Store(gs.redeemGeneration)
-		return gs.SetState(EmergencyState)
+		gs.beginRedeemHaltLocked()
 	}
 	return nil
+}
+
+// Startup calls this before workers start. At runtime the state lock is held.
+func (gs *GlobalState) beginRedeemHaltLocked() {
+	oldState := gs.effectiveStateLocked()
+	gs.redeemGeneration++
+	gs.redeemHaltPending.Store(gs.redeemGeneration)
+	// A config saved at any point during a redeem-only emergency can safely
+	// restart halted. Pending evidence restores the emergency until acknowledged.
+	if *gs.state != EmergencyState {
+		*gs.state = HaltedState
+	}
+	gs.publishStateLocked(oldState)
 }
 
 // RedeemHaltGeneration is zero when scanning may proceed. A new observation
@@ -67,9 +78,11 @@ func (gs *GlobalState) ReportRedeemIncident(ev RedeemIncident) error {
 		gs.redeemWriteFailed = true
 	}
 	if err != nil || pending {
-		gs.redeemGeneration++
-		gs.redeemHaltPending.Store(gs.redeemGeneration)
-		gs.setStateLocked(EmergencyState)
+		gs.beginRedeemHaltLocked()
+		if err != nil {
+			// Without durable evidence a restart must still see an emergency.
+			gs.setStateLocked(EmergencyState)
+		}
 	}
 	return err
 }
@@ -91,6 +104,6 @@ func (gs *GlobalState) CompleteEmergencyHalt(generation uint64) error {
 		return err
 	}
 	gs.redeemHaltPending.Store(0)
-	gs.setStateLocked(HaltedState)
+	gs.publishStateLocked(EmergencyState)
 	return nil
 }

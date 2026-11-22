@@ -771,6 +771,10 @@ func (r *EvmRpc) GetCurrentTss() (ecommon.Address, error) {
 	return r.bridgeContract.Tss(&bind.CallOpts{Context: r.ctx})
 }
 
+func (r *EvmRpc) HaltFlagSet() (bool, error) {
+	return r.bridgeContract.Halted(&bind.CallOpts{Context: r.ctx})
+}
+
 func (r *EvmRpc) IsHalted() (bool, error) {
 	return r.bridgeContract.IsHalted(&bind.CallOpts{Context: r.ctx})
 }

@@ -74,11 +74,12 @@ type Node struct {
 func NewNode(config *oconfig.Config, logger *zap.Logger) (_ *Node, initErr error) {
 	var err error
 
+	initialState := config.GlobalState
 	node := &Node{
 		config:   config,
 		logger:   logger.Sugar(),
 		stopChan: make(chan os.Signal, 1),
-		state:    common.NewGlobalState(&config.GlobalState),
+		state:    common.NewGlobalState(&initialState),
 	}
 
 	// prepare node
@@ -167,7 +168,7 @@ func NewNode(config *oconfig.Config, logger *zap.Logger) (_ *Node, initErr error
 		node.state.SetIsAdministratorActive(true)
 	}
 
-	if err := oconfig.WriteConfig(*node.config); err != nil {
+	if err := oconfig.WriteConfig(*node.GetConfig()); err != nil {
 		node.logger.Info(err.Error())
 	}
 
@@ -760,7 +761,7 @@ func (node *Node) processSignatures() {
 			//	}
 			//}
 
-			if err := oconfig.WriteConfig(*node.config); err != nil {
+			if err := oconfig.WriteConfig(*node.GetConfig()); err != nil {
 				node.logger.Info(err.Error())
 			}
 		case common.LiveState:
@@ -1577,7 +1578,12 @@ func (node *Node) haltNetworksAdministrator() {
 // Getters
 
 func (node *Node) GetConfig() *oconfig.Config {
-	return node.config
+	if node.config == nil {
+		return nil
+	}
+	cfg := *node.config
+	cfg.GlobalState = node.state.ConfigState()
+	return &cfg
 }
 
 func (node *Node) getParticipantsLength() uint32 {

@@ -41,16 +41,10 @@ func (eN *evmNetwork) registerRedeem(log etypes.Log, live bool) error {
 			netAmount.Cmp(redeem.Amount) == 0 && strings.EqualFold(wrap.ToAddress, redeem.To.Hex()) &&
 			strings.EqualFold(wrap.TokenAddress, redeem.Token.Hex()) {
 			store := eN.dbManager.ZnnStorage()
-			current, err := store.GetWrapRequestById(id)
-			if err != nil {
+			if err := store.ApplyRedeemLog(eN.ChainId(), id, log.BlockNumber, log.Index, common.PendingRedeemStatus); err != nil {
 				return err
 			}
-			if current == nil {
-				if err := store.AddWrapRequest(common.ZnnWrapToOrchestratorWrap(wrap)); err != nil {
-					return err
-				}
-			}
-			return store.SetWrapRequestStatus(id, common.PendingRedeemStatus)
+			return store.AddWrapRequest(common.ZnnWrapToOrchestratorWrap(wrap))
 		}
 	}
 
