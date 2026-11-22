@@ -503,7 +503,7 @@ func (rC *znnNetwork) interpretSendBlockData(ctx context.Context, sendBlock *api
 			// someone is trying to redeem a non existent event
 			rC.logger.Info("there is a redeem attempt for a non existing unwrap event")
 			break
-		} else if !rC.dbManager.HasEvmStorage(rpcEvent.ChainId) {
+		} else if rpcEvent.NetworkClass != definition.EvmClass || !rC.dbManager.HasEvmStorage(rpcEvent.ChainId) {
 			rC.logger.Infof("skipping redeem of unwrap %s/%d: chainId %d is not a configured network on this node", param.TransactionHash.String(), param.LogIndex, rpcEvent.ChainId)
 			break
 		} else {
@@ -741,7 +741,7 @@ func (rC *znnNetwork) interpretSendBlockData(ctx context.Context, sendBlock *api
 			// someone is trying to redeem a non existent event
 			rC.logger.Info("event non existent")
 			break
-		} else if !rC.dbManager.HasEvmStorage(rpcEvent.ChainId) {
+		} else if rpcEvent.NetworkClass != definition.EvmClass || !rC.dbManager.HasEvmStorage(rpcEvent.ChainId) {
 			rC.logger.Infof("skipping revoke of unwrap %s/%d: chainId %d is not a configured network on this node", param.TransactionHash.String(), param.LogIndex, rpcEvent.ChainId)
 			break
 		} else {
