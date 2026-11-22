@@ -3,6 +3,7 @@ package network
 import (
 	"context"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"github.com/ethereum/go-ethereum"
 	ecommon "github.com/ethereum/go-ethereum/common"
@@ -371,19 +372,34 @@ func (rC *znnNetwork) interpretConfirmedReceive(ctx context.Context, receive, se
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	return rC.interpretSendBlockData(ctx, send, mode, receive.Height, refresh)
+	return rC.interpretSendBlockData(ctx, send, mode, embeddedReceiveFailed(receive), receive.Height, refresh)
 }
 
-// InterpretSendBlockData We assume that if the receive acc block was created then it was no error
+// The bridge creates a receive block for every send, including one whose
+// method returned an error. go-zenon then rolls the contract state back and
+// writes a non-zero status into the receive block's data.
+func embeddedReceiveFailed(receive *api.AccountBlock) bool {
+	return len(receive.Data) == 8 && binary.BigEndian.Uint64(receive.Data) != 0
+}
+
+// Bech32 also accepts an all-uppercase spelling, and the EVM contract emits
+// the recipient exactly as the user typed it. Compare addresses by value.
+func sameZenonAddress(source string, registered types.Address) bool {
+	parsed, err := types.ParseAddress(source)
+	return err == nil && parsed == registered
+}
+
+// InterpretSendBlockData interprets a send without its receive block, so it
+// cannot tell whether the bridge accepted the send.
 func (rC *znnNetwork) InterpretSendBlockData(sendBlock *api.AccountBlock, live bool, receiveBlockHeight uint64) error {
 	mode := startupHistory
 	if live {
 		mode = liveReceive
 	}
-	return rC.interpretSendBlockData(rC.listenerCtx, sendBlock, mode, receiveBlockHeight, rC.refreshSettings)
+	return rC.interpretSendBlockData(rC.listenerCtx, sendBlock, mode, false, receiveBlockHeight, rC.refreshSettings)
 }
 
-func (rC *znnNetwork) interpretSendBlockData(ctx context.Context, sendBlock *api.AccountBlock, mode receiveMode, receiveBlockHeight uint64, refreshSettings func() error) error {
+func (rC *znnNetwork) interpretSendBlockData(ctx context.Context, sendBlock *api.AccountBlock, mode receiveMode, receiveFailed bool, receiveBlockHeight uint64, refreshSettings func() error) error {
 	live := mode == liveReceive
 	rC.logger.Debugf("InterpretSendBlockData, live: %v", live)
 	if len(sendBlock.Data) < 4 {
@@ -500,6 +516,17 @@ func (rC *znnNetwork) interpretSendBlockData(ctx context.Context, sendBlock *api
 		rC.logger.Infof("NetworkClass: %d, ChainId: %d, TransactionHash: %s, LogIndex: %d, ToAddress: %s, TokenAddress: %s, Amount: %s, Signature: %s",
 			param.NetworkClass, param.ChainId, param.TransactionHash, param.LogIndex, param.ToAddress.String(), param.TokenAddress, param.Amount.String(), param.Signature)
 
+		// Anyone can resend UnwrapToken for a transaction and log index that
+		// are already registered. The bridge rejects the duplicate, so that
+		// send describes no request and must not be checked as if it did.
+		if receiveFailed {
+			rC.logger.Infof("ignoring UnwrapToken send %s for %s/%d: the bridge rejected it and registered nothing",
+				sendBlock.Hash, param.TransactionHash.String(), param.LogIndex)
+			break
+		}
+
+		// The registered request names the source chain. The send's own
+		// parameters are only what its sender claimed.
 		if rpcZnnEvent, rpcZnnErr := rC.GetUnwrapTokenRequestByHashAndLog(param.TransactionHash, param.LogIndex); rpcZnnErr != nil {
 			if bridgeObjectGone(rpcZnnErr) {
 				// A request the bridge no longer recognises, typically because
@@ -515,14 +542,14 @@ func (rC *znnNetwork) interpretSendBlockData(ctx context.Context, sendBlock *api
 			// We don't care if it the rpc does not return it, it means the tx returned an error
 			rC.logger.Infof("unwrap event non existent: %s", param.TransactionHash.String())
 			break
-		} else if !rC.rpcManager.HasEvmNetwork(param.ChainId) || !rC.dbManager.HasEvmStorage(param.ChainId) {
+		} else if !rC.rpcManager.HasEvmNetwork(rpcZnnEvent.ChainId) || !rC.dbManager.HasEvmStorage(rpcZnnEvent.ChainId) {
 			// The bridge still knows the request but this node has no client
 			// or store for its chain; looking either up would stop the node.
 			rC.logger.Infof("skipping unwrap request %s/%d: chainId %d is not a configured network on this node",
-				param.TransactionHash.String(), param.LogIndex, param.ChainId)
+				param.TransactionHash.String(), param.LogIndex, rpcZnnEvent.ChainId)
 			break
 		} else {
-			if tx, rpcEvmErr := rC.rpcManager.Evm(param.ChainId).TransactionReceiptContext(ctx, ecommon.Hash(param.TransactionHash)); rpcEvmErr != nil {
+			if tx, rpcEvmErr := rC.rpcManager.Evm(rpcZnnEvent.ChainId).TransactionReceiptContext(ctx, ecommon.Hash(param.TransactionHash)); rpcEvmErr != nil {
 				rC.logger.Debugf("error: %s", rpcEvmErr.Error())
 				// todo filter errors, maybe just an rpc error
 				if rpcEvmErr.Error() == ethereum.NotFound.Error() || rpcEvmErr.Error() == "server returned transaction without signature" {
@@ -539,7 +566,7 @@ func (rC *znnNetwork) interpretSendBlockData(ctx context.Context, sendBlock *api
 				}
 			} else {
 				found := false
-				if logs, err := rC.rpcManager.Evm(param.ChainId).FilterBlockLogsContext(ctx, tx.BlockHash); err != nil {
+				if logs, err := rC.rpcManager.Evm(rpcZnnEvent.ChainId).FilterBlockLogsContext(ctx, tx.BlockHash); err != nil {
 					rC.logger.Debug(err)
 					return err
 				} else {
@@ -548,16 +575,16 @@ func (rC *znnNetwork) interpretSendBlockData(ctx context.Context, sendBlock *api
 						LogIndex:        param.LogIndex,
 						BlockHash:       tx.BlockHash,
 					}
-					if log, ok := findUnwrapLog(logs, event, rC.rpcManager.Evm(param.ChainId).BridgeAddress()); !ok {
+					if log, ok := findUnwrapLog(logs, event, rC.rpcManager.Evm(rpcZnnEvent.ChainId).BridgeAddress()); !ok {
 						rC.logger.Debugf("Matching unwrap log not found for tx %s and log index %d", param.TransactionHash.String(), param.LogIndex)
 					} else {
-						if strings.ToLower(log.Address.String()) != strings.ToLower(rC.rpcManager.Evm(param.ChainId).BridgeAddress().String()) {
+						if strings.ToLower(log.Address.String()) != strings.ToLower(rC.rpcManager.Evm(rpcZnnEvent.ChainId).BridgeAddress().String()) {
 							rC.logger.Debugf("Address that generated this log %s is different than contract address %s",
-								strings.ToLower(log.Address.String()), strings.ToLower(rC.rpcManager.Evm(param.ChainId).BridgeAddress().String()))
+								strings.ToLower(log.Address.String()), strings.ToLower(rC.rpcManager.Evm(rpcZnnEvent.ChainId).BridgeAddress().String()))
 						} else if log.Topics[0].Hex() != common.UnwrapSigHash.Hex() {
 							rC.logger.Debugf("log Topic hash %s is different than unwrapSigHash %s", log.Topics[0].Hex(), common.UnwrapSigHash.Hex())
 						} else {
-							if unwrapRequest, parseErr := rC.rpcManager.Evm(param.ChainId).Bridge().ParseUnwrapped(log); parseErr != nil {
+							if unwrapRequest, parseErr := rC.rpcManager.Evm(rpcZnnEvent.ChainId).Bridge().ParseUnwrapped(log); parseErr != nil {
 								rC.logger.Debugf("Could not parse unwrapped event with error: %s", parseErr.Error())
 							} else {
 								addresses := strings.Split(unwrapRequest.To, common.AffiliateProgramAddressSeparator)
@@ -578,13 +605,13 @@ func (rC *znnNetwork) interpretSendBlockData(ctx context.Context, sendBlock *api
 
 									var policy common.AffiliatePolicy
 									if parseOk {
-										stored, exists, err := rC.dbManager.EvmStorage(param.ChainId).UnwrapAffiliatePolicy(affiliateEvidenceKey(log))
+										stored, exists, err := rC.dbManager.EvmStorage(rpcZnnEvent.ChainId).UnwrapAffiliatePolicy(affiliateEvidenceKey(log))
 										if err != nil {
 											return err
 										}
 										policy = stored
 										if !exists {
-											policy = rC.state.AffiliatePolicyAt(param.ChainId, unwrapRequest.Token.Hex(), log.BlockNumber)
+											policy = rC.state.AffiliatePolicyAt(rpcZnnEvent.ChainId, unwrapRequest.Token.Hex(), log.BlockNumber)
 										}
 									}
 									isAffiliateProgramActive := policy&common.VerifyAffiliate != 0
@@ -594,7 +621,7 @@ func (rC *znnNetwork) interpretSendBlockData(ctx context.Context, sendBlock *api
 										if param.LogIndex >= common.AffiliateLogIndexAddition {
 											rC.logger.Debugf("Found affiliate logIndex but this is a non affiliate unwrap - len(addresses): %d, !parseOk: %t,"+
 												"!isAffiliateProgramActive: %t", len(addresses), !parseOk, !isAffiliateProgramActive)
-										} else if addresses[0] != rpcZnnEvent.ToAddress.String() {
+										} else if !sameZenonAddress(addresses[0], rpcZnnEvent.ToAddress) {
 											rC.logger.Debugf("Normal unwrap event address %s different than znn unwrap toAddress %s", addresses[0], rpcZnnEvent.ToAddress.String())
 										} else if unwrapRequest.Amount.Cmp(rpcZnnEvent.Amount) != 0 {
 											rC.logger.Debugf("Normal unwrap event amount %s different than znn unwrap amount %s", unwrapRequest.Amount.String(), rpcZnnEvent.Amount.String())
@@ -621,7 +648,7 @@ func (rC *znnNetwork) interpretSendBlockData(ctx context.Context, sendBlock *api
 
 										rC.logger.Infof("addressToCheck: %s", addressToCheck)
 										rC.logger.Infof("amountToCheck: %s", amountToCheck.String())
-										if addressToCheck != rpcZnnEvent.ToAddress.String() {
+										if !sameZenonAddress(addressToCheck, rpcZnnEvent.ToAddress) {
 											rC.logger.Debugf("Affiliate unwrap event address %s different than znn unwrap toAddress %s", addressToCheck, rpcZnnEvent.ToAddress.String())
 										} else if strings.ToLower(unwrapRequest.Token.String()) != rpcZnnEvent.TokenAddress {
 											rC.logger.Debugf("Affiliate unwrap event Token %s different than znn unwrap TokenAddress %s", unwrapRequest.Token.String(), rpcZnnEvent.TokenAddress)
@@ -655,11 +682,11 @@ func (rC *znnNetwork) interpretSendBlockData(ctx context.Context, sendBlock *api
 				}
 				rC.logger.Debug("Trying to add unwrap request")
 				// we just overwrite the event and set it's status as pending redeem, we don't care about block number anymore
-				if storageErr := rC.dbManager.EvmStorage(param.ChainId).AddUnwrapRequest(common.ZnnUnwrapToOrchestatorUnwrap(rpcZnnEvent)); storageErr != nil {
+				if storageErr := rC.dbManager.EvmStorage(rpcZnnEvent.ChainId).AddUnwrapRequest(common.ZnnUnwrapToOrchestatorUnwrap(rpcZnnEvent)); storageErr != nil {
 					return storageErr
 				}
 				rC.logger.Debug("Successfully added unwrap request")
-				if err := rC.dbManager.EvmStorage(param.ChainId).SetUnwrapRequestStatus(ecommon.Hash(param.TransactionHash), param.LogIndex, common.PendingRedeemStatus); err != nil {
+				if err := rC.dbManager.EvmStorage(rpcZnnEvent.ChainId).SetUnwrapRequestStatus(ecommon.Hash(param.TransactionHash), param.LogIndex, common.PendingRedeemStatus); err != nil {
 					return err
 				}
 			}
