@@ -15,7 +15,7 @@ import (
 
 func TestBridgeListenerReplaysFailedReceiveInOrder(t *testing.T) {
 	first, missed, last := startupReceive(2), startupReceive(3), startupReceive(4)
-	for _, failure := range []string{"lookup", "interpretation", "missing height", "unconfirmed", "wrong send type", "wrong destination", "send timeout"} {
+	for _, failure := range []string{"lookup", "interpretation", "missing height", "unconfirmed", "zero confirmation height", "wrong send type", "wrong destination", "send timeout"} {
 		t.Run(failure, func(t *testing.T) {
 			recovered := false
 			ledger := &startupLedger{page: func(height uint64) *api.AccountBlockListMarshal {
@@ -24,9 +24,12 @@ func TestBridgeListenerReplaysFailedReceiveInOrder(t *testing.T) {
 					if failure == "missing height" {
 						return startupPage(first, last)
 					}
-					if failure == "unconfirmed" {
+					if failure == "unconfirmed" || failure == "zero confirmation height" {
 						pending := *missed
 						pending.ConfirmationDetail = nil
+						if failure == "zero confirmation height" {
+							pending.ConfirmationDetail = &api.AccountBlockConfirmationDetail{}
+						}
 						return startupPage(first, &pending, last)
 					}
 					return startupPage(first, missed, last)

@@ -487,13 +487,40 @@ func (r *EvmRpc) FilterLogs(left, right uint64) ([]etypes.Log, error) {
 	return r.rpcClient.FilterLogs(ctx, query)
 }
 
+// A bridge lookup can end when either its listener or its EVM client stops.
+// Keep both cancellations active while waiting for a permit and during the RPC.
+func (r *EvmRpc) lookupContext(parent context.Context) (context.Context, context.CancelFunc, error) {
+	ctx, cancel := context.WithCancel(parent)
+	stop := context.AfterFunc(r.ctx, cancel)
+	if r.ctx.Err() != nil {
+		cancel()
+	}
+	cleanup := func() {
+		stop()
+		cancel()
+	}
+	read, end, err := limitedCallContext(ctx, r.limiter, evmCallTimeout)
+	if err != nil {
+		cleanup()
+		return nil, nil, err
+	}
+	return read, func() {
+		end()
+		cleanup()
+	}, nil
+}
+
 // FilterBlockLogs returns the bridge contract's logs in the given block.
 func (r *EvmRpc) FilterBlockLogs(blockHash ecommon.Hash) ([]etypes.Log, error) {
+	return r.FilterBlockLogsContext(r.ctx, blockHash)
+}
+
+func (r *EvmRpc) FilterBlockLogsContext(parent context.Context, blockHash ecommon.Hash) ([]etypes.Log, error) {
 	newFilterQuery := ethereum.FilterQuery{
 		BlockHash: &blockHash,
 		Addresses: r.filterQuery.Addresses,
 	}
-	ctx, cancel, err := r.callContext(evmCallTimeout)
+	ctx, cancel, err := r.lookupContext(parent)
 	if err != nil {
 		return nil, err
 	}
@@ -502,7 +529,11 @@ func (r *EvmRpc) FilterBlockLogs(blockHash ecommon.Hash) ([]etypes.Log, error) {
 }
 
 func (r *EvmRpc) TransactionReceipt(txHash ecommon.Hash) (*etypes.Receipt, error) {
-	ctx, cancel, err := r.callContext(evmCallTimeout)
+	return r.TransactionReceiptContext(r.ctx, txHash)
+}
+
+func (r *EvmRpc) TransactionReceiptContext(parent context.Context, txHash ecommon.Hash) (*etypes.Receipt, error) {
+	ctx, cancel, err := r.lookupContext(parent)
 	if err != nil {
 		return nil, err
 	}

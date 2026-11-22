@@ -355,15 +355,15 @@ func (rC *znnNetwork) syncReceive(ctx context.Context, listed *api.AccountBlock)
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	return rC.InterpretSendBlockData(send, live, receive.Height)
+	return rC.interpretSendBlockData(ctx, send, live, receive.Height, rC.refreshSettings)
 }
 
 // InterpretSendBlockData We assume that if the receive acc block was created then it was no error
 func (rC *znnNetwork) InterpretSendBlockData(sendBlock *api.AccountBlock, live bool, receiveBlockHeight uint64) error {
-	return rC.interpretSendBlockData(sendBlock, live, receiveBlockHeight, rC.refreshSettings)
+	return rC.interpretSendBlockData(rC.listenerCtx, sendBlock, live, receiveBlockHeight, rC.refreshSettings)
 }
 
-func (rC *znnNetwork) interpretSendBlockData(sendBlock *api.AccountBlock, live bool, receiveBlockHeight uint64, refreshSettings func() error) error {
+func (rC *znnNetwork) interpretSendBlockData(ctx context.Context, sendBlock *api.AccountBlock, live bool, receiveBlockHeight uint64, refreshSettings func() error) error {
 	rC.logger.Debugf("InterpretSendBlockData, live: %v", live)
 	if len(sendBlock.Data) < 4 {
 		return errors.Errorf("bridge send %s has no complete method selector", sendBlock.Hash)
@@ -501,7 +501,7 @@ func (rC *znnNetwork) interpretSendBlockData(sendBlock *api.AccountBlock, live b
 				param.TransactionHash.String(), param.LogIndex, param.ChainId)
 			break
 		} else {
-			if tx, rpcEvmErr := rC.rpcManager.Evm(param.ChainId).TransactionReceipt(ecommon.Hash(param.TransactionHash)); rpcEvmErr != nil {
+			if tx, rpcEvmErr := rC.rpcManager.Evm(param.ChainId).TransactionReceiptContext(ctx, ecommon.Hash(param.TransactionHash)); rpcEvmErr != nil {
 				rC.logger.Debugf("error: %s", rpcEvmErr.Error())
 				// todo filter errors, maybe just an rpc error
 				if rpcEvmErr.Error() == ethereum.NotFound.Error() || rpcEvmErr.Error() == "server returned transaction without signature" {
@@ -518,7 +518,7 @@ func (rC *znnNetwork) interpretSendBlockData(sendBlock *api.AccountBlock, live b
 				}
 			} else {
 				found := false
-				if logs, err := rC.rpcManager.Evm(param.ChainId).FilterBlockLogs(tx.BlockHash); err != nil {
+				if logs, err := rC.rpcManager.Evm(param.ChainId).FilterBlockLogsContext(ctx, tx.BlockHash); err != nil {
 					rC.logger.Debug(err)
 					return err
 				} else {
@@ -1139,7 +1139,7 @@ func (rC *znnNetwork) processBridgeAccountPage(ctx context.Context, height uint6
 		if block == nil || block.Height != height+1 || block.Address != types.BridgeContract {
 			return height, false, errors.Errorf("expected bridge account block at height %d", height+1)
 		}
-		if block.ConfirmationDetail == nil {
+		if block.ConfirmationDetail == nil || block.ConfirmationDetail.MomentumHeight == 0 {
 			return height, false, errors.Errorf("bridge account block %d awaits confirmation", block.Height)
 		}
 		receive, err := bridgeAccountReceive(block.BlockType, block.Height)
@@ -1159,7 +1159,7 @@ func (rC *znnNetwork) processBridgeAccountPage(ctx context.Context, height uint6
 			if err := ctx.Err(); err != nil {
 				return height, false, err
 			}
-			if err := rC.interpretSendBlockData(send, true, block.Height, refresh); err != nil {
+			if err := rC.interpretSendBlockData(ctx, send, true, block.Height, refresh); err != nil {
 				return height, false, err
 			}
 		}

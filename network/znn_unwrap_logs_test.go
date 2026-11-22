@@ -1,6 +1,7 @@
 package network
 
 import (
+	"context"
 	"encoding/json"
 	"math/big"
 	"net/http"
@@ -9,6 +10,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	ecommon "github.com/ethereum/go-ethereum/common"
 	etypes "github.com/ethereum/go-ethereum/core/types"
@@ -48,9 +50,12 @@ func TestInterpretUnwrapSelectsLogByIdentity(t *testing.T) {
 		index      uint
 		affiliate  bool
 		historical bool
+		stallRPC   string
 		change     func(etypes.Log) []etypes.Log
 		valid      bool
 	}{
+		{name: "shutdown during receipt", stallRPC: "eth_getTransactionReceipt"},
+		{name: "shutdown during log query", stallRPC: "eth_getLogs"},
 		{name: "first log", valid: true},
 		{name: "unrelated logs precede bridge log", index: 9, valid: true},
 		{name: "historical filtered block", index: 9, historical: true, valid: true},
@@ -134,6 +139,7 @@ func TestInterpretUnwrapSelectsLogByIdentity(t *testing.T) {
 				logs = tc.change(log)
 			}
 			var filteredCalls atomic.Int32
+			entered, release := make(chan struct{}), make(chan struct{})
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				var call struct {
 					ID     json.RawMessage   `json:"id"`
@@ -143,6 +149,14 @@ func TestInterpretUnwrapSelectsLogByIdentity(t *testing.T) {
 				if err := json.NewDecoder(r.Body).Decode(&call); err != nil {
 					t.Errorf("decode RPC request: %v", err)
 					http.Error(w, "invalid request", http.StatusBadRequest)
+					return
+				}
+				if call.Method == tc.stallRPC {
+					close(entered)
+					select {
+					case <-r.Context().Done():
+					case <-release:
+					}
 					return
 				}
 				var result interface{}
@@ -178,6 +192,7 @@ func TestInterpretUnwrapSelectsLogByIdentity(t *testing.T) {
 				}
 			}))
 			t.Cleanup(server.Close)
+			defer close(release)
 			stop := make(chan os.Signal, 8)
 			rpcs, err := rpc.NewRpcManager(config.BaseNetworkConfig{Urls: []string{server.URL}}, stop)
 			if err != nil {
@@ -197,14 +212,49 @@ func TestInterpretUnwrapSelectsLogByIdentity(t *testing.T) {
 				state.SetTokensMap(1, types.ZnnTokenStandard.String(), strings.ToLower(token.Hex()))
 				state.SetIsAffiliateProgram(common.AffiliateProgram{Networks: map[uint32]common.AffiliateNetwork{1: {StartingHeight: 1, ZNN: true}}})
 			}
-			network := &znnNetwork{dbManager: stores, rpcManager: rpcs, state: state, stopChan: stop, logger: zap.NewNop().Sugar()}
+			listenerCtx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			network := &znnNetwork{listenerCtx: listenerCtx, cancelListener: cancel, dbManager: stores, rpcManager: rpcs, state: state, stopChan: stop, logger: zap.NewNop().Sugar()}
 			method, err := definition.ABIBridge.PackMethod(definition.UnwrapTokenMethodName,
 				request.NetworkClass, request.ChainId, request.TransactionHash, request.LogIndex,
 				request.ToAddress, request.TokenAddress, request.Amount, request.Signature)
 			if err != nil {
 				t.Fatal(err)
 			}
-			if err := network.InterpretSendBlockData(&api.AccountBlock{AccountBlock: nom.AccountBlock{Data: method}}, !tc.historical, 42); err != nil {
+			send := &api.AccountBlock{AccountBlock: nom.AccountBlock{Data: method}}
+			if tc.stallRPC != "" {
+				initial, err := stores.znn.GetLastUpdateHeight()
+				if err != nil {
+					t.Fatal(err)
+				}
+				result := make(chan error, 1)
+				network.listenerWorker.Add(1)
+				go func() {
+					defer network.listenerWorker.Done()
+					result <- network.InterpretSendBlockData(send, true, 42)
+				}()
+				select {
+				case <-entered:
+				case <-time.After(3 * time.Second):
+					t.Fatal("listener did not reach " + tc.stallRPC)
+				}
+				stopped := make(chan error, 1)
+				go func() { stopped <- network.Stop() }()
+				select {
+				case err := <-stopped:
+					if err != nil {
+						t.Fatal(err)
+					}
+				case <-time.After(2 * time.Second):
+					t.Fatal("shutdown blocked on " + tc.stallRPC)
+				}
+				if err := <-result; err == nil {
+					t.Fatal("interpreter accepted an interrupted lookup")
+				}
+				checkStartupCursor(t, network, initial)
+				return
+			}
+			if err := network.InterpretSendBlockData(send, !tc.historical, 42); err != nil {
 				t.Fatal(err)
 			}
 			if filteredCalls.Load() != 1 {

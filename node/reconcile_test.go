@@ -178,7 +178,7 @@ type fixtureStores struct{ store db.EvmStorage }
 func (s fixtureStores) EvmStorage(uint32) db.EvmStorage { return s.store }
 func (s fixtureStores) HasEvmStorage(id uint32) bool    { return id == 1 }
 func (s fixtureStores) AddEvmEventStore(uint32, string, uint64) (func(), error) {
-	panic("unexpected EVM network creation")
+	return func() {}, nil
 }
 func (s fixtureStores) ZnnStorage() db.ZnnStorage { return nil }
 
