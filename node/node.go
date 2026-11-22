@@ -319,6 +319,9 @@ func (node *Node) closeSnapshot() {
 }
 
 func (node *Node) Stop() error {
+	// Start holds the lock during bridge sync. Interrupt pending ledger
+	// reads and backoff before waiting for the startup path to unwind.
+	node.networksManager.Znn().CancelAccountBlockReads()
 	node.lock.Lock()
 	defer node.lock.Unlock()
 	defer close(node.stopChan)
