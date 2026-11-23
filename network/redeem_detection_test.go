@@ -2,6 +2,7 @@ package network
 
 import (
 	"math/big"
+	"sync"
 	"testing"
 	"time"
 
@@ -34,6 +35,7 @@ func TestCatchUpChecksYoungRegistrations(t *testing.T) {
 		sources  func(etypes.Log) []*redeemSource
 		lagging  bool // one EVM endpoint does not serve the log
 		wantHalt bool
+		wantHeld bool // no answer yet: kept for the recheck worker
 	}{
 		{name: "no source request", wantHalt: true,
 			sources: func(etypes.Log) []*redeemSource { return []*redeemSource{{synced: true, err: notFound}} }},
@@ -53,15 +55,15 @@ func TestCatchUpChecksYoungRegistrations(t *testing.T) {
 				request.NetworkClass = definition.NoMClass
 				return []*redeemSource{{synced: true, wrap: request}}
 			}},
-		{name: "source endpoints disagree",
+		{name: "source endpoints disagree", wantHeld: true,
 			sources: func(log etypes.Log) []*redeemSource {
 				return []*redeemSource{{synced: true, err: notFound}, {synced: true, wrap: sourceRequestFor(log)}}
 			}},
-		{name: "one source endpoint is not synced",
+		{name: "one source endpoint is not synced", wantHeld: true,
 			sources: func(etypes.Log) []*redeemSource {
 				return []*redeemSource{{synced: true, err: notFound}, {synced: false, err: notFound}}
 			}},
-		{name: "one EVM endpoint does not serve the log", lagging: true,
+		{name: "one EVM endpoint does not serve the log", lagging: true, wantHeld: true,
 			sources: func(etypes.Log) []*redeemSource { return []*redeemSource{{synced: true, err: notFound}} }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -79,6 +81,9 @@ func TestCatchUpChecksYoungRegistrations(t *testing.T) {
 			if halted := n.state.RedeemHaltGeneration() != 0; halted != tc.wantHalt {
 				t.Fatalf("halt pending=%t, want %t", halted, tc.wantHalt)
 			}
+			if held := len(n.heldRedeemLogs()) == 1; held != tc.wantHeld {
+				t.Fatalf("held=%t, want %t", held, tc.wantHeld)
+			}
 			// Durable status and the redeem checkpoint wait for finality.
 			row, err := n.dbManager.ZnnStorage().GetWrapRequestById(types.Hash(reg.Topics[1]))
 			if err != nil || row != nil {
@@ -93,6 +98,26 @@ func TestCatchUpChecksYoungRegistrations(t *testing.T) {
 				t.Fatalf("scan height %d, want %d", through, wantThrough)
 			}
 		})
+	}
+}
+
+// A registration log without its data cannot be compared with anything. It
+// is an unanswered check, not a crash and not a match.
+func TestRegistrationWithoutDataIsNotDecided(t *testing.T) {
+	src := &redeemSource{synced: true}
+	n, reg, _ := redeemFixture(t, src)
+	src.wrap = sourceRequestFor(reg)
+	reg.Data = nil
+	for _, live := range []bool{true, false} {
+		if err := n.InterpretLog(reg, live); err == nil || n.state.RedeemHaltGeneration() != 0 {
+			t.Fatalf("live=%t: err=%v pending=%d", live, err, n.state.RedeemHaltGeneration())
+		}
+	}
+	if row, err := n.dbManager.ZnnStorage().GetWrapRequestById(src.wrap.Id); err != nil || row != nil {
+		t.Fatalf("a log without data wrote a wrap row: %+v %v", row, err)
+	}
+	if len(n.heldRedeemLogs()) != 1 {
+		t.Fatal("the unanswered live check was not held")
 	}
 }
 
@@ -143,8 +168,8 @@ func TestSettledHistoryDoesNotHaltAFreshSigner(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// The administrator revoked the redeem and unhalted at block 120.
-	chain.contract.closed.Store(true)
+	// The administrator revoked the redeem at block 110 and unhalted at 120.
+	chain.contract.closedAt.Store(110)
 	chain.contract.unhaltedAt.Store(120)
 
 	// Second life: same chain, empty databases.
@@ -177,41 +202,59 @@ func TestSettledHistoryDoesNotHaltAFreshSigner(t *testing.T) {
 	}
 }
 
-// Only a closed redeem followed by a finalized unhalt is archived. Anything
-// else still holds the bridge, and an answer that is not unanimous or not
-// final decides nothing.
+// Only a redeem that, at the final height, is closed and followed by an
+// unhalt is archived. Anything else still holds the bridge, and an answer that
+// is not unanimous or rests on blocks that are not final decides nothing.
+// The fixture head is 140 with 12 confirmations, so the final height is 128.
 func TestOnlySettledHistoryIsArchived(t *testing.T) {
 	for _, tc := range []struct {
 		name       string
-		closed     bool
-		unhaltedAt uint64
-		unreadable bool                  // no endpoint can read the contract
-		secondary  func(*redeemContract) // nil: both endpoints report the same state
+		closedAt   uint64                // 0: still payable
+		unhaltedAt uint64                // 0: never unhalted
+		primary    func(*redeemContract) // extra condition on the first endpoint
+		secondary  func(*redeemContract) // nil: both endpoints report the same contract
+		lagging    uint64                // head of the second endpoint, when it is behind
 		wantHalt   bool
 		wantErr    bool
 		wantStored bool
 	}{
 		{name: "payable after an unhalt", unhaltedAt: 120, wantHalt: true},
-		{name: "closed without a later unhalt", closed: true, wantHalt: true},
-		{name: "closed, unhalt in the registration block", closed: true, unhaltedAt: 100, wantHalt: true},
-		{name: "closed, unhalt one block later", closed: true, unhaltedAt: 101, wantStored: true},
-		{name: "closed, unhalt at the final height", closed: true, unhaltedAt: 128, wantStored: true},
-		{name: "closed, unhalt not final", closed: true, unhaltedAt: 129, wantErr: true},
-		{name: "endpoints disagree", closed: true, unhaltedAt: 120, wantErr: true,
+		{name: "payable, unhalt above the final height", unhaltedAt: 135, wantHalt: true},
+		{name: "closed without a later unhalt", closedAt: 110, wantHalt: true},
+		{name: "closed, unhalt in the registration block", closedAt: 110, unhaltedAt: 100, wantHalt: true},
+		{name: "closed, unhalt one block later", closedAt: 110, unhaltedAt: 101, wantStored: true},
+		{name: "closed and unhalted at the final height", closedAt: 128, unhaltedAt: 128, wantStored: true},
+		{name: "unhalt above the final height", closedAt: 110, unhaltedAt: 129, wantErr: true},
+		{name: "closed above the final height", closedAt: 129, unhaltedAt: 120, wantErr: true},
+		{name: "closed in the head block", closedAt: 140, unhaltedAt: 120, wantErr: true},
+		{name: "endpoints disagree on the entry", closedAt: 110, unhaltedAt: 120, wantErr: true,
 			secondary: func(c *redeemContract) { c.unhaltedAt.Store(120) }},
-		{name: "one endpoint cannot read the contract", closed: true, unhaltedAt: 120, wantErr: true,
+		{name: "endpoints disagree on the unhalt height", closedAt: 110, unhaltedAt: 120, wantErr: true,
+			secondary: func(c *redeemContract) { c.closedAt.Store(110); c.unhaltedAt.Store(119) }},
+		{name: "only one endpoint sees the settlement, in its latest state", wantErr: true,
+			secondary: func(c *redeemContract) { c.closedAt.Store(130); c.unhaltedAt.Store(131) }},
+		{name: "one endpoint cannot read the contract", closedAt: 110, unhaltedAt: 120, wantErr: true,
 			secondary: func(c *redeemContract) { c.failing.Store(true) }},
-		{name: "no endpoint can read the contract", closed: true, unhaltedAt: 120, unreadable: true, wantErr: true},
+		{name: "no endpoint can read the contract", closedAt: 110, unhaltedAt: 120, wantErr: true,
+			primary: func(c *redeemContract) { c.failing.Store(true) }},
+		{name: "one endpoint has no state at the final height", closedAt: 110, unhaltedAt: 120, wantErr: true,
+			secondary: func(c *redeemContract) { c.closedAt.Store(110); c.unhaltedAt.Store(120); c.pruned.Store(true) }},
+		{name: "one endpoint has not reached the final height", closedAt: 110, unhaltedAt: 120, lagging: 120, wantErr: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			src := &redeemSource{synced: true, err: constants.ErrDataNonExistent.Error()}
 			n, reg, chain := redeemFixture(t, src)
-			chain.primary.contract.closed.Store(tc.closed)
+			chain.primary.contract.closedAt.Store(tc.closedAt)
 			chain.primary.contract.unhaltedAt.Store(tc.unhaltedAt)
-			chain.primary.contract.failing.Store(tc.unreadable)
+			if tc.primary != nil {
+				tc.primary(chain.primary.contract)
+			}
 			if tc.secondary != nil {
 				chain.contract = new(redeemContract)
 				tc.secondary(chain.contract)
+			}
+			if tc.lagging != 0 {
+				chain.set(evidenceReceipt(reg), []etypes.Log{reg}, tc.lagging)
 			}
 			err := n.InterpretLog(reg, false)
 			if (err != nil) != tc.wantErr {
@@ -225,5 +268,85 @@ func TestOnlySettledHistoryIsArchived(t *testing.T) {
 				t.Fatalf("archived=%t err=%v, want %t", stored, err, tc.wantStored)
 			}
 		})
+	}
+}
+
+// A signer that restarts with a stored incident the chain settled while it
+// was down releases it in its first scan, before anything acts on the
+// restored emergency, and then scans on.
+func TestRestoredIncidentIsReleasedByTheFirstScan(t *testing.T) {
+	src := &redeemSource{synced: true, err: constants.ErrDataNonExistent.Error()}
+	n, reg, chain := redeemFixture(t, src)
+	db, err := leveldb.Open(storage.NewMemStorage(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	restart := func() {
+		t.Helper()
+		n.state = common.NewGlobalState(new(uint8))
+		if err := n.state.RestoreRedeemIncidents(wrap.NewRedeemIncidentStore(db)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	restart()
+	if err := n.Sync(); err != nil || n.state.RedeemHaltGeneration() == 0 {
+		t.Fatalf("payable unmatched registration: err=%v pending=%d", err, n.state.RedeemHaltGeneration())
+	}
+
+	// Still payable after a restart: the first scan must keep the emergency.
+	restart()
+	if err := n.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	if state, _ := n.state.GetState(); n.state.RedeemHaltGeneration() == 0 || state != common.EmergencyState {
+		t.Fatalf("a payable incident did not survive the restart: pending=%d state=%d", n.state.RedeemHaltGeneration(), state)
+	}
+
+	// The halt, the revocation and the unhalt all happened while it was down.
+	chain.contract.closedAt.Store(110)
+	chain.contract.unhaltedAt.Store(120)
+	restart()
+	if state, _ := n.state.GetState(); state != common.EmergencyState {
+		t.Fatalf("restored state = %d", state)
+	}
+	if err := n.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	state, _ := n.state.GetState()
+	cursor, _ := n.eventsStore().GetLastUpdateHeight()
+	if n.state.RedeemHaltGeneration() != 0 || state == common.EmergencyState || cursor != 140 {
+		t.Fatalf("settled incident after the first scan: pending=%d state=%d cursor=%d", n.state.RedeemHaltGeneration(), state, cursor)
+	}
+	if archived, err := n.state.HandledRedeemLog(1, reg); err != nil || !archived {
+		t.Fatalf("released incident lost its evidence: %t %v", archived, err)
+	}
+}
+
+// In a long pass the checkpoint limit is fixed by the first range. A
+// registration above that limit that is final under the current head is
+// decided by the finalized rules, so settled history is archived there too.
+func TestSettledRegistrationAboveTheCheckpointLimit(t *testing.T) {
+	src := &redeemSource{synced: true, err: constants.ErrDataNonExistent.Error()}
+	n, reg, chain := redeemFixture(t, src)
+	reg.BlockNumber = 110
+	reg.BlockHash = canonicalHeader(110).Hash()
+	chain.setChain(112, reg) // the pass starts here: checkpoint limit 100
+	chain.contract.closedAt.Store(115)
+	chain.contract.unhaltedAt.Store(120)
+	n.queryRange = newQueryRangeAdapter(5)
+	chain.primary.afterRange = sync.OnceFunc(func() { chain.setChain(150, reg) })
+	if err := n.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	through, from, _, err := n.eventsStore().GetScanHeights(n.ConfirmationsToFinality())
+	if err != nil || through != 150 || from != 100 {
+		t.Fatalf("through=%d redeem=%d err=%v", through, from, err)
+	}
+	if state, _ := n.state.GetState(); n.state.RedeemHaltGeneration() != 0 || state != common.LiveState || len(n.heldRedeemLogs()) != 0 {
+		t.Fatalf("settled registration above the limit: pending=%d state=%d held=%d", n.state.RedeemHaltGeneration(), state, len(n.heldRedeemLogs()))
+	}
+	if archived, err := n.state.HandledRedeemLog(1, reg); err != nil || !archived {
+		t.Fatalf("settled registration was not kept as evidence: %t %v", archived, err)
 	}
 }

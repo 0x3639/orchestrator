@@ -8,8 +8,9 @@ import (
 	etypes "github.com/ethereum/go-ethereum/core/types"
 )
 
-// lossyIncidentStore fails to record while failing is set and holds nothing.
-type lossyIncidentStore struct{ failing bool }
+// lossyIncidentStore fails to record while failing is set, fails to list
+// while unreadable is set, and holds nothing.
+type lossyIncidentStore struct{ failing, unreadable bool }
 
 func (s *lossyIncidentStore) RecordRedeemIncident(RedeemIncident) (bool, error) {
 	if s.failing {
@@ -18,7 +19,12 @@ func (s *lossyIncidentStore) RecordRedeemIncident(RedeemIncident) (bool, error) 
 	return true, nil
 }
 func (s *lossyIncidentStore) HandledRedeemLog(uint32, etypes.Log) (bool, error) { return false, nil }
-func (s *lossyIncidentStore) HasPendingRedeemIncident() (bool, error)           { return false, nil }
+func (s *lossyIncidentStore) HasPendingRedeemIncident() (bool, error) {
+	if s.unreadable {
+		return false, errors.New("read failed")
+	}
+	return false, nil
+}
 func (s *lossyIncidentStore) PendingRedeemIncidents() ([]RedeemIncident, error) { return nil, nil }
 func (s *lossyIncidentStore) ResolveRedeemIncident(RedeemIncident, RedeemResolution) error {
 	return nil
@@ -40,8 +46,35 @@ func TestResolvingAnIncidentKeepsAHaltWhoseEvidenceWasLost(t *testing.T) {
 	if err := state.ArchiveSettledRedeem(RedeemIncident{ChainID: 56}); err != nil {
 		t.Fatal(err)
 	}
+	if err := state.ReleaseResolvedRedeemHalt(); err != nil {
+		t.Fatal(err)
+	}
 	if state.RedeemHaltGeneration() == 0 {
 		t.Fatal("resolving one incident released a halt whose evidence was never stored")
+	}
+}
+
+// A read that fails right after the last incident was resolved leaves the
+// halt in place for that moment only: the next look releases it.
+func TestHaltIsReleasedAfterAFailedPendingRead(t *testing.T) {
+	store := new(lossyIncidentStore)
+	state := NewGlobalState(new(uint8))
+	if err := state.RestoreRedeemIncidents(store); err != nil {
+		t.Fatal(err)
+	}
+	if err := state.ReportRedeemIncident(RedeemIncident{ChainID: 1}); err != nil || state.RedeemHaltGeneration() == 0 {
+		t.Fatalf("reported incident: pending=%d err=%v", state.RedeemHaltGeneration(), err)
+	}
+	store.unreadable = true
+	if err := state.ArchiveSettledRedeem(RedeemIncident{ChainID: 1}); err == nil || state.RedeemHaltGeneration() == 0 {
+		t.Fatalf("failed read: pending=%d err=%v", state.RedeemHaltGeneration(), err)
+	}
+	if err := state.ReleaseResolvedRedeemHalt(); err == nil || state.RedeemHaltGeneration() == 0 {
+		t.Fatalf("still unreadable: pending=%d err=%v", state.RedeemHaltGeneration(), err)
+	}
+	store.unreadable = false
+	if err := state.ReleaseResolvedRedeemHalt(); err != nil || state.RedeemHaltGeneration() != 0 {
+		t.Fatalf("readable again: pending=%d err=%v", state.RedeemHaltGeneration(), err)
 	}
 }
 

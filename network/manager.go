@@ -106,6 +106,10 @@ func (m *NetworksManager) Init(networksInfo map[string]config.BaseNetworkConfig,
 				common.GlobalLogger.Infof("err: %s", err.Error())
 				return err
 			}
+			// Keep the client for the network's lifetime, as a runtime addition
+			// does. A worker that is mid-call when the network is removed then
+			// gets a stopped client instead of none.
+			newEvmNetwork.client = newRpcManager.Evm(network.Id)
 
 			newEvmNetworks = append(newEvmNetworks, newEvmNetwork)
 		default:

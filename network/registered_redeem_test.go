@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"math/big"
 	"net/http"
 	"net/http/httptest"
@@ -35,11 +36,27 @@ import (
 	"orchestrator/rpc"
 )
 
-// redeemContract is the bridge storage one fixture endpoint reports.
+// redeemContract is the bridge storage one fixture endpoint reports. A read
+// at a block sees only what had happened by that block.
 type redeemContract struct {
-	closed     atomic.Bool   // the redeem entry was paid or revoked
-	unhaltedAt atomic.Uint64 // height of the last administrator unhalt
-	failing    atomic.Bool   // contract reads fail on this endpoint
+	closedAt   atomic.Uint64 // block that paid or revoked the redeem entry; 0 while payable
+	unhaltedAt atomic.Uint64 // block of the last administrator unhalt
+	failing    atomic.Bool   // every contract read fails on this endpoint
+	pruned     atomic.Bool   // only the latest state can be read on this endpoint
+	reads      atomic.Uint64 // redeem entry reads served
+}
+
+func (c *redeemContract) stateAt(block string) (uint64, error) {
+	if c.failing.Load() {
+		return 0, errors.New("contract state unavailable")
+	}
+	if block == "latest" {
+		return math.MaxUint64, nil
+	}
+	if c.pruned.Load() {
+		return 0, errors.New("missing trie node")
+	}
+	return hexutil.DecodeUint64(block)
 }
 
 type redeemProvider struct {
@@ -48,6 +65,22 @@ type redeemProvider struct {
 	halted     *bool
 	contract   *redeemContract
 	afterRange func()
+	headFails  atomic.Bool   // eth_blockNumber fails on this endpoint
+	headReads  atomic.Uint64 // eth_blockNumber requests received
+	blockReads atomic.Uint64 // eth_getBlockByNumber requests received
+}
+
+func (p *redeemProvider) BlockNumber() (hexutil.Uint64, error) {
+	p.headReads.Add(1)
+	if p.headFails.Load() {
+		return 0, errors.New("head unavailable")
+	}
+	return p.unwrapProvider.BlockNumber(), nil
+}
+
+func (p *redeemProvider) GetBlockByNumber(n hexutil.Uint64, full bool) map[string]interface{} {
+	p.blockReads.Add(1)
+	return p.unwrapProvider.GetBlockByNumber(n, full)
 }
 
 func (p *redeemProvider) setChain(head uint64, logs ...etypes.Log) {
@@ -71,7 +104,7 @@ func (p *redeemProvider) GetLogs(q scanQuery) []etypes.Log {
 	return result
 }
 
-func (p *redeemProvider) Call(call map[string]any, _ string) (hexutil.Bytes, error) {
+func (p *redeemProvider) Call(call map[string]any, block string) (hexutil.Bytes, error) {
 	result := make([]byte, 32)
 	input, _ := call["input"].(string)
 	switch {
@@ -82,20 +115,25 @@ func (p *redeemProvider) Call(call map[string]any, _ string) (hexutil.Bytes, err
 			result[31] = 1
 		}
 	case strings.HasPrefix(input, "0xa75f8096"): // redeemsInfo(nonce): block number, params hash.
-		if p.contract.failing.Load() {
-			return nil, errors.New("contract state unavailable")
+		at, err := p.contract.stateAt(block)
+		if err != nil {
+			return nil, err
 		}
+		p.contract.reads.Add(1)
 		result = make([]byte, 64)
-		if p.contract.closed.Load() {
+		if closed := p.contract.closedAt.Load(); closed != 0 && closed <= at {
 			copy(result, bytes.Repeat([]byte{0xff}, 32))
 		} else {
 			result[31] = 100
 		}
 	case input == "0x69d11381": // unhaltedAt()
-		if p.contract.failing.Load() {
-			return nil, errors.New("contract state unavailable")
+		at, err := p.contract.stateAt(block)
+		if err != nil {
+			return nil, err
 		}
-		binary.BigEndian.PutUint64(result[24:], p.contract.unhaltedAt.Load())
+		if unhalted := p.contract.unhaltedAt.Load(); unhalted <= at {
+			binary.BigEndian.PutUint64(result[24:], unhalted)
+		}
 	default:
 		return nil, fmt.Errorf("unexpected contract call %v", call["input"])
 	}
@@ -449,8 +487,8 @@ func TestCatchupRedeemWaitsForFinalityAcrossRestart(t *testing.T) {
 	if err := n.Sync(); err != nil {
 		t.Fatal(err)
 	}
-	if n.state.RedeemHaltGeneration() != 0 {
-		t.Fatal("an unchecked young registration opened a halt")
+	if n.state.RedeemHaltGeneration() != 0 || len(n.heldRedeemLogs()) != 1 {
+		t.Fatalf("unchecked young registration: pending=%d held=%d", n.state.RedeemHaltGeneration(), len(n.heldRedeemLogs()))
 	}
 	through, from, _, err := stores.evm.GetScanHeights(n.ConfirmationsToFinality())
 	if err != nil || through != head || from != reg.BlockNumber {
@@ -508,8 +546,8 @@ func TestCatchupRedeemRetainsGapWhenHeadAdvances(t *testing.T) {
 		t.Fatal(err)
 	}
 	through, from, _, err := n.eventsStore().GetScanHeights(n.ConfirmationsToFinality())
-	if err != nil || through != 140 || from >= reg.BlockNumber || n.state.RedeemHaltGeneration() != 0 {
-		t.Fatalf("through=%d redeem=%d pending=%d err=%v", through, from, n.state.RedeemHaltGeneration(), err)
+	if err != nil || through != 140 || from >= reg.BlockNumber || n.state.RedeemHaltGeneration() != 0 || len(n.heldRedeemLogs()) != 1 {
+		t.Fatalf("through=%d redeem=%d pending=%d held=%d err=%v", through, from, n.state.RedeemHaltGeneration(), len(n.heldRedeemLogs()), err)
 	}
 	src.synced = true
 	if err := n.Sync(); err != nil {
@@ -618,8 +656,8 @@ func TestRedeemFinalizesWhileSubscriptionIsUnavailable(t *testing.T) {
 	if err := n.Sync(); err != nil {
 		t.Fatal(err)
 	}
-	if n.state.RedeemHaltGeneration() != 0 {
-		t.Fatal("an unchecked young registration halted the bridge")
+	if n.state.RedeemHaltGeneration() != 0 || len(n.heldRedeemLogs()) != 1 {
+		t.Fatalf("unchecked young registration: pending=%d held=%d", n.state.RedeemHaltGeneration(), len(n.heldRedeemLogs()))
 	}
 	n.heldRedeems = nil // leave the finalized scan as the only path
 	src.synced = true

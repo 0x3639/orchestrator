@@ -188,6 +188,13 @@ func (gs *GlobalState) CompleteEmergencyHalt(generation uint64, checkedChains ma
 	return nil
 }
 
+// RedeemLogAcknowledged reports whether the operator named this registration.
+func (gs *GlobalState) RedeemLogAcknowledged(ev RedeemIncident) bool {
+	gs.stateMu.Lock()
+	defer gs.stateMu.Unlock()
+	return gs.acknowledgedRedeems[redeemLogID(ev)]
+}
+
 // PendingRedeemIncidents lists the evidence that still holds the bridge.
 func (gs *GlobalState) PendingRedeemIncidents() ([]RedeemIncident, error) {
 	if gs.redeemIncidents == nil {
@@ -208,11 +215,28 @@ func (gs *GlobalState) ArchiveSettledRedeem(ev RedeemIncident) error {
 	return gs.resolveRedeemLocked(ev, RedeemSettledOnChain)
 }
 
-// A pending halt ends here only when no stored incident still needs it.
 func (gs *GlobalState) resolveRedeemLocked(ev RedeemIncident, reason RedeemResolution) error {
 	if err := gs.redeemIncidents.ResolveRedeemIncident(ev, reason); err != nil {
 		return err
 	}
+	return gs.releaseResolvedHaltLocked()
+}
+
+// ReleaseResolvedRedeemHalt ends a pending halt that no stored incident needs
+// any more. Resolving the last incident does this itself; the recheck worker
+// repeats it so a failed read at that moment cannot leave the halt in place.
+func (gs *GlobalState) ReleaseResolvedRedeemHalt() error {
+	gs.stateMu.Lock()
+	defer gs.stateMu.Unlock()
+	if gs.redeemIncidents == nil {
+		return errors.New("missing redeem incident store")
+	}
+	return gs.releaseResolvedHaltLocked()
+}
+
+// A pending halt ends here only when no stored incident still needs it. A
+// halt that began with a failed evidence write is not in the store and stays.
+func (gs *GlobalState) releaseResolvedHaltLocked() error {
 	if gs.RedeemHaltGeneration() == 0 || gs.redeemWriteFailed {
 		return nil
 	}

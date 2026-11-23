@@ -1,6 +1,7 @@
 package network
 
 import (
+	"math/big"
 	"testing"
 	"time"
 
@@ -31,13 +32,21 @@ func (p *unwrapProvider) setReplacement(hash ecommon.Hash) {
 
 func waitFor(t *testing.T, what string, done func() bool) {
 	t.Helper()
-	deadline := time.Now().Add(10 * time.Second)
+	deadline := time.Now().Add(20 * time.Second)
 	for !done() {
 		if time.Now().After(deadline) {
 			t.Fatal(what)
 		}
 		time.Sleep(2 * time.Millisecond)
 	}
+}
+
+// waitForMore blocks until a counter the worker drives has advanced by more,
+// so that an assertion that something did not happen follows real rounds.
+func waitForMore(t *testing.T, counter func() uint64, more uint64) {
+	t.Helper()
+	start := counter()
+	waitFor(t, "the recheck worker made no further requests", func() bool { return counter() >= start+more })
 }
 
 // A held registration is kept past finality for as long as its check cannot
@@ -56,7 +65,7 @@ func TestHeldRegistrationIsKeptUntilAnswered(t *testing.T) {
 	final := young + 6
 	chain.primary.set(evidenceReceipt(reg), nil, final)
 	chain.set(evidenceReceipt(reg), nil, final)
-	time.Sleep(100 * time.Millisecond) // many recheck rounds
+	waitForMore(t, func() uint64 { return uint64(src.lookups()) }, 6)
 	if held := len(n.heldRedeemLogs()); held != 1 || n.state.RedeemHaltGeneration() != 0 {
 		t.Fatalf("unanswered registration: held=%d pending=%d", held, n.state.RedeemHaltGeneration())
 	}
@@ -79,8 +88,8 @@ func TestHeldRegistrationIsReleasedWhenItsBlockIsReplaced(t *testing.T) {
 	// The canonical block at that height carries no such log.
 	chain.setChain(reg.BlockNumber + n.ConfirmationsToFinality() + 5)
 	waitFor(t, "a replaced registration stayed held", func() bool { return len(n.heldRedeemLogs()) == 0 })
+	// Nothing rechecks a released entry, so there is no later round to wait for.
 	src.update(func(s *redeemSource) { s.synced = true })
-	time.Sleep(100 * time.Millisecond)
 	if n.state.RedeemHaltGeneration() != 0 {
 		t.Fatal("a registration outside the canonical chain opened a halt")
 	}
@@ -97,7 +106,7 @@ func TestHeldRegistrationSettledByTheTimeItIsFinal(t *testing.T) {
 	if err := n.InterpretLog(reg, true); err == nil {
 		t.Fatal("an unsynced source confirmed the registration")
 	}
-	chain.contract.closed.Store(true)
+	chain.contract.closedAt.Store(105)
 	chain.contract.unhaltedAt.Store(110)
 	chain.primary.set(evidenceReceipt(reg), nil, 142)
 	chain.set(evidenceReceipt(reg), nil, 142)
@@ -112,10 +121,64 @@ func TestHeldRegistrationSettledByTheTimeItIsFinal(t *testing.T) {
 	}
 }
 
+// The age of a held registration selects its rules. While the head cannot be
+// read the age is unknown, so nothing is decided: a final, settled
+// registration must not be reported by the live rules.
+func TestHeldRegistrationWaitsWhileTheHeadIsUnknown(t *testing.T) {
+	src := &redeemSource{synced: false, err: constants.ErrDataNonExistent.Error()}
+	n, reg, chain := redeemFixture(t, src)
+	young := reg.BlockNumber + n.ConfirmationsToFinality() - 1
+	chain.primary.set(evidenceReceipt(reg), nil, young)
+	chain.set(evidenceReceipt(reg), nil, young)
+	if err := n.InterpretLog(reg, true); err == nil {
+		t.Fatal("an unsynced source confirmed the registration")
+	}
+	chain.contract.closedAt.Store(105)
+	chain.contract.unhaltedAt.Store(110)
+	chain.primary.set(evidenceReceipt(reg), nil, 142)
+	chain.set(evidenceReceipt(reg), nil, 142)
+	src.synced = true
+	chain.primary.headFails.Store(true)
+	startRedeemWatch(t, n)
+	waitForMore(t, chain.primary.headReads.Load, 8)
+	if held := len(n.heldRedeemLogs()); held != 1 || n.state.RedeemHaltGeneration() != 0 {
+		t.Fatalf("head unknown: held=%d pending=%d", held, n.state.RedeemHaltGeneration())
+	}
+	chain.primary.headFails.Store(false)
+	waitFor(t, "the registration stayed held after the head returned", func() bool { return len(n.heldRedeemLogs()) == 0 })
+	if state, _ := n.state.GetState(); n.state.RedeemHaltGeneration() != 0 || state != common.LiveState {
+		t.Fatalf("settled registration: pending=%d state=%d", n.state.RedeemHaltGeneration(), state)
+	}
+}
+
+// An answer for a log with the same identity and other content does not
+// release the registration that is held under that identity.
+func TestHeldRegistrationIsNotReleasedByOtherContent(t *testing.T) {
+	// The source knows a request that matches the variant, not the held log.
+	src := &redeemSource{synced: true}
+	n, reg, chain := redeemFixture(t, src)
+	variant := reg
+	variant.Data = ecommon.LeftPadBytes([]byte{22}, 32)
+	src.wrap = sourceRequestFor(reg)
+	src.wrap.Amount = big.NewInt(23)
+	young := reg.BlockNumber + n.ConfirmationsToFinality() - 1
+	chain.primary.set(evidenceReceipt(reg), nil, young)
+	chain.set(nil, nil, young) // one endpoint cannot confirm the log yet
+	if err := n.InterpretLog(reg, true); err == nil || len(n.heldRedeemLogs()) != 1 {
+		t.Fatalf("mismatching registration was not held: %v", err)
+	}
+	if err := n.InterpretLog(variant, true); err != nil {
+		t.Fatalf("matching variant: %v", err)
+	}
+	if held := n.heldRedeemLogs(); len(held) != 1 || held[0].Data[31] != reg.Data[31] {
+		t.Fatalf("held after the variant matched: %+v", held)
+	}
+}
+
 // A stored incident keeps holding the bridge across rechecks while its redeem
-// is payable or the unhalt after it is not final, and is released once every
-// endpoint shows it settled. An incident on another chain is not this
-// network's to release.
+// is payable or its settlement is not final, and is released once every
+// endpoint shows it settled at the final height. An incident on another chain
+// is not this network's to release.
 func TestStoredIncidentIsReleasedOnceSettled(t *testing.T) {
 	src := &redeemSource{synced: true, err: constants.ErrDataNonExistent.Error()}
 	n, reg, chain := redeemFixture(t, src)
@@ -128,23 +191,26 @@ func TestStoredIncidentIsReleasedOnceSettled(t *testing.T) {
 	startRedeemWatch(t, n)
 	stillHeld := func(why string) {
 		t.Helper()
-		time.Sleep(150 * time.Millisecond) // several settlement rounds
+		// Each settlement round reads the entry at two blocks on two endpoints.
+		waitForMore(t, chain.contract.reads.Load, 12)
 		pending, err := n.state.PendingRedeemIncidents()
 		if state, _ := n.state.GetState(); err != nil || len(pending) != 2 || n.state.RedeemHaltGeneration() == 0 || state != common.EmergencyState {
 			t.Fatalf("%s released the incident: pending=%d err=%v", why, len(pending), err)
 		}
 	}
 	stillHeld("a payable redeem")
-	chain.contract.closed.Store(true)
+	chain.contract.closedAt.Store(110)
 	stillHeld("a closed redeem with no unhalt after it")
-	chain.contract.unhaltedAt.Store(129) // head 140, finality 12
+	chain.contract.unhaltedAt.Store(129) // head 140, 12 confirmations: final height 128
 	stillHeld("an unhalt that is not final")
 	chain.contract.unhaltedAt.Store(120)
+	chain.contract.closedAt.Store(129)
+	stillHeld("a closure that is not final")
+	chain.contract.closedAt.Store(110)
 	waitFor(t, "a settled incident was not archived", func() bool {
 		archived, err := n.state.HandledRedeemLog(1, reg)
 		return err == nil && archived
 	})
-	time.Sleep(150 * time.Millisecond)
 	pending, err := n.state.PendingRedeemIncidents()
 	if err != nil || len(pending) != 1 || pending[0].ChainID != 56 || n.state.RedeemHaltGeneration() == 0 {
 		t.Fatalf("incident on another chain: pending=%+v generation=%d err=%v", pending, n.state.RedeemHaltGeneration(), err)
@@ -173,20 +239,23 @@ func TestStoredIncidentOutsideTheCanonicalChainIsNotReleased(t *testing.T) {
 	}
 	chain.primary.setReplacement(ecommon.Hash{})
 	chain.setReplacement(ecommon.Hash{})
-	chain.contract.closed.Store(true)
+	chain.contract.closedAt.Store(110)
 	chain.contract.unhaltedAt.Store(120)
 	startRedeemWatch(t, n)
-	time.Sleep(200 * time.Millisecond)
+	// Each settlement round asks both endpoints for two block hashes.
+	waitForMore(t, chain.primary.blockReads.Load, 8)
 	if n.state.RedeemHaltGeneration() == 0 {
 		t.Fatal("an incident outside the canonical chain was released on contract state")
 	}
 }
 
 // A registration the operator named at startup is archived when the scan
-// meets it. Any other unmatched registration still holds the bridge.
+// meets it, whether or not the contract state can be read. Any other
+// unmatched registration still holds the bridge.
 func TestOperatorAcknowledgedRegistrationIsArchived(t *testing.T) {
 	src := &redeemSource{synced: true, err: constants.ErrDataNonExistent.Error()}
 	n, reg, chain := redeemFixture(t, src)
+	chain.contract.failing.Store(true)
 	db, err := leveldb.Open(storage.NewMemStorage(), nil)
 	if err != nil {
 		t.Fatal(err)
@@ -208,6 +277,7 @@ func TestOperatorAcknowledgedRegistrationIsArchived(t *testing.T) {
 	if archived, err := n.state.HandledRedeemLog(1, reg); err != nil || !archived {
 		t.Fatalf("acknowledged registration was not kept as evidence: %t %v", archived, err)
 	}
+	chain.contract.failing.Store(false)
 	other := reg
 	other.Index++
 	chain.setChain(140, reg, other)

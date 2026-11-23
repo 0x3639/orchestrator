@@ -1,6 +1,8 @@
 package network
 
 import (
+	"fmt"
+	"slices"
 	"time"
 
 	ecommon "github.com/ethereum/go-ethereum/common"
@@ -12,9 +14,9 @@ const (
 	// no answer. It is short against the shortest configured time between a
 	// registration and its payout.
 	heldRedeemRetryInterval = 3 * time.Second
-	// heldRedeemReportEvery is how many failed rechecks pass between the
-	// repeated lines that tell the operator a registration is still unchecked.
-	heldRedeemReportEvery = 20
+	// heldRedeemReportEvery is the time between the repeated lines that tell
+	// the operator a registration is still unchecked.
+	heldRedeemReportEvery = time.Minute
 	// settleIncidentsEvery is how many recheck rounds pass between looks at
 	// whether the chain has settled a stored incident.
 	settleIncidentsEvery = 10
@@ -28,6 +30,7 @@ type heldRedeemKey struct {
 type heldRedeem struct {
 	log      etypes.Log
 	since    time.Time
+	reported time.Time
 	attempts int
 }
 
@@ -44,13 +47,24 @@ func (eN *evmNetwork) checkLiveRedeem(log etypes.Log) error {
 	return err
 }
 
+// examineRegistration checks a registration the range scan met above the
+// redeem checkpoint limit, and holds it when the check gives no answer.
+func (eN *evmNetwork) examineRegistration(log etypes.Log, young bool) {
+	if log.Removed || log.Address != *eN.ContractAddress() {
+		return // InterpretLog rejects these once the finalized scan reaches them.
+	}
+	eN.noteRedeemCheck(log, eN.registerRedeem(log, young))
+}
+
 func (eN *evmNetwork) noteRedeemCheck(log etypes.Log, err error) {
 	key := heldKey(log)
 	eN.heldMu.Lock()
 	defer eN.heldMu.Unlock()
 	entry := eN.heldRedeems[key]
 	if err == nil {
-		if entry != nil {
+		// An answer for other content under the same identity says nothing
+		// about the held log.
+		if entry != nil && slices.Equal(entry.log.Topics, log.Topics) && slices.Equal(entry.log.Data, log.Data) {
 			delete(eN.heldRedeems, key)
 			eN.logger.Infof("Redeem registration on chain %d, block %d, transaction %s, log %d was checked after %d retries",
 				eN.ChainId(), log.BlockNumber, log.TxHash, log.Index, entry.attempts)
@@ -61,13 +75,14 @@ func (eN *evmNetwork) noteRedeemCheck(log etypes.Log, err error) {
 		if eN.heldRedeems == nil {
 			eN.heldRedeems = make(map[heldRedeemKey]*heldRedeem)
 		}
-		eN.heldRedeems[key] = &heldRedeem{log: log, since: time.Now()}
+		eN.heldRedeems[key] = &heldRedeem{log: log, since: time.Now(), reported: time.Now()}
 		eN.logger.Warnf("Redeem registration on chain %d, block %d, transaction %s, log %d could not be checked and will be retried: %v",
 			eN.ChainId(), log.BlockNumber, log.TxHash, log.Index, err)
 		return
 	}
 	entry.attempts++
-	if entry.attempts%heldRedeemReportEvery == 0 {
+	if time.Since(entry.reported) >= heldRedeemReportEvery {
+		entry.reported = time.Now()
 		eN.logger.Errorf("Redeem registration on chain %d, block %d, transaction %s, log %d is still unchecked after %s and %d retries: %v",
 			eN.ChainId(), log.BlockNumber, log.TxHash, log.Index, time.Since(entry.since).Round(time.Second), entry.attempts, err)
 	}
@@ -93,10 +108,15 @@ func (eN *evmNetwork) recheckHeldRedeems() {
 			return
 		default:
 		}
-		depth := eN.ConfirmationsToFinality()
-		head, headErr := eN.EvmRpc().BlockNumber()
-		final := headErr == nil && head >= log.BlockNumber && head-log.BlockNumber >= depth
-		err := eN.registerRedeem(log, !final)
+		// Without the head the registration's age is unknown, and the age
+		// selects the rules. Decide nothing this round.
+		head, err := eN.EvmRpc().BlockNumber()
+		if err != nil {
+			eN.noteRedeemCheck(log, fmt.Errorf("read chain head: %w", err))
+			continue
+		}
+		final := head >= log.BlockNumber && head-log.BlockNumber >= eN.ConfirmationsToFinality()
+		err = eN.registerRedeem(log, !final)
 		if err != nil && final {
 			// A block replaced before finality never reaches the finalized
 			// scan, so nothing else would release this entry.
@@ -114,13 +134,18 @@ func (eN *evmNetwork) recheckHeldRedeems() {
 }
 
 // settlePendingIncidents releases stored incidents on this chain once every
-// endpoint shows the registration final, closed, and followed by a finalized
-// administrator unhalt. A signer that was not running during that halt would
-// otherwise wait for the next one.
+// endpoint shows, at the final height, the registration canonical, closed, and
+// followed by an administrator unhalt. A signer that was not running during
+// that halt would otherwise wait for the next one.
 func (eN *evmNetwork) settlePendingIncidents() {
 	if eN.state.RedeemHaltGeneration() == 0 {
 		return
 	}
+	defer func() {
+		if err := eN.state.ReleaseResolvedRedeemHalt(); err != nil {
+			eN.logger.Warnf("Cannot tell whether a redeem incident is still pending: %v", err)
+		}
+	}()
 	pending, err := eN.state.PendingRedeemIncidents()
 	if err != nil {
 		eN.logger.Warnf("Cannot list pending redeem incidents for chain %d: %v", eN.ChainId(), err)
@@ -176,4 +201,13 @@ func (eN *evmNetwork) watchRedeems(stop <-chan struct{}) {
 			eN.settlePendingIncidents()
 		}
 	}
+}
+
+// withRedeemWatch runs fn beside the recheck worker and returns once both
+// have ended.
+func (eN *evmNetwork) withRedeemWatch(fn func()) {
+	stop, watching := make(chan struct{}), make(chan struct{})
+	go func() { defer close(watching); eN.watchRedeems(stop) }()
+	defer func() { close(stop); <-watching }()
+	fn()
 }

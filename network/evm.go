@@ -233,9 +233,13 @@ func (eN *evmNetwork) Start() (startErr error) {
 		}
 		eN.backfillBlocks = 0
 	}
-	if err := eN.Sync(); err != nil {
-		eN.logger.Debug(err)
-		return err
+	// A registration held during this first scan is rechecked while the scan
+	// is still working through later ranges.
+	var syncErr error
+	eN.withRedeemWatch(func() { syncErr = eN.Sync() })
+	if syncErr != nil {
+		eN.logger.Debug(syncErr)
+		return syncErr
 	}
 
 	select {
@@ -328,6 +332,11 @@ const (
 func (eN *evmNetwork) Sync() error {
 	eN.logger.Info("In sync evm")
 	eN.resetCanonicalCache()
+	if eN.state.RedeemHaltGeneration() != 0 {
+		// The first scan after a restart runs before anything acts on a
+		// restored incident. Release what the chain has settled since.
+		eN.settlePendingIncidents()
+	}
 	startHeight, redeemFrom, legacy, err := eN.eventsStore().GetScanHeights(eN.ConfirmationsToFinality())
 	if err != nil {
 		return err
@@ -460,13 +469,15 @@ func (eN *evmNetwork) Sync() error {
 					continue
 				}
 				if recent || log.BlockNumber > finalizedTip {
-					// The finalized scan revisits this tail and owns its
-					// durable status. A young registration is still checked
-					// now, as the subscription would check it; a check
-					// without an answer is held for retry and does not stall
-					// the range.
+					// The redeem checkpoint cannot pass this tail in this
+					// pass, so a later pass revisits it. A registration is
+					// still examined now: by the live rules while it is
+					// young, as the subscription would, and by the finalized
+					// rules when only the checkpoint limit, fixed earlier in
+					// a long pass, keeps it here. A check without an answer
+					// is held for retry and does not stall the range.
 					if log.Topics[0] == common.RegisteredRedeemSigHash {
-						_ = eN.InterpretLog(log, true)
+						eN.examineRegistration(log, recent)
 						if eN.state.RedeemHaltGeneration() != 0 {
 							return nil
 						}
@@ -798,12 +809,12 @@ const (
 // is logged and retried at the next refresh; it never leaves the node
 // without a subscription. Registrations whose live check gave no answer are
 // rechecked beside it, at their own pace, while a Sync or a resubscribe waits.
-// The recheck worker ends with this loop, and the loop returns after it has.
 func (eN *evmNetwork) SubscribeToEvents() {
+	eN.withRedeemWatch(eN.subscribeToEvents)
+}
+
+func (eN *evmNetwork) subscribeToEvents() {
 	eN.logger.Infof("SubscribeToEvents for network with chainId: %d", eN.ChainId())
-	stopWatch, watching := make(chan struct{}), make(chan struct{})
-	go func() { defer close(watching); eN.watchRedeems(stopWatch) }()
-	defer func() { close(stopWatch); <-watching }()
 	resubscribeBackoff := processEventsBaseBackoff
 	var nextCatchUp time.Time
 	catchUp := func() {

@@ -20,11 +20,15 @@ func (eN *evmNetwork) registerRedeem(log etypes.Log, live bool) error {
 	if err != nil {
 		return err
 	}
+	// The decoder leaves the amount unset when a log carries no data.
+	if redeem.Nonce == nil || redeem.Amount == nil {
+		return errors.New("incomplete redeem registration log")
+	}
 	if handled, err := eN.state.HandledRedeemLog(eN.ChainId(), log); err != nil || handled {
 		return err
 	}
 	id := types.Hash(ecommon.BigToHash(redeem.Nonce))
-	wrap, err := eN.rpcManager.Znn().GetWrapTokenRequestById(id)
+	wrap, err := eN.rpcManager.Znn().RedeemWrapRequestById(id)
 	if err != nil && !rpc.WrapNotFound(err) {
 		return err
 	}
@@ -68,7 +72,9 @@ func (eN *evmNetwork) registerRedeem(log etypes.Log, live bool) error {
 		return err
 	}
 	incident := common.RedeemIncident{ChainID: eN.ChainId(), Log: confirmed, Wrap: wrap}
-	if !live {
+	// An operator acknowledgement is decided by ReportRedeemIncident and does
+	// not wait for contract state.
+	if !live && !eN.state.RedeemLogAcknowledged(incident) {
 		// A signer replaying history must not halt again for a redeem that can
 		// no longer be paid and that a completed halt already covered.
 		settled, err := eN.redeemSettled(incident)
@@ -94,20 +100,26 @@ func (eN *evmNetwork) registerRedeem(log etypes.Log, live bool) error {
 	return nil
 }
 
-// redeemSettled asks every endpoint whether the registration in an incident is
-// closed and was followed by a finalized administrator unhalt.
+// redeemSettled asks every endpoint whether, at the confirmation-deep height,
+// the registration in an incident is closed and was followed by an
+// administrator unhalt. The caller has verified the log at that depth, so a
+// head that does not place the registration below the final height is a
+// contradiction and decides nothing.
 func (eN *evmNetwork) redeemSettled(incident common.RedeemIncident) (bool, error) {
 	redeem, err := eN.EvmRpc().Bridge().ParseRegisteredRedeem(incident.Log)
 	if err != nil {
 		return false, err
+	}
+	if redeem.Nonce == nil {
+		return false, errors.New("incomplete redeem registration log")
 	}
 	head, err := eN.EvmRpc().BlockNumber()
 	if err != nil {
 		return false, err
 	}
 	depth := eN.ConfirmationsToFinality()
-	if head < depth {
-		return false, nil
+	if head < depth || head-depth < incident.Log.BlockNumber {
+		return false, fmt.Errorf("chain head %d does not place the registration at block %d at or below the final height", head, incident.Log.BlockNumber)
 	}
 	return eN.EvmRpc().RedeemSettledAfterHalt(redeem.Nonce, incident.Log.BlockNumber, head-depth)
 }

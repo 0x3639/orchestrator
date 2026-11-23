@@ -229,6 +229,20 @@ func (r *ZnnRpc) GetWrapTokenRequestById(id types.Hash) (*definition.WrapTokenRe
 	return r.rpcClient.BridgeApi.GetWrapTokenRequestById(id)
 }
 
+// RedeemWrapRequestById is the source lookup of the redeem check. That check
+// repeats on a timer, so the read is bounded: an endpoint that accepts the
+// request and never answers must not stop the rechecks behind it. An unknown
+// id is reported as an error, see WrapNotFound.
+func (r *ZnnRpc) RedeemWrapRequestById(id types.Hash) (*definition.WrapTokenRequest, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), ZnnLedgerTimeout)
+	defer cancel()
+	var wrap *definition.WrapTokenRequest
+	if err := r.settingsClient.CallContext(ctx, &wrap, "embedded.bridge.getWrapTokenRequestById", id); err != nil {
+		return nil, err
+	}
+	return wrap, nil
+}
+
 func (r *ZnnRpc) GetUnwrapTokenRequestByHashAndLog(txHash types.Hash, logIndex uint32) (*definition.UnwrapTokenRequest, error) {
 	return r.rpcClient.BridgeApi.GetUnwrapTokenRequestByHashAndLog(txHash, logIndex)
 }
