@@ -564,6 +564,98 @@ func TestRejectedDuplicatesDoNotHideAForgedRegistration(t *testing.T) {
 	}
 }
 
+// The listener retries a held receive while the frontier moves on. A receive
+// that was live when it was first held still gets its source check when it
+// resolves after finality. A receive first seen after finality does not gain
+// one by being held.
+func TestHeldLiveReceiveKeepsItsSourceCheck(t *testing.T) {
+	var unreadable []byte
+	accepted, rejected := receiveStatus(vmResultSuccess), receiveStatus(vmResultFail)
+	// The receive confirms at momentum 100 and finality is 5 momentums.
+	const live, final = 104, 110
+	for _, tc := range []struct {
+		name              string
+		firstFrontier     uint64
+		firstStatus       []byte
+		firstReceiptFails bool
+		resolvedStatus    []byte
+		want              uint8
+		heldAsLiveAtFirst bool
+		replaced          bool // another receive takes the held one's height
+	}{
+		{"status unreadable while live, then accepted", live, unreadable, false, accepted, common.EmergencyState, true, false},
+		{"source lookup failed while live, then no source", live, accepted, true, accepted, common.EmergencyState, true, false},
+		{"status unreadable while live, then rejected", live, unreadable, false, rejected, common.LiveState, true, false},
+		{"status unreadable after finality, then accepted", final, unreadable, false, accepted, common.LiveState, false, false},
+		{"held while live, then replaced by a receive first seen after finality", live, unreadable, false, accepted, common.LiveState, true, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			b := newReplayBridge(t)
+			var ledger atomic.Pointer[replayLedger]
+			var receiptFails atomic.Bool
+			ledger.Store(newReplayLedger(t, b, tc.firstFrontier, tc.firstStatus))
+			receiptFails.Store(tc.firstReceiptFails)
+			url := replayServerWithErrors(t, func(method string, params []json.RawMessage) (interface{}, *replayRPCError) {
+				if result, ok := ledger.Load().answer(t, method, params); ok {
+					return result, nil
+				}
+				switch method {
+				case "embedded.bridge.getUnwrapTokenRequestByHashAndLog":
+					return b.request, nil
+				case "eth_getTransactionReceipt":
+					if receiptFails.Load() {
+						return nil, &replayRPCError{Code: -32000, Message: "upstream timeout"}
+					}
+					return nil, nil // no such transaction on the source chain
+				}
+				t.Errorf("unexpected method %s", method)
+				return nil, nil
+			})
+			n, _ := replayNetwork(t, b, url, map[uint32]string{1: url})
+			n.SetConfirmationsToFinality(5)
+			if err := n.state.SetFrontierMomentum(tc.firstFrontier); err != nil {
+				t.Fatal(err)
+			}
+
+			height, _, err := n.processBridgeAccountPage(n.listenerCtx, 1, n.refreshSettings)
+			if err == nil || height != 1 {
+				t.Fatalf("first pass: height %d, err %v, want the receive held at 1", height, err)
+			}
+			if got := replayState(t, n); got != common.LiveState {
+				t.Fatalf("first pass: state %s", common.StateToText(got))
+			}
+			if held := n.heldLiveReceive != types.ZeroHash; held != tc.heldAsLiveAtFirst {
+				t.Fatalf("first pass: held as live %v, want %v", held, tc.heldAsLiveAtFirst)
+			}
+
+			// The endpoint recovers only after the receive is final.
+			const later = 120
+			resolved := newReplayLedger(t, b, later, tc.resolvedStatus)
+			if tc.replaced {
+				receive := resolved.receives[0]
+				delete(resolved.blocks, receive.Hash)
+				receive.Hash = types.Hash{9}
+				resolved.blocks[receive.Hash] = receive
+			}
+			ledger.Store(resolved)
+			receiptFails.Store(false)
+			if err := n.state.SetFrontierMomentum(later); err != nil {
+				t.Fatal(err)
+			}
+			height, _, err = n.processBridgeAccountPage(n.listenerCtx, 1, n.refreshSettings)
+			if err != nil || height != 2 {
+				t.Fatalf("second pass: height %d, err %v, want 2", height, err)
+			}
+			if got := replayState(t, n); got != tc.want {
+				t.Fatalf("second pass: state %s, want %s", common.StateToText(got), common.StateToText(tc.want))
+			}
+			if n.heldLiveReceive != types.ZeroHash {
+				t.Fatal("the listener still marks a receive it has finished")
+			}
+		})
+	}
+}
+
 // Startup reads each receive by hash. An accepted registration is recorded
 // against the local row. A rejected duplicate, whose source event does exist,
 // must leave that row alone.
