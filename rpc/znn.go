@@ -3,6 +3,7 @@ package rpc
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	sdk_rpc_client "github.com/MoonBaZZe/znn-sdk-go/rpc_client"
 	"github.com/MoonBaZZe/znn-sdk-go/zenon"
 	ic "github.com/libp2p/go-libp2p-core/crypto"
@@ -233,20 +234,29 @@ func (r *ZnnRpc) GetUnwrapTokenRequestByHashAndLog(txHash types.Hash, logIndex u
 	return r.rpcClient.BridgeApi.GetUnwrapTokenRequestByHashAndLog(txHash, logIndex)
 }
 
-// UnwrapRedeemableInContext returns how many momentums remain before the
-// bridge lets the unwrap request be redeemed; zero once its redeem delay has
-// passed. The node computes it from the token pair's current delay.
-func (r *ZnnRpc) UnwrapRedeemableInContext(ctx context.Context, txHash types.Hash, logIndex uint32) (uint64, error) {
-	var request *struct {
+// UnwrapTokenRequestContext reads an unwrap request and, from the same reply,
+// how many momentums remain before the bridge lets it be redeemed (zero once
+// its redeem delay has passed). The request is nil when the node returns none,
+// and the delay is nil when the reply leaves it out.
+func (r *ZnnRpc) UnwrapTokenRequestContext(ctx context.Context, txHash types.Hash, logIndex uint32) (*definition.UnwrapTokenRequest, *uint64, error) {
+	var reply json.RawMessage
+	if err := r.settingsClient.CallContext(ctx, &reply, "embedded.bridge.getUnwrapTokenRequestByHashAndLog", txHash, logIndex); err != nil {
+		return nil, nil, err
+	}
+	if len(reply) == 0 || string(reply) == "null" {
+		return nil, nil, nil
+	}
+	request := new(definition.UnwrapTokenRequest)
+	if err := json.Unmarshal(reply, request); err != nil {
+		return nil, nil, err
+	}
+	var delay struct {
 		RedeemableIn *uint64 `json:"redeemableIn"`
 	}
-	if err := r.settingsClient.CallContext(ctx, &request, "embedded.bridge.getUnwrapTokenRequestByHashAndLog", txHash, logIndex); err != nil {
-		return 0, err
+	if err := json.Unmarshal(reply, &delay); err != nil {
+		return nil, nil, err
 	}
-	if request == nil || request.RedeemableIn == nil {
-		return 0, errors.New("the node returned no redeem delay for the unwrap request")
-	}
-	return *request.RedeemableIn, nil
+	return request, delay.RedeemableIn, nil
 }
 
 func (r *ZnnRpc) GetAllWrapTokenRequests(pageIndex, pageSize uint32) (*embedded.WrapTokenRequestList, error) {

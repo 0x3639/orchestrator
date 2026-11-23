@@ -69,6 +69,22 @@ func NewPersistentGlobalState(state *uint8, persistEmergency func(uint8) error) 
 func (gs *GlobalState) SetState(newState uint8) error {
 	gs.stateMu.Lock()
 	defer gs.stateMu.Unlock()
+	return gs.setStateLocked(newState)
+}
+
+// SetStateIf moves to newState only from the expected state and reports
+// whether it did. The comparison and the change happen under one lock, so a
+// state another goroutine set in between is never overwritten.
+func (gs *GlobalState) SetStateIf(expected, newState uint8) (bool, error) {
+	gs.stateMu.Lock()
+	defer gs.stateMu.Unlock()
+	if *gs.state != expected {
+		return false, nil
+	}
+	return true, gs.setStateLocked(newState)
+}
+
+func (gs *GlobalState) setStateLocked(newState uint8) error {
 	previous := *gs.state
 	if previous == EmergencyState && newState != EmergencyState && newState != HaltedState {
 		return errors.New("emergency halt is still pending")

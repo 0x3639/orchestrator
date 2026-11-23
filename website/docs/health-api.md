@@ -149,7 +149,10 @@ legacy methods. Keep the Unix socket private when retiring public health RPC.
   `attempts`. The listener reads nothing after a held height, so alert on any
   hold that lasts more than a few minutes. After ten minutes at one height the
   signer stops itself; see [Signer states](operations/states.md). The field is
-  absent from snapshots of earlier builds.
+  absent from snapshots of earlier builds and present, as `null`, in every
+  snapshot of this one. A collector that validates against a copy of the
+  earlier schema rejects the extra property, so update the collector's schema
+  before upgrading the first signer.
 - **Pending work.** Each direction reports finality waits, unsigned observations,
   the actual selection for a signing window, signed records awaiting submission,
   and the last successfully persisted signing window. Each measurement carries

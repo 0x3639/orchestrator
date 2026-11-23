@@ -36,13 +36,13 @@ type lateNode struct {
 	syncing  atomic.Bool
 	evmCalls atomic.Int32
 	// Momentums left before the bridge lets the request be redeemed, and
-	// whether the node fails to say.
+	// whether the node's reply leaves that out.
 	redeemableIn      atomic.Uint64
-	redeemDelayFails  atomic.Bool
 	redeemDelayAbsent atomic.Bool
-	redeemDelayChecks atomic.Int32
-	n                 *znnNetwork
-	stores            replayStores
+	// Called when the listener asks the node for its sync status.
+	onSyncStatus atomic.Pointer[func()]
+	n            *znnNetwork
+	stores       replayStores
 }
 
 func newLateNode(t *testing.T, register func(*replayBridge)) *lateNode {
@@ -56,15 +56,13 @@ func newLateNode(t *testing.T, register func(*replayBridge)) *lateNode {
 	url := replayServerWithErrors(t, func(method string, params []json.RawMessage) (interface{}, *replayRPCError) {
 		switch method {
 		case "stats.syncInfo":
+			if hook := l.onSyncStatus.Load(); hook != nil {
+				(*hook)()
+			}
 			if l.syncing.Load() {
 				return &protocol.SyncInfo{State: protocol.Syncing}, nil
 			}
 		case "embedded.bridge.getUnwrapTokenRequestByHashAndLog":
-			// The listener reads the request first and, where it has to
-			// decide by the redeem delay, a second time for the delay.
-			if l.redeemDelayChecks.Add(1) > 1 && l.redeemDelayFails.Load() {
-				return nil, &replayRPCError{-32000, "upstream timeout"}
-			}
 			if l.redeemDelayAbsent.Load() {
 				return l.bridge.request, nil
 			}
@@ -193,6 +191,19 @@ func (l *lateNode) logsFail(message string) *evmSource {
 	return &evmSource{
 		receipt: func() (interface{}, *replayRPCError) { return l.bridge.receipt(), nil },
 		logs:    func() (interface{}, *replayRPCError) { return nil, &replayRPCError{-32000, message} },
+	}
+}
+
+// alteredLogs is an endpoint whose receipt lists the matching bridge log and
+// whose log query returns that slot with another payload.
+func (l *lateNode) alteredLogs() *evmSource {
+	log := l.bridge.sourceLog(l.t, l.bridge.recipient.String())
+	receipt := l.bridge.receipt()
+	receipt.Logs = []*etypes.Log{&log}
+	altered := l.bridge.sourceLog(l.t, "z1qpp8g8v4hrd5ernfrgsn86jmv09ra6zrvhvmr7")
+	return &evmSource{
+		receipt: func() (interface{}, *replayRPCError) { return receipt, nil },
+		logs:    func() (interface{}, *replayRPCError) { return []etypes.Log{altered}, nil },
 	}
 }
 
@@ -406,42 +417,110 @@ func TestFirstReadOfTheAccountChecksRequestsInsideTheirRedeemDelay(t *testing.T)
 }
 
 // Whether a request is still inside its redeem delay decides if it is checked.
-// A node that does not say holds the receive; it is not read as past the delay.
+// A reply that does not say holds the receive; it is not read as past the delay.
 func TestFirstReadWaitsForTheRedeemDelay(t *testing.T) {
-	for name, unknown := range map[string]func(*lateNode) *atomic.Bool{
-		"the read fails":                 func(l *lateNode) *atomic.Bool { return &l.redeemDelayFails },
-		"the reply leaves the delay out": func(l *lateNode) *atomic.Bool { return &l.redeemDelayAbsent },
-	} {
-		t.Run(name, func(t *testing.T) {
-			l := newLateNode(t, nil)
-			l.redeemableIn.Store(30)
-			unknown(l).Store(true)
-			l.at(5000, acceptedReceive)
-			if err := l.n.Sync(); err == nil {
-				t.Fatal("startup passed a request without knowing its redeem delay")
-			}
-			l.expect("delay unknown", common.LiveState, 1)
-			if l.evmCalls.Load() != 0 || l.row() != nil {
-				t.Fatalf("the request was handled without its redeem delay: %d source lookups, row %v", l.evmCalls.Load(), l.row())
-			}
-			unknown(l).Store(false)
-			if err := l.n.Sync(); err != nil {
-				t.Fatal(err)
-			}
-			l.expect("delay known", common.EmergencyState, 2)
-		})
+	l := newLateNode(t, nil)
+	l.redeemableIn.Store(30)
+	l.redeemDelayAbsent.Store(true)
+	l.at(5000, acceptedReceive)
+	if err := l.n.Sync(); err == nil {
+		t.Fatal("startup passed a request without knowing its redeem delay")
+	}
+	l.expect("delay unknown", common.LiveState, 1)
+	if l.evmCalls.Load() != 0 || l.row() != nil {
+		t.Fatalf("the request was handled without its redeem delay: %d source lookups, row %v", l.evmCalls.Load(), l.row())
+	}
+	l.redeemDelayAbsent.Store(false)
+	if err := l.n.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	l.expect("delay known", common.EmergencyState, 2)
+}
+
+// The node works a request's remaining delay out from its own frontier. While
+// it is syncing that says nothing, and startup waits instead of taking on
+// every later receive as new.
+func TestFirstReadDoesNotTrustTheRedeemDelayOfASyncingNode(t *testing.T) {
+	l := newLateNode(t, nil)
+	l.redeemableIn.Store(30)
+	l.syncing.Store(true)
+	l.at(5000, acceptedReceive)
+	if err := l.n.Sync(); err == nil {
+		t.Fatal("startup decided by the redeem delay of a node that is syncing")
+	}
+	l.expect("syncing", common.LiveState, 1)
+	started, err := l.stores.znn.BridgeWatchStarted()
+	if err != nil || started || l.evmCalls.Load() != 0 {
+		t.Fatalf("watch recorded %v (err %v), %d source lookups, on a node that is syncing", started, err, l.evmCalls.Load())
 	}
 }
 
-// A request the node already has to vouch for is not asked for its delay.
+// A request the node already has to vouch for is not decided by its delay.
 func TestCheckedRegistrationDoesNotDependOnTheRedeemDelay(t *testing.T) {
 	l := newLateNode(t, nil)
-	l.redeemDelayFails.Store(true)
+	l.redeemDelayAbsent.Store(true)
 	l.at(5000, acceptedReceive)
 	if err := l.listen(); err != nil {
 		t.Fatal(err)
 	}
 	l.expect("listener", common.EmergencyState, 2)
+}
+
+// A first read that has to check a request and cannot finish keeps the
+// obligation. The next start checks the request although it is by then past
+// finality and past its redeem delay.
+func TestFirstReadKeepsACheckItCouldNotFinish(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		frontier     uint64
+		redeemableIn uint64
+	}{
+		{"request inside its redeem delay", 5000, 30},
+		{"receive within finality", 104, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			l := newLateNode(t, nil)
+			l.redeemableIn.Store(tc.redeemableIn)
+			l.source.Store(l.receiptFails("upstream timeout"))
+			l.at(tc.frontier, acceptedReceive)
+			if err := l.n.Sync(); err == nil {
+				t.Fatal("startup passed a request whose source it could not read")
+			}
+			l.expect("first start", common.LiveState, 1)
+
+			l.restart()
+			l.redeemableIn.Store(0)
+			l.source.Store(l.noTransaction())
+			l.at(9000, acceptedReceive)
+			if err := l.n.Sync(); err != nil {
+				t.Fatal(err)
+			}
+			l.expect("second start", common.EmergencyState, 2)
+		})
+	}
+}
+
+// An empty page may be the tip of a node that was still catching up. Startup
+// reads the tip again after the node says it is synced, and what appears then
+// is still history to a database on its first read.
+func TestStartupReadsTheTipAgainOnceTheNodeIsSynced(t *testing.T) {
+	l := newLateNode(t, nil)
+	l.at(5000)
+	arrived := false
+	hook := func() {
+		if !arrived {
+			arrived = true
+			l.ledger.Store(newReplayLedger(t, l.bridge, 5000, acceptedReceive))
+		}
+	}
+	l.onSyncStatus.Store(&hook)
+	if err := l.n.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	l.expect("startup", common.LiveState, 2)
+	if l.row() == nil || l.evmCalls.Load() != 0 {
+		t.Fatalf("the late block was not read as first-read history: row %v, %d source lookups", l.row(), l.evmCalls.Load())
+	}
 }
 
 // For a registration the node must vouch for, a source it cannot read is not
@@ -456,6 +535,7 @@ func TestCheckedRegistrationWaitsForAReadableSource(t *testing.T) {
 		{"endpoint has pruned the receipt", func(l *lateNode) *evmSource { return l.receiptFails("pruned history unavailable") }},
 		{"endpoint has no archive logs", func(l *lateNode) *evmSource { return l.logsFail("archive data is not supported on this plan") }},
 		{"endpoint omits the block's logs", (*lateNode).incompleteLogs},
+		{"endpoint's logs differ from its receipt", (*lateNode).alteredLogs},
 	} {
 		for name, frontier := range map[string]uint64{"live": 104, "late": 5000} {
 			t.Run(name+", "+tc.name, func(t *testing.T) {
@@ -559,7 +639,9 @@ func TestLateKeyGenExitFollowsTheBridge(t *testing.T) {
 		{"late, keygen switched off, on again since", late, false, allowOff, false, bridge(true, key), common.KeyGenState, false, 0},
 		{"late, keygen switched on, off since", late, false, allowOn, false, bridge(false, key), common.LiveState, false, 0},
 		{"late, keygen switched off, settings unreadable", late, false, allowOff, false, unavailable, common.KeyGenState, true, 0},
-		{"late, keygen switched off by another account", late, false, allowOff, true, nil, common.KeyGenState, false, 0},
+		{"live, keygen switched off by another account", live, false, allowOff, true, nil, common.KeyGenState, false, 0},
+		{"late, sent by a former administrator, keygen off", late, false, allowOff, true, bridge(false, key), common.LiveState, false, 0},
+		{"late, sent by another account, keygen still on", late, false, allowOff, true, bridge(true, key), common.KeyGenState, false, 0},
 		{"startup, keygen switched off, still off", 5000, true, allowOff, false, bridge(false, key), common.LiveState, false, 0},
 		{"startup, keygen switched off, on again since", 5000, true, allowOff, false, bridge(true, key), common.KeyGenState, false, 0},
 		{"live, key changed to this key", live, false, changeKey, false, bridge(false, key), common.LiveState, false, 0},
@@ -645,4 +727,38 @@ func TestFirstReadComparesTheRegisteredAmount(t *testing.T) {
 		t.Fatal(err)
 	}
 	l.expect("startup", common.EmergencyState, 2)
+}
+
+// A signer that stopped in key generation may find the receive that ended it
+// behind its checkpoint. Reaching the tip, startup follows the bridge.
+func TestStartupLeavesKeyGenerationTheBridgeHasEnded(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		allow bool
+		from  uint8
+		want  uint8
+	}{
+		{"bridge no longer allows key generation", false, common.KeyGenState, common.LiveState},
+		{"bridge still allows key generation", true, common.KeyGenState, common.KeyGenState},
+		{"signer is halted", false, common.HaltedState, common.HaltedState},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ledger := &startupLedger{
+				page: func(uint64) *api.AccountBlockListMarshal { return startupPage() },
+				bridgeInfo: func() (*definition.BridgeInfoVariable, error) {
+					return &definition.BridgeInfoVariable{AllowKeyGen: tc.allow}, nil
+				},
+			}
+			n := startupNetwork(t, ledger)
+			if err := n.state.SetState(tc.from); err != nil {
+				t.Fatal(err)
+			}
+			if err := n.Sync(); err != nil {
+				t.Fatal(err)
+			}
+			if got := replayState(t, n); got != tc.want {
+				t.Fatalf("state %s, want %s", common.StateToText(got), common.StateToText(tc.want))
+			}
+		})
+	}
 }

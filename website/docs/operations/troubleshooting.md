@@ -36,7 +36,7 @@ Log lines you will meet, what they mean, and what to do.
 | `the bridge account listener could not pass height N for 10m0s; stopping …` | The signer stopped instead of signing without its listener | Fix the cause; the supervisor restart retries the block at startup. |
 | `the Zenon node is not synced; …` | The node reported a sync state other than done while a recent block was being classified, or when startup reached the tip | Wait for the node, or point the signer at a synced one. |
 | `unwrap request … has no matching source event on chainId N` | The signer entered `EmergencyState` | Look the transaction up on that network through an independent endpoint and coordinate with the other signers. See [Signer states](states.md). |
-| `ignoring bridge metadata that does not decode, the current settings stay in force` | The administrator set metadata the orchestrator cannot decode | The administrator corrects the metadata; the previous settings apply until then. |
+| `ignoring bridge metadata that does not decode, the current settings stay in force` | The administrator set metadata the orchestrator cannot decode | The administrator corrects the metadata. A running signer keeps the previous settings until then; a signer that restarts in the meantime does not start, because startup needs metadata it can decode. |
 | `Too many requests, retry later` (health API `429`) | Monitoring probe exceeded the health rate cap | Raise `HealthConfig` limits or probe less often. |
 
 ## Comparing signers

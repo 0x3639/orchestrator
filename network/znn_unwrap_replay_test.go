@@ -324,10 +324,10 @@ func TestRedeemAndRevokeRecordOnlyRequestsOnTheEvmNetwork(t *testing.T) {
 	}
 }
 
-// The receive registered the request, so an endpoint that reports none is
-// behind the ledger the receive was read from. The listener waits for it,
-// however late it reads the receive; dropping it would drop the source check
-// with it. Only a database reading the account for the first time moves on.
+// The receive registered the request and the bridge never deletes one, so an
+// endpoint that reports none is behind the ledger the receive was read from.
+// The listener and startup wait for it, however late they read the receive;
+// dropping it would drop the source check with it.
 func TestAcceptedUnwrapWaitsForTheRegisteredRequest(t *testing.T) {
 	noData := func() (interface{}, *replayRPCError) { return nil, &replayRPCError{-32000, "data non existent"} }
 	null := func() (interface{}, *replayRPCError) { return nil, nil }
@@ -346,8 +346,9 @@ func TestAcceptedUnwrapWaitsForTheRegisteredRequest(t *testing.T) {
 		{"read late by the listener, no data", 1000, false, noData, true},
 		{"read late by the listener, null result", 1000, false, null, true},
 		{"read late by the listener, network removed", 1000, false, removed, false},
-		{"first read of the account, no data", 1000, true, noData, false},
-		{"first read of the account, null result", 1000, true, null, false},
+		{"first read of the account, no data", 1000, true, noData, true},
+		{"first read of the account, null result", 1000, true, null, true},
+		{"first read of the account, network removed", 1000, true, removed, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			b := newReplayBridge(t)

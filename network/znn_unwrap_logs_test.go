@@ -19,6 +19,7 @@ import (
 	"github.com/zenon-network/go-zenon/chain/nom"
 	zdb "github.com/zenon-network/go-zenon/common/db"
 	"github.com/zenon-network/go-zenon/common/types"
+	"github.com/zenon-network/go-zenon/protocol"
 	"github.com/zenon-network/go-zenon/rpc/api"
 	"github.com/zenon-network/go-zenon/vm/embedded/definition"
 	"go.uber.org/zap"
@@ -165,6 +166,8 @@ func TestInterpretUnwrapSelectsLogByIdentity(t *testing.T) {
 				}
 				var result interface{}
 				switch call.Method {
+				case "stats.syncInfo":
+					result = &protocol.SyncInfo{State: protocol.SyncDone}
 				case "embedded.bridge.getUnwrapTokenRequestByHashAndLog":
 					// The historical case reads a request the bridge still
 					// withholds, which startup checks like a live one.

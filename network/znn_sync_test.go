@@ -242,7 +242,8 @@ func TestStartupSyncSendReadPreservesCheckpoint(t *testing.T) {
 				t.Fatal(err)
 			}
 			checkStartupCursor(t, n, 3)
-			if want := []uint64{2, 3, 4}; !reflect.DeepEqual(l.starts, want) {
+			// Startup reads the tip a second time after the node says it is synced.
+			if want := []uint64{2, 3, 4, 4}; !reflect.DeepEqual(l.starts, want) {
 				t.Fatalf("requested pages %v, want %v", l.starts, want)
 			}
 		})

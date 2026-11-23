@@ -42,16 +42,25 @@ type heldListener struct {
 	exited  chan struct{}
 	hints   chan []subscribe.AccountBlock
 	reads   atomic.Int32 // bridge account pages the listener has read
+	// The endpoint fails the page read, or answers it without any block.
+	pageFails  atomic.Bool
+	hideBlocks atomic.Bool
 }
 
-func startHeldListener(t *testing.T) *heldListener {
+func startHeldListener(t *testing.T, prepare ...func(*heldListener)) *heldListener {
 	t.Helper()
 	h := &heldListener{stop: make(chan os.Signal, 1), exited: make(chan struct{}), hints: make(chan []subscribe.AccountBlock)}
+	for _, set := range prepare {
+		set(h)
+	}
 	receives := []*api.AccountBlockMarshal{startupReceive(2), startupReceive(3)}
 	ledger := &startupLedger{
 		page: func(height uint64) *api.AccountBlockListMarshal {
 			h.reads.Add(1)
-			if height > 3 {
+			if h.pageFails.Load() {
+				return nil
+			}
+			if height > 3 || h.hideBlocks.Load() {
 				return startupPage()
 			}
 			return startupPage(receives[height-2:]...)
@@ -102,10 +111,25 @@ func TestHeldBridgeAccountShowsInTheHealthSnapshot(t *testing.T) {
 	if first.Height != 2 || first.Attempts == 0 || first.Since.IsZero() {
 		t.Fatalf("reported hold %+v, want height 2 with a start time and an attempt", first)
 	}
-	// The hold keeps its start time across retries.
-	waitFor(t, "a second attempt", func() bool { return h.reportedHold().Attempts >= 2 })
-	if second := h.reportedHold(); !second.Since.Equal(first.Since) || second.Height != 2 {
-		t.Fatalf("the hold restarted on a retry: %+v after %+v", second, first)
+	// The hold keeps its start time across retries, while the clock moves,
+	// and says so at error level once a minute.
+	attemptsAfter := func(elapsed time.Duration) {
+		t.Helper()
+		h.elapsed.Store(int64(elapsed))
+		seen := h.reportedHold().Attempts
+		waitFor(t, "two more attempts", func() bool { return h.reportedHold().Attempts >= seen+2 })
+	}
+	for _, step := range []struct {
+		elapsed time.Duration
+		reports int
+	}{{30 * time.Second, 0}, {61 * time.Second, 1}, {110 * time.Second, 1}, {121 * time.Second, 2}} {
+		attemptsAfter(step.elapsed)
+		if hold := h.reportedHold(); !hold.Since.Equal(first.Since) || hold.Height != 2 {
+			t.Fatalf("after %s the hold restarted: %+v, first %+v", step.elapsed, hold, first)
+		}
+		if got := len(h.errorLines()); got != step.reports {
+			t.Fatalf("after %s: %d error lines about the hold, want %d: %q", step.elapsed, got, step.reports, h.errorLines())
+		}
 	}
 	// A hold at the next height is a new hold. The time spent at the height
 	// before does not count towards stopping the node.
@@ -179,51 +203,92 @@ func TestHeldBridgeAccountIsLoggedAndStopsTheNode(t *testing.T) {
 	checkStartupCursor(t, h.n, 1)
 }
 
+// A hold at a block the endpoint listed ends when the listener has processed
+// that block. An answer without the block does not end it or restart its
+// clock.
+func TestHeldBridgeAccountStaysHeldWhenTheEndpointStopsListingTheBlock(t *testing.T) {
+	h := startHeldListener(t)
+	waitFor(t, "the hold to be reported", func() bool { return h.reportedHold() != nil })
+	first := h.reportedHold()
+	h.hideBlocks.Store(true)
+	waitFor(t, "attempts against the empty answer", func() bool {
+		hold := h.reportedHold()
+		return hold == nil || hold.Attempts >= first.Attempts+3
+	})
+	hold := h.reportedHold()
+	if hold == nil || hold.Height != 2 || !hold.Since.Equal(first.Since) {
+		t.Fatalf("an answer without the held block ended or restarted the hold: %+v, first %+v", hold, first)
+	}
+	if h.logs.FilterMessageSnippet("bridge account listener passed height").Len() != 0 {
+		t.Fatal("the listener reported passing a block it never processed")
+	}
+	h.elapsed.Store(int64(maxBridgeAccountHold))
+	select {
+	case <-h.stop:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the node was not stopped while the endpoint withheld the block")
+	}
+	checkStartupCursor(t, h.n, 1)
+}
+
+// A page read that fails says nothing about a block. That hold ends as soon
+// as the page reads again, with or without new blocks.
+func TestHoldFromAFailedPageReadEndsWhenThePageReads(t *testing.T) {
+	h := startHeldListener(t, func(h *heldListener) { h.pageFails.Store(true); h.hideBlocks.Store(true) })
+	waitFor(t, "the hold to be reported", func() bool { return h.reportedHold() != nil })
+	h.elapsed.Store(int64(maxBridgeAccountHold - time.Minute))
+	h.pageFails.Store(false)
+	waitFor(t, "the hold to clear", func() bool { return h.reportedHold() == nil })
+	select {
+	case <-h.stop:
+		t.Fatal("a hold that ended stopped the node")
+	default:
+	}
+	checkStartupCursor(t, h.n, 1)
+}
+
 // Startup hands over to the listener, which treats every receive as new, only
-// from a node that is synced. It records reaching the tip once.
+// from a node that is synced. Reaching the tip is recorded once and kept.
 func TestStartupRecordsReachingTheTipOnASyncedNode(t *testing.T) {
 	state := protocol.SyncDone
-	tip := uint64(700)
 	ledger := &startupLedger{
 		page:       func(uint64) *api.AccountBlockListMarshal { return startupPage() },
 		syncStatus: func() *protocol.SyncInfo { return &protocol.SyncInfo{State: state} },
-		tip:        func() *api.Momentum { return startupMomentum(tip) },
 	}
 	n := startupNetwork(t, ledger)
-	watchStart := func() uint64 {
+	recorded := func() bool {
 		t.Helper()
-		momentum, err := n.eventsStore().BridgeWatchStart()
+		started, err := n.eventsStore().BridgeWatchStarted()
 		if err != nil {
 			t.Fatal(err)
 		}
-		return momentum
+		return started
 	}
 
 	state = protocol.Syncing
 	if err := n.Sync(); err == nil {
 		t.Fatal("startup handed over to the listener on a node that is syncing")
 	}
-	if n.watching || watchStart() != 0 {
-		t.Fatalf("startup recorded reaching the tip on a node that is syncing: %d", watchStart())
+	if n.watching || recorded() {
+		t.Fatal("startup recorded reaching the tip on a node that is syncing")
 	}
 
 	state = protocol.SyncDone
 	if err := n.Sync(); err != nil {
 		t.Fatal(err)
 	}
-	if !n.watching || watchStart() != 700 {
-		t.Fatalf("watching %v from momentum %d, want true from 700", n.watching, watchStart())
+	if !n.watching || !recorded() {
+		t.Fatalf("after reaching the tip: watching %v, recorded %v", n.watching, recorded())
 	}
 
-	// A later start reads the record and leaves it as it is.
-	tip = 900
+	// A later start reads the record.
 	restarted := startupNetwork(t, ledger)
 	restarted.dbManager = n.dbManager
 	if err := restarted.Sync(); err != nil {
 		t.Fatal(err)
 	}
-	if !restarted.watching || watchStart() != 700 {
-		t.Fatalf("after a restart: watching %v from momentum %d, want true from 700", restarted.watching, watchStart())
+	if !restarted.watching || !recorded() {
+		t.Fatalf("after a restart: watching %v, recorded %v", restarted.watching, recorded())
 	}
 
 	// It also still refuses to hand over while the node is syncing.
