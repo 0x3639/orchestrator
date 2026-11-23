@@ -703,7 +703,7 @@ func (rC *znnNetwork) interpretSendBlockData(ctx context.Context, sendBlock *api
 				param.TransactionHash.String(), param.LogIndex, rpcZnnEvent.NetworkClass, rpcZnnEvent.ChainId)
 			break
 		} else {
-			if err := rC.recordUnwrapRegistration(ctx, param, rpcZnnEvent, redeemableIn, sourceChecked); err != nil {
+			if err := rC.recordUnwrapRegistration(ctx, param, rpcZnnEvent, redeemableIn, sourceChecked, live); err != nil {
 				return err
 			}
 		}
@@ -907,8 +907,10 @@ func (rC *znnNetwork) interpretSendBlockData(ctx context.Context, sendBlock *api
 		if err != nil {
 			return err
 		}
-		// If the key was changed to the param, we are no longer in keyGen
-		if bridgeInfo.CompressedTssECDSAPubKey == param.PubKey {
+		// If the key was changed to the param, we are no longer in keyGen. A
+		// key change that takes effect ends key generation on the bridge; if
+		// the bridge allows it again, a newer round has begun.
+		if bridgeInfo.CompressedTssECDSAPubKey == param.PubKey && !bridgeInfo.AllowKeyGen {
 			if err := rC.leaveKeyGen(); err != nil {
 				return err
 			}
@@ -1004,38 +1006,64 @@ func (rC *znnNetwork) interpretSendBlockData(ctx context.Context, sendBlock *api
 	return rC.eventsStore().SetLastUpdateHeight(receiveBlockHeight)
 }
 
-// unwrapHasSource reports whether the EVM event a registered unwrap request
-// claims as its source exists and carries the same transfer. An endpoint
-// without a receipt for the transaction answers no.
-func (rC *znnNetwork) unwrapHasSource(ctx context.Context, param *definition.UnwrapTokenParam, rpcZnnEvent *definition.UnwrapTokenRequest) (bool, error) {
+type unwrapSource uint8
+
+const (
+	// The source chain served the event and it carries the registered transfer.
+	sourceMatches unwrapSource = iota
+	// The source chain served the transaction or its block and no log there
+	// carries the registered transfer.
+	sourceDiffers
+	// The endpoint has no receipt for the transaction and this node has no
+	// record of the event.
+	sourceUnknown
+)
+
+// unwrapSource looks for the EVM event a registered unwrap request claims as
+// its source.
+func (rC *znnNetwork) unwrapSource(ctx context.Context, param *definition.UnwrapTokenParam, rpcZnnEvent *definition.UnwrapTokenRequest) (unwrapSource, error) {
 	evm := rC.rpcManager.Evm(rpcZnnEvent.ChainId)
+	var blockHash ecommon.Hash
+	var logs []etypes.Log
 	tx, rpcEvmErr := evm.TransactionReceiptContext(ctx, ecommon.Hash(param.TransactionHash))
 	if rpcEvmErr != nil {
 		rC.logger.Debugf("error: %s", rpcEvmErr.Error())
 		// todo filter errors, maybe just an rpc error
-		if rpcEvmErr.Error() == ethereum.NotFound.Error() || rpcEvmErr.Error() == "server returned transaction without signature" {
-			return false, nil
+		if rpcEvmErr.Error() != ethereum.NotFound.Error() && rpcEvmErr.Error() != "server returned transaction without signature" {
+			return sourceUnknown, rpcEvmErr
 		}
-		return false, rpcEvmErr
-	}
-	logs, err := evm.FilterBlockLogsContext(ctx, tx.BlockHash)
-	if err != nil {
-		rC.logger.Debug(err)
-		return false, err
-	}
-	// The receipt and the block's logs are two views of the same data. An
-	// endpoint that lists a bridge log in one and omits or alters it in the
-	// other is not serving this block, and its answer says nothing about the
-	// request.
-	if index, missing := receiptLogMissingFrom(logs, tx, evm.BridgeAddress()); missing {
-		return false, errors.Errorf("the endpoint's logs for block %s do not contain bridge log %d as the receipt of %s lists it",
-			tx.BlockHash, index, param.TransactionHash)
+		// A node can drop a transaction from its index and still serve the
+		// block's logs. Where this node recorded the event's block when it
+		// read the source chain itself, the event is read from that block.
+		recorded, err := rC.recordedUnwrapLog(evm, param, rpcZnnEvent)
+		if err != nil {
+			return sourceUnknown, err
+		}
+		if recorded == nil {
+			return sourceUnknown, nil
+		}
+		blockHash, logs = recorded.BlockHash, []etypes.Log{*recorded}
+	} else {
+		blockHash = tx.BlockHash
+		var err error
+		if logs, err = evm.FilterBlockLogsContext(ctx, tx.BlockHash); err != nil {
+			rC.logger.Debug(err)
+			return sourceUnknown, err
+		}
+		// The receipt and the block's logs are two views of the same data. An
+		// endpoint that lists a bridge log in one and omits or alters it in
+		// the other is not serving this block, and its answer says nothing
+		// about the request.
+		if index, missing := receiptLogMissingFrom(logs, tx, evm.BridgeAddress()); missing {
+			return sourceUnknown, errors.Errorf("the endpoint's logs for block %s do not contain bridge log %d as the receipt of %s lists it",
+				tx.BlockHash, index, param.TransactionHash)
+		}
 	}
 	found := false
 	event := &events.UnwrapRequestEvm{
 		TransactionHash: ecommon.Hash(param.TransactionHash),
 		LogIndex:        param.LogIndex,
-		BlockHash:       tx.BlockHash,
+		BlockHash:       blockHash,
 	}
 	if log, ok := findUnwrapLog(logs, event, evm.BridgeAddress()); !ok {
 		rC.logger.Debugf("Matching unwrap log not found for tx %s and log index %d", param.TransactionHash.String(), param.LogIndex)
@@ -1073,7 +1101,7 @@ func (rC *znnNetwork) unwrapHasSource(ctx context.Context, param *definition.Unw
 					if parseOk {
 						stored, exists, err := rC.dbManager.EvmStorage(rpcZnnEvent.ChainId).UnwrapAffiliatePolicy(affiliateEvidenceKey(log))
 						if err != nil {
-							return false, err
+							return sourceUnknown, err
 						}
 						policy = stored
 						if !exists {
@@ -1138,7 +1166,37 @@ func (rC *znnNetwork) unwrapHasSource(ctx context.Context, param *definition.Unw
 		}
 	}
 	rC.logger.Infof("found: %t", found)
-	return found, nil
+	if found {
+		return sourceMatches, nil
+	}
+	return sourceDiffers, nil
+}
+
+// recordedUnwrapLog returns the source log of an unwrap from the block this
+// node recorded for it when it read the source chain itself, as every
+// configured endpoint serves that block now. It returns nil when the node has
+// no such record.
+func (rC *znnNetwork) recordedUnwrapLog(evm *rpc.EvmRpc, param *definition.UnwrapTokenParam, rpcZnnEvent *definition.UnwrapTokenRequest) (*etypes.Log, error) {
+	row, err := rC.dbManager.EvmStorage(rpcZnnEvent.ChainId).GetUnwrapRequestByHashAndLog(ecommon.Hash(param.TransactionHash), param.LogIndex)
+	if err != nil {
+		return nil, err
+	}
+	if row == nil || row.BlockHash == (ecommon.Hash{}) {
+		return nil, nil
+	}
+	canonical, err := evm.CanonicalHash(row.BlockNumber)
+	if err != nil {
+		return nil, err
+	}
+	if canonical != row.BlockHash {
+		return nil, errors.Errorf("the block recorded for unwrap %s/%d is not the canonical block at height %d",
+			param.TransactionHash.String(), param.LogIndex, row.BlockNumber)
+	}
+	log, err := evm.AgreedUnwrapLog(row.BlockNumber, row.BlockHash, row.TransactionHash, originalLogIndex(row), 0)
+	if err != nil {
+		return nil, err
+	}
+	return &log, nil
 }
 
 // receiptLogMissingFrom returns the index of a bridge log the receipt lists
@@ -1174,6 +1232,12 @@ func receiptLogMissingFrom(blockLogs []etypes.Log, receipt *etypes.Receipt, brid
 // a receive is read, a request without its source event is an emergency and a
 // source that cannot be read holds the checkpoint.
 //
+// A receive read after finality gives the endpoint's history time to move on.
+// An endpoint with no receipt for the transaction then does not show that the
+// transaction never existed. Unless the node recorded the event's block
+// itself, or the source chain serves a transaction without the event, such a
+// request is held and reported instead of judged.
+//
 // Anything else is history a database reads on its way to the tip for the
 // first time. The bridge withholds a request for its redeem delay so that it
 // can be checked, and a request still inside that delay is checked here like
@@ -1181,7 +1245,7 @@ func receiptLogMissingFrom(blockLogs []etypes.Log, receipt *etypes.Receipt, brid
 // enough ago that an endpoint may no longer serve its transaction, which the
 // node could not tell from a transaction that never existed. Those are
 // recorded without asking.
-func (rC *znnNetwork) recordUnwrapRegistration(ctx context.Context, param *definition.UnwrapTokenParam, rpcZnnEvent *definition.UnwrapTokenRequest, redeemableIn *uint64, checked bool) error {
+func (rC *znnNetwork) recordUnwrapRegistration(ctx context.Context, param *definition.UnwrapTokenParam, rpcZnnEvent *definition.UnwrapTokenRequest, redeemableIn *uint64, checked, live bool) error {
 	if !checked {
 		inside, err := insideRedeemDelay(rpcZnnEvent, redeemableIn)
 		if err != nil {
@@ -1210,11 +1274,16 @@ func (rC *znnNetwork) recordUnwrapRegistration(ctx context.Context, param *defin
 		return nil
 	}
 	if checked {
-		found, err := rC.unwrapHasSource(ctx, param, rpcZnnEvent)
+		source, err := rC.unwrapSource(ctx, param, rpcZnnEvent)
 		if err != nil {
 			return err
 		}
-		if !found {
+		if source == sourceUnknown && !live {
+			return errors.Errorf("unwrap request %s/%d on chainId %d cannot be judged: the endpoint has no receipt for its transaction and this node has no record of the event, "+
+				"and this long after the receive that does not show whether the transaction never existed or lies outside the endpoint's history",
+				param.TransactionHash.String(), param.LogIndex, rpcZnnEvent.ChainId)
+		}
+		if source != sourceMatches {
 			rC.logger.Errorf("unwrap request %s/%d has no matching source event on chainId %d",
 				param.TransactionHash.String(), param.LogIndex, rpcZnnEvent.ChainId)
 			if stateErr := rC.state.SetState(common.EmergencyState); stateErr != nil {
@@ -1584,6 +1653,9 @@ func (rC *znnNetwork) processBridgeAccountPage(ctx context.Context, height uint6
 		}
 		if block == nil || block.Height != height+1 || block.Address != types.BridgeContract {
 			return height, false, errors.Errorf("expected bridge account block at height %d", height+1)
+		}
+		if block.Hash == types.ZeroHash {
+			return height, false, errors.Errorf("bridge account block %d has no hash", block.Height)
 		}
 		if block.ConfirmationDetail == nil || block.ConfirmationDetail.MomentumHeight == 0 {
 			return height, false, errors.Errorf("bridge account block %d awaits confirmation", block.Height)

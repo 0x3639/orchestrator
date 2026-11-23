@@ -488,7 +488,11 @@ func TestLiveListenerActsOnTheBridgeReceiveStatus(t *testing.T) {
 				case "embedded.bridge.getUnwrapTokenRequestByHashAndLog":
 					return b.request
 				case "eth_getTransactionReceipt":
-					return nil // the endpoint no longer serves this old receipt
+					return b.receipt()
+				case "eth_getLogs":
+					// The transaction emitted no such event. A missing receipt
+					// would be answered from the block the stored row records.
+					return []etypes.Log{}
 				}
 				t.Errorf("unexpected method %s", method)
 				return nil
@@ -600,10 +604,10 @@ func TestHeldReceiveKeepsItsSourceCheck(t *testing.T) {
 		replaced          bool // another receive takes the held one's height
 	}{
 		{"status unreadable while live, then accepted", live, unreadable, false, accepted, common.EmergencyState, false},
-		{"source lookup failed while live, then no source", live, accepted, true, accepted, common.EmergencyState, false},
+		{"source lookup failed while live, then no such event", live, accepted, true, accepted, common.EmergencyState, false},
 		{"status unreadable while live, then rejected", live, unreadable, false, rejected, common.LiveState, false},
 		{"status unreadable after finality, then accepted", final, unreadable, false, accepted, common.EmergencyState, false},
-		{"source lookup failed after finality, then no source", final, accepted, true, accepted, common.EmergencyState, false},
+		{"source lookup failed after finality, then no such event", final, accepted, true, accepted, common.EmergencyState, false},
 		{"status unreadable after finality, then rejected", final, unreadable, false, rejected, common.LiveState, false},
 		{"held while live, then replaced by another accepted receive", live, unreadable, false, accepted, common.EmergencyState, true},
 	} {
@@ -624,7 +628,9 @@ func TestHeldReceiveKeepsItsSourceCheck(t *testing.T) {
 					if receiptFails.Load() {
 						return nil, &replayRPCError{Code: -32000, Message: "upstream timeout"}
 					}
-					return nil, nil // no such transaction on the source chain
+					return b.receipt(), nil
+				case "eth_getLogs":
+					return []etypes.Log{}, nil // the transaction emitted no such event
 				}
 				t.Errorf("unexpected method %s", method)
 				return nil, nil

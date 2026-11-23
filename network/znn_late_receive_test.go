@@ -16,6 +16,7 @@ import (
 	"github.com/zenon-network/go-zenon/vm/embedded/definition"
 
 	"orchestrator/common"
+	"orchestrator/common/events"
 )
 
 // evmSource is what the EVM endpoint answers for the transaction an unwrap
@@ -45,8 +46,10 @@ type lateNode struct {
 	// send paired with a receive.
 	requestReads   atomic.Int32
 	sendUnreadable atomic.Bool
-	n              *znnNetwork
-	stores         replayStores
+	// The hash the EVM endpoint reports for block 100, where the event is.
+	canonical atomic.Pointer[ecommon.Hash]
+	n         *znnNetwork
+	stores    replayStores
 }
 
 func newLateNode(t *testing.T, register func(*replayBridge)) *lateNode {
@@ -57,6 +60,7 @@ func newLateNode(t *testing.T, register func(*replayBridge)) *lateNode {
 	}
 	l.ledger.Store(newReplayLedger(t, l.bridge, 100))
 	l.source.Store(l.noTransaction())
+	l.canonical.Store(&l.bridge.blockHash)
 	url := replayServerWithErrors(t, func(method string, params []json.RawMessage) (interface{}, *replayRPCError) {
 		switch method {
 		case "stats.syncInfo":
@@ -77,6 +81,8 @@ func newLateNode(t *testing.T, register func(*replayBridge)) *lateNode {
 				return l.bridge.request, nil
 			}
 			return withRedeemDelay(l.bridge.request, l.redeemableIn.Load()), nil
+		case "eth_getBlockByNumber":
+			return map[string]interface{}{"number": "0x64", "hash": l.canonical.Load()}, nil
 		case "eth_getTransactionReceipt":
 			l.evmCalls.Add(1)
 			return l.source.Load().receipt()
@@ -152,6 +158,29 @@ func (l *lateNode) expect(step string, state uint8, cursor uint64) {
 	}
 	if got := l.cursor(); got != cursor {
 		l.t.Fatalf("%s: checkpoint %d, want %d", step, got, cursor)
+	}
+}
+
+// recordEvent stores the unwrap as this signer's own scan of the source chain
+// recorded it, with the block it found the event in.
+func (l *lateNode) recordEvent() {
+	l.t.Helper()
+	if err := l.stores.evm[1].AddUnwrapRequest(events.UnwrapRequestEvm{
+		NetworkClass: definition.EvmClass, ChainId: 1, BlockNumber: 100, BlockHash: l.bridge.blockHash,
+		TransactionHash: l.bridge.txHash, LogIndex: l.bridge.request.LogIndex, From: ecommon.HexToAddress("0x03"),
+		To: l.bridge.recipient.String(), Token: l.bridge.token, Amount: big.NewInt(100), RedeemStatus: common.UnredeemedStatus,
+	}); err != nil {
+		l.t.Fatal(err)
+	}
+}
+
+// droppedFromIndex is an endpoint that no longer finds the transaction by
+// hash and still serves the logs of its block.
+func (l *lateNode) droppedFromIndex() *evmSource {
+	log := l.bridge.sourceLog(l.t, l.bridge.recipient.String())
+	return &evmSource{
+		receipt: func() (interface{}, *replayRPCError) { return nil, nil },
+		logs:    func() (interface{}, *replayRPCError) { return []etypes.Log{log}, nil },
 	}
 }
 
@@ -247,21 +276,25 @@ var acceptedReceive, rejectedReceive = receiveStatus(vmResultSuccess), receiveSt
 
 // The listener starts at the tip of the bridge account, so a registration it
 // reads was made while it was running. How far the frontier has moved by the
-// time it reads it says nothing about the registration.
+// time it reads it does not take the registration out of the check. A late
+// read changes one thing: an endpoint with no receipt no longer shows that the
+// transaction never existed, so that request is held instead of judged.
 func TestRunningListenerChecksARegistrationHoweverLateItReadsIt(t *testing.T) {
 	for _, tc := range []struct {
 		name     string
 		frontier uint64
 		source   func(*lateNode) *evmSource
 		want     uint8
+		held     bool
 		stored   bool
 	}{
-		{"within finality, no transaction", 104, (*lateNode).noTransaction, common.EmergencyState, false},
-		{"at finality, no transaction", 105, (*lateNode).noTransaction, common.EmergencyState, false},
-		{"long after finality, no transaction", 5000, (*lateNode).noTransaction, common.EmergencyState, false},
-		{"long after finality, another event", 5000, (*lateNode).anotherEvent, common.EmergencyState, false},
-		{"long after finality, matching event", 5000, (*lateNode).matchingEvent, common.LiveState, true},
-		{"long after finality, matching event beside another contract's log", 5000, (*lateNode).besideAnotherContract, common.LiveState, true},
+		{"within finality, no receipt", 104, (*lateNode).noTransaction, common.EmergencyState, false, false},
+		{"at finality, no receipt", 105, (*lateNode).noTransaction, common.LiveState, true, false},
+		{"long after finality, no receipt", 5000, (*lateNode).noTransaction, common.LiveState, true, false},
+		{"at finality, another event", 105, (*lateNode).anotherEvent, common.EmergencyState, false, false},
+		{"long after finality, another event", 5000, (*lateNode).anotherEvent, common.EmergencyState, false, false},
+		{"long after finality, matching event", 5000, (*lateNode).matchingEvent, common.LiveState, false, true},
+		{"long after finality, matching event beside another contract's log", 5000, (*lateNode).besideAnotherContract, common.LiveState, false, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			l := newLateNode(t, func(b *replayBridge) {
@@ -271,15 +304,69 @@ func TestRunningListenerChecksARegistrationHoweverLateItReadsIt(t *testing.T) {
 			})
 			l.source.Store(tc.source(l))
 			l.at(tc.frontier, acceptedReceive)
-			if err := l.listen(); err != nil {
-				t.Fatal(err)
+			if err := l.listen(); (err != nil) != tc.held {
+				t.Fatalf("error %v, want held %v", err, tc.held)
 			}
-			l.expect("listener", tc.want, 2)
+			wantCursor := uint64(2)
+			if tc.held {
+				wantCursor = 1
+			}
+			l.expect("listener", tc.want, wantCursor)
 			if row := l.row(); (row != nil) != tc.stored {
 				t.Fatalf("stored row %v, want stored %v", row, tc.stored)
 			} else if tc.stored && row.status != common.PendingRedeemStatus {
 				t.Fatalf("stored status %d", row.status)
 			}
+		})
+	}
+}
+
+// A node can drop a transaction from its index and still serve the block's
+// logs. Where this signer recorded the event's block when it read the source
+// chain itself, a missing receipt is answered from that block: the event is
+// compared as usual, live or late, and nothing is concluded from the receipt.
+func TestMissingReceiptIsAnsweredFromTheRecordedBlock(t *testing.T) {
+	replaced := ecommon.HexToHash("0xcd")
+	for _, tc := range []struct {
+		name      string
+		frontier  uint64
+		amount    int64 // registered amount; the event carries 100
+		source    func(*lateNode) *evmSource
+		canonical *ecommon.Hash
+		want      uint8
+		held      bool
+	}{
+		{"late, event still served by block", 5000, 100, (*lateNode).droppedFromIndex, nil, common.LiveState, false},
+		{"live, event still served by block", 104, 100, (*lateNode).droppedFromIndex, nil, common.LiveState, false},
+		{"late, served event carries another amount", 5000, 101, (*lateNode).droppedFromIndex, nil, common.EmergencyState, false},
+		{"late, block logs do not have the event", 5000, 100, (*lateNode).noTransaction, nil, common.LiveState, true},
+		{"live, block logs do not have the event", 104, 100, (*lateNode).noTransaction, nil, common.LiveState, true},
+		{"late, recorded block is no longer canonical", 5000, 100, (*lateNode).droppedFromIndex, &replaced, common.LiveState, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			l := newLateNode(t, func(b *replayBridge) { b.request.Amount = big.NewInt(tc.amount) })
+			l.recordEvent()
+			if tc.source(l).logs == nil {
+				// An endpoint whose log query answers, without the event.
+				l.source.Store(&evmSource{
+					receipt: func() (interface{}, *replayRPCError) { return nil, nil },
+					logs:    func() (interface{}, *replayRPCError) { return []etypes.Log{}, nil },
+				})
+			} else {
+				l.source.Store(tc.source(l))
+			}
+			if tc.canonical != nil {
+				l.canonical.Store(tc.canonical)
+			}
+			l.at(tc.frontier, acceptedReceive)
+			if err := l.listen(); (err != nil) != tc.held {
+				t.Fatalf("error %v, want held %v", err, tc.held)
+			}
+			wantCursor := uint64(2)
+			if tc.held {
+				wantCursor = 1
+			}
+			l.expect("listener", tc.want, wantCursor)
 		})
 	}
 }
@@ -299,6 +386,7 @@ func TestListenerWaitsWhileTheNodeIsSyncing(t *testing.T) {
 	}
 	// The node catches up long after the receive became final.
 	l.syncing.Store(false)
+	l.source.Store(l.anotherEvent())
 	l.at(5000, acceptedReceive)
 	if err := l.listen(); err != nil {
 		t.Fatal(err)
@@ -310,6 +398,7 @@ func TestListenerWaitsWhileTheNodeIsSyncing(t *testing.T) {
 // it. They are checked when it reaches them.
 func TestRegistrationBehindAHeldReceiveIsChecked(t *testing.T) {
 	l := newLateNode(t, nil)
+	l.source.Store(l.anotherEvent())
 	l.at(104, nil, acceptedReceive) // the first receive has no readable status
 	if err := l.listen(); err == nil {
 		t.Fatal("the listener passed a receive without a status")
@@ -334,7 +423,7 @@ func TestRestartChecksReceivesMadeAfterTheDatabaseReachedTheTip(t *testing.T) {
 		want       uint8
 		fails      bool
 	}{
-		{"reached the tip before, no transaction", true, (*lateNode).noTransaction, common.EmergencyState, false},
+		{"reached the tip before, no receipt", true, (*lateNode).noTransaction, common.LiveState, true},
 		{"reached the tip before, another event", true, (*lateNode).anotherEvent, common.EmergencyState, false},
 		{"reached the tip before, matching event", true, (*lateNode).matchingEvent, common.LiveState, false},
 		{"reached the tip before, endpoint has pruned the block", true,
@@ -404,8 +493,8 @@ func TestFirstReadOfTheAccountChecksRequestsInsideTheirRedeemDelay(t *testing.T)
 	}{
 		{"inside the delay, matching event", nil, 30, (*lateNode).matchingEvent, common.LiveState, false, true, true},
 		{"inside the delay, another event", nil, 30, (*lateNode).anotherEvent, common.EmergencyState, false, false, true},
-		{"inside the delay, no transaction", nil, 30, (*lateNode).noTransaction, common.EmergencyState, false, false, true},
-		{"last momentum of the delay, no transaction", nil, 1, (*lateNode).noTransaction, common.EmergencyState, false, false, true},
+		{"inside the delay, no receipt", nil, 30, (*lateNode).noTransaction, common.LiveState, true, false, true},
+		{"last momentum of the delay, another event", nil, 1, (*lateNode).anotherEvent, common.EmergencyState, false, false, true},
 		{"inside the delay, receipt lookup times out", nil, 30, timesOut, common.LiveState, true, false, true},
 		{"inside the delay, endpoint omits the block's logs", nil, 30, (*lateNode).incompleteLogs, common.LiveState, true, false, true},
 		{"past the delay, no transaction", nil, 0, (*lateNode).noTransaction, common.LiveState, false, true, false},
@@ -460,6 +549,7 @@ func TestFirstReadWaitsForTheRedeemDelay(t *testing.T) {
 		t.Fatalf("the request was handled without its redeem delay: %d source lookups, row %v", l.evmCalls.Load(), l.row())
 	}
 	l.redeemDelayAbsent.Store(false)
+	l.source.Store(l.anotherEvent())
 	if err := l.n.Sync(); err != nil {
 		t.Fatal(err)
 	}
@@ -533,6 +623,7 @@ func TestCheckedRegistrationWaitsForItsNetworkClient(t *testing.T) {
 func TestCheckedRegistrationDoesNotDependOnTheRedeemDelay(t *testing.T) {
 	l := newLateNode(t, nil)
 	l.redeemDelayAbsent.Store(true)
+	l.source.Store(l.anotherEvent())
 	l.at(5000, acceptedReceive)
 	if err := l.listen(); err != nil {
 		t.Fatal(err)
@@ -568,7 +659,7 @@ func TestFirstReadKeepsACheckItCouldNotFinish(t *testing.T) {
 			l.restart()
 			l.sendUnreadable.Store(false)
 			l.redeemableIn.Store(0)
-			l.source.Store(l.noTransaction())
+			l.source.Store(l.anotherEvent())
 			l.at(9000, acceptedReceive)
 			if err := l.n.Sync(); err != nil {
 				t.Fatal(err)
@@ -625,7 +716,7 @@ func TestCheckedRegistrationWaitsForAReadableSource(t *testing.T) {
 					t.Fatal("the listener passed a registration whose source it could not read")
 				}
 				l.expect("unreadable", common.LiveState, 1)
-				l.source.Store(l.noTransaction())
+				l.source.Store(l.anotherEvent())
 				if err := l.listen(); err != nil {
 					t.Fatal(err)
 				}
@@ -728,6 +819,7 @@ func TestLateKeyGenExitFollowsTheBridge(t *testing.T) {
 		{"startup, keygen switched off, on again since", 5000, true, allowOff, false, bridge(true, key), common.KeyGenState, false, 0},
 		{"live, key changed to this key", live, false, changeKey, false, bridge(false, key), common.LiveState, false, 0},
 		{"live, bridge holds another key", live, false, changeKey, false, bridge(false, otherKey), common.KeyGenState, false, 0},
+		{"live, key changed, keygen allowed again", live, false, changeKey, false, bridge(true, key), common.KeyGenState, false, 0},
 		{"late, key changed, keygen over", late, false, changeKey, false, bridge(false, otherKey), common.LiveState, false, 0},
 		{"late, key changed, keygen allowed again", late, false, changeKey, false, bridge(true, key), common.KeyGenState, false, 0},
 		{"late, key changed, settings unreadable", late, false, changeKey, false, unavailable, common.KeyGenState, true, 0},
@@ -886,5 +978,84 @@ func TestStartupRejectsANodeBehindTheCheckpoint(t *testing.T) {
 	}
 	if err := n.Sync(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// A stored row without a block is not a record of the event: a registration
+// read from Zenon leaves one. It does not stand in for the source.
+func TestStoredRowWithoutABlockIsNotARecordOfTheEvent(t *testing.T) {
+	l := newLateNode(t, nil)
+	if err := l.stores.evm[1].AddUnwrapRequest(common.ZnnUnwrapToOrchestatorUnwrap(l.bridge.request)); err != nil {
+		t.Fatal(err)
+	}
+	l.source.Store(l.droppedFromIndex())
+	l.at(104, acceptedReceive)
+	if err := l.listen(); err != nil {
+		t.Fatal(err)
+	}
+	l.expect("listener", common.EmergencyState, 2)
+}
+
+// A page entry without its own hash is not a block the listener can identify.
+// It waits for a complete entry.
+func TestListenerRequiresTheReceiveHash(t *testing.T) {
+	l := newLateNode(t, nil)
+	l.source.Store(l.anotherEvent())
+	l.at(104, acceptedReceive)
+	complete := l.ledger.Load()
+	nameless := newReplayLedger(t, l.bridge, 104, acceptedReceive)
+	nameless.receives[0].Hash = types.ZeroHash
+	l.ledger.Store(nameless)
+	if err := l.listen(); err == nil {
+		t.Fatal("the listener processed a bridge account block without a hash")
+	}
+	l.expect("no hash", common.LiveState, 1)
+	if l.requestReads.Load() != 0 {
+		t.Fatal("the receive was interpreted without its hash")
+	}
+	// The endpoint repairs the entry after the receive is final.
+	l.ledger.Store(complete)
+	l.at(5000, acceptedReceive)
+	if err := l.listen(); err != nil {
+		t.Fatal(err)
+	}
+	l.expect("complete", common.EmergencyState, 2)
+}
+
+// The bridge accepts a registration whose transaction hash and log index are
+// both zero. An endpoint's null reply for it is an absent request, not a
+// request with those values.
+func TestNullRequestReplyIsNotARequestWithZeroIdentity(t *testing.T) {
+	for _, startup := range []bool{false, true} {
+		b := newReplayBridge(t)
+		b.txHash = ecommon.Hash{}
+		b.request.TransactionHash = types.Hash{}
+		ledger := newReplayLedger(t, b, 5000, acceptedReceive)
+		url := replayServerWithParams(t, func(method string, params []json.RawMessage) interface{} {
+			if result, ok := ledger.answer(t, method, params); ok {
+				return result
+			}
+			if method != "embedded.bridge.getUnwrapTokenRequestByHashAndLog" {
+				t.Errorf("unexpected method %s", method)
+			}
+			return nil
+		})
+		n, stores := replayNetwork(t, b, url, map[uint32]string{1: url})
+		n.SetConfirmationsToFinality(5)
+		if err := n.state.SetFrontierMomentum(5000); err != nil {
+			t.Fatal(err)
+		}
+		var err error
+		if startup {
+			err = n.Sync()
+		} else {
+			_, _, err = n.processBridgeAccountPage(n.listenerCtx, 1, n.refreshSettings)
+		}
+		if err == nil {
+			t.Fatalf("startup %v: a null reply was taken for the request", startup)
+		}
+		if cursor, _ := stores.znn.GetLastUpdateHeight(); cursor != 1 {
+			t.Fatalf("startup %v: checkpoint %d", startup, cursor)
+		}
 	}
 }
