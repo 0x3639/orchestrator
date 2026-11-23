@@ -243,10 +243,12 @@ func TestOnlySettledHistoryIsArchived(t *testing.T) {
 			primary: func(c *redeemContract) { c.failing.Store(true) }},
 		{name: "one endpoint has no state at the final height", closedAt: 110, unhaltedAt: 120, wantErr: true,
 			secondary: func(c *redeemContract) { c.closedAt.Store(110); c.unhaltedAt.Store(120); c.pruned.Store(true) }},
-		{name: "one endpoint has not reached the final height", closedAt: 110, unhaltedAt: 120, lagging: 120, wantErr: true},
-		// The final height must be confirmation-deep for every endpoint, not
-		// only for the one that reported the head.
-		{name: "one endpoint is past the final height but behind the head", closedAt: 110, unhaltedAt: 120, lagging: 139, wantErr: true},
+		// The final height is measured from the endpoint that is furthest
+		// behind, so it is confirmation-deep for every one of them: with a
+		// second endpoint at 139 it is 127, at 131 it is 119, at 120 it is 108.
+		{name: "one endpoint is a block behind", closedAt: 110, unhaltedAt: 120, lagging: 139, wantStored: true},
+		{name: "the unhalt is not final for the endpoint that is behind", closedAt: 110, unhaltedAt: 120, lagging: 131, wantErr: true},
+		{name: "the closure is not final for the endpoint that is behind", closedAt: 110, unhaltedAt: 120, lagging: 120, wantErr: true},
 		// What can still be paid is reported without any older state.
 		{name: "payable, no endpoint has state at the final height", unhaltedAt: 120, wantHalt: true,
 			primary: func(c *redeemContract) { c.pruned.Store(true) }},

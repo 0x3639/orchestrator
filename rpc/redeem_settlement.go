@@ -27,8 +27,8 @@ func (v redeemView) settledAfter(registeredAt uint64) bool {
 }
 
 // RedeemSettledAfterHalt reports whether a redeem registered at registeredAt
-// is settled: in the contract state confirmations below head, on every
-// configured endpoint, it is both
+// is settled: in the contract state at the final height, on every configured
+// endpoint, it is both
 //
 //   - closed, so it was paid or revoked and can never be paid again, and
 //   - followed by an administrator unhalt, so a halt covered the registration
@@ -45,24 +45,28 @@ func (v redeemView) settledAfter(registeredAt uint64) bool {
 // paid is reported even by endpoints that keep no older state.
 //
 // Only the answer "settled" releases a registration, and it is given on
-// confirmation-deep evidence alone. Every endpoint must have reached head on
-// the same chain, so that the final height is confirmations deep for each of
-// them and not only for the endpoint that reported the head. They must agree
-// on the block at the final height, before and after the read, and report
-// identical state at it. A later reorganization then cannot undo what the
-// answer rests on. A closure or unhalt that is visible in the latest state
-// but not yet at the final height, an endpoint that is behind head or cannot
-// serve state at the final height, and any failed read are errors, so the
-// caller retries instead of deciding.
-func (r *EvmRpc) RedeemSettledAfterHalt(nonce *big.Int, registeredAt, head, confirmations uint64) (bool, error) {
-	if head < confirmations || head-confirmations < registeredAt {
-		return false, errors.New("the redeem registration is not final yet")
-	}
-	finalHeight := head - confirmations
+// confirmation-deep evidence alone. The final height is confirmations below
+// the lowest head any endpoint reports, so it is that deep for each of them
+// and not only for the endpoint that is furthest ahead. The endpoints must
+// agree on the block at that lowest head and on the block at the final
+// height, before and after the read, and report identical state at it. A
+// later reorganization then cannot undo what the answer rests on. A closure
+// or unhalt that is visible in the latest state but not yet at the final
+// height, an endpoint that cannot serve state at the final height, and any
+// failed read are errors, so the caller retries instead of deciding.
+func (r *EvmRpc) RedeemSettledAfterHalt(nonce *big.Int, registeredAt, confirmations uint64) (bool, error) {
 	_, anySettled, err := r.RedeemSettledInLatestState(nonce, registeredAt)
 	if err != nil || !anySettled {
 		return false, err
 	}
+	head, err := r.lowestHead()
+	if err != nil {
+		return false, err
+	}
+	if head < confirmations || head-confirmations < registeredAt {
+		return false, errors.New("the redeem registration is not final on every endpoint yet")
+	}
+	finalHeight := head - confirmations
 	if _, err := r.CanonicalHash(head); err != nil {
 		return false, err
 	}
@@ -105,6 +109,37 @@ func (r *EvmRpc) RedeemSettledInLatestState(nonce *big.Int, registeredAt uint64)
 		any = any || settled
 	}
 	return every, any, nil
+}
+
+// lowestHead returns the lowest chain head among the configured endpoints.
+func (r *EvmRpc) lowestHead() (uint64, error) {
+	urls := r.Urls.Urls
+	if len(urls) == 0 {
+		return 0, errors.New("no EVM endpoints configured")
+	}
+	heads := make([]uint64, len(urls))
+	errs := make([]error, len(urls))
+	var wg sync.WaitGroup
+	for i := range urls {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			errs[i] = r.callEndpoint(i, func(ctx context.Context, c *ethclient.Client) error {
+				var err error
+				heads[i], err = c.BlockNumber(ctx)
+				return err
+			})
+		}(i)
+	}
+	wg.Wait()
+	lowest := heads[0]
+	for i := range urls {
+		if errs[i] != nil {
+			return 0, fmt.Errorf("chain head from endpoint #%d: %s", i, config.RedactErrorForURL(errs[i], urls[i]))
+		}
+		lowest = min(lowest, heads[i])
+	}
+	return lowest, nil
 }
 
 // redeemViews reads one view from every configured endpoint at block, or at

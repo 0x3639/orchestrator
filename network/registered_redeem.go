@@ -116,9 +116,7 @@ func (eN *evmNetwork) registerRedeem(log etypes.Log, live bool) error {
 
 // redeemSettled asks every endpoint whether, at the confirmation-deep height,
 // the registration in an incident is closed and was followed by an
-// administrator unhalt. The caller has verified the log at that depth, so a
-// head that does not place the registration at or below the final height is
-// a contradiction and decides nothing.
+// administrator unhalt.
 func (eN *evmNetwork) redeemSettled(incident common.RedeemIncident) (bool, error) {
 	redeem, err := eN.EvmRpc().Bridge().ParseRegisteredRedeem(incident.Log)
 	if err != nil {
@@ -127,11 +125,7 @@ func (eN *evmNetwork) redeemSettled(incident common.RedeemIncident) (bool, error
 	if redeem.Nonce == nil {
 		return false, errors.New("incomplete redeem registration log")
 	}
-	head, err := eN.EvmRpc().BlockNumber()
-	if err != nil {
-		return false, err
-	}
-	return eN.EvmRpc().RedeemSettledAfterHalt(redeem.Nonce, incident.Log.BlockNumber, head, eN.ConfirmationsToFinality())
+	return eN.EvmRpc().RedeemSettledAfterHalt(redeem.Nonce, incident.Log.BlockNumber, eN.ConfirmationsToFinality())
 }
 
 // redeemClosedEverywhere reports whether every endpoint's latest state shows
