@@ -47,9 +47,6 @@ type znnNetwork struct {
 	highestSigningHeight uint64
 	stopHealth           func()
 	coverage             receiveCoverage
-	// The receive the listener is holding after it failed as a live receive.
-	// Only the listener goroutine reads and writes it.
-	heldLiveReceive types.Hash
 	config.ZnnParams
 	dbManager         networkEventStores
 	rpcManager        *rpc.Manager
@@ -375,22 +372,7 @@ func (rC *znnNetwork) interpretConfirmedReceive(ctx context.Context, receive, se
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if history != listenerHistory {
-		return rC.interpretSendBlockData(ctx, send, mode, embeddedReceiveOutcome(receive), receive.Height, refresh)
-	}
-	// The listener retries a failed receive until it succeeds, and the frontier
-	// moves on meanwhile. A receive that was live when it first failed keeps
-	// its live checks, however long the retries take.
-	if rC.heldLiveReceive != types.ZeroHash && rC.heldLiveReceive == receive.Hash {
-		mode = liveReceive
-	}
-	err = rC.interpretSendBlockData(ctx, send, mode, embeddedReceiveOutcome(receive), receive.Height, refresh)
-	if err == nil {
-		rC.heldLiveReceive = types.ZeroHash
-	} else if mode == liveReceive {
-		rC.heldLiveReceive = receive.Hash
-	}
-	return err
+	return rC.interpretSendBlockData(ctx, send, mode, embeddedReceiveOutcome(receive), receive.Height, refresh)
 }
 
 type receiveOutcome uint8
