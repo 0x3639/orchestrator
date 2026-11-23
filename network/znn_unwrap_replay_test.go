@@ -271,6 +271,7 @@ func TestRedeemAndRevokeRecordOnlyRequestsOnTheEvmNetwork(t *testing.T) {
 		{"redeem registered, EVM", definition.RedeemUnwrapMethodName, definition.EvmClass, 0, 0, common.PendingRedeemStatus},
 		{"redeem completed, EVM", definition.RedeemUnwrapMethodName, definition.EvmClass, 1, 0, common.RedeemedStatus},
 		{"redeem attempted on a revoked request, EVM", definition.RedeemUnwrapMethodName, definition.EvmClass, 0, 1, common.RevokedStatus},
+		{"redeem attempted on a request revoked after it was redeemed, EVM", definition.RedeemUnwrapMethodName, definition.EvmClass, 1, 1, common.RevokedStatus},
 		{"revoke, EVM", definition.RevokeUnwrapRequestMethodName, definition.EvmClass, 0, 1, common.RevokedStatus},
 		{"redeem, another class", definition.RedeemUnwrapMethodName, definition.EvmClass + 1, 1, 0, common.UnredeemedStatus},
 		{"revoke, another class", definition.RevokeUnwrapRequestMethodName, definition.EvmClass + 1, 0, 1, common.UnredeemedStatus},
