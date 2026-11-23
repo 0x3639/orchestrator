@@ -185,6 +185,45 @@ func TestReconcileStatusPreservesListenerUpdate(t *testing.T) {
 	}
 }
 
+func TestReconcilePendingAdvancesToTerminal(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		want uint32
+	}{
+		{"redeemed", common.RedeemedStatus},
+		{"revoked", common.RevokedStatus},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := newSigner(t)
+			c.lookup = func(i uint32) (*definition.UnwrapTokenRequest, error) {
+				if i != 0 {
+					return stableLookup(i)
+				}
+				if err := c.EvmStorage.SetUnwrapRequestStatus(signerTestTx, i, common.PendingRedeemStatus); err != nil {
+					return nil, err
+				}
+				request := registeredLog(i)
+				if tc.want == common.RedeemedStatus {
+					request.Redeemed = 1
+				} else {
+					request.Revoked = 1
+				}
+				return request, nil
+			}
+			if _, _, err := c.pool(t); err != nil {
+				t.Fatal(err)
+			}
+			got, err := c.GetUnwrapRequestByHashAndLog(signerTestTx, 0)
+			if err != nil || got == nil {
+				t.Fatalf("could not read reconciled event: %v", err)
+			}
+			if got.RedeemStatus != tc.want {
+				t.Errorf("after pending listener update, stored status %d; want %d", got.RedeemStatus, tc.want)
+			}
+		})
+	}
+}
+
 func TestReconcileBridgeAdvancesDuringReads(t *testing.T) {
 	for _, log0Known := range []bool{false, true} {
 		t.Run(fmt.Sprintf("log0Known=%t", log0Known), func(t *testing.T) {

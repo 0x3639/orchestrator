@@ -716,12 +716,12 @@ func (m *NetworksManager) SetEvmUnwrapRequestAsSent(event *events.UnwrapRequestE
 	return nil
 }
 
-// SetEvmUnwrapRequestStatus records a reconciliation result when the stored
-// status still matches the snapshot selected before the Zenon lookup.
+// SetEvmUnwrapRequestStatus applies a Zenon reconciliation result while
+// preserving terminal statuses already recorded by the listener.
 func (m *NetworksManager) SetEvmUnwrapRequestStatus(event *events.UnwrapRequestEvm, status uint32) error {
 	for _, network := range m.evmNetworks {
 		if network.ChainId() == event.ChainId {
-			if err := network.eventsStore().SetUnwrapRequestStatusIfCurrent(event.TransactionHash, event.LogIndex, event.RedeemStatus, status); err != nil {
+			if err := network.eventsStore().ApplyUnwrapReconciliationStatus(event.TransactionHash, event.LogIndex, event.RedeemStatus, status); err != nil {
 				return err
 			}
 		}

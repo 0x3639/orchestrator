@@ -163,7 +163,7 @@ func (es *evmStorage) SetUnwrapRequestStatus(txHash ecommon.Hash, logIndex, stat
 	return es.setUnwrapRequestStatus(txHash, logIndex, status, nil)
 }
 
-func (es *evmStorage) SetUnwrapRequestStatusIfCurrent(txHash ecommon.Hash, logIndex, expected, status uint32) error {
+func (es *evmStorage) ApplyUnwrapReconciliationStatus(txHash ecommon.Hash, logIndex, expected, status uint32) error {
 	return es.setUnwrapRequestStatus(txHash, logIndex, status, &expected)
 }
 
@@ -178,8 +178,16 @@ func (es *evmStorage) setUnwrapRequestStatus(txHash ecommon.Hash, logIndex, stat
 	if event == nil {
 		return leveldb.ErrNotFound
 	}
-	if expected != nil && event.RedeemStatus != *expected {
-		return nil
+	if expected != nil {
+		current := event.RedeemStatus
+		if current == common.RedeemedStatus || current == common.RevokedStatus {
+			return nil
+		}
+		advancesPending := current == common.PendingRedeemStatus &&
+			(status == common.RedeemedStatus || status == common.RevokedStatus)
+		if current != *expected && !advancesPending {
+			return nil
+		}
 	}
 	event.RedeemStatus = status
 	return es.putUnwrapRequest(*event)
