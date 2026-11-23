@@ -85,6 +85,33 @@
         },
         "processedReceiveHeight": {
           "$ref": "#/$defs/numberObservation"
+        },
+        "receiveHold": {
+          "anyOf": [
+            {
+              "type": "null"
+            },
+            {
+              "type": "object",
+              "required": [
+                "height",
+                "since",
+                "attempts"
+              ],
+              "properties": {
+                "height": {
+                  "$ref": "#/$defs/integer"
+                },
+                "since": {
+                  "$ref": "#/$defs/timestamp"
+                },
+                "attempts": {
+                  "$ref": "#/$defs/integer"
+                }
+              },
+              "additionalProperties": false
+            }
+          ]
         }
       },
       "additionalProperties": false

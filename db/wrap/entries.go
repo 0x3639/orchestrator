@@ -261,6 +261,37 @@ func (es *eventStore) SaveReceiveCoverageCheckpoint(height uint64) error {
 	return es.DB.Put(receiveCoverageKey, data[:])
 }
 
+// BridgeWatchStart returns the frontier momentum at which this database first
+// reached the tip of the bridge account, or zero while it never has. Bridge
+// receives read after that point are new to this node whenever it reads them.
+func (es *eventStore) BridgeWatchStart() (uint64, error) {
+	data, err := es.DB.Get(bridgeWatchKey)
+	if err == leveldb.ErrNotFound {
+		return 0, nil
+	}
+	if err != nil {
+		es.SendSigInt()
+		return 0, err
+	}
+	if len(data) != 8 || binary.LittleEndian.Uint64(data) == 0 {
+		return 0, errors.New("invalid bridge watch record")
+	}
+	return binary.LittleEndian.Uint64(data), nil
+}
+
+func (es *eventStore) SaveBridgeWatchStart(momentum uint64) error {
+	if momentum == 0 {
+		return errors.New("bridge watch start needs a momentum height")
+	}
+	var data [8]byte
+	binary.LittleEndian.PutUint64(data[:], momentum)
+	if err := es.DB.Put(bridgeWatchKey, data[:]); err != nil {
+		es.SendSigInt()
+		return err
+	}
+	return nil
+}
+
 func (es *eventStore) GetLastUpdateHeight() (uint64, error) {
 	data, err := es.DB.Get(getLastUpdateKey())
 	if err == leveldb.ErrNotFound {

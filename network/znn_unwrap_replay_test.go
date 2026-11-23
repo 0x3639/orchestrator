@@ -19,6 +19,7 @@ import (
 	"github.com/zenon-network/go-zenon/common/types"
 	"github.com/zenon-network/go-zenon/protocol"
 	"github.com/zenon-network/go-zenon/rpc/api"
+	"github.com/zenon-network/go-zenon/rpc/api/embedded"
 	"github.com/zenon-network/go-zenon/vm/embedded/definition"
 	"go.uber.org/zap"
 
@@ -105,6 +106,12 @@ func (b *replayBridge) send(t *testing.T, chainID uint32, amount *big.Int, signa
 		t.Fatal(err)
 	}
 	return &api.AccountBlock{AccountBlock: nom.AccountBlock{Hash: types.Hash{9}, Data: method}}
+}
+
+// withRedeemDelay is the request as the node's API returns it, with the
+// momentums left before the bridge lets it be redeemed.
+func withRedeemDelay(request *definition.UnwrapTokenRequest, remaining uint64) *embedded.UnwrapTokenRequest {
+	return &embedded.UnwrapTokenRequest{UnwrapTokenRequest: request, RedeemableIn: remaining}
 }
 
 func replayServer(t *testing.T, answer func(method string) interface{}) string {
@@ -318,29 +325,33 @@ func TestRedeemAndRevokeRecordOnlyRequestsOnTheEvmNetwork(t *testing.T) {
 }
 
 // The receive registered the request, so an endpoint that reports none is
-// behind the ledger the receive was read from. While the receive is live the
-// listener waits for it; dropping it would drop the source check with it.
-func TestAcceptedLiveUnwrapWaitsForTheRegisteredRequest(t *testing.T) {
+// behind the ledger the receive was read from. The listener waits for it,
+// however late it reads the receive; dropping it would drop the source check
+// with it. Only a database reading the account for the first time moves on.
+func TestAcceptedUnwrapWaitsForTheRegisteredRequest(t *testing.T) {
+	noData := func() (interface{}, *replayRPCError) { return nil, &replayRPCError{-32000, "data non existent"} }
+	null := func() (interface{}, *replayRPCError) { return nil, nil }
+	removed := func() (interface{}, *replayRPCError) { return nil, &replayRPCError{-32000, "unknown network"} }
 	for _, tc := range []struct {
-		name string
-		live bool
+		name     string
+		frontier uint64
+		startup  bool
 		// answer is the Zenon endpoint's reply to the request lookup.
 		answer func() (interface{}, *replayRPCError)
 		held   bool
 	}{
-		{"live, no data", true, func() (interface{}, *replayRPCError) { return nil, &replayRPCError{-32000, "data non existent"} }, true},
-		{"live, null result", true, func() (interface{}, *replayRPCError) { return nil, nil }, true},
-		{"live, network removed", true, func() (interface{}, *replayRPCError) { return nil, &replayRPCError{-32000, "unknown network"} }, false},
-		{"history, no data", false, func() (interface{}, *replayRPCError) { return nil, &replayRPCError{-32000, "data non existent"} }, false},
-		{"history, null result", false, func() (interface{}, *replayRPCError) { return nil, nil }, false},
+		{"live, no data", 104, false, noData, true},
+		{"live, null result", 104, false, null, true},
+		{"live, network removed", 104, false, removed, false},
+		{"read late by the listener, no data", 1000, false, noData, true},
+		{"read late by the listener, null result", 1000, false, null, true},
+		{"read late by the listener, network removed", 1000, false, removed, false},
+		{"first read of the account, no data", 1000, true, noData, false},
+		{"first read of the account, null result", 1000, true, null, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			b := newReplayBridge(t)
-			frontier := uint64(104)
-			if !tc.live {
-				frontier = 1000
-			}
-			ledger := newReplayLedger(t, b, frontier, receiveStatus(vmResultSuccess))
+			ledger := newReplayLedger(t, b, tc.frontier, receiveStatus(vmResultSuccess))
 			url := replayServerWithErrors(t, func(method string, params []json.RawMessage) (interface{}, *replayRPCError) {
 				if result, ok := ledger.answer(t, method, params); ok {
 					return result, nil
@@ -353,16 +364,21 @@ func TestAcceptedLiveUnwrapWaitsForTheRegisteredRequest(t *testing.T) {
 			})
 			n, stores := replayNetwork(t, b, url, map[uint32]string{1: url})
 			n.SetConfirmationsToFinality(5)
-			if err := n.state.SetFrontierMomentum(frontier); err != nil {
+			if err := n.state.SetFrontierMomentum(tc.frontier); err != nil {
 				t.Fatal(err)
 			}
-			height, _, err := n.processBridgeAccountPage(n.listenerCtx, 1, n.refreshSettings)
+			var err error
+			if tc.startup {
+				err = n.Sync()
+			} else {
+				_, _, err = n.processBridgeAccountPage(n.listenerCtx, 1, n.refreshSettings)
+			}
 			wantHeight := uint64(2)
 			if tc.held {
 				wantHeight = 1
 			}
-			if (err != nil) != tc.held || height != wantHeight {
-				t.Fatalf("height %d, err %v; want height %d, held %v", height, err, wantHeight, tc.held)
+			if (err != nil) != tc.held {
+				t.Fatalf("err %v; want held %v", err, tc.held)
 			}
 			if got := replayState(t, n); got != common.LiveState {
 				t.Fatalf("state %s", common.StateToText(got))
@@ -565,6 +581,92 @@ func TestRejectedDuplicatesDoNotHideAForgedRegistration(t *testing.T) {
 	}
 }
 
+// The listener retries a held receive while the frontier moves on. Whatever it
+// reads at that height once the hold ends gets its source check: the receive
+// it held, or another one that took its place, first seen live or not.
+func TestHeldReceiveKeepsItsSourceCheck(t *testing.T) {
+	var unreadable []byte
+	accepted, rejected := receiveStatus(vmResultSuccess), receiveStatus(vmResultFail)
+	// The receive confirms at momentum 100 and finality is 5 momentums.
+	const live, final = 104, 110
+	for _, tc := range []struct {
+		name              string
+		firstFrontier     uint64
+		firstStatus       []byte
+		firstReceiptFails bool
+		resolvedStatus    []byte
+		want              uint8
+		replaced          bool // another receive takes the held one's height
+	}{
+		{"status unreadable while live, then accepted", live, unreadable, false, accepted, common.EmergencyState, false},
+		{"source lookup failed while live, then no source", live, accepted, true, accepted, common.EmergencyState, false},
+		{"status unreadable while live, then rejected", live, unreadable, false, rejected, common.LiveState, false},
+		{"status unreadable after finality, then accepted", final, unreadable, false, accepted, common.EmergencyState, false},
+		{"source lookup failed after finality, then no source", final, accepted, true, accepted, common.EmergencyState, false},
+		{"status unreadable after finality, then rejected", final, unreadable, false, rejected, common.LiveState, false},
+		{"held while live, then replaced by another accepted receive", live, unreadable, false, accepted, common.EmergencyState, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			b := newReplayBridge(t)
+			var ledger atomic.Pointer[replayLedger]
+			var receiptFails atomic.Bool
+			ledger.Store(newReplayLedger(t, b, tc.firstFrontier, tc.firstStatus))
+			receiptFails.Store(tc.firstReceiptFails)
+			url := replayServerWithErrors(t, func(method string, params []json.RawMessage) (interface{}, *replayRPCError) {
+				if result, ok := ledger.Load().answer(t, method, params); ok {
+					return result, nil
+				}
+				switch method {
+				case "embedded.bridge.getUnwrapTokenRequestByHashAndLog":
+					return b.request, nil
+				case "eth_getTransactionReceipt":
+					if receiptFails.Load() {
+						return nil, &replayRPCError{Code: -32000, Message: "upstream timeout"}
+					}
+					return nil, nil // no such transaction on the source chain
+				}
+				t.Errorf("unexpected method %s", method)
+				return nil, nil
+			})
+			n, _ := replayNetwork(t, b, url, map[uint32]string{1: url})
+			n.SetConfirmationsToFinality(5)
+			if err := n.state.SetFrontierMomentum(tc.firstFrontier); err != nil {
+				t.Fatal(err)
+			}
+
+			height, _, err := n.processBridgeAccountPage(n.listenerCtx, 1, n.refreshSettings)
+			if err == nil || height != 1 {
+				t.Fatalf("first pass: height %d, err %v, want the receive held at 1", height, err)
+			}
+			if got := replayState(t, n); got != common.LiveState {
+				t.Fatalf("first pass: state %s", common.StateToText(got))
+			}
+
+			// The endpoint recovers only after the receive is final.
+			const later = 120
+			resolved := newReplayLedger(t, b, later, tc.resolvedStatus)
+			if tc.replaced {
+				receive := resolved.receives[0]
+				delete(resolved.blocks, receive.Hash)
+				receive.Hash = types.Hash{9}
+				resolved.blocks[receive.Hash] = receive
+			}
+			ledger.Store(resolved)
+			receiptFails.Store(false)
+			if err := n.state.SetFrontierMomentum(later); err != nil {
+				t.Fatal(err)
+			}
+			height, _, err = n.processBridgeAccountPage(n.listenerCtx, 1, n.refreshSettings)
+			if err != nil || height != 2 {
+				t.Fatalf("second pass: height %d, err %v, want 2", height, err)
+			}
+			if got := replayState(t, n); got != tc.want {
+				t.Fatalf("second pass: state %s, want %s", common.StateToText(got), common.StateToText(tc.want))
+			}
+		})
+	}
+}
+
 // Startup reads each receive by hash. An accepted registration is recorded
 // against the local row. A rejected duplicate, whose source event does exist,
 // must leave that row alone.
@@ -590,7 +692,7 @@ func TestStartupSyncRecordsAnAcceptedUnwrapAndSkipsARejectedOne(t *testing.T) {
 				}
 				switch method {
 				case "embedded.bridge.getUnwrapTokenRequestByHashAndLog":
-					return b.request
+					return withRedeemDelay(b.request, 0)
 				case "eth_getTransactionReceipt":
 					return b.receipt()
 				case "eth_getLogs":

@@ -55,8 +55,22 @@ func (l *startupLedger) GetAccountBlockByHash(hash types.Hash) (*api.AccountBloc
 func (l *startupLedger) GetBridgeInfo() (*definition.BridgeInfoVariable, error) {
 	return l.bridgeInfo()
 }
-func (l *startupLedger) SyncInfo() *protocol.SyncInfo       { return l.syncStatus() }
-func (l *startupLedger) GetFrontierMomentum() *api.Momentum { return l.tip() }
+
+// A ledger that does not say otherwise is synced, with its frontier at the
+// momentum that confirms the fixture receives.
+func (l *startupLedger) SyncInfo() *protocol.SyncInfo {
+	if l.syncStatus == nil {
+		return &protocol.SyncInfo{State: protocol.SyncDone}
+	}
+	return l.syncStatus()
+}
+
+func (l *startupLedger) GetFrontierMomentum() *api.Momentum {
+	if l.tip == nil {
+		return startupMomentum(100)
+	}
+	return l.tip()
+}
 
 type startupTransport struct{ handler http.Handler }
 
@@ -106,6 +120,10 @@ func startupSend(receive *api.AccountBlockMarshal) *api.AccountBlockMarshal {
 	return &api.AccountBlockMarshal{AccountBlockMarshal: nom.AccountBlockMarshal{
 		BlockType: nom.BlockTypeUserSend, Hash: receive.FromBlockHash, ToAddress: types.BridgeContract, Amount: "0", Data: []byte{0, 0, 0, 0},
 	}}
+}
+
+func startupMomentum(height uint64) *api.Momentum {
+	return &api.Momentum{Momentum: &nom.Momentum{Height: height, Hash: types.Hash{1}}}
 }
 
 func startupPage(blocks ...*api.AccountBlockMarshal) *api.AccountBlockListMarshal {
@@ -373,7 +391,9 @@ func TestStartupSyncObservesFinalityAfterSyncStatus(t *testing.T) {
 			if err := n.Sync(); (err != nil) != tc.fail {
 				t.Fatalf("sync error %v", err)
 			}
-			if !reflect.DeepEqual(reads, []string{"sync", "frontier"}) || dispatched != tc.live {
+			// The receive is classified from the first two reads. Startup then
+			// reads both once more when it reaches the tip.
+			if len(reads) < 2 || !reflect.DeepEqual(reads[:2], []string{"sync", "frontier"}) || dispatched != tc.live {
 				t.Fatalf("read order %v, dispatched live=%v, want %v", reads, dispatched, tc.live)
 			}
 			if tc.fail {

@@ -166,7 +166,13 @@ func TestInterpretUnwrapSelectsLogByIdentity(t *testing.T) {
 				var result interface{}
 				switch call.Method {
 				case "embedded.bridge.getUnwrapTokenRequestByHashAndLog":
-					result = request
+					// The historical case reads a request the bridge still
+					// withholds, which startup checks like a live one.
+					remaining := uint64(0)
+					if tc.historical {
+						remaining = 1
+					}
+					result = withRedeemDelay(request, remaining)
 				case "eth_getTransactionReceipt":
 					if tc.missingReceipt {
 						break

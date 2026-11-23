@@ -233,6 +233,22 @@ func (r *ZnnRpc) GetUnwrapTokenRequestByHashAndLog(txHash types.Hash, logIndex u
 	return r.rpcClient.BridgeApi.GetUnwrapTokenRequestByHashAndLog(txHash, logIndex)
 }
 
+// UnwrapRedeemableInContext returns how many momentums remain before the
+// bridge lets the unwrap request be redeemed; zero once its redeem delay has
+// passed. The node computes it from the token pair's current delay.
+func (r *ZnnRpc) UnwrapRedeemableInContext(ctx context.Context, txHash types.Hash, logIndex uint32) (uint64, error) {
+	var request *struct {
+		RedeemableIn *uint64 `json:"redeemableIn"`
+	}
+	if err := r.settingsClient.CallContext(ctx, &request, "embedded.bridge.getUnwrapTokenRequestByHashAndLog", txHash, logIndex); err != nil {
+		return 0, err
+	}
+	if request == nil || request.RedeemableIn == nil {
+		return 0, errors.New("the node returned no redeem delay for the unwrap request")
+	}
+	return *request.RedeemableIn, nil
+}
+
 func (r *ZnnRpc) GetAllWrapTokenRequests(pageIndex, pageSize uint32) (*embedded.WrapTokenRequestList, error) {
 	return r.rpcClient.BridgeApi.GetAllWrapTokenRequests(pageIndex, pageSize)
 }
