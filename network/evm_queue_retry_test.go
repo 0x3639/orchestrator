@@ -16,6 +16,7 @@ import (
 	zdb "github.com/zenon-network/go-zenon/common/db"
 	"go.uber.org/zap"
 
+	"orchestrator/common"
 	"orchestrator/common/events"
 	"orchestrator/db/unwrap"
 	"orchestrator/rpc"
@@ -121,5 +122,75 @@ func TestQueuedUnwrapSurvivesTwoReceiptErrorsAndRestart(t *testing.T) {
 	requests, err := store.GetUnsignedUnwrapRequests()
 	if err != nil || queue.Size() != 0 || len(requests) != 1 || requests[0].TransactionHash != event.TransactionHash || requests[0].LogIndex != event.LogIndex {
 		t.Fatalf("after RPC recovery: queue=%d, requests=%v, err=%v", queue.Size(), requests, err)
+	}
+}
+
+// A record made from the bridge's registration has no source block. When the
+// event behind it is confirmed from the queue, the block is recorded on that
+// record, and the registration's status and signature stay.
+func TestConfirmedEventRecordsItsBlockOnARegisteredRecord(t *testing.T) {
+	event := testEvent(105, canonicalHeader(105))
+	event.To = "z1qqjnwjjpnue8xmmpanz6csze6tcmtzzdtfsww7"
+	event.ChainId = 1
+	params := fixtureParams(t)
+	event.NetworkClass = params.NetworkClass()
+	provider := &recoveringReceiptProvider{event: event, twoErrors: make(chan struct{}), log: transferLog(t, event, event.To, 1), unwrapProvider: unwrapProvider{head: 150}}
+	provider.attempts.Store(2) // the receipt is served from the first call
+	cfg := evidenceEndpoints(t, provider)
+	stopChan := make(chan os.Signal, 1)
+	store := unwrap.NewEvmStorage(zdb.NewMemDB(), stopChan, 0)
+	registered := *event
+	registered.BlockNumber, registered.BlockHash = 0, ecommon.Hash{}
+	registered.Signature, registered.RedeemStatus = "signature", common.PendingRedeemStatus
+	if err := store.AddUnwrapRequest(registered); err != nil {
+		t.Fatal(err)
+	}
+	queue, err := dque.NewOrOpen("Ethereum", t.TempDir(), 128, events.UnwrapRequestEvmBuilder)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := queue.Enqueue(event); err != nil {
+		t.Fatal(err)
+	}
+	rpcs, err := rpc.NewRpcManager(cfg, stopChan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := rpcs.AddEvmClient(cfg, 1, "queue-test", testContract); err != nil {
+		t.Fatal(err)
+	}
+	net := &evmNetwork{EvmParams: params,
+		unconfirmedQueue: queue, dbManager: unwrapTestStores{evm: store}, rpcManager: rpcs,
+		stopChan: stopChan, done: make(chan struct{}), logger: zap.NewNop().Sugar(),
+	}
+	net.SetConfirmationsToFinality(12)
+	exited := make(chan struct{})
+	go func() {
+		defer close(exited)
+		net.ProcessEvents()
+	}()
+	t.Cleanup(func() {
+		net.Stop()
+		<-exited
+	})
+	deadline := time.Now().Add(10 * time.Second)
+	for queue.Size() != 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	row, err := store.GetUnwrapRequestByHashAndLog(event.TransactionHash, event.LogIndex)
+	if err != nil || row == nil || queue.Size() != 0 {
+		t.Fatalf("stored record %v, err %v, %d events still queued", row, err, queue.Size())
+	}
+	if row.BlockNumber != 105 || row.BlockHash != event.BlockHash {
+		t.Fatalf("the record has block %d %s, want the confirmed block 105 %s", row.BlockNumber, row.BlockHash, event.BlockHash)
+	}
+	if row.Signature != "signature" || row.RedeemStatus != common.PendingRedeemStatus {
+		t.Fatalf("the record lost its registration: status %d, signature %q", row.RedeemStatus, row.Signature)
+	}
+	// The confirmed block is also the event's location, which is what
+	// answers when a record names a block that has been replaced.
+	number, hash, found, err := store.UnwrapSourceLocation(event.TransactionHash, event.LogIndex)
+	if err != nil || !found || number != 105 || hash != event.BlockHash {
+		t.Fatalf("recorded location: block %d %s, found %v, err %v", number, hash, found, err)
 	}
 }

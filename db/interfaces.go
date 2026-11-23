@@ -20,7 +20,16 @@ type EvmStorage interface {
 	// keeps the source block and sender an existing record already holds.
 	AddRegisteredUnwrapRequest(events.UnwrapRequestEvm) error
 	UpdateUnwrapRequestBlockNumber(events.UnwrapRequestEvm) error
+	// FillUnwrapRequestBlock records the event's block, and its sender when
+	// the record has none, on an existing record that has no block. A
+	// record with a block, and a missing record, are left as they are.
+	FillUnwrapRequestBlock(events.UnwrapRequestEvm) error
 	HydrateUnsignedUnwrap(before, verified events.UnwrapRequestEvm) error
+	// SaveUnwrapSourceLocation records the block in which this node's scan
+	// found the source event of a transaction and log index.
+	// UnwrapSourceLocation returns it, and whether one is recorded.
+	SaveUnwrapSourceLocation(txHash ecommon.Hash, logIndex uint32, blockNumber uint64, blockHash ecommon.Hash) error
+	UnwrapSourceLocation(txHash ecommon.Hash, logIndex uint32) (uint64, ecommon.Hash, bool, error)
 	UnwrapAffiliatePolicy(ecommon.Hash) (common.AffiliatePolicy, bool, error)
 	PinUnwrapAffiliatePolicy(ecommon.Hash, common.AffiliatePolicy) error
 	GetUnwrapRequestByHashAndLog(ecommon.Hash, uint32) (*events.UnwrapRequestEvm, error)
@@ -49,6 +58,9 @@ type ZnnStorage interface {
 	SendSigInt()
 
 	AddWrapRequest(events.WrapRequestZnn) error
+	// AddWrapRequestKeepingStatus stores a request read from the bridge and
+	// keeps the redeem status an existing record already holds.
+	AddWrapRequestKeepingStatus(events.WrapRequestZnn) error
 	SetWrapRequestStatus(types.Hash, uint32) error
 	SetWrapRequestSignature(types.Hash, string) error
 	SetWrapRequestSentSignature(types.Hash, bool) error

@@ -43,3 +43,86 @@ func TestWhileSigningTransfersRunsOnlyOutsideEmergencyAndHalt(t *testing.T) {
 		}
 	}
 }
+
+// Startup completes once and stays complete. Before that the signer signs no
+// transfer, whatever state it is in.
+func TestStartupCompletesOnce(t *testing.T) {
+	gs := NewGlobalState(new(uint8))
+	if gs.StartupComplete() {
+		t.Fatal("startup is complete on a state nothing has started")
+	}
+	select {
+	case <-gs.StartupDone():
+		t.Fatal("startup is signalled before it is complete")
+	default:
+	}
+	gs.CompleteStartup()
+	gs.CompleteStartup()
+	if !gs.StartupComplete() {
+		t.Fatal("startup is not complete after it was completed")
+	}
+	select {
+	case <-gs.StartupDone():
+	default:
+		t.Fatal("completing startup did not signal it")
+	}
+	if err := gs.SetState(EmergencyState); err != nil {
+		t.Fatal(err)
+	}
+	if !gs.StartupComplete() {
+		t.Fatal("a state change undid the completion of startup")
+	}
+}
+
+// A signer with a halt still to sign is the one state in which a start held
+// at a settings change keeps running.
+func TestUnlessInEmergencyRunsInEveryOtherState(t *testing.T) {
+	for state, runs := range map[uint8]bool{
+		LiveState: true, KeyGenState: true, ReSignState: true, HaltedState: true, EmergencyState: false,
+	} {
+		value := state
+		gs := NewGlobalState(&value)
+		ran := false
+		if got := gs.UnlessInEmergency(func() { ran = true }); got != runs || ran != runs {
+			t.Errorf("%s: ran %v, reported %v, want %v", StateToText(state), ran, got, runs)
+		}
+	}
+}
+
+// Once the node knows its settings may be older than the bridge's, it stays
+// so for the life of the process.
+func TestSettingsStayStaleOnceMarked(t *testing.T) {
+	gs := NewGlobalState(new(uint8))
+	if gs.SettingsStale() {
+		t.Fatal("settings are stale on a state nothing has marked")
+	}
+	ran := false
+	if current, err := gs.WhileSettingsCurrent(func() error { ran = true; return nil }); err != nil || !current || !ran {
+		t.Fatalf("with current settings: ran %v, reported %v, err %v", ran, current, err)
+	}
+	gs.MarkSettingsStale()
+	if !gs.SettingsStale() {
+		t.Fatal("marking the settings stale had no effect")
+	}
+	ran = false
+	if current, err := gs.WhileSettingsCurrent(func() error { ran = true; return nil }); err != nil || current || ran {
+		t.Fatalf("with stale settings: ran %v, reported %v, err %v", ran, current, err)
+	}
+}
+
+// The node says once that it has applied what it reads from the bridge.
+func TestNodeReadyIsSignalledOnce(t *testing.T) {
+	gs := NewGlobalState(new(uint8))
+	select {
+	case <-gs.NodeReady():
+		t.Fatal("the node is ready on a state nothing has started")
+	default:
+	}
+	gs.MarkNodeReady()
+	gs.MarkNodeReady()
+	select {
+	case <-gs.NodeReady():
+	default:
+		t.Fatal("marking the node ready did not signal it")
+	}
+}

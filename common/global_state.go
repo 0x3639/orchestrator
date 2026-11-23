@@ -29,11 +29,23 @@ type CeremonyWindow struct {
 
 type GlobalState struct {
 	// Health is assigned once before any network workers start.
-	Health                 *snapshot.Store
-	state                  *uint8
-	stateMu                sync.Mutex
-	persistEmergency       func(uint8) error
-	emergencyWritePending  bool
+	Health                *snapshot.Store
+	state                 *uint8
+	stateMu               sync.Mutex
+	persistEmergency      func(uint8) error
+	emergencyWritePending bool
+	// Closed once startup has read the bridge account to its tip and every
+	// EVM network has finished its startup scan.
+	startupDone chan struct{}
+	startupOnce sync.Once
+	// Closed once the node has applied what it reads from the bridge when
+	// it starts.
+	nodeReady     chan struct{}
+	nodeReadyOnce sync.Once
+	// Set when the node goes on running although it has read, as history, a
+	// change to what it took from the bridge when it started.
+	settingsMu             sync.RWMutex
+	settingsStale          bool
 	frontierMomentumHeight uint64
 	frontierMomSemaphore   *semaphore.Weighted
 	lastCeremony           CeremonyWindow
@@ -56,6 +68,8 @@ func NewGlobalState(state *uint8) *GlobalState {
 func NewPersistentGlobalState(state *uint8, persistEmergency func(uint8) error) *GlobalState {
 	return &GlobalState{
 		persistEmergency:         persistEmergency,
+		startupDone:              make(chan struct{}),
+		nodeReady:                make(chan struct{}),
 		state:                    state,
 		frontierMomentumHeight:   0,
 		frontierMomSemaphore:     semaphore.NewWeighted(1),
@@ -141,6 +155,81 @@ func (gs *GlobalState) WhileSigningTransfers(do func()) bool {
 	}
 	do()
 	return true
+}
+
+// CompleteStartup records that the bridge account has been read to its tip
+// and every EVM network has finished its startup scan. Until then the signer
+// signs no transfer; see StartupComplete.
+func (gs *GlobalState) CompleteStartup() {
+	gs.startupOnce.Do(func() { close(gs.startupDone) })
+}
+
+// StartupComplete reports whether CompleteStartup has been called. It never
+// turns false again in the same process.
+func (gs *GlobalState) StartupComplete() bool {
+	select {
+	case <-gs.startupDone:
+		return true
+	default:
+		return false
+	}
+}
+
+// StartupDone is closed by CompleteStartup.
+func (gs *GlobalState) StartupDone() <-chan struct{} {
+	return gs.startupDone
+}
+
+// UnlessInEmergency runs do unless the signer is in EmergencyState, and
+// reports whether it ran. The state lock is held throughout, as in
+// WhileSigningTransfers. do must not touch the state.
+func (gs *GlobalState) UnlessInEmergency(do func()) bool {
+	gs.stateMu.Lock()
+	defer gs.stateMu.Unlock()
+	if *gs.state == EmergencyState {
+		return false
+	}
+	do()
+	return true
+}
+
+// MarkNodeReady records that the node has applied the settings and state it
+// reads from the bridge when it starts. A startup that completes in the
+// background waits for it before it looks at the halt flags.
+func (gs *GlobalState) MarkNodeReady() {
+	gs.nodeReadyOnce.Do(func() { close(gs.nodeReady) })
+}
+
+// NodeReady is closed by MarkNodeReady.
+func (gs *GlobalState) NodeReady() <-chan struct{} {
+	return gs.nodeReady
+}
+
+// MarkSettingsStale records that the settings this process holds may be
+// older than the bridge's, for as long as the process runs.
+func (gs *GlobalState) MarkSettingsStale() {
+	gs.settingsMu.Lock()
+	defer gs.settingsMu.Unlock()
+	gs.settingsStale = true
+}
+
+// SettingsStale reports whether MarkSettingsStale has been called.
+func (gs *GlobalState) SettingsStale() bool {
+	gs.settingsMu.RLock()
+	defer gs.settingsMu.RUnlock()
+	return gs.settingsStale
+}
+
+// WhileSettingsCurrent runs do unless MarkSettingsStale has been called, and
+// reports whether it ran. A call to MarkSettingsStale waits for do, so what do
+// writes was decided with settings nothing had marked stale.
+func (gs *GlobalState) WhileSettingsCurrent(do func() error) (bool, error) {
+	gs.settingsMu.RLock()
+	defer gs.settingsMu.RUnlock()
+	if gs.settingsStale {
+		return false, nil
+	}
+	return true, do()
 }
 
 func (gs *GlobalState) GetState() (uint8, error) {

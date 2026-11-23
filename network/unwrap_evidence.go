@@ -1,6 +1,7 @@
 package network
 
 import (
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -15,6 +16,7 @@ import (
 
 	"orchestrator/common"
 	"orchestrator/common/events"
+	"orchestrator/rpc"
 )
 
 func (eN *evmNetwork) confirmUnwrap(req *events.UnwrapRequestEvm) confirmDecision {
@@ -109,9 +111,18 @@ func (eN *evmNetwork) unwrapRequestsFromLog(log etypes.Log, expected *events.Unw
 			return nil, errors.New("stored unwrap differs from the source transfer")
 		}
 	}
+	if pin && eN.state.SettingsStale() {
+		// The node knows the bridge's settings changed after it read them.
+		// How they apply to this event is fixed by a start that has read
+		// them; until then the event stays unread.
+		return nil, errSettingsStale
+	}
 	if pin {
 		// A pre-upgrade record may already represent this transfer. A rescan
 		// must not pin today's settings over a conflicting legacy interpretation.
+		// Sampled before any row is read: if the account had been read by
+		// now, a request the bridge registered is in the store.
+		ahead := eN.aheadOfBridgeAccount()
 		indexes := []uint32{uint32(log.Index)}
 		if uint64(log.Index) <= math.MaxUint32-uint64(common.AffiliateLogIndexAddition) {
 			indexes = append(indexes, uint32(log.Index)+common.AffiliateLogIndexAddition)
@@ -120,6 +131,19 @@ func (eN *evmNetwork) unwrapRequestsFromLog(log etypes.Log, expected *events.Unw
 			old, err := eN.eventsStore().GetUnwrapRequestByHashAndLog(log.TxHash, index)
 			if err != nil {
 				return nil, err
+			}
+			if ahead {
+				// A request the bridge already holds for this transfer is
+				// what the settings must agree with. It may not be in the
+				// store yet, or the store may still hold this node's own
+				// earlier reading of the event in its place.
+				registered, err := eN.registeredUnwrap(log.TxHash, index)
+				if err != nil {
+					return nil, err
+				}
+				if registered != nil {
+					old = registered
+				}
 			}
 			if old == nil || (old.BlockHash != (ecommon.Hash{}) && old.BlockHash != log.BlockHash) {
 				continue
@@ -135,11 +159,89 @@ func (eN *evmNetwork) unwrapRequestsFromLog(log etypes.Log, expected *events.Unw
 				return nil, errors.New("affiliate settings do not match the existing unwrap record")
 			}
 		}
-		if err := eN.eventsStore().PinUnwrapAffiliatePolicy(key, policy); err != nil {
+		// The settings may have been marked stale while the rows and the
+		// bridge were read. Nothing is fixed with settings marked so.
+		current, err := eN.state.WhileSettingsCurrent(func() error {
+			return eN.eventsStore().PinUnwrapAffiliatePolicy(key, policy)
+		})
+		if err != nil {
 			return nil, err
+		}
+		if !current {
+			return nil, errSettingsStale
 		}
 	}
 	return transfers, nil
+}
+
+var errSettingsStale = errors.New("the affiliate settings for this event are fixed once the node has read the bridge's current settings")
+
+// recordSourceLocation stores the block in which the scan found an unwrap
+// event, for the event's own request and for the affiliate's, while the scan
+// is ahead of the read of the bridge account. The block of the log must have
+// been agreed by the endpoints.
+//
+// The read of the bridge account may be waiting for exactly this: a request
+// whose transaction the endpoint has no receipt for is compared with the
+// event in the block this node recorded. That must not depend on the scan
+// being able to interpret the event, which a request that disagrees with the
+// affiliate settings prevents. Only the location is stored. The record of a
+// request is written by the receive that registers it.
+func (eN *evmNetwork) recordSourceLocation(log etypes.Log) error {
+	if !eN.aheadOfBridgeAccount() {
+		return nil
+	}
+	indexes := []uint32{uint32(log.Index)}
+	if uint64(log.Index) <= math.MaxUint32-uint64(common.AffiliateLogIndexAddition) {
+		indexes = append(indexes, uint32(log.Index)+common.AffiliateLogIndexAddition)
+	}
+	for _, index := range indexes {
+		if err := eN.eventsStore().SaveUnwrapSourceLocation(log.TxHash, index, log.BlockNumber, log.BlockHash); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// aheadOfBridgeAccount reports whether this start has yet to read the bridge
+// account to its tip while the network is already scanning. Requests the
+// bridge registered before then are not all in the store.
+func (eN *evmNetwork) aheadOfBridgeAccount() bool {
+	if eN.bridgeRead == nil {
+		return false
+	}
+	select {
+	case <-eN.bridgeRead:
+		return false
+	default:
+		return true
+	}
+}
+
+// registeredUnwrap returns the request the bridge holds for a transaction and
+// log index on this network as the store would record it, or nil when it
+// holds none it can return.
+func (eN *evmNetwork) registeredUnwrap(tx ecommon.Hash, index uint32) (*events.UnwrapRequestEvm, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), rpc.ZnnSettingsTimeout)
+	defer cancel()
+	request, _, err := eN.rpcManager.Znn().UnwrapTokenRequestContext(ctx, types.Hash(tx), index)
+	if bridgeObjectGone(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if request == nil {
+		return nil, nil
+	}
+	if request.TransactionHash != types.Hash(tx) || request.LogIndex != index {
+		return nil, fmt.Errorf("the bridge returned another request than the one asked for, %s/%d", tx, index)
+	}
+	if request.NetworkClass != eN.NetworkClass() || request.ChainId != eN.ChainId() {
+		return nil, nil
+	}
+	row := common.ZnnUnwrapToOrchestatorUnwrap(request)
+	return &row, nil
 }
 
 func affiliateTransfer(transfer *events.UnwrapRequestEvm, to string, amount *big.Int) (*events.UnwrapRequestEvm, error) {

@@ -66,7 +66,9 @@ type Node struct {
 
 	// Channel to wait for termination notifications
 	stopChan chan os.Signal
-	lock     sync.RWMutex
+	// Closed by Stop.
+	stopped chan struct{}
+	lock    sync.RWMutex
 	// Prevents concurrent use of instance directory
 	dataDirLock fileutil.Releaser
 }
@@ -78,6 +80,7 @@ func NewNode(config *oconfig.Config, logger *zap.Logger) (_ *Node, initErr error
 		config:   config,
 		logger:   logger.Sugar(),
 		stopChan: make(chan os.Signal, 1),
+		stopped:  make(chan struct{}),
 		state: common.NewPersistentGlobalState(&config.GlobalState, func(state uint8) error {
 			return oconfig.WriteGlobalState(config.DataPath, state)
 		}),
@@ -266,17 +269,28 @@ func (node *Node) Start() (startErr error) {
 
 	// If we are in emergency we should stay so we can halt the network
 	// Otherwise we should check
-	if currentState == common.LiveState {
+	//
+	// A start that returned early, with the bridge account or the EVM scans
+	// still outstanding, signs no transfer yet, and its EVM endpoints may not
+	// answer yet. The networks manager makes this check before it completes
+	// that startup, and tries again when the flags cannot be read.
+	if currentState == common.LiveState && !node.networksManager.CompletesStartupLater() {
 		if halted, _, err := node.networksManager.CountNetworksHaltState(); err != nil {
 			return err
 		} else {
 			if node.networksManager.Znn().IsHalted() || halted > 0 {
-				if err := node.state.SetState(common.HaltedState); err != nil {
+				// Only from the state these reads were made for. The bridge
+				// listener may have recorded an emergency in the meantime,
+				// and a halt of one network does not end that.
+				if _, err := node.state.SetStateIf(common.LiveState, common.HaltedState); err != nil {
 					return err
 				}
 			}
 		}
 	}
+
+	// From here on Start changes nothing it read from the bridge.
+	node.state.MarkNodeReady()
 
 	pillars, err := node.networksManager.Znn().GetAllPillars()
 	if err != nil {
@@ -310,10 +324,39 @@ func (node *Node) Start() (startErr error) {
 		}
 	}()
 
-	node.state.HealthStore().SetPhase("running")
+	// The phase stays syncingBridge while startup is held: the networks
+	// manager returned before the bridge account was read to its tip or
+	// before the EVM networks finished their startup scan.
+	select {
+	case <-node.state.StartupDone():
+		node.state.HealthStore().SetPhase("running")
+	default:
+		node.logger.Warn("startup is not complete: until it is, this signer acts only on an emergency and signs no transfer")
+		go func() {
+			select {
+			case <-node.state.StartupDone():
+				node.state.HealthStore().AdvancePhase("syncingBridge", "running")
+			case <-node.stopped:
+			}
+		}()
+	}
 	go node.processSignatures()
 	go node.sendSignatures()
 	return nil
+}
+
+// waitsForStartup reports whether the signing loops leave a signer in state
+// alone because startup is not complete: the bridge account has not been read
+// to its tip, or an EVM network has not finished its startup scan. Until then
+// the signer signs and sends nothing for a transfer, generates no key and
+// re-signs nothing. It still acts on an emergency: in EmergencyState it signs
+// and sends the halt, and in HaltedState it watches whether the halt holds.
+//
+// started is StartupComplete as read before state was. Startup completes only
+// after the bridge's halt flags have been looked at, so a state read once the
+// gate is open already reflects them; a state read earlier may not.
+func waitsForStartup(started bool, state uint8) bool {
+	return !started && state != common.EmergencyState && state != common.HaltedState
 }
 
 func (node *Node) closeSnapshot() {
@@ -330,6 +373,7 @@ func (node *Node) Stop() error {
 	node.lock.Lock()
 	defer node.lock.Unlock()
 	defer close(node.stopChan)
+	close(node.stopped)
 	node.logger.Info("stopping node ...")
 
 	node.state.HealthStore().SetPhase("stopping")
@@ -360,6 +404,7 @@ func (node *Node) processSignatures() {
 	node.logger.Info("in node processSignatures")
 	for {
 		time.Sleep(time.Second)
+		started := node.state.StartupComplete() // before the state: see waitsForStartup
 		currentState, err := node.state.GetState()
 		if err != nil {
 			node.logger.Debug("currentState error in processSig")
@@ -374,6 +419,9 @@ func (node *Node) processSignatures() {
 			}
 			node.haltNetworksAdministrator()
 			time.Sleep(5 * time.Second)
+			continue
+		}
+		if waitsForStartup(started, currentState) {
 			continue
 		}
 		switch currentState {
@@ -1395,6 +1443,7 @@ func (node *Node) sendSignatures() {
 
 	sendPending := newSignatureSendPoll(node.sendSignaturesWrap, node.sendUnwrapRequests)
 	for {
+		started := node.state.StartupComplete() // before the state: see waitsForStartup
 		currentState, err := node.state.GetState()
 		if err != nil {
 			node.logger.Debug("currentState error in processSig")
@@ -1404,7 +1453,7 @@ func (node *Node) sendSignatures() {
 		}
 		switch currentState {
 		case common.LiveState:
-			if len(node.tssManager.GetPubKey()) != 0 {
+			if !waitsForStartup(started, currentState) && len(node.tssManager.GetPubKey()) != 0 {
 				sendPending()
 			}
 		}

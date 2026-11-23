@@ -31,11 +31,17 @@ import (
 
 type evmNetwork struct {
 	// A runtime addition uses its own client until startup succeeds.
-	client        *rpc.EvmRpc
-	startupDone   <-chan struct{}
+	client      *rpc.EvmRpc
+	startupDone <-chan struct{}
+	// When set, closed once this start has read the bridge account to its
+	// tip. Until then a scan can be ahead of that read: see
+	// aheadOfBridgeAccount.
+	bridgeRead    <-chan struct{}
 	rollbackStore func()
-	stopHealth    func()
-	health        *snapshot.Store
+	// Start sets it while Stop may already be running.
+	healthMu   sync.Mutex
+	stopHealth func()
+	health     *snapshot.Store
 	config.EvmParams
 	unconfirmedQueue *dque.DQue
 	dbManager        networkEventStores
@@ -183,13 +189,16 @@ func (eN *evmNetwork) Start() (startErr error) {
 		}
 	}
 	if eN.health != nil {
-		eN.stopHealth = eN.health.Poll(func(ctx context.Context) {
+		stopHealth := eN.health.Poll(func(ctx context.Context) {
 			eN.observeQueueDepth()
 			eN.recordSync(client.SampleSyncState(ctx))
 		})
+		eN.healthMu.Lock()
+		eN.stopHealth = stopHealth
+		eN.healthMu.Unlock()
 		defer func() {
 			if startErr != nil {
-				eN.stopHealth()
+				stopHealth()
 			}
 		}()
 	}
@@ -233,6 +242,9 @@ func (eN *evmNetwork) Start() (startErr error) {
 
 	select {
 	case <-eN.startupDone:
+		return context.Canceled
+	case <-eN.done:
+		// Stopped or removed while it was starting.
 		return context.Canceled
 	default:
 	}
@@ -532,6 +544,9 @@ func (eN *evmNetwork) InterpretLog(log etypes.Log, live bool) error {
 			}
 			if !slices.Equal(source.Topics, log.Topics) || !slices.Equal(source.Data, log.Data) {
 				return errors.New("historical range log differs from the agreed unwrap evidence")
+			}
+			if err := eN.recordSourceLocation(log); err != nil {
+				return err
 			}
 		}
 		eventsToProcess, err := eN.unwrapRequestsFromLog(log, nil)
@@ -1044,12 +1059,32 @@ func (eN *evmNetwork) ProcessEvents() {
 				// plus periodic Sync). The existing record may already carry a
 				// signature or a sent status and must not be reset.
 				eN.logger.Infof("Event %s already in persistent storage, keeping the existing record", key)
+				// A record made from the bridge's registration has no source
+				// block. The confirmed block is recorded on it; its status
+				// and signature stay.
+				if err := eN.recordConfirmedBlock(frontEvent); err != nil {
+					eN.logger.Error(err)
+					eN.requestStop()
+					return
+				}
 			}
 			if !eN.dropQueuedEvent() {
 				return
 			}
 		}
 	}
+}
+
+// recordConfirmedBlock writes the block of a confirmed event to the stored
+// record of that event when the record has none. A record that names another
+// block keeps it, and the confirmed block is stored as the event's location,
+// which the bridge listener turns to when the record's block has been
+// replaced.
+func (eN *evmNetwork) recordConfirmedBlock(confirmed *events.UnwrapRequestEvm) error {
+	if err := eN.eventsStore().FillUnwrapRequestBlock(*confirmed); err != nil {
+		return err
+	}
+	return eN.eventsStore().SaveUnwrapSourceLocation(confirmed.TransactionHash, confirmed.LogIndex, confirmed.BlockNumber, confirmed.BlockHash)
 }
 
 // dropQueuedEvent removes the head of the unconfirmed queue. It returns
@@ -1071,10 +1106,18 @@ func (eN *evmNetwork) observeQueueDepth() {
 	eN.health.UpdateNetwork(eN.ChainId(), func(n *snapshot.Network) { n.Unwrap.AwaitingFinality = snapshot.Measure(depth) })
 }
 
-func (eN *evmNetwork) Stop() {
-	if eN.stopHealth != nil {
-		eN.stopHealth()
+// endHealthPoll stops the health sampler Start began, if it has begun one.
+func (eN *evmNetwork) endHealthPoll() {
+	eN.healthMu.Lock()
+	stopHealth := eN.stopHealth
+	eN.healthMu.Unlock()
+	if stopHealth != nil {
+		stopHealth()
 	}
+}
+
+func (eN *evmNetwork) Stop() {
+	eN.endHealthPoll()
 	eN.stopOnce.Do(func() { close(eN.done) })
 	eN.EvmRpc().Stop()
 	_ = eN.unconfirmedQueue.Close()
