@@ -218,6 +218,7 @@ func TestOnlySettledHistoryIsArchived(t *testing.T) {
 		primary    func(*redeemContract) // extra condition on the first endpoint
 		secondary  func(*redeemContract) // nil: both endpoints report the same contract
 		lagging    uint64                // head of the second endpoint, when it is behind
+		reorg      bool                  // the chain is replaced while the older state is read
 		wantHalt   bool
 		wantErr    bool
 		wantStored bool
@@ -249,6 +250,7 @@ func TestOnlySettledHistoryIsArchived(t *testing.T) {
 		{name: "one endpoint is a block behind", closedAt: 110, unhaltedAt: 120, lagging: 139, wantStored: true},
 		{name: "the unhalt is not final for the endpoint that is behind", closedAt: 110, unhaltedAt: 120, lagging: 131, wantErr: true},
 		{name: "the closure is not final for the endpoint that is behind", closedAt: 110, unhaltedAt: 120, lagging: 120, wantErr: true},
+		{name: "the block at the final height changes during the read", closedAt: 110, unhaltedAt: 120, reorg: true, wantErr: true},
 		// What can still be paid is reported without any older state.
 		{name: "payable, no endpoint has state at the final height", unhaltedAt: 120, wantHalt: true,
 			primary: func(c *redeemContract) { c.pruned.Store(true) }},
@@ -271,6 +273,12 @@ func TestOnlySettledHistoryIsArchived(t *testing.T) {
 			}
 			if tc.lagging != 0 {
 				chain.set(evidenceReceipt(reg), []etypes.Log{reg}, tc.lagging)
+			}
+			if tc.reorg {
+				chain.primary.contract.onOldRead = sync.OnceFunc(func() {
+					chain.primary.setReplacement(ecommon.HexToHash("0xbeef"))
+					chain.setReplacement(ecommon.HexToHash("0xbeef"))
+				})
 			}
 			err := n.InterpretLog(reg, false)
 			if (err != nil) != tc.wantErr {
@@ -423,6 +431,8 @@ func TestRestoredIncidentWaitsOnlyWhileItsRedeemCannotBePaid(t *testing.T) {
 		{name: "closed after a completed halt", closedAt: 110, unhaltedAt: 120, wantWait: true},
 		{name: "one endpoint shows it payable", closedAt: 110, unhaltedAt: 120,
 			secondary: func(c *redeemContract) { c.unhaltedAt.Store(120) }},
+		{name: "the other endpoint shows it payable", unhaltedAt: 120,
+			secondary: func(c *redeemContract) { c.closedAt.Store(110); c.unhaltedAt.Store(120) }},
 		{name: "the contract cannot be read", closedAt: 110, unhaltedAt: 120, unreadable: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

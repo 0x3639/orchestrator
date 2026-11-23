@@ -44,6 +44,7 @@ type redeemContract struct {
 	failing    atomic.Bool   // every contract read fails on this endpoint
 	pruned     atomic.Bool   // only the latest state can be read on this endpoint
 	reads      atomic.Uint64 // redeem entry reads served
+	onOldRead  func()        // runs when state at a numbered block is read
 }
 
 func (c *redeemContract) stateAt(block string) (uint64, error) {
@@ -55,6 +56,9 @@ func (c *redeemContract) stateAt(block string) (uint64, error) {
 	}
 	if c.pruned.Load() {
 		return 0, errors.New("missing trie node")
+	}
+	if c.onOldRead != nil {
+		c.onOldRead()
 	}
 	return hexutil.DecodeUint64(block)
 }
