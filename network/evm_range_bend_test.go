@@ -24,11 +24,11 @@ func FuzzQueryRangeGrowth(f *testing.F) {
 
 func TestRejectionAtFloorRestartsGrowthStreak(t *testing.T) {
 	a := newQueryRangeAdapter(32)
-	a.shrink(minQueryRange)
+	a.shrink(32, minQueryRange)
 	for i := 0; i < growAfterRanges-1; i++ {
 		a.noteSuccess()
 	}
-	a.shrink(0) // rejected, already at the automatic halving floor
+	a.shrink(minQueryRange, 0) // rejected, already at the automatic halving floor
 	if width, grew := a.noteSuccess(); grew || width != minQueryRange {
 		t.Fatalf("one success after a rejection grew the window to %d", width)
 	}

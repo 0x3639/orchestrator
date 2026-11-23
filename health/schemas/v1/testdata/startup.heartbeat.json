@@ -1,0 +1,38 @@
+{
+  "schemaVersion": 1,
+  "streamId": "e71664d3-a7ba-4029-8e17-95a5d0b85537",
+  "sequence": 1,
+  "sentAt": "2026-11-21T12:00:01Z",
+  "localRead": "ok",
+  "lastLocalSuccessAt": "2026-11-21T12:00:01Z",
+  "snapshot": {
+    "schemaVersion": 1,
+    "sampledAt": "2026-11-21T12:00:01Z",
+    "startedAt": "2026-11-21T12:00:01Z",
+    "build": {
+      "version": "v0.0.9a",
+      "gitCommit": null
+    },
+    "phase": "starting",
+    "bridgeState": null,
+    "zenon": {
+      "nodeSync": {
+        "value": null,
+        "asOf": null,
+        "quality": "unknown"
+      },
+      "frontierMomentum": {
+        "value": null,
+        "asOf": null,
+        "quality": "unknown"
+      },
+      "processedReceiveHeight": {
+        "value": null,
+        "asOf": null,
+        "quality": "unknown"
+      }
+    },
+    "networksKnown": false,
+    "networks": []
+  }
+}

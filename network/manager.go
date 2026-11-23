@@ -1,9 +1,12 @@
 package network
 
 import (
+	"bytes"
+	"cmp"
 	"crypto/ecdsa"
 	"encoding/base64"
 	"encoding/hex"
+	"fmt"
 	ecommon "github.com/ethereum/go-ethereum/common"
 	etypes "github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
@@ -18,11 +21,14 @@ import (
 	"orchestrator/common/config"
 	"orchestrator/common/events"
 	"orchestrator/db/manager"
+	"orchestrator/health/snapshot"
 	"orchestrator/rpc"
 	"os"
+	"slices"
 )
 
 type NetworksManager struct {
+	health      *snapshot.Store
 	znnNetwork  *znnNetwork
 	evmNetworks []*evmNetwork
 	stopChan    chan os.Signal
@@ -44,6 +50,7 @@ func NewNetworksManager(stopChan chan os.Signal) (*NetworksManager, error) {
 }
 
 func (m *NetworksManager) Init(networksInfo map[string]config.BaseNetworkConfig, dbManager *manager.Manager, state *common.GlobalState, setBridgeMetadata func(metadata *common.BridgeMetadata)) error {
+	m.health = state.HealthStore()
 	if len(networksInfo) < 2 {
 		return errors.New("wrong network initializers 1")
 	}
@@ -69,6 +76,12 @@ func (m *NetworksManager) Init(networksInfo map[string]config.BaseNetworkConfig,
 		return err
 	}
 
+	for _, n := range networks {
+		if n.NetworkClass == definition.EvmClass {
+			m.health.AddNetwork(n.NetworkClass, n.Id)
+		}
+	}
+	m.health.SetNetworksKnown()
 	newEvmNetworks := make([]*evmNetwork, 0)
 	for _, network := range networks {
 		switch network.NetworkClass {
@@ -128,9 +141,15 @@ func (m *NetworksManager) AddEvmNetwork(network *evmNetwork) {
 }
 
 func (m *NetworksManager) RemoveEvmNetwork(chainId uint32) {
+	m.health.RemoveNetwork(chainId)
 	for idx, network := range m.evmNetworks {
 		if network.ChainId() == chainId {
+			if network.stopHealth != nil {
+				network.stopHealth()
+			}
+			network.stopOnce.Do(func() { close(network.done) })
 			m.evmNetworks = append(m.evmNetworks[:idx], m.evmNetworks[idx+1:]...)
+			return
 		}
 	}
 }
@@ -304,7 +323,15 @@ func (m *NetworksManager) GetWrapEventById(id types.Hash) (*events.WrapRequestZn
 }
 
 func (m *NetworksManager) GetUnsentSignedWrapRequests() ([]*events.WrapRequestZnn, error) {
-	return m.Znn().GetUnsentSignedWrapRequests()
+	requests, err := m.Znn().GetUnsentSignedWrapRequests()
+	if m.health != nil {
+		counts := make(map[uint32]int)
+		for _, req := range requests {
+			counts[req.ChainId]++
+		}
+		m.health.UpdateNetworks(func(n *snapshot.Network) { n.Wrap.SignedAwaitingSubmission = snapshot.Reading(counts[n.ChainID], err) })
+	}
+	return requests, err
 }
 
 func (m *NetworksManager) GetUnredeemedWrapRequests() ([]*events.WrapRequestZnn, error) {
@@ -314,19 +341,7 @@ func (m *NetworksManager) GetUnredeemedWrapRequests() ([]*events.WrapRequestZnn,
 func (m *NetworksManager) GetUnsignedWrapRequests() ([]*definition.WrapTokenRequest, error) {
 	// todo how many to get for signing?
 	requests, err := m.Znn().GetUnsignedWrapRequestsRpc(0, 100)
-	if err != nil {
-		return nil, err
-	}
-	if requests == nil || len(requests.List) == 0 {
-		return nil, nil
-	}
-	ans := make([]*definition.WrapTokenRequest, 0)
-	for _, request := range requests.List {
-		if request.ConfirmationsToFinality == 0 {
-			ans = append(ans, request.WrapTokenRequest)
-		}
-	}
-	return ans, nil
+	return filterWrapPage(m.health, requests, err)
 }
 
 // / Evm
@@ -603,7 +618,66 @@ func (m *NetworksManager) GetUnsignedUnwrapRequests() ([]*events.UnwrapRequestEv
 			ans = append(ans, req)
 		}
 	}
+	// Signers may discover their networks in different orders. Order the
+	// combined candidates before reconciliation applies either of its limits.
+	slices.SortFunc(ans, func(a, b *events.UnwrapRequestEvm) int {
+		if c := cmp.Compare(a.ChainId, b.ChainId); c != 0 {
+			return c
+		}
+		if c := bytes.Compare(a.TransactionHash[:], b.TransactionHash[:]); c != 0 {
+			return c
+		}
+		return cmp.Compare(a.LogIndex, b.LogIndex)
+	})
 	return ans, nil
+}
+
+// VerifyUnwrapsForSigning checks exactly the rows used to construct this
+// ceremony's messages. Unavailable evidence postpones the entire batch.
+func (m *NetworksManager) VerifyUnwrapsForSigning(requests []*events.UnwrapRequestEvm) error {
+	for _, req := range requests {
+		var source *evmNetwork
+		for _, network := range m.evmNetworks {
+			if network.ChainId() == req.ChainId && network.NetworkClass() == req.NetworkClass {
+				source = network
+				break
+			}
+		}
+		if source == nil {
+			return fmt.Errorf("no source network for unwrap %s/%d", req.TransactionHash, req.LogIndex)
+		}
+		candidate := *req
+		if candidate.BlockHash == (ecommon.Hash{}) {
+			// A receipt is a locator only. The canonical hash, finality depth and
+			// transfer below still require agreement from all configured endpoints.
+			receipt, err := source.EvmRpc().TransactionReceipt(candidate.TransactionHash)
+			if err != nil {
+				return fmt.Errorf("unwrap %s/%d cannot be signed: locating its source block: %w", req.TransactionHash, req.LogIndex, err)
+			}
+			if receipt == nil || receipt.TxHash != candidate.TransactionHash || receipt.BlockNumber == nil || !receipt.BlockNumber.IsUint64() ||
+				receipt.BlockHash == (ecommon.Hash{}) || (candidate.BlockNumber != 0 && candidate.BlockNumber != receipt.BlockNumber.Uint64()) {
+				return fmt.Errorf("unwrap %s/%d cannot be signed: no matching source block", req.TransactionHash, req.LogIndex)
+			}
+			candidate.BlockNumber, candidate.BlockHash = receipt.BlockNumber.Uint64(), receipt.BlockHash
+		}
+		canonical, err := source.EvmRpc().CanonicalHash(candidate.BlockNumber)
+		if err != nil {
+			return fmt.Errorf("unwrap %s/%d cannot be signed: %w", req.TransactionHash, req.LogIndex, err)
+		}
+		if canonical != candidate.BlockHash {
+			return fmt.Errorf("unwrap %s/%d cannot be signed: its block was replaced", req.TransactionHash, req.LogIndex)
+		}
+		if err := source.verifyUnwrapTransfer(&candidate, true); err != nil {
+			return fmt.Errorf("unwrap %s/%d cannot be signed: %w", req.TransactionHash, req.LogIndex, err)
+		}
+		if candidate.BlockHash != req.BlockHash || candidate.From != req.From {
+			if err := source.eventsStore().HydrateUnsignedUnwrap(*req, candidate); err != nil {
+				return err
+			}
+			*req = candidate
+		}
+	}
+	return nil
 }
 
 func (m *NetworksManager) GetUnsentSignedUnwrapRequests() ([]*events.UnwrapRequestEvm, error) {

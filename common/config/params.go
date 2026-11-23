@@ -4,6 +4,7 @@ import (
 	ecommon "github.com/ethereum/go-ethereum/common"
 	"github.com/zenon-network/go-zenon/vm/embedded/definition"
 	"orchestrator/common"
+	"sync/atomic"
 	"time"
 )
 
@@ -95,28 +96,28 @@ func NewZnnParams(orchestratorInfo *definition.OrchestratorInfo) (*ZnnParams, er
 }
 
 func (zP *ZnnParams) SetWindowSize(windowSize uint64) {
-	zP.windowSize = windowSize
+	atomic.StoreUint64(&zP.windowSize, windowSize)
 }
 func (zP *ZnnParams) SetKeyGenThreshold(keyGenThreshold uint32) {
-	zP.keyGenThreshold = keyGenThreshold
+	atomic.StoreUint32(&zP.keyGenThreshold, keyGenThreshold)
 }
 func (zP *ZnnParams) SetConfirmationsToFinality(confirmationsToFinality uint32) {
-	zP.confirmationsToFinality = confirmationsToFinality
+	atomic.StoreUint32(&zP.confirmationsToFinality, confirmationsToFinality)
 }
 func (zP *ZnnParams) SetEstimatedMomentumTime(estimatedMomentumTime uint32) {
-	zP.estimatedMomentumTime = estimatedMomentumTime
+	atomic.StoreUint32(&zP.estimatedMomentumTime, estimatedMomentumTime)
 }
 
 func (zP *ZnnParams) KeyGenThreshold() uint32 {
-	return zP.keyGenThreshold
+	return atomic.LoadUint32(&zP.keyGenThreshold)
 }
 
 func (zP *ZnnParams) ConfirmationsToFinality() uint32 {
-	return zP.confirmationsToFinality
+	return atomic.LoadUint32(&zP.confirmationsToFinality)
 }
 func (zP *ZnnParams) EstimatedMomentumTime() uint32 {
-	return zP.estimatedMomentumTime
+	return atomic.LoadUint32(&zP.estimatedMomentumTime)
 }
 func (zP *ZnnParams) WindowSize() uint64 {
-	return zP.windowSize
+	return atomic.LoadUint64(&zP.windowSize)
 }

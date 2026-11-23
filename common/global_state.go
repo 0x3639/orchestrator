@@ -2,9 +2,15 @@ package common
 
 import (
 	"context"
+	"errors"
+	"strings"
+	"sync"
+
 	"github.com/zenon-network/go-zenon/common/types"
 	"golang.org/x/sync/semaphore"
 	"math/big"
+
+	"orchestrator/health/snapshot"
 )
 
 const (
@@ -15,52 +21,100 @@ const (
 	ReSignState    uint8 = 4
 )
 
+// CeremonyWindow identifies the chain interval even when governance resizes windows.
+type CeremonyWindow struct {
+	Number uint64
+	Size   uint64
+}
+
 type GlobalState struct {
+	// Health is assigned once before any network workers start.
+	Health                 *snapshot.Store
 	state                  *uint8
-	stateSemaphore         *semaphore.Weighted
+	stateMu                sync.Mutex
+	persistEmergency       func(uint8) error
+	emergencyWritePending  bool
 	frontierMomentumHeight uint64
 	frontierMomSemaphore   *semaphore.Weighted
-	lastCeremony           uint64
+	lastCeremony           CeremonyWindow
 	isAdministratorActive  bool
 	tokensMap              map[uint32]map[string]string
+	affiliateMu            sync.RWMutex
 	// [chainId][token] -> bool
 	isAffiliateProgramActive map[uint32]map[string]bool
 	// [chainId] -> height
-	affiliateStartingHeight map[uint32]*big.Int
+	affiliateStartingHeight map[uint32]uint64
 	resignNetworkClass      uint32
 	resignNetworkChainId    uint32
 }
 
 func NewGlobalState(state *uint8) *GlobalState {
+	return NewPersistentGlobalState(state, nil)
+}
+
+// NewPersistentGlobalState orders emergency persistence and receive processing.
+func NewPersistentGlobalState(state *uint8, persistEmergency func(uint8) error) *GlobalState {
 	return &GlobalState{
+		persistEmergency:         persistEmergency,
 		state:                    state,
-		lastCeremony:             0,
 		frontierMomentumHeight:   0,
-		stateSemaphore:           semaphore.NewWeighted(1),
 		frontierMomSemaphore:     semaphore.NewWeighted(1),
 		isAdministratorActive:    false,
 		tokensMap:                make(map[uint32]map[string]string),
 		isAffiliateProgramActive: make(map[uint32]map[string]bool),
+		affiliateStartingHeight:  make(map[uint32]uint64),
 	}
 }
 
 func (gs *GlobalState) SetState(newState uint8) error {
-	err := gs.stateSemaphore.Acquire(context.Background(), 1)
-	if err != nil {
-		return err
+	gs.stateMu.Lock()
+	defer gs.stateMu.Unlock()
+	previous := *gs.state
+	if previous == EmergencyState && newState != EmergencyState && newState != HaltedState {
+		return errors.New("emergency halt is still pending")
 	}
+	// A failed write must stop signing in this process and prevent the caller
+	// from checkpointing the receive. A repeated emergency retries persistence.
+	var persistErr error
+	if gs.persistEmergency != nil && (newState == EmergencyState || previous == EmergencyState) {
+		persistErr = gs.persistEmergency(newState)
+
+		if persistErr != nil && newState != EmergencyState {
+			return persistErr
+		}
+	}
+	gs.emergencyWritePending = persistErr != nil
 	GlobalLogger.Infof("Old state: %s, New state: %s\n", StateToText(*gs.state), StateToText(newState))
 	*gs.state = newState
-	gs.stateSemaphore.Release(1)
+	gs.Health.SetBridgeState(StateToText(newState))
+	return persistErr
+}
+
+// A receive retried after a storage error may by then be historical. Even
+// if it no longer triggers a live transition, its checkpoint must wait.
+func (gs *GlobalState) FlushPendingEmergency() error {
+	gs.stateMu.Lock()
+	defer gs.stateMu.Unlock()
+	if gs.emergencyWritePending {
+		if err := gs.persistEmergency(EmergencyState); err != nil {
+			return err
+		}
+		gs.emergencyWritePending = false
+	}
 	return nil
 }
 
+// SaveConfig serializes full config saves with emergency transitions. The
+// callback reads the config containing the state pointer supplied at startup.
+func (gs *GlobalState) SaveConfig(save func() error) error {
+	gs.stateMu.Lock()
+	defer gs.stateMu.Unlock()
+	return save()
+}
+
 func (gs *GlobalState) GetState() (uint8, error) {
-	err := gs.stateSemaphore.Acquire(context.Background(), 1)
-	if err != nil {
-		return 0, err
-	}
-	defer gs.stateSemaphore.Release(1)
+	gs.stateMu.Lock()
+	defer gs.stateMu.Unlock()
 	return *gs.state, nil
 }
 
@@ -70,6 +124,7 @@ func (gs *GlobalState) SetFrontierMomentum(frMom uint64) error {
 		return err
 	}
 	gs.frontierMomentumHeight = frMom
+	gs.Health.UpdateZenon(func(z *snapshot.Zenon) { z.FrontierMomentum = snapshot.Measure(frMom) })
 	gs.frontierMomSemaphore.Release(1)
 	return nil
 }
@@ -83,15 +138,19 @@ func (gs *GlobalState) GetFrontierMomentum() (uint64, error) {
 	return gs.frontierMomentumHeight, nil
 }
 
-func (gs *GlobalState) SetLastCeremony(ceremony uint64) {
-	gs.lastCeremony = ceremony
-}
-
-func (gs *GlobalState) GetLastCeremony() uint64 {
-	return gs.lastCeremony
+// BeginCeremony is called by the signing loop before attempting either round.
+func (gs *GlobalState) BeginCeremony(window CeremonyWindow) bool {
+	if window.Size == 0 || window == gs.lastCeremony || (gs.lastCeremony.Size == 0 && window.Number == 0) {
+		return false
+	}
+	gs.lastCeremony = window
+	return true
 }
 
 func (gs *GlobalState) SetTokensMap(chainId uint32, zts, token string) {
+	gs.affiliateMu.Lock()
+	defer gs.affiliateMu.Unlock()
+	token = strings.ToLower(token)
 	if _, found := gs.tokensMap[chainId]; !found {
 		gs.tokensMap[chainId] = make(map[string]string)
 	}
@@ -101,7 +160,9 @@ func (gs *GlobalState) SetTokensMap(chainId uint32, zts, token string) {
 }
 
 func (gs *GlobalState) GetTokensMap(chainId uint32, ztsOrToken string) string {
-	if value, found := gs.tokensMap[chainId][ztsOrToken]; found {
+	gs.affiliateMu.RLock()
+	defer gs.affiliateMu.RUnlock()
+	if value, found := gs.tokensMap[chainId][strings.ToLower(ztsOrToken)]; found {
 		return value
 	}
 	return ""
@@ -117,75 +178,66 @@ func (gs *GlobalState) GetIsAdministratorActive() bool {
 }
 
 func (gs *GlobalState) SetIsAffiliateProgram(program AffiliateProgram) {
-	for chainId, networkValues := range program.Networks {
-		GlobalLogger.Infof("Set affiliate program values for network: %d", chainId)
-		if _, foundNetwork := gs.isAffiliateProgramActive[chainId]; !foundNetwork {
-			gs.isAffiliateProgramActive = make(map[uint32]map[string]bool)
+	gs.affiliateMu.Lock()
+	defer gs.affiliateMu.Unlock()
+	// An update replaces the listed chains. Unlisted chains keep their settings.
+	for id, values := range program.Networks {
+		znn, qsr := types.ZnnTokenStandard.String(), types.QsrTokenStandard.String()
+		flags := map[string]bool{znn: values.ZNN, qsr: values.QSR}
+		if addr := gs.tokensMap[id][znn]; addr != "" {
+			flags[addr] = values.WZNN
 		}
-
-		gs.SetAffiliateStartingHeight(chainId, networkValues.StartingHeight)
-		GlobalLogger.Infof("SetAffiliateStartingHeight: %d", networkValues.StartingHeight)
-
-		if tokenInfo, found := gs.isAffiliateProgramActive[chainId]; found {
-			tokenInfo[types.ZnnTokenStandard.String()] = networkValues.ZNN
-		} else {
-			gs.isAffiliateProgramActive[chainId] = make(map[string]bool)
-			gs.isAffiliateProgramActive[chainId][types.ZnnTokenStandard.String()] = networkValues.ZNN
+		if addr := gs.tokensMap[id][qsr]; addr != "" {
+			flags[addr] = values.WQSR
 		}
-		GlobalLogger.Infof("SetIsAffiliateProgramActive for %s to : %t", types.ZnnTokenStandard.String(), networkValues.ZNN)
-
-		if tokenInfo, found := gs.isAffiliateProgramActive[chainId]; found {
-			tokenInfo[types.QsrTokenStandard.String()] = networkValues.QSR
-		} else {
-			gs.isAffiliateProgramActive[chainId] = make(map[string]bool)
-			gs.isAffiliateProgramActive[chainId][types.QsrTokenStandard.String()] = networkValues.QSR
-		}
-		GlobalLogger.Infof("SetIsAffiliateProgramActive for %s to : %t", types.QsrTokenStandard.String(), networkValues.QSR)
-
-		wZnnTokenAddress := gs.GetTokensMap(chainId, types.ZnnTokenStandard.String())
-		if len(wZnnTokenAddress) > 0 {
-			if tokenInfo, found := gs.isAffiliateProgramActive[chainId]; found {
-				tokenInfo[wZnnTokenAddress] = networkValues.WZNN
-			} else {
-				gs.isAffiliateProgramActive[chainId] = make(map[string]bool)
-				gs.isAffiliateProgramActive[chainId][wZnnTokenAddress] = networkValues.WZNN
-			}
-			GlobalLogger.Infof("SetIsAffiliateProgramActive for %s (wZNN) to : %t", wZnnTokenAddress, networkValues.WZNN)
-		}
-		wQsrTokenAddress := gs.GetTokensMap(chainId, types.QsrTokenStandard.String())
-		if len(wQsrTokenAddress) > 0 {
-			if tokenInfo, found := gs.isAffiliateProgramActive[chainId]; found {
-				tokenInfo[wQsrTokenAddress] = networkValues.WQSR
-			} else {
-				gs.isAffiliateProgramActive[chainId] = make(map[string]bool)
-				gs.isAffiliateProgramActive[chainId][wQsrTokenAddress] = networkValues.WQSR
-			}
-			GlobalLogger.Infof("SetIsAffiliateProgramActive for %s (wQSR) to : %t", wQsrTokenAddress, networkValues.WQSR)
-		}
+		gs.isAffiliateProgramActive[id] = flags
+		gs.affiliateStartingHeight[id] = values.StartingHeight
+		GlobalLogger.Infof("Updated affiliate program for network %d at starting height %d", id, values.StartingHeight)
 	}
 }
 
-func (gs *GlobalState) GetIsAffiliateProgramActive(chainId uint32, token string) bool {
-	if networkInfo, foundNetwork := gs.isAffiliateProgramActive[chainId]; foundNetwork {
-		if value, foundToken := networkInfo[token]; foundToken {
-			return value
-		}
-	}
-	return false
+func (gs *GlobalState) GetIsAffiliateProgramActive(id uint32, token string) bool {
+	gs.affiliateMu.RLock()
+	defer gs.affiliateMu.RUnlock()
+	return gs.isAffiliateProgramActive[id][strings.ToLower(token)]
 }
 
-func (gs *GlobalState) SetAffiliateStartingHeight(chainId uint32, value uint64) {
-	if _, foundNetwork := gs.isAffiliateProgramActive[chainId]; !foundNetwork {
-		gs.affiliateStartingHeight = make(map[uint32]*big.Int)
-	}
-	gs.affiliateStartingHeight[chainId] = big.NewInt(0).SetUint64(value)
+func (gs *GlobalState) SetAffiliateStartingHeight(id uint32, height uint64) {
+	gs.affiliateMu.Lock()
+	defer gs.affiliateMu.Unlock()
+	gs.affiliateStartingHeight[id] = height
 }
 
-func (gs *GlobalState) GetAffiliateStartingHeight(chainId uint32) *big.Int {
-	if value, found := gs.affiliateStartingHeight[chainId]; found {
-		return value
+func (gs *GlobalState) GetAffiliateStartingHeight(id uint32) *big.Int {
+	gs.affiliateMu.RLock()
+	defer gs.affiliateMu.RUnlock()
+	return new(big.Int).SetUint64(gs.affiliateStartingHeight[id])
+}
+
+// Wrapped and native token flags govern distinct sides of the bridge.
+type AffiliatePolicy byte
+
+const (
+	SplitAffiliate AffiliatePolicy = 1 << iota
+	VerifyAffiliate
+)
+
+func (gs *GlobalState) AffiliatePolicyAt(id uint32, token string, height uint64) AffiliatePolicy {
+	gs.affiliateMu.RLock()
+	defer gs.affiliateMu.RUnlock()
+	if start := gs.affiliateStartingHeight[id]; start == 0 || height < start {
+		return 0
 	}
-	return big.NewInt(0)
+	token = strings.ToLower(token)
+	flags := gs.isAffiliateProgramActive[id]
+	var policy AffiliatePolicy
+	if flags[token] {
+		policy |= SplitAffiliate
+	}
+	if flags[gs.tokensMap[id][token]] {
+		policy |= VerifyAffiliate
+	}
+	return policy
 }
 
 func (gs *GlobalState) GetResignNetwork() (uint32, uint32) {
@@ -195,4 +247,12 @@ func (gs *GlobalState) GetResignNetwork() (uint32, uint32) {
 func (gs *GlobalState) SetResignNetwork(networkClass, chainId uint32) {
 	gs.resignNetworkClass = networkClass
 	gs.resignNetworkChainId = chainId
+}
+
+// HealthStore returns the optional observer for callers that run without node state.
+func (gs *GlobalState) HealthStore() *snapshot.Store {
+	if gs == nil {
+		return nil
+	}
+	return gs.Health
 }

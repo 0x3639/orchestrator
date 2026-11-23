@@ -1,0 +1,92 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:zenon:orchestrator:health:heartbeat:v1",
+  "title": "Outbound operator heartbeat v1",
+  "description": "POST /v1/heartbeats. Authenticate the enrolled reporter using mutual TLS. The collector must also enforce size, time, identity, per-chain uniqueness and per-stream sequence rules before storing a report.",
+  "type": "object",
+  "required": [
+    "schemaVersion",
+    "streamId",
+    "sequence",
+    "sentAt",
+    "localRead",
+    "lastLocalSuccessAt",
+    "snapshot"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "const": 1
+    },
+    "streamId": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "sequence": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 9007199254740991
+    },
+    "sentAt": {
+      "$ref": "urn:zenon:orchestrator:health:snapshot:v1#/$defs/timestamp"
+    },
+    "localRead": {
+      "enum": [
+        "ok",
+        "unreachable",
+        "timeout",
+        "invalidResponse",
+        "unsupported"
+      ]
+    },
+    "lastLocalSuccessAt": {
+      "anyOf": [
+        {
+          "$ref": "urn:zenon:orchestrator:health:snapshot:v1#/$defs/timestamp"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "snapshot": {
+      "anyOf": [
+        {
+          "$ref": "urn:zenon:orchestrator:health:snapshot:v1"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    }
+  },
+  "additionalProperties": false,
+  "if": {
+    "properties": {
+      "localRead": {
+        "const": "ok"
+      }
+    }
+  },
+  "then": {
+    "properties": {
+      "lastLocalSuccessAt": {
+        "$ref": "urn:zenon:orchestrator:health:snapshot:v1#/$defs/timestamp"
+      },
+      "snapshot": {
+        "$ref": "urn:zenon:orchestrator:health:snapshot:v1",
+        "properties": {
+          "networks": {
+            "maxItems": 64
+          }
+        }
+      }
+    }
+  },
+  "else": {
+    "properties": {
+      "snapshot": {
+        "type": "null"
+      }
+    }
+  }
+}

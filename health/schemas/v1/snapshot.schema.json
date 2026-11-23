@@ -1,0 +1,333 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:zenon:orchestrator:health:snapshot:v1",
+  "title": "Orchestrator local health snapshot v1",
+  "type": "object",
+  "required": [
+    "schemaVersion",
+    "sampledAt",
+    "startedAt",
+    "build",
+    "phase",
+    "bridgeState",
+    "zenon",
+    "networksKnown",
+    "networks"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "const": 1
+    },
+    "sampledAt": {
+      "$ref": "#/$defs/timestamp"
+    },
+    "startedAt": {
+      "$ref": "#/$defs/timestamp"
+    },
+    "build": {
+      "type": "object",
+      "required": [
+        "version",
+        "gitCommit"
+      ],
+      "properties": {
+        "version": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "gitCommit": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^[0-9a-f]{7,64}$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "phase": {
+      "enum": [
+        "starting",
+        "waitingForZenon",
+        "syncingBridge",
+        "running",
+        "stopping"
+      ]
+    },
+    "bridgeState": {
+      "enum": [
+        null,
+        "LiveState",
+        "KeyGenState",
+        "ReSignState",
+        "EmergencyState",
+        "HaltedState"
+      ]
+    },
+    "zenon": {
+      "type": "object",
+      "required": [
+        "nodeSync",
+        "frontierMomentum",
+        "processedReceiveHeight"
+      ],
+      "properties": {
+        "nodeSync": {
+          "$ref": "#/$defs/syncObservation"
+        },
+        "frontierMomentum": {
+          "$ref": "#/$defs/numberObservation"
+        },
+        "processedReceiveHeight": {
+          "$ref": "#/$defs/numberObservation"
+        }
+      },
+      "additionalProperties": false
+    },
+    "networksKnown": {
+      "type": "boolean"
+    },
+    "networks": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/network"
+      },
+      "uniqueItems": true
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "Z$"
+    },
+    "integer": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9007199254740991
+    },
+    "observation": {
+      "type": "object",
+      "required": [
+        "value",
+        "asOf",
+        "quality"
+      ],
+      "properties": {
+        "value": {},
+        "asOf": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/timestamp"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "quality": {
+          "enum": [
+            "unknown",
+            "partial",
+            "complete"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "if": {
+        "properties": {
+          "quality": {
+            "const": "unknown"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "value": {
+            "type": "null"
+          },
+          "asOf": {
+            "type": "null"
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "value": {
+            "not": {
+              "type": "null"
+            }
+          },
+          "asOf": {
+            "$ref": "#/$defs/timestamp"
+          }
+        }
+      }
+    },
+    "numberObservation": {
+      "$ref": "#/$defs/observation",
+      "properties": {
+        "value": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "syncObservation": {
+      "$ref": "#/$defs/observation",
+      "properties": {
+        "value": {
+          "anyOf": [
+            {
+              "enum": [
+                "synced",
+                "syncing"
+              ]
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "selectionObservation": {
+      "$ref": "#/$defs/observation",
+      "properties": {
+        "value": {
+          "anyOf": [
+            {
+              "type": "object",
+              "required": [
+                "window",
+                "count"
+              ],
+              "properties": {
+                "window": {
+                  "$ref": "#/$defs/integer"
+                },
+                "count": {
+                  "$ref": "#/$defs/integer"
+                }
+              },
+              "additionalProperties": false
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "timeObservation": {
+      "$ref": "#/$defs/observation",
+      "properties": {
+        "value": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/timestamp"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "work": {
+      "type": "object",
+      "required": [
+        "awaitingFinality",
+        "unsignedObserved",
+        "selected",
+        "signedAwaitingSubmission",
+        "oldestPendingSince",
+        "lastSignedWindow"
+      ],
+      "properties": {
+        "awaitingFinality": {
+          "$ref": "#/$defs/numberObservation"
+        },
+        "unsignedObserved": {
+          "$ref": "#/$defs/numberObservation"
+        },
+        "selected": {
+          "$ref": "#/$defs/selectionObservation"
+        },
+        "signedAwaitingSubmission": {
+          "$ref": "#/$defs/numberObservation"
+        },
+        "oldestPendingSince": {
+          "$ref": "#/$defs/timeObservation"
+        },
+        "lastSignedWindow": {
+          "$ref": "#/$defs/numberObservation"
+        }
+      },
+      "additionalProperties": false
+    },
+    "network": {
+      "type": "object",
+      "required": [
+        "networkClass",
+        "chainId",
+        "nodeSync",
+        "headHeight",
+        "scannedThrough",
+        "lastRangeAt",
+        "wrap",
+        "unwrap"
+      ],
+      "properties": {
+        "networkClass": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295
+        },
+        "chainId": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295
+        },
+        "nodeSync": {
+          "$ref": "#/$defs/syncObservation"
+        },
+        "headHeight": {
+          "$ref": "#/$defs/numberObservation"
+        },
+        "scannedThrough": {
+          "$ref": "#/$defs/numberObservation"
+        },
+        "lastRangeAt": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/timestamp"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "wrap": {
+          "$ref": "#/$defs/work"
+        },
+        "unwrap": {
+          "$ref": "#/$defs/work"
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

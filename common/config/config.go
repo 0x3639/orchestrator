@@ -51,6 +51,8 @@ type TssManagerConfig struct {
 }
 
 type HealthRpcConfig struct {
+	// SnapshotSocket enables the private v1 API at this absolute Unix socket path.
+	SnapshotSocket string `json:",omitempty"`
 	// Address is the interface to listen on. Empty means DefaultHealthRpcAddress.
 	Address             string
 	Port                int
@@ -116,7 +118,10 @@ const maxConfigFileBytes = 1 << 20
 // without following symlinks and checked for type and ownership on that
 // descriptor before any bytes are parsed.
 func ReadConfigFile(cfg *Config) (bool, error) {
-	configPath := cfg.ConfigPath()
+	return readConfigFile(cfg.ConfigPath(), cfg)
+}
+
+func readConfigFile(configPath string, dst any) (bool, error) {
 	f, err := openNoFollow(configPath)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -143,7 +148,7 @@ func ReadConfigFile(cfg *Config) (bool, error) {
 	if len(raw) > maxConfigFileBytes {
 		return false, fmt.Errorf("%s exceeds %d bytes", configPath, maxConfigFileBytes)
 	}
-	if err := json.Unmarshal(raw, cfg); err != nil {
+	if err := json.Unmarshal(raw, dst); err != nil {
 		return true, fmt.Errorf("config malformed: %w", err)
 	}
 	return true, nil
@@ -197,15 +202,51 @@ func EnsureDataDir(dataPath string) error {
 }
 
 func WriteConfig(cfg Config) error {
-	if err := EnsureDataDir(cfg.DataPath); err != nil {
+	return writeConfig(cfg.DataPath, cfg)
+}
+
+// InitializeLocked is called after taking the instance lock. Another process
+// may have persisted an emergency since the initial CLI config read.
+func (cfg *Config) InitializeLocked() error {
+	var latest struct{ GlobalState *uint8 }
+	if _, err := readConfigFile(cfg.ConfigPath(), &latest); err != nil {
 		return err
 	}
-	configPath := cfg.ConfigPath()
+	if latest.GlobalState != nil {
+		cfg.GlobalState = *latest.GlobalState
+	}
+	return WriteConfig(*cfg)
+}
+
+// WriteGlobalState updates just the persisted state. Runtime key generation
+// and metadata updates may be changing other fields of the in-memory config.
+func WriteGlobalState(dataPath string, state uint8) error {
+	configPath := filepath.Join(dataPath, DefaultNodeConfigFileName)
+	var fields map[string]json.RawMessage
+	found, err := readConfigFile(configPath, &fields)
+	if err != nil {
+		return err
+	}
+	if !found || fields == nil {
+		return fmt.Errorf("cannot update state in missing or empty config %s", configPath)
+	}
+	fields["GlobalState"], err = json.Marshal(state)
+	if err != nil {
+		return err
+	}
+	return writeConfig(dataPath, fields)
+}
+
+func writeConfig(dataPath string, contents any) error {
+	if err := EnsureDataDir(dataPath); err != nil {
+		return err
+	}
+	configPath := filepath.Join(dataPath, DefaultNodeConfigFileName)
 	if err := VerifyOwnedPath(configPath); err != nil && !os.IsNotExist(err) {
 		return err
 	}
 
-	configBytes, err := json.MarshalIndent(cfg, "", "    ")
+	configBytes, err := json.MarshalIndent(contents, "", "    ")
 	if err != nil {
 		return err
 	}
@@ -214,7 +255,7 @@ func WriteConfig(cfg Config) error {
 	// target so the on-disk config is never truncated, never inherits a
 	// wider legacy mode, and cannot be redirected through a pre-existing
 	// symlink at configPath.
-	tmp, err := os.CreateTemp(cfg.DataPath, "."+DefaultNodeConfigFileName+".*")
+	tmp, err := os.CreateTemp(dataPath, "."+DefaultNodeConfigFileName+".*")
 	if err != nil {
 		return err
 	}
@@ -240,5 +281,11 @@ func WriteConfig(cfg Config) error {
 		_ = os.Remove(tmpPath)
 		return err
 	}
-	return nil
+	// Persist the directory entry before a separate database can advance.
+	dir, err := os.Open(dataPath)
+	if err != nil {
+		return err
+	}
+	defer dir.Close()
+	return dir.Sync()
 }

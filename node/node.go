@@ -17,6 +17,8 @@ import (
 	"orchestrator/common/events"
 	"orchestrator/db/manager"
 	"orchestrator/health"
+	"orchestrator/health/snapshot"
+	"orchestrator/metadata"
 	"orchestrator/network"
 	"orchestrator/tss"
 	"os"
@@ -58,6 +60,7 @@ type Node struct {
 	state           *common.GlobalState
 
 	healthRpcServer *http.Server
+	snapshotServer  *http.Server
 
 	logger *zap.SugaredLogger
 
@@ -68,20 +71,42 @@ type Node struct {
 	dataDirLock fileutil.Releaser
 }
 
-func NewNode(config *oconfig.Config, logger *zap.Logger) (*Node, error) {
+func NewNode(config *oconfig.Config, logger *zap.Logger) (_ *Node, initErr error) {
 	var err error
 
 	node := &Node{
 		config:   config,
 		logger:   logger.Sugar(),
 		stopChan: make(chan os.Signal, 1),
-		state:    common.NewGlobalState(&config.GlobalState),
+		state: common.NewPersistentGlobalState(&config.GlobalState, func(state uint8) error {
+			return oconfig.WriteGlobalState(config.DataPath, state)
+		}),
 	}
 
 	// prepare node
 	node.logger.Info("preparing node ... ")
 	if err = node.openDataDir(); err != nil {
 		return nil, err
+	}
+	defer func() {
+		if initErr != nil {
+			node.closeSnapshot()
+			node.closeDataDir()
+		}
+	}()
+	if err := config.InitializeLocked(); err != nil {
+		return nil, err
+	}
+	if config.HealthConfig.SnapshotSocket != "" {
+		store := snapshot.New(metadata.Version, metadata.GitCommit)
+		server, listenErr := health.ListenSnapshot(config.HealthConfig.SnapshotSocket, store, config.HealthConfig)
+		if listenErr != nil {
+			node.logger.Warnf("Local health snapshot unavailable: %v", listenErr)
+		} else {
+			node.state.Health = store
+			node.snapshotServer = server
+			store.SetBridgeState(common.StateToText(config.GlobalState))
+		}
 	}
 	if node.dbManager, err = manager.NewDbManager(node.stopChan); err != nil {
 		return nil, err
@@ -123,6 +148,7 @@ func NewNode(config *oconfig.Config, logger *zap.Logger) (*Node, error) {
 	node.evmAddress = crypto.PubkeyToAddress(node.ecdsaPrivateKey.PublicKey)
 	node.config.EvmAddress = node.evmAddress.String()
 
+	node.state.HealthStore().SetPhase("waitingForZenon")
 	for node.networksManager.Znn().IsSynced() == false {
 		node.logger.Info("node is syncing, will wait for it to finish")
 		time.Sleep(15 * time.Second)
@@ -143,7 +169,7 @@ func NewNode(config *oconfig.Config, logger *zap.Logger) (*Node, error) {
 		node.state.SetIsAdministratorActive(true)
 	}
 
-	if err := oconfig.WriteConfig(*node.config); err != nil {
+	if err := node.SaveConfig(); err != nil {
 		node.logger.Info(err.Error())
 	}
 
@@ -157,7 +183,13 @@ func NewNode(config *oconfig.Config, logger *zap.Logger) (*Node, error) {
 	return node, nil
 }
 
-func (node *Node) Start() error {
+func (node *Node) Start() (startErr error) {
+	defer func() {
+		if startErr != nil {
+			node.closeSnapshot()
+		}
+	}()
+	node.state.HealthStore().SetPhase("syncingBridge")
 	node.lock.Lock()
 	defer node.lock.Unlock()
 
@@ -259,13 +291,15 @@ func (node *Node) Start() error {
 	}
 
 	identity := health.Identity{
-		Producer:      node.producerKeyPair.Address.String(),
-		PillarName:    pillarName,
-		TssPeerPubKey: node.tssManager.GetPeerPubKey(),
-		TssPeerId:     node.tssManager.GetPeerId().String(),
-		EvmAddress:    node.config.EvmAddress,
+		Producer:   node.producerKeyPair.Address.String(),
+		PillarName: pillarName,
+		EvmAddress: node.config.EvmAddress,
 	}
 
+	if node.tssManager != nil {
+		identity.TssPeerPubKey = node.tssManager.GetPeerPubKey()
+		identity.TssPeerId = node.tssManager.GetPeerId().String()
+	}
 	node.healthRpcServer.Handler.(*health.Handler).SetTssManager(node.tssManager)
 	node.healthRpcServer.Handler.(*health.Handler).SetIdentity(identity)
 
@@ -276,18 +310,33 @@ func (node *Node) Start() error {
 		}
 	}()
 
+	node.state.HealthStore().SetPhase("running")
 	go node.processSignatures()
 	go node.sendSignatures()
 	return nil
 }
 
+func (node *Node) closeSnapshot() {
+	node.state.HealthStore().Close()
+	if node.snapshotServer != nil {
+		node.snapshotServer.Close()
+	}
+}
+
 func (node *Node) Stop() error {
+	// Start holds the lock during bridge sync. Interrupt pending ledger
+	// reads and backoff before waiting for the startup path to unwind.
+	node.networksManager.Znn().CancelAccountBlockReads()
 	node.lock.Lock()
 	defer node.lock.Unlock()
 	defer close(node.stopChan)
 	node.logger.Info("stopping node ...")
 
-	node.tssManager.Stop()
+	node.state.HealthStore().SetPhase("stopping")
+	defer node.closeSnapshot()
+	if node.tssManager != nil {
+		node.tssManager.Stop()
+	}
 	node.networksManager.Stop()
 
 	if err := node.healthRpcServer.Shutdown(context.Background()); err != nil {
@@ -702,7 +751,7 @@ func (node *Node) processSignatures() {
 			//	}
 			//}
 
-			if err := oconfig.WriteConfig(*node.config); err != nil {
+			if err := node.SaveConfig(); err != nil {
 				node.logger.Info(err.Error())
 			}
 		case common.LiveState:
@@ -726,36 +775,34 @@ func (node *Node) processSignatures() {
 					node.logger.Debug(err.Error())
 				}
 			} else if node.tssManager.CanProcessSignatures() && bridgeInfo.CompressedTssECDSAPubKey == node.tssManager.GetPubKey() {
-				frontierMomentum, getFrErr := node.state.GetFrontierMomentum()
-				if getFrErr != nil {
-					node.logger.Debug(getFrErr)
+				currentCeremony, err := node.networksManager.Znn().CurrentCeremony()
+				if err != nil {
+					node.logger.Debug(err)
 					continue
 				}
-
-				currentCeremony := frontierMomentum / node.networksManager.WindowSize()
-				state := currentCeremony % 2
-				lastCeremony := node.state.GetLastCeremony()
-				if state == common.WrapCeremonyState && currentCeremony != lastCeremony {
-					node.logger.Debugf("state wrap - lastCeremony: %d", lastCeremony)
-					node.state.SetLastCeremony(currentCeremony)
-					if err, ok := node.processSignaturesWrap(); err != nil {
+				state := currentCeremony.Number % 2
+				if !node.state.BeginCeremony(currentCeremony) {
+					continue
+				}
+				if state == common.WrapCeremonyState {
+					node.logger.Debugf("wrap ceremony %d (window size %d)", currentCeremony.Number, currentCeremony.Size)
+					if err, ok := node.processSignaturesWrap(currentCeremony.Number); err != nil {
 						node.logger.Debug(err)
 					} else if ok == false {
 						node.logger.Debug("Nothing to sign, try unwrap")
 						// If we had nothing to sign we try the other direction
-						if err, _ := node.processSignaturesUnwrap(); err != nil {
+						if err, _ := node.processSignaturesUnwrap(currentCeremony.Number, currentCeremony.Size); err != nil {
 							node.logger.Debug(err)
 						}
 					}
-				} else if state == common.UnwrapCeremonyState && currentCeremony != lastCeremony {
-					node.logger.Debugf("state unwrap - lastCeremony: %d", lastCeremony)
-					node.state.SetLastCeremony(currentCeremony)
-					if err, ok := node.processSignaturesUnwrap(); err != nil {
+				} else if state == common.UnwrapCeremonyState {
+					node.logger.Debugf("unwrap ceremony %d (window size %d)", currentCeremony.Number, currentCeremony.Size)
+					if err, ok := node.processSignaturesUnwrap(currentCeremony.Number, currentCeremony.Size); err != nil {
 						node.logger.Debug(err)
 					} else if ok == false {
 						node.logger.Debug("Nothing to sign, try wrap")
 						// If we had nothing to sign we try the other direction
-						if err, _ := node.processSignaturesWrap(); err != nil {
+						if err, _ := node.processSignaturesWrap(currentCeremony.Number); err != nil {
 							node.logger.Debug(err)
 						}
 					}
@@ -983,7 +1030,9 @@ func (node *Node) processSignatures() {
 
 // ok == true we had a signing ceremony
 // ok == false means that we had nothing to sign
-func (node *Node) processSignaturesWrap() (error, bool) {
+func (node *Node) processSignaturesWrap(window uint64) (error, bool) {
+	store := node.state.HealthStore()
+	store.Selected(snapshot.Wrap, window, nil)
 	wrapRequestsIds, err := node.networksManager.GetUnsignedWrapRequests()
 	if err != nil {
 		return err, false
@@ -1002,6 +1051,7 @@ func (node *Node) processSignaturesWrap() (error, bool) {
 
 	wrapRequestsIds = append(wrapRequestsIds, resignableWrapsRequestsIds...)
 	if len(wrapRequestsIds) == 0 {
+		store.Selected(snapshot.Wrap, window, map[uint32]int{})
 		return nil, false
 	}
 	node.logger.Debugf("Final WrapRequests len: %d", len(wrapRequestsIds))
@@ -1069,6 +1119,7 @@ func (node *Node) processSignaturesWrap() (error, bool) {
 	}
 
 	if len(messagesToSign) == 0 {
+		store.Selected(snapshot.Wrap, window, map[uint32]int{})
 		return nil, false
 	}
 
@@ -1077,6 +1128,14 @@ func (node *Node) processSignaturesWrap() (error, bool) {
 		right = common.SignCeremonyPoolSize
 	}
 	messagesToSign = messagesToSign[:right]
+	if store != nil {
+		counts := make(map[uint32]int)
+		for _, msg := range messagesToSign {
+			index := msgsIndexes[base64.StdEncoding.EncodeToString(msg)]
+			counts[wrapRequestsIds[index].ChainId]++
+		}
+		store.Selected(snapshot.Wrap, window, counts)
+	}
 	response, err := node.signMessages(messagesToSign, msgsIndexes)
 	if err != nil {
 		return err, true
@@ -1111,6 +1170,8 @@ func (node *Node) processSignaturesWrap() (error, bool) {
 			continue
 		}
 
+		store.Signed(snapshot.Wrap, wrapRequestsIds[msgsIndexes[sig.Msg]].ChainId, window)
+
 		// Set it as unsent after setting the new signature for resigned requests
 		if err = node.networksManager.SetWrapRequestSentSignature(wrapRequestsIds[msgsIndexes[sig.Msg]].Id, false); err != nil {
 			node.logger.Debug(err)
@@ -1129,7 +1190,9 @@ func (node *Node) processSignaturesWrap() (error, bool) {
 
 // ok == true means that we had a signing ceremony or at least we tried
 // ok == false means that we had nothing to sign
-func (node *Node) processSignaturesUnwrap() (error, bool) {
+func (node *Node) processSignaturesUnwrap(number, size uint64) (error, bool) {
+	store := node.state.HealthStore()
+	store.Selected(snapshot.Unwrap, number, nil)
 	// todo discuss what requests should the orchestrator sign in a ceremony
 	requests, err := node.networksManager.GetUnsignedUnwrapRequests()
 	if err != nil {
@@ -1147,7 +1210,14 @@ func (node *Node) processSignaturesUnwrap() (error, bool) {
 		return nil, false
 	}
 	if len(requests) == 0 {
+		store.Selected(snapshot.Unwrap, number, map[uint32]int{})
 		return nil, false
+	}
+
+	// Includes unsigned rows created by earlier binaries or restored from local
+	// checkpoints. Check only the bounded pool selected by reconciliation.
+	if err := node.networksManager.VerifyUnwrapsForSigning(requests); err != nil {
+		return err, true
 	}
 
 	msgsIndexes := make(map[string]int)
@@ -1170,6 +1240,7 @@ func (node *Node) processSignaturesUnwrap() (error, bool) {
 	}
 
 	if len(messagesToSign) == 0 {
+		store.Selected(snapshot.Unwrap, number, map[uint32]int{})
 		return nil, false
 	}
 
@@ -1179,7 +1250,34 @@ func (node *Node) processSignaturesUnwrap() (error, bool) {
 	}
 	messagesToSign = messagesToSign[:right]
 	//node.logger.Debug("MessagesToSign: ", messagesToSign)
-	response, err := node.signMessages(messagesToSign, msgsIndexes)
+	if store != nil {
+		counts := make(map[uint32]int)
+		for _, msg := range messagesToSign {
+			index := msgsIndexes[base64.StdEncoding.EncodeToString(msg)]
+			counts[requests[index].ChainId]++
+		}
+		store.Selected(snapshot.Unwrap, number, counts)
+	}
+	ceremony := common.CeremonyWindow{Number: number, Size: size}
+	response, err := node.tssManager.SignUnwrapPool(ceremony, messagesToSign, func() error {
+		current, err := node.networksManager.Znn().CurrentCeremony()
+		if err != nil {
+			return err
+		}
+		if current != ceremony {
+			return errors.New("unwrap ceremony expired before signing")
+		}
+		// The listener can enter emergency mode during agreement or either RPC
+		// read. Check live state last, immediately before requesting signatures.
+		state, err := node.state.GetState()
+		if err != nil {
+			return err
+		}
+		if state != common.LiveState {
+			return errors.New("node is no longer live before unwrap signing")
+		}
+		return nil
+	})
 	if err != nil {
 		return err, true
 	} else if response.Status != tcommon.Success {
@@ -1188,6 +1286,7 @@ func (node *Node) processSignaturesUnwrap() (error, bool) {
 		return nil, true
 	}
 
+	sortSignatures(response, msgsIndexes)
 	for idx, sig := range response.Signatures {
 		signature, err := base64.StdEncoding.DecodeString(sig.Signature)
 		if err != nil {
@@ -1211,6 +1310,8 @@ func (node *Node) processSignaturesUnwrap() (error, bool) {
 			node.logger.Debug(err.Error())
 			continue
 		}
+		store.Signed(snapshot.Unwrap, requests[msgsIndexes[sig.Msg]].ChainId, number)
+
 		node.logger.Debugf("\n%d. msg: %s\n\n", idx, base64.StdEncoding.EncodeToString(messagesToSign[idx]))
 		node.logger.Debugf("\n%d. sig: %s, recoveryID: %s, FinalSig: %s \n", msgsIndexes[sig.Msg], sig.Signature, sig.RecoveryID, requests[msgsIndexes[sig.Msg]].Signature)
 	}
@@ -1292,7 +1393,7 @@ func (node *Node) sendSignatures() {
 		return
 	}
 
-	seenEventsCount := make(map[string]uint32)
+	sendPending := newSignatureSendPoll(node.sendSignaturesWrap, node.sendUnwrapRequests)
 	for {
 		currentState, err := node.state.GetState()
 		if err != nil {
@@ -1304,17 +1405,7 @@ func (node *Node) sendSignatures() {
 		switch currentState {
 		case common.LiveState:
 			if len(node.tssManager.GetPubKey()) != 0 {
-				var senders sync.WaitGroup
-				senders.Add(2)
-				go func() {
-					defer senders.Done()
-					node.sendSignaturesWrap(seenEventsCount)
-				}()
-				go func() {
-					defer senders.Done()
-					node.sendUnwrapRequests(seenEventsCount)
-				}()
-				senders.Wait()
+				sendPending()
 			}
 		}
 		// todo use constant for momentum duration
@@ -1455,6 +1546,10 @@ func (node *Node) haltNetworksAdministrator() {
 }
 
 // Getters
+
+func (node *Node) SaveConfig() error {
+	return node.state.SaveConfig(func() error { return oconfig.WriteConfig(*node.config) })
+}
 
 func (node *Node) GetConfig() *oconfig.Config {
 	return node.config
@@ -1597,10 +1692,14 @@ func (node *Node) signMessages(messagesToSign [][]byte, msgsIndexes map[string]i
 	}
 	elapsed := time.Since(start)
 	node.logger.Infof("bulkSign took %f", elapsed.Seconds())
+	sortSignatures(response, msgsIndexes)
+	return response, err
+}
+
+func sortSignatures(response *keysign.Response, msgsIndexes map[string]int) {
 	sort.Slice(response.Signatures, func(i, j int) bool {
 		return msgsIndexes[response.Signatures[i].Msg] < msgsIndexes[response.Signatures[j].Msg]
 	})
-	return response, err
 }
 
 func (node *Node) validateSignatures(response *keysign.Response, pubKey string, messagesToSign [][]byte) (string, [][]byte, error) {

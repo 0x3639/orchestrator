@@ -59,8 +59,15 @@ func main() {
 
 			// Nominate Guardians (Step 1/2)
 			// We won't be able to perform any other action on the bridge if the guardians are not set
+			guardians := []types.Address{
+				types.ParseAddressPanic("z1qpp8g8v4hrd5ernfrgsn86jmv09ra6zrvhvmr7"),
+				types.ParseAddressPanic("z1qrupr2rvzllzgk26qezwuflwujmn0z3gsxjnjv"),
+				types.ParseAddressPanic("z1qrqsclgp2pfca7yg74lzke0ve93zvdqyvxfxd8"),
+				types.ParseAddressPanic("z1qrantskdqaue5q8qzll97nx75g9vn05h2668l0"),
+				types.ParseAddressPanic("z1qr8fmf2regmlgs004d32jnujw3p5hhgsdw5vwe"),
+			}
 			fmt.Println("Nominate Guardians (Step 1/2)")
-			if err := z.Send(z.Client.BridgeApi.NominateGuardians([]string{"qwTYX+dQSceeIM6WYAJjlbe5S0HHIdOnoBqlcaXB8YM=", "PGXPrhy88Mt9FoMHbJMyD/ECxT5o/T843MbnYzBV234=", "BEDqbIoqicO03NPOsvBIaVzkH4QAaE+3dsDALB03IQg=", "1PWYLNn2Xvw8t/IP/Q9msGAg72GH/7B5mLJRjJ80P3U=", "xhiXsj84MWLSYlDhppkgSdec5ptKd97yJ4iHICJ5oJU="})); err != nil {
+			if err := z.Send(z.Client.BridgeApi.NominateGuardians(guardians)); err != nil {
 				fmt.Println(err)
 			}
 			fmt.Println("Done")
@@ -70,7 +77,7 @@ func main() {
 
 			// Commit Guardians (Step 2/2)
 			fmt.Println("Commit Guardians (Step 2/2)")
-			if err := z.Send(z.Client.BridgeApi.NominateGuardians([]string{"qwTYX+dQSceeIM6WYAJjlbe5S0HHIdOnoBqlcaXB8YM=", "PGXPrhy88Mt9FoMHbJMyD/ECxT5o/T843MbnYzBV234=", "BEDqbIoqicO03NPOsvBIaVzkH4QAaE+3dsDALB03IQg=", "1PWYLNn2Xvw8t/IP/Q9msGAg72GH/7B5mLJRjJ80P3U=", "xhiXsj84MWLSYlDhppkgSdec5ptKd97yJ4iHICJ5oJU="})); err != nil {
+			if err := z.Send(z.Client.BridgeApi.NominateGuardians(guardians)); err != nil {
 				fmt.Println(err)
 			}
 			fmt.Println("Done")

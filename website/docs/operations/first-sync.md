@@ -11,7 +11,7 @@ On first start, and after a [backfill](backfill.md), the orchestrator scans ever
 ## Before you start
 
 1. Configure two or more independent, full-history endpoints per network. See [EVM networks](../networks.md).
-2. Set `RpcRequestsPerSecond` and `RpcBurst` under the provider's degraded limit. The sizing table in [EVM networks](../networks.md#rate-limits) covers a typical free tier.
+2. Set `RpcRequestsPerSecond` and `RpcBurst` under the provider's degraded limit. See the [free-tier configuration example](../networks.md#low-rate-configuration) for fractional request rates and per-query block limits.
 3. Make sure the Zenon node is synced. The orchestrator waits for it before doing anything else.
 
 ## What you will see
@@ -32,7 +32,7 @@ Ethereum mainnet from an 18M-block deployment to a 26M head, at 2,000 blocks per
 When the provider rejects or times out a query:
 
 ```
-Sync for chainId 1: eth_getLogs for blocks [18004000, 18006000] failed at block 18004000 (attempt 3/12), retrying in 8s: 429 Too Many Requests
+Sync for chainId 1: eth_getLogs for blocks [18004000, 18005999] failed at block 18004000 (attempt 3/12), retrying in 8s: 429 Too Many Requests
 ```
 
 The same range is retried with backoff from 2 seconds to 2 minutes. After 12 consecutive failures the pass stops. What happens next depends on when it failed:
@@ -44,7 +44,7 @@ The cursor **never** advances past a range that did not complete, so nothing is 
 
 ## Historical events are validated
 
-Every unwrap log found during the scan is checked against the canonical block before it is stored: all configured endpoints must agree on the block hash. A log from a block the endpoints agree was reorged out is skipped with a warning. If the endpoints disagree or one is unreachable, the range is retried; that is the message to look for if a sync seems stuck:
+For each mature unwrap, the signer checks the canonical block hash and confirmation depth across the configured endpoints. Each endpoint must also return the same bridge event from its receipt or a single-height log query. The signer skips an agreed orphan block. Missing or conflicting evidence causes the range to retry. A disagreement can appear in the log as follows.
 
 ```
 cannot validate historical unwrap 0x…/3 against the canonical chain: canonical block 18004123 inconclusive, 1 of 2 endpoints did not answer
@@ -54,4 +54,4 @@ cannot validate historical unwrap 0x…/3 against the canonical chain: canonical
 
 The orchestrator subscribes to new logs and refreshes the subscription every 3 minutes with a short catch-up sync. `latestUpdateHeight` in [`getStatus`](../health-api.md) should then follow the head.
 
-Live events wait in `queues/` until they have `confirmationsToFinality` confirmations. A live event is confirmed by its transaction receipt from the connected endpoint: a successful receipt in the block the event was observed in is enough. The other endpoints are consulted only when the receipt is missing, reverted, or in a different block, and an event is discarded only when every endpoint agrees its block was reorged out, across three checks 30 seconds apart. Confirmed events then enter the signing pool.
+Live unwraps wait in `queues/` until the same confirmation and transfer checks pass. The signer discards a queued event only after all endpoints report the same replacement block across three checks 30 seconds apart. Before a signing ceremony, the signer rechecks the selected unsigned records against the source event, including the recipient, token, amount and any affiliate split. This covers records created by an earlier binary or restored from a checkpoint. A batch with unresolved source evidence waits for a later ceremony.

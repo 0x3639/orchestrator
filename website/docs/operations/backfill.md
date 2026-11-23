@@ -20,7 +20,7 @@ The flag is never persisted. It applies once per process start, so leaving it in
 
 ## Runbook
 
-1. **Stop the signer** and back up `~/.orchestrator/events` and `~/.orchestrator/queues`.
+1. **Stop the signer** and save its current event stores and queues together. Name this [local checkpoint](sync-checkpoints.md) as a pre-repair copy so it can be distinguished from a verified healthy point.
 2. **Verify the endpoints.** Two or more independent, full-history providers per network, all healthy and agreeing. Backfill refuses to delete on any disagreement and fails the range on any unreachable endpoint, so a flaky provider makes it stall rather than repair. See [EVM networks](../networks.md).
 3. **Choose `N`** so that `cursor − N` precedes the earliest event the signer may have missed, plus a margin of one confirmation window. The reliable way is by block number, not by time: on the network's block explorer, find the block that was current when the signer last agreed with its peers, and set `N` to the difference between `latestUpdateHeight` in [`getStatus`](../health-api.md) and that block, plus `confirmationsToFinality`. If you must convert from time, use the chain's real block interval: Ethereum's 12-second blocks make a day about 7,200 blocks and a week `50000`; BSC has cut its interval repeatedly (450 ms at the time of writing, roughly 190,000 blocks a day) and may again, so check the current interval before converting. Do not use `estimatedBlockTime` from the health API for this; it is the bridge's whole-second parameter, not a measured interval, and cannot express sub-second chains.
 4. **Start once with the flag**:
@@ -42,4 +42,4 @@ The flag is never persisted. It applies once per process start, so leaving it in
 
 - The provider cannot serve history back to the range you need. Switch providers rather than wiping; a wipe needs the same history.
 - The divergence is in `LocalPubKeys`, not in events. See [Signing stalls](signing-stalls.md).
-- The store or queue is corrupt. Use the [emergency reset](emergency-reset.md).
+- The store or queue is corrupt. Restore a [healthy checkpoint](sync-checkpoints.md) from before the problem. Without one, follow the [full rebuild procedure](emergency-reset.md).

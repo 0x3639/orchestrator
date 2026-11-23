@@ -1,11 +1,13 @@
 package rpc
 
 import (
+	"context"
 	"encoding/base64"
 	sdk_rpc_client "github.com/MoonBaZZe/znn-sdk-go/rpc_client"
 	"github.com/MoonBaZZe/znn-sdk-go/zenon"
 	ic "github.com/libp2p/go-libp2p-core/crypto"
 	"github.com/libp2p/go-libp2p-core/peer"
+	"time"
 
 	"github.com/pkg/errors"
 	"github.com/zenon-network/go-zenon/chain/nom"
@@ -24,9 +26,16 @@ import (
 	"orchestrator/common/events"
 )
 
+// ZnnSettingsTimeout bounds a settings refresh or an entire signing-window read.
+const ZnnSettingsTimeout = 10 * time.Second
+
+// ZnnLedgerTimeout bounds an individual block or page read.
+const ZnnLedgerTimeout = 10 * time.Second
+
 type ZnnRpc struct {
-	rpcClient *sdk_rpc_client.RpcClient
-	Urls      config.UrlsInfo
+	settingsClient *server.Client
+	rpcClient      *sdk_rpc_client.RpcClient
+	Urls           config.UrlsInfo
 
 	momentumsSub  *server.ClientSubscription
 	momentumsChan chan []subscribe.Momentum
@@ -41,9 +50,21 @@ func NewZnnRpcClient(networkConfig config.BaseNetworkConfig) (*ZnnRpc, error) {
 		return nil, err
 	}
 	var newZnnClient *sdk_rpc_client.RpcClient
+	var settingsClient *server.Client
 	currentUrl := newUrls.GetCurrentUrl()
 	for {
 		newZnnClient, err = sdk_rpc_client.NewRpcClient(currentUrl)
+		if err == nil {
+			// The SDK hides its transport and only exposes calls without a
+			// context. Reuse a second connection to this endpoint for reads
+			// that must be cancellable.
+			ctx, cancel := context.WithTimeout(context.Background(), ZnnSettingsTimeout)
+			settingsClient, err = server.DialContext(ctx, currentUrl)
+			cancel()
+			if err != nil {
+				newZnnClient.Stop()
+			}
+		}
 		if err != nil {
 			common.GlobalLogger.Infof("Error when dialing %s, got: %s\n", config.RedactURL(currentUrl), config.RedactErrorForURL(err, currentUrl))
 		} else {
@@ -57,19 +78,19 @@ func NewZnnRpcClient(networkConfig config.BaseNetworkConfig) (*ZnnRpc, error) {
 
 	newUrls.Clear()
 	return &ZnnRpc{
-		rpcClient: newZnnClient,
-		Urls:      *newUrls,
+		rpcClient:      newZnnClient,
+		settingsClient: settingsClient,
+		Urls:           *newUrls,
 	}, nil
 }
 
 /// Utils
 
 func (r *ZnnRpc) Stop() error {
-	close(r.momentumsChan)
-	close(r.accountBlocksChan)
 	if r.rpcClient == nil {
 		return errors.New("znn rpc client is nil")
 	}
+	r.settingsClient.Close()
 	r.rpcClient.Stop()
 	return nil
 }
@@ -143,19 +164,57 @@ func (r *ZnnRpc) GetBridgeInfo() (*definition.BridgeInfoVariable, error) {
 	return r.rpcClient.BridgeApi.GetBridgeInfo()
 }
 
+func (r *ZnnRpc) GetBridgeInfoContext(ctx context.Context) (*definition.BridgeInfoVariable, error) {
+	var info *definition.BridgeInfoVariable
+	if err := r.settingsClient.CallContext(ctx, &info, "embedded.bridge.getBridgeInfo"); err != nil {
+		return nil, err
+	}
+	if info == nil {
+		return nil, errors.New("missing Zenon bridge info")
+	}
+	return info, nil
+}
+
 func (r *ZnnRpc) GetSyncInfo() (*protocol.SyncInfo, error) {
 	return r.rpcClient.StatsApi.SyncInfo()
 }
 
-func (r *ZnnRpc) GetOrchestratorInfo() (*definition.OrchestratorInfo, error) {
-	orchestratorInfo, err := r.rpcClient.BridgeApi.GetOrchestratorInfo()
+func (r *ZnnRpc) GetSyncInfoContext(ctx context.Context) (*protocol.SyncInfo, error) {
+	var info *protocol.SyncInfo
+	if err := r.settingsClient.CallContext(ctx, &info, "stats.syncInfo"); err != nil {
+		return nil, err
+	}
+	return info, nil
+}
+
+// SampleSyncInfo uses a context-bound connection because the SDK's StatsApi
+// does not expose a deadline. A slow monitoring probe cannot hold up signing.
+func (r *ZnnRpc) SampleSyncInfo(ctx context.Context) (*protocol.SyncInfo, error) {
+	client, err := server.DialContext(ctx, r.Urls.GetCurrentUrl())
 	if err != nil {
+		return nil, err
+	}
+	defer client.Close()
+	var info *protocol.SyncInfo
+	err = client.CallContext(ctx, &info, "stats.syncInfo")
+	return info, err
+}
+
+func (r *ZnnRpc) GetOrchestratorInfo() (*definition.OrchestratorInfo, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), ZnnSettingsTimeout)
+	defer cancel()
+	return r.GetOrchestratorInfoContext(ctx)
+}
+
+func (r *ZnnRpc) GetOrchestratorInfoContext(ctx context.Context) (*definition.OrchestratorInfo, error) {
+	var orchestratorInfo definition.OrchestratorInfo
+	if err := r.settingsClient.CallContext(ctx, &orchestratorInfo, "embedded.bridge.getOrchestratorInfo"); err != nil {
 		return nil, err
 	}
 	if orchestratorInfo.WindowSize == 0 || orchestratorInfo.KeyGenThreshold == 0 || orchestratorInfo.ConfirmationsToFinality == 0 || orchestratorInfo.EstimatedMomentumTime == 0 {
 		return nil, constants.ErrOrchestratorNotInitialized
 	}
-	return orchestratorInfo, nil
+	return &orchestratorInfo, nil
 }
 
 func (r *ZnnRpc) GetSecurityInfo() (*definition.SecurityInfoVariable, error) {
@@ -179,11 +238,42 @@ func (r *ZnnRpc) GetAllWrapTokenRequests(pageIndex, pageSize uint32) (*embedded.
 }
 
 func (r *ZnnRpc) GetAccountBlockByHash(hash types.Hash) (*api.AccountBlock, error) {
-	return r.rpcClient.LedgerApi.GetAccountBlockByHash(hash)
+	ctx, cancel := context.WithTimeout(context.Background(), ZnnLedgerTimeout)
+	defer cancel()
+	return r.GetAccountBlockByHashContext(ctx, hash)
+}
+
+func (r *ZnnRpc) GetAccountBlockByHashContext(ctx context.Context, hash types.Hash) (*api.AccountBlock, error) {
+	var block *api.AccountBlock
+	if err := r.settingsClient.CallContext(ctx, &block, "ledger.getAccountBlockByHash", hash); err != nil {
+		return nil, err
+	}
+	return block, nil
 }
 
 func (r *ZnnRpc) GetAccountBlocksByHeight(address types.Address, height, count uint64) (*api.AccountBlockList, error) {
-	return r.rpcClient.LedgerApi.GetAccountBlocksByHeight(address, height, count)
+	ctx, cancel := context.WithTimeout(context.Background(), ZnnLedgerTimeout)
+	defer cancel()
+	return r.GetAccountBlocksByHeightContext(ctx, address, height, count)
+}
+
+func (r *ZnnRpc) GetAccountBlocksByHeightContext(ctx context.Context, address types.Address, height, count uint64) (*api.AccountBlockList, error) {
+	// The SDK list decoder dereferences each entry. Decode the RPC fields
+	// directly so a null page or entry can be reported at its own height.
+	var page *api.AccountBlockListMarshal
+	if err := r.settingsClient.CallContext(ctx, &page, "ledger.getAccountBlocksByHeight", address, height, count); err != nil {
+		return nil, err
+	}
+	if page == nil || page.List == nil {
+		return nil, errors.Errorf("missing Zenon account block page at height %d", height)
+	}
+	blocks := make([]*api.AccountBlock, len(page.List))
+	for i, entry := range page.List {
+		if entry != nil {
+			blocks[i] = entry.FromApiMarshalJson()
+		}
+	}
+	return &api.AccountBlockList{List: blocks, Count: page.Count, More: page.More}, nil
 }
 
 func (r *ZnnRpc) GetMomentumsByHeight(height, count uint64) (*api.MomentumList, error) {
@@ -192,6 +282,14 @@ func (r *ZnnRpc) GetMomentumsByHeight(height, count uint64) (*api.MomentumList, 
 
 func (r *ZnnRpc) GetFrontierMomentum() (*api.Momentum, error) {
 	return r.rpcClient.LedgerApi.GetFrontierMomentum()
+}
+
+func (r *ZnnRpc) GetFrontierMomentumContext(ctx context.Context) (*api.Momentum, error) {
+	var tip *api.Momentum
+	if err := r.settingsClient.CallContext(ctx, &tip, "ledger.getFrontierMomentum"); err != nil {
+		return nil, err
+	}
+	return tip, nil
 }
 
 func (r *ZnnRpc) GetAllPillars() (*embedded.PillarInfoList, error) {

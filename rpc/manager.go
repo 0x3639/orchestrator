@@ -5,11 +5,12 @@ import (
 	"orchestrator/common"
 	"orchestrator/common/config"
 	"os"
-	"syscall"
+	"sync"
 )
 
 type Manager struct {
 	znnClient  *ZnnRpc
+	evmMu      sync.RWMutex
 	evmClients map[uint32]*EvmRpc
 	stopChan   chan os.Signal
 }
@@ -31,18 +32,31 @@ func (m *Manager) AddEvmClient(networkConfig config.BaseNetworkConfig, chainId u
 	if newClient, err := NewEvmRpcClient(networkConfig, networkName, address); err != nil {
 		return err
 	} else {
-		m.evmClients[chainId] = newClient
+		m.RegisterEvmClient(chainId, newClient)
 	}
 	return nil
 }
 
+func (m *Manager) RegisterEvmClient(chainId uint32, client *EvmRpc) {
+	m.evmMu.Lock()
+	defer m.evmMu.Unlock()
+	m.evmClients[chainId] = client
+}
+
 func (m *Manager) RemoveEvmClient(chainId uint32) {
-	m.Evm(chainId).Stop()
-	m.Evm(chainId).DeleteDirectories()
+	m.evmMu.Lock()
+	client := m.evmClients[chainId]
 	delete(m.evmClients, chainId)
+	m.evmMu.Unlock()
+	if client != nil {
+		client.Stop()
+		client.DeleteDirectories()
+	}
 }
 
 func (m *Manager) HasEvmNetwork(chainId uint32) bool {
+	m.evmMu.RLock()
+	defer m.evmMu.RUnlock()
 	_, ok := m.evmClients[chainId]
 	if !ok {
 		return false
@@ -55,10 +69,12 @@ func (m *Manager) Znn() *ZnnRpc {
 }
 
 func (m *Manager) Evm(chainId uint32) *EvmRpc {
+	m.evmMu.RLock()
 	client, ok := m.evmClients[chainId]
+	m.evmMu.RUnlock()
 	if !ok || client == nil {
 		common.GlobalLogger.Debugf("evm rpc client non existent for chainId %d", chainId)
-		m.stopChan <- syscall.SIGINT
+		common.RequestStop(m.stopChan)
 	}
 	return client
 }

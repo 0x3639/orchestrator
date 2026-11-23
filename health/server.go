@@ -13,6 +13,7 @@ import (
 	"orchestrator/common"
 	"orchestrator/common/config"
 	"orchestrator/db/manager"
+	"orchestrator/health/snapshot"
 	"orchestrator/metadata"
 	"orchestrator/network"
 	"orchestrator/tss"
@@ -39,6 +40,7 @@ const (
 
 // HealthRPCHandler struct
 type Handler struct {
+	snapshot        *snapshot.Store
 	state           *common.GlobalState
 	networksManager *network.NetworksManager
 	dbManager       *manager.Manager
@@ -133,7 +135,7 @@ func (s *Handler) GetStatus(params []interface{}) (interface{}, error) {
 
 	wraps, errWraps := s.networksManager.GetUnsignedWrapRequests()
 	if errWraps != nil {
-		return nil, err
+		return nil, errWraps
 	} else if len(wraps) != 0 {
 		sort.Slice(wraps, func(i, j int) bool {
 			return wraps[i].Id.String() < wraps[j].Id.String()
@@ -210,13 +212,14 @@ func (s *Handler) GetStatus(params []interface{}) (interface{}, error) {
 
 	peersLen := uint32(0)
 	peers := make([]string, 0)
-	addressBook := s.tssManager.ExportPeersStore()
-	for k, _ := range addressBook {
-		if s.identity.TssPeerId == k.String() {
-			continue
+	if s.tssManager != nil {
+		for k := range s.tssManager.ExportPeersStore() {
+			if s.identity.TssPeerId == k.String() {
+				continue
+			}
+			peersLen += 1
+			peers = append(peers, k.String())
 		}
-		peersLen += 1
-		peers = append(peers, k.String())
 	}
 
 	status := Status{
@@ -292,15 +295,8 @@ func (s *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var method func([]interface{}) (interface{}, error)
-	switch req.Method {
-	case "getStatus":
-		method = s.GetStatus
-	case "getBuildInfo":
-		method = s.GetBuildInfo
-	case "getIdentity":
-		method = s.GetIdentity
-	default:
+	method := s.method(req.Method)
+	if method == nil {
 		writeError(w, http.StatusNotFound, fmt.Sprintf("Method %s not found", req.Method))
 		return
 	}
@@ -331,10 +327,31 @@ func (s *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(res)
 }
 
+// The socket and TCP listener have disjoint method sets.
+func (s *Handler) method(name string) func([]interface{}) (interface{}, error) {
+	if s.snapshot != nil {
+		if name == "getHealthSnapshot" {
+			return func([]interface{}) (interface{}, error) { return s.snapshot.Read(), nil }
+		}
+		return nil
+	}
+	switch name {
+	case "getStatus":
+		return s.GetStatus
+	case "getBuildInfo":
+		return s.GetBuildInfo
+	case "getIdentity":
+		return s.GetIdentity
+	default:
+		return nil
+	}
+}
+
 // allow charges the per-client bucket first so a throttled source does not
 // drain the shared budget, then the aggregate cap.
 func (s *Handler) allow(r *http.Request) bool {
-	if s.clientLimiters != nil && !s.clientLimiters.allow(clientKey(r)) {
+	// Socket clients have no distinct remote IP. They share only the aggregate limit.
+	if s.snapshot == nil && s.clientLimiters != nil && !s.clientLimiters.allow(clientKey(r)) {
 		return false
 	}
 	return s.limiter.Allow()

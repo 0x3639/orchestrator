@@ -1,6 +1,7 @@
 package network
 
 import (
+	"context"
 	"crypto/ecdsa"
 	"fmt"
 	ecommon "github.com/ethereum/go-ethereum/common"
@@ -14,8 +15,10 @@ import (
 	"orchestrator/common/config"
 	"orchestrator/common/storage"
 	"orchestrator/db"
+	"orchestrator/health/snapshot"
 	"orchestrator/rpc"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -27,6 +30,12 @@ import (
 )
 
 type evmNetwork struct {
+	// A runtime addition uses its own client until startup succeeds.
+	client        *rpc.EvmRpc
+	startupDone   <-chan struct{}
+	rollbackStore func()
+	stopHealth    func()
+	health        *snapshot.Store
 	config.EvmParams
 	unconfirmedQueue *dque.DQue
 	dbManager        networkEventStores
@@ -98,15 +107,21 @@ func NewEvmNetwork(network *definition.NetworkInfo, dbManager networkEventStores
 		return nil, err
 	}
 
-	dbManager.AddEvmEventStore(network.Id, network.Name, newConfig.ContractDeploymentHeight())
-
 	newLogger, errLog := common.CreateSugarLogger()
 	if errLog != nil {
+		_ = newQueue.Close()
 		return nil, errLog
+	}
+	rollback, err := dbManager.AddEvmEventStore(network.Id, network.Name, newConfig.ContractDeploymentHeight())
+	if err != nil {
+		_ = newQueue.Close()
+		return nil, err
 	}
 
 	newEvmNetwork := &evmNetwork{
+		rollbackStore:    rollback,
 		EvmParams:        newConfig,
+		health:           state.HealthStore(),
 		dbManager:        dbManager,
 		rpcManager:       rpcManager,
 		unconfirmedQueue: newQueue,
@@ -133,6 +148,8 @@ func (eN *evmNetwork) sleep(d time.Duration) bool {
 	select {
 	case <-timer.C:
 		return true
+	case <-eN.startupDone:
+		return false
 	case <-eN.done:
 		return false
 	}
@@ -152,12 +169,29 @@ func (eN *evmNetwork) requestStop() {
 	}
 }
 
-func (eN *evmNetwork) Start() error {
-	synced := eN.rpcManager.Evm(eN.ChainId()).IsSynced()
-	for synced == false {
-		eN.logger.Infof("evm node for network %d is not synced, will wait for it to sync\n", eN.ChainId())
-		time.Sleep(10 * time.Second)
-		synced = eN.rpcManager.Evm(eN.ChainId()).IsSynced()
+func (eN *evmNetwork) recordSync(synced bool, err error) bool {
+	eN.health.UpdateNetwork(eN.ChainId(), func(n *snapshot.Network) { n.NodeSync = snapshot.SyncResult(synced, err == nil) })
+	return synced
+}
+
+func (eN *evmNetwork) Start() (startErr error) {
+	client := eN.EvmRpc()
+	for !eN.recordSync(client.SyncState()) {
+		eN.logger.Infof("evm node for network %d is not synced, will wait for it to sync", eN.ChainId())
+		if !eN.sleep(10 * time.Second) {
+			return context.Canceled
+		}
+	}
+	if eN.health != nil {
+		eN.stopHealth = eN.health.Poll(func(ctx context.Context) {
+			eN.observeQueueDepth()
+			eN.recordSync(client.SampleSyncState(ctx))
+		})
+		defer func() {
+			if startErr != nil {
+				eN.stopHealth()
+			}
+		}()
 	}
 	if err := eN.FillEvmParamsRpc(); err != nil {
 		eN.logger.Debug(err)
@@ -197,6 +231,12 @@ func (eN *evmNetwork) Start() error {
 		return err
 	}
 
+	select {
+	case <-eN.startupDone:
+		return context.Canceled
+	default:
+	}
+	eN.observeQueueDepth()
 	go eN.SubscribeToEvents()
 	// todo defer unsub?
 
@@ -209,6 +249,9 @@ func (eN *evmNetwork) eventsStore() db.EvmStorage {
 }
 
 func (eN *evmNetwork) EvmRpc() *rpc.EvmRpc {
+	if eN.client != nil {
+		return eN.client
+	}
 	return eN.rpcManager.Evm(eN.ChainId())
 }
 
@@ -278,13 +321,13 @@ const (
 func (eN *evmNetwork) Sync() error {
 	eN.logger.Info("In sync evm")
 	eN.resetCanonicalCache()
-	updateHeight, err := eN.eventsStore().GetLastUpdateHeight()
+	startHeight, err := eN.eventsStore().GetLastUpdateHeight()
 	if err != nil {
 		return err
 	}
-	eN.logger.Info("updateHeight: ", updateHeight)
+	eN.logger.Info("updateHeight: ", startHeight)
 
-	startHeight := updateHeight
+	fromBlock := startHeight
 	startedAt := time.Now()
 	ranges := 0
 	attempts := 0
@@ -294,17 +337,16 @@ func (eN *evmNetwork) Sync() error {
 	// than growing toward a newer head.
 	var rangeEnd uint64
 	rangeFrozen := false
-	rangeIsTip := false
 
 	// retryRange pauses before the same range is attempted again. It
 	// returns an error once the attempt budget is spent or the node stops.
 	retryRange := func(what string, cause error) error {
 		attempts++
 		if attempts >= syncMaxRangeAttempts {
-			return fmt.Errorf("sync for chainId %d: %s failed %d times at block %d, giving up until the next refresh: %w", eN.ChainId(), what, attempts, updateHeight, cause)
+			return fmt.Errorf("sync for chainId %d: %s failed %d times at block %d, giving up until the next refresh: %w", eN.ChainId(), what, attempts, fromBlock, cause)
 		}
 		eN.logger.Warnf("Sync for chainId %d: %s failed at block %d (attempt %d/%d), retrying in %s: %v",
-			eN.ChainId(), what, updateHeight, attempts, syncMaxRangeAttempts, backoff, cause)
+			eN.ChainId(), what, fromBlock, attempts, syncMaxRangeAttempts, backoff, cause)
 		if !eN.sleep(backoff) {
 			return errors.New("sync interrupted by shutdown")
 		}
@@ -317,6 +359,7 @@ func (eN *evmNetwork) Sync() error {
 
 	for {
 		latestBlock, rpcErr := eN.EvmRpc().BlockNumber()
+		eN.health.UpdateNetwork(eN.ChainId(), func(n *snapshot.Network) { n.HeadHeight = snapshot.Reading(latestBlock, rpcErr) })
 		if rpcErr != nil {
 			if err := retryRange("reading chain head", rpcErr); err != nil {
 				return err
@@ -324,30 +367,18 @@ func (eN *evmNetwork) Sync() error {
 			continue
 		}
 
-		if updateHeight > latestBlock {
+		if fromBlock > latestBlock {
 			// todo this can happen if we have a fork
 			return errors.Errorf("sync evm problem for network: %s, chainId: %d", eN.NetworkName(), eN.ChainId())
 		}
 
 		if eN.queryRange == nil {
-			eN.queryRange = newQueryRangeAdapter(eN.rpcManager.Evm(eN.ChainId()).FilterQuerySize())
+			eN.queryRange = newQueryRangeAdapter(eN.EvmRpc().FilterQuerySize())
 		}
 		if !rangeFrozen {
-			distance := latestBlock - updateHeight
-			filterQuerySize := eN.queryRange.size()
-			rangeIsTip = false
-			if distance < eN.ConfirmationsToFinality() || distance == 0 {
-				// The range reaches the head. A zero distance still queries
-				// the cursor block once: on first start the cursor is the
-				// deployment height, which has not been scanned yet, and the
-				// query is idempotent otherwise. rangeIsTip ends the pass so
-				// it cannot spin on the same block.
-				filterQuerySize = distance
-				rangeIsTip = true
-			} else if distance < filterQuerySize {
-				filterQuerySize = distance
-			}
-			rangeEnd = updateHeight + filterQuerySize
+			// Both RPC bounds are inclusive. Limit the offset before adding so a
+			// scan near MaxUint64 cannot wrap past the head.
+			rangeEnd = fromBlock + min(latestBlock-fromBlock, eN.queryRange.size()-1)
 			rangeFrozen = true
 		}
 		if latestBlock < rangeEnd {
@@ -360,24 +391,20 @@ func (eN *evmNetwork) Sync() error {
 			}
 			continue
 		}
-		filterQuerySize := rangeEnd - updateHeight
-		// Only stop when the covered range still reaches the current head;
-		// if the head moved on during retries there is more to fetch.
-		end := rangeIsTip && latestBlock == rangeEnd
+		blockCount := rangeEnd - fromBlock + 1
 
-		logs, err := eN.EvmRpc().FilterLogs(updateHeight, rangeEnd)
+		logs, err := eN.EvmRpc().FilterLogs(fromBlock, rangeEnd)
 		if err != nil {
-			if isRangeLimitError(err) && filterQuerySize > 1 {
+			if isRangeLimitError(err) {
 				// The provider rejected the window's width or result size.
 				// Narrow the window, to the width the message suggests when
 				// it gives one, and retry at once; this is not a transient
 				// failure, so it does not spend the retry budget. The reduced
 				// width is kept for the following ranges.
 				hint, _ := suggestedRange(err)
-				newSize, _ := eN.queryRange.shrink(hint)
-				if newSize < filterQuerySize {
+				if newSize, changed := eN.queryRange.shrink(blockCount, hint); changed {
 					eN.logger.Warnf("Sync for chainId %d: provider rejected an eth_getLogs window of %d blocks (%v); narrowing to %d blocks",
-						eN.ChainId(), filterQuerySize, err, newSize)
+						eN.ChainId(), blockCount, err, newSize)
 					rangeFrozen = false
 					if !eN.sleep(time.Second) {
 						return errors.New("sync interrupted by shutdown")
@@ -385,20 +412,28 @@ func (eN *evmNetwork) Sync() error {
 					continue
 				}
 			}
-			if err := retryRange(fmt.Sprintf("eth_getLogs for blocks [%d, %d]", updateHeight, rangeEnd), err); err != nil {
+			if err := retryRange(fmt.Sprintf("eth_getLogs for blocks [%d, %d]", fromBlock, rangeEnd), err); err != nil {
+				return err
+			}
+			continue
+		}
+		// Check the entire reply before applying any event. In particular a
+		// future block must never underflow the unsigned finality calculation.
+		if err := validateLogHeights(logs, fromBlock, rangeEnd); err != nil {
+			if err := retryRange("validating returned log heights", err); err != nil {
 				return err
 			}
 			continue
 		}
 		interpretFailed := false
 		for _, log := range logs {
-			// if we have confirmations then we are live, otherwise we are not
+			// Recent events enter the live confirmation queue.
 			if err := eN.InterpretLog(log, latestBlock-log.BlockNumber < eN.ConfirmationsToFinality()); err != nil {
 				// Do not advance the cursor past a range with an unprocessed
 				// log; the same range is retried. Skipping it would silently
 				// lose the event on this signer only.
 				eN.logger.Errorf("Sync: failed to interpret log tx %s logIndex %d in block %d, range [%d, %d] will be retried: %v",
-					log.TxHash.String(), log.Index, log.BlockNumber, updateHeight, updateHeight+filterQuerySize, err)
+					log.TxHash.String(), log.Index, log.BlockNumber, fromBlock, rangeEnd, err)
 				if err := retryRange("interpreting logs", err); err != nil {
 					return err
 				}
@@ -418,28 +453,47 @@ func (eN *evmNetwork) Sync() error {
 			eN.logger.Infof("Sync for chainId %d: %d consecutive ranges succeeded, widening the eth_getLogs window to %d blocks", eN.ChainId(), growAfterRanges, newSize)
 		}
 
-		updateHeight += filterQuerySize
-		if err := eN.eventsStore().SetLastUpdateHeight(updateHeight); err != nil {
+		if err := eN.eventsStore().SetLastUpdateHeight(rangeEnd); err != nil {
 			return err
 		}
+		eN.health.UpdateNetwork(eN.ChainId(), func(n *snapshot.Network) {
+			n.ScannedThrough = snapshot.Measure(rangeEnd)
+			n.LastRangeAt = n.ScannedThrough.AsOf
+		})
 		ranges++
 		if ranges%syncProgressEvery == 0 {
-			done := updateHeight - startHeight
+			done := rangeEnd - startHeight
 			total := latestBlock - startHeight
 			pct := float64(0)
 			if total > 0 {
 				pct = 100 * float64(done) / float64(total)
 			}
 			eN.logger.Infof("Sync progress for chainId %d: block %d of %d (%.1f%%), %d ranges in %s",
-				eN.ChainId(), updateHeight, latestBlock, pct, ranges, time.Since(startedAt).Round(time.Second))
+				eN.ChainId(), rangeEnd, latestBlock, pct, ranges, time.Since(startedAt).Round(time.Second))
 		}
-		if end {
+		if rangeEnd == latestBlock {
 			break
+		}
+		// Keep the existing boundary overlap for multi-block queries. A
+		// one-block query covered its entire interval, so move past it.
+		if fromBlock == rangeEnd {
+			fromBlock++
+		} else {
+			fromBlock = rangeEnd
 		}
 	}
 	if ranges >= syncProgressEvery {
 		eN.logger.Infof("Sync complete for chainId %d: blocks %d to %d in %d ranges, %s",
-			eN.ChainId(), startHeight, updateHeight, ranges, time.Since(startedAt).Round(time.Second))
+			eN.ChainId(), startHeight, rangeEnd, ranges, time.Since(startedAt).Round(time.Second))
+	}
+	return nil
+}
+
+func validateLogHeights(logs []etypes.Log, from, to uint64) error {
+	for _, log := range logs {
+		if log.BlockNumber < from || log.BlockNumber > to {
+			return fmt.Errorf("provider returned log at block %d outside requested interval [%d,%d]", log.BlockNumber, from, to)
+		}
 	}
 	return nil
 }
@@ -453,89 +507,37 @@ func (eN *evmNetwork) InterpretLog(log etypes.Log, live bool) error {
 		eN.logger.Infof("InterpretLog - ignoring removed log tx: %s logIndex: %d block: %d", log.TxHash.String(), log.Index, log.BlockNumber)
 		return nil
 	}
+	if log.Address != *eN.ContractAddress() || len(log.Topics) == 0 {
+		return fmt.Errorf("unexpected EVM log emitter or missing event topic in block %d", log.BlockNumber)
+	}
 	eN.logger.Infof("InterpretLog - tx: %s and log topic: %s - live: %v", log.TxHash.String(), log.Topics[0].Hex(), live)
 
 	switch log.Topics[0].Hex() {
 	case common.UnwrapSigHash.Hex():
-		unwrapped, errParse := eN.EvmRpc().Bridge().ParseUnwrapped(log)
-		if errParse != nil {
-			return errParse
+		if uint64(log.Index) >= uint64(common.AffiliateLogIndexAddition) {
+			return fmt.Errorf("source log index %d overlaps the reserved affiliate range", log.Index)
 		}
-		eN.logger.Debug("Found unwrap event evm")
-
-		if len(unwrapped.To) == 0 {
-			eN.logger.Debugf("Could not parse zenon address: %s", unwrapped.To)
-			break
-		}
-		addresses := strings.Split(unwrapped.To, common.AffiliateProgramAddressSeparator)
-		// only process events that have valid addresses
-		if beneficiaryZnn, errParseBeneficiary := common.ParseAddressString(addresses[0], definition.NoMClass); errParseBeneficiary != nil {
-			eN.logger.Debugf("Could not parse zenon address: %s", addresses[0])
-			break
-		} else if types.IsEmbeddedAddress(beneficiaryZnn.(types.Address)) {
-			eN.logger.Debugf("Beneficiary cannot be an embedded: %s for hash: %s, logIndex: %d",
-				addresses[0], log.TxHash.String(), log.Index)
-			break
-		}
-
-		var eventsToProcess []*events.UnwrapRequestEvm
-
-		event := &events.UnwrapRequestEvm{
-			NetworkClass:    eN.NetworkClass(),
-			ChainId:         eN.ChainId(),
-			BlockNumber:     log.BlockNumber,
-			BlockHash:       log.BlockHash,
-			TransactionHash: log.TxHash,
-			LogIndex:        uint32(log.Index),
-			From:            unwrapped.From,
-			To:              addresses[0], // this element will always exist even if unwrapped.To is the empty string and we know that it is a valid address
-			Token:           unwrapped.Token,
-			Amount:          big.NewInt(0).Set(unwrapped.Amount),
-			Signature:       "",
-			RedeemStatus:    common.UnredeemedStatus,
-		}
-		eventsToProcess = append(eventsToProcess, event)
-
-		token := strings.ToLower(unwrapped.Token.String())
-		affiliateStartingHeight := eN.state.GetAffiliateStartingHeight(eN.ChainId()).Uint64()
-		isAffiliateProgramActive := eN.state.GetIsAffiliateProgramActive(eN.ChainId(), token)
-		isAffiliateProgramActive = isAffiliateProgramActive && (log.BlockNumber >= affiliateStartingHeight)
-		isAffiliateProgramActive = isAffiliateProgramActive && (affiliateStartingHeight > 0)
-
-		// Add affiliate event if: affiliate is active for that token, affiliate program has started, the affiliate address exists and is correct
-		if isAffiliateProgramActive && len(addresses) > 1 {
-			if affiliateAddress, errParseAffiliate := common.ParseAddressString(addresses[1], definition.NoMClass); errParseAffiliate != nil {
-				eN.logger.Debugf("Could not parse zenon address '%s' for affiliate with error: %s", addresses[1], errParseAffiliate.Error())
-			} else if types.IsEmbeddedAddress(affiliateAddress.(types.Address)) {
-				eN.logger.Debugf("Affiliate address cannot be an embedded: %s for hash: %s, logIndex: %d",
-					addresses[1], log.TxHash.String(), log.Index)
-			} else {
-				initiatorAmount := big.NewInt(0).Set(unwrapped.Amount)
-				initiatorAmount.Div(initiatorAmount, big.NewInt(100))                     // 1%
-				eventsToProcess[0].Amount.Add(eventsToProcess[0].Amount, initiatorAmount) // 101%
-
-				affiliateAmount := big.NewInt(0).Set(unwrapped.Amount)
-				affiliateAmount.Mul(affiliateAmount, big.NewInt(2))
-				affiliateAmount.Div(affiliateAmount, big.NewInt(100)) // 2%
-
-				affiliateEvent := &events.UnwrapRequestEvm{
-					NetworkClass:    eN.NetworkClass(),
-					ChainId:         eN.ChainId(),
-					BlockNumber:     log.BlockNumber,
-					BlockHash:       log.BlockHash,
-					TransactionHash: log.TxHash,
-					LogIndex:        uint32(log.Index) + common.AffiliateLogIndexAddition,
-					From:            unwrapped.From,
-					To:              addresses[1], // we checked this exists
-					Token:           unwrapped.Token,
-					Amount:          affiliateAmount,
-					Signature:       "",
-					RedeemStatus:    common.UnredeemedStatus,
-				}
-				eventsToProcess = append(eventsToProcess, affiliateEvent)
+		if !live {
+			canonical, err := eN.agreedHashForLog(log.BlockNumber, log.BlockHash)
+			if err != nil {
+				return fmt.Errorf("cannot validate historical unwrap %s/%d against the canonical chain: %w", log.TxHash, log.Index, err)
+			}
+			if canonical != log.BlockHash {
+				eN.logger.Warnf("Skipping historical unwrap %s/%d from block %d (%s): every endpoint agrees the canonical block is %s", log.TxHash, log.Index, log.BlockNumber, log.BlockHash, canonical)
+				break
+			}
+			source, err := eN.EvmRpc().AgreedUnwrapLog(log.BlockNumber, log.BlockHash, log.TxHash, uint32(log.Index), eN.ConfirmationsToFinality())
+			if err != nil {
+				return err
+			}
+			if !slices.Equal(source.Topics, log.Topics) || !slices.Equal(source.Data, log.Data) {
+				return errors.New("historical range log differs from the agreed unwrap evidence")
 			}
 		}
-
+		eventsToProcess, err := eN.unwrapRequestsFromLog(log, nil)
+		if err != nil {
+			return err
+		}
 		for _, ev := range eventsToProcess {
 			// we enqueue the event only if we are live or we don't have confirmations
 			if live {
@@ -549,26 +551,9 @@ func (eN *evmNetwork) InterpretLog(log etypes.Log, live bool) error {
 				}
 				eN.logger.Info("Successfully enqueued event")
 			} else {
-				// Historical logs bypass the unconfirmed queue, so a backend on
-				// a minority fork must not be able to plant a fork-only record.
-				// The range log itself is the presence evidence: it is stored
-				// when every endpoint agrees its block is canonical, skipped
-				// when every endpoint agrees on a different block (an orphan
-				// log), and the range is retried when endpoints disagree or
-				// fail. This never pins on a provider that cannot serve
-				// block-hash log queries.
-				canonical, err := eN.agreedHashForLog(ev.BlockNumber, ev.BlockHash)
-				if err != nil {
-					return fmt.Errorf("cannot validate historical unwrap %s/%d against the canonical chain: %w", ev.TransactionHash.String(), ev.LogIndex, err)
-				}
-				if canonical != ev.BlockHash {
-					eN.logger.Warnf("Skipping historical unwrap %s/%d from block %d (%s): every endpoint agrees the canonical block is %s",
-						ev.TransactionHash.String(), ev.LogIndex, ev.BlockNumber, ev.BlockHash.Hex(), canonical.Hex())
-					continue
-				}
 				// Present already when the znn sync or a previous pass stored it;
 				// UpdateUnwrapRequestBlockNumber inserts when missing and otherwise
-				// only refreshes the block fields, never the signature or status.
+				// refreshes the block fields and missing sender, preserving signature and status.
 				if err := eN.eventsStore().UpdateUnwrapRequestBlockNumber(*ev); err != nil {
 					return err
 				}
@@ -594,7 +579,7 @@ func (eN *evmNetwork) InterpretLog(log etypes.Log, live bool) error {
 				if live {
 					if stateErr := eN.state.SetState(common.EmergencyState); stateErr != nil {
 						eN.logger.Info("sent SIGINT from here 4")
-						eN.stopChan <- syscall.SIGINT
+						eN.requestStop()
 						return stateErr
 					}
 				}
@@ -605,7 +590,7 @@ func (eN *evmNetwork) InterpretLog(log etypes.Log, live bool) error {
 			if live {
 				if stateErr := eN.state.SetState(common.EmergencyState); stateErr != nil {
 					eN.logger.Info("sent SIGINT from here 5")
-					eN.stopChan <- syscall.SIGINT
+					eN.requestStop()
 					return stateErr
 				}
 			}
@@ -619,7 +604,7 @@ func (eN *evmNetwork) InterpretLog(log etypes.Log, live bool) error {
 				if live {
 					if stateErr := eN.state.SetState(common.EmergencyState); stateErr != nil {
 						eN.logger.Info("sent SIGINT from here 8")
-						eN.stopChan <- syscall.SIGINT
+						eN.requestStop()
 						return stateErr
 					}
 				}
@@ -689,14 +674,14 @@ func (eN *evmNetwork) InterpretLog(log etypes.Log, live bool) error {
 			currentState, err := eN.state.GetState()
 			if err != nil {
 				eN.logger.Debug(err)
-				eN.stopChan <- syscall.SIGINT
+				eN.requestStop()
 				return err
 			}
 			// if the node is in emergency, it will set the state to halted after all txs, we don't need to do it after we see one
 			if currentState != common.EmergencyState {
 				if err := eN.state.SetState(common.HaltedState); err != nil {
 					eN.logger.Debug(err)
-					eN.stopChan <- syscall.SIGINT
+					eN.requestStop()
 					return err
 				}
 			}
@@ -974,15 +959,15 @@ func (eN *evmNetwork) ProcessEvents() {
 		}
 		eN.logger.Debugf("Processing evm event %s", key)
 
-		decision := confirmQueuedEvent(eN.EvmRpc(), frontEvent, *eN.ContractAddress(), eN.EvmParams.ConfirmationsToFinality(), eN.EvmParams.EstimatedBlockTime())
+		decision := eN.confirmUnwrap(frontEvent)
 
 		switch decision.outcome {
 		case outcomeRetry:
 			discardVotes = 0
 			if decision.err != nil {
 				attempts++
-				eN.logger.Warnf("Event %s not confirmable yet (%s): %v; attempt %d, retrying in %s, queue size %d",
-					key, decision.reason, decision.err, attempts, backoff, eN.unconfirmedQueue.Size())
+				eN.logger.Warnf("Event %s not confirmable yet (%s): %v; attempt %d, retrying in %s",
+					key, decision.reason, decision.err, attempts, backoff)
 				if attempts%processEventsWarnEvery == 0 {
 					eN.logger.Errorf("Event %s has failed confirmation %d times in a row; the unconfirmed queue is blocked until the EVM node answers consistently", key, attempts)
 				}
@@ -1078,7 +1063,18 @@ func (eN *evmNetwork) dropQueuedEvent() bool {
 	return true
 }
 
+func (eN *evmNetwork) observeQueueDepth() {
+	if eN.health == nil {
+		return
+	}
+	depth := eN.unconfirmedQueue.Size()
+	eN.health.UpdateNetwork(eN.ChainId(), func(n *snapshot.Network) { n.Unwrap.AwaitingFinality = snapshot.Measure(depth) })
+}
+
 func (eN *evmNetwork) Stop() {
+	if eN.stopHealth != nil {
+		eN.stopHealth()
+	}
 	eN.stopOnce.Do(func() { close(eN.done) })
 	eN.EvmRpc().Stop()
 	_ = eN.unconfirmedQueue.Close()
@@ -1092,7 +1088,9 @@ func (eN *evmNetwork) SignTx(tx *etypes.Transaction, ecdsaPrivateKey *ecdsa.Priv
 // Local storage
 
 func (eN *evmNetwork) GetUnsignedUnwrapRequests() ([]*events.UnwrapRequestEvm, error) {
-	return eN.eventsStore().GetUnsignedUnwrapRequests()
+	requests, err := eN.eventsStore().GetUnsignedUnwrapRequests()
+	observeUnwraps(eN.health, eN.ChainId(), requests, err)
+	return requests, err
 }
 
 func (eN *evmNetwork) AddUnwrapRequest(event events.UnwrapRequestEvm) error {
@@ -1120,7 +1118,9 @@ func (eN *evmNetwork) GetUnwrapRequestsByStatus(status uint32) ([]*events.Unwrap
 }
 
 func (eN *evmNetwork) GetUnsentSignedUnwrapRequests() ([]*events.UnwrapRequestEvm, error) {
-	return eN.eventsStore().GetUnsentSignedUnwrapRequests()
+	requests, err := eN.eventsStore().GetUnsentSignedUnwrapRequests()
+	eN.health.UpdateNetwork(eN.ChainId(), func(n *snapshot.Network) { n.Unwrap.SignedAwaitingSubmission = snapshot.Reading(len(requests), err) })
+	return requests, err
 }
 
 ///////// RPC

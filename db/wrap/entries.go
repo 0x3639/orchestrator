@@ -248,6 +248,19 @@ func getLastUpdateKey() []byte {
 	return zcommon.JoinBytes(lastUpdatePrefix)
 }
 
+// Monitoring can trust a previously verified receive cursor on a clean restart.
+// A missing, mismatched or unreadable checkpoint simply means partial coverage.
+func (es *eventStore) HasReceiveCoverageCheckpoint(height uint64) bool {
+	data, err := es.DB.Get(receiveCoverageKey)
+	return err == nil && len(data) == 8 && binary.LittleEndian.Uint64(data) == height
+}
+
+func (es *eventStore) SaveReceiveCoverageCheckpoint(height uint64) error {
+	var data [8]byte
+	binary.LittleEndian.PutUint64(data[:], height)
+	return es.DB.Put(receiveCoverageKey, data[:])
+}
+
 func (es *eventStore) GetLastUpdateHeight() (uint64, error) {
 	data, err := es.DB.Get(getLastUpdateKey())
 	if err == leveldb.ErrNotFound {
