@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
-	"slices"
 	"sync"
 
 	"github.com/ethereum/go-ethereum/accounts/abi/bind"
@@ -28,8 +27,8 @@ func (v redeemView) settledAfter(registeredAt uint64) bool {
 }
 
 // RedeemSettledAfterHalt reports whether a redeem registered at registeredAt
-// is settled: in the contract state at finalHeight on every configured
-// endpoint it is both
+// is settled: in the contract state confirmations below head, on every
+// configured endpoint, it is both
 //
 //   - closed, so it was paid or revoked and can never be paid again, and
 //   - followed by an administrator unhalt, so a halt covered the registration
@@ -39,36 +38,44 @@ func (v redeemView) settledAfter(registeredAt uint64) bool {
 // accepts no registration while halted. An unhalt height above registeredAt
 // therefore proves a halt began after the registration.
 //
-// Both facts are permanent once they hold, so a redeem that is settled at
-// finalHeight is also settled in every endpoint's latest state. The latest
+// Both facts are permanent once they hold, so a redeem that is settled at the
+// final height is also settled in every endpoint's latest state. The latest
 // state is read first. When no endpoint shows the redeem settled there, it is
 // not settled, and that answer needs nothing more: a redeem that can still be
 // paid is reported even by endpoints that keep no older state.
 //
 // Only the answer "settled" releases a registration, and it is given on
-// confirmation-deep evidence alone: the endpoints must agree on the block at
-// finalHeight and report identical state at it. A later reorganization then
-// cannot undo what the answer rests on. A closure or unhalt that is visible
-// in the latest state but not yet at finalHeight, an endpoint that cannot
-// serve state at finalHeight, and any failed read are errors, so the caller
-// retries instead of deciding.
-func (r *EvmRpc) RedeemSettledAfterHalt(nonce *big.Int, registeredAt, finalHeight uint64) (bool, error) {
-	if finalHeight < registeredAt {
+// confirmation-deep evidence alone. Every endpoint must have reached head on
+// the same chain, so that the final height is confirmations deep for each of
+// them and not only for the endpoint that reported the head. They must agree
+// on the block at the final height, before and after the read, and report
+// identical state at it. A later reorganization then cannot undo what the
+// answer rests on. A closure or unhalt that is visible in the latest state
+// but not yet at the final height, an endpoint that is behind head or cannot
+// serve state at the final height, and any failed read are errors, so the
+// caller retries instead of deciding.
+func (r *EvmRpc) RedeemSettledAfterHalt(nonce *big.Int, registeredAt, head, confirmations uint64) (bool, error) {
+	if head < confirmations || head-confirmations < registeredAt {
 		return false, errors.New("the redeem registration is not final yet")
 	}
-	latest, err := r.redeemViews(nonce, nil)
-	if err != nil {
+	finalHeight := head - confirmations
+	_, anySettled, err := r.RedeemSettledInLatestState(nonce, registeredAt)
+	if err != nil || !anySettled {
 		return false, err
 	}
-	if !slices.ContainsFunc(latest, func(v redeemView) bool { return v.settledAfter(registeredAt) }) {
-		return false, nil
+	if _, err := r.CanonicalHash(head); err != nil {
+		return false, err
 	}
-	if _, err := r.CanonicalHash(finalHeight); err != nil {
+	before, err := r.CanonicalHash(finalHeight)
+	if err != nil {
 		return false, err
 	}
 	final, err := r.redeemViews(nonce, new(big.Int).SetUint64(finalHeight))
 	if err != nil {
 		return false, fmt.Errorf("at block %d: %w", finalHeight, err)
+	}
+	if after, err := r.CanonicalHash(finalHeight); err != nil || after != before {
+		return false, fmt.Errorf("block %d changed while its state was read: %v", finalHeight, err)
 	}
 	for _, view := range final {
 		if view.closedAt.Cmp(final[0].closedAt) != 0 || view.unhaltedAt.Cmp(final[0].unhaltedAt) != 0 {
@@ -79,6 +86,25 @@ func (r *EvmRpc) RedeemSettledAfterHalt(nonce *big.Int, registeredAt, finalHeigh
 		return false, fmt.Errorf("the redeem is settled in the latest state but not yet at block %d", finalHeight)
 	}
 	return true, nil
+}
+
+// RedeemSettledInLatestState reports whether every endpoint, and whether any
+// endpoint, shows the redeem closed and followed by an administrator unhalt
+// in its latest state. Neither answer archives anything. "Any" tells a caller
+// that the registration is not, or may no longer be, a live discrepancy.
+// "Every" tells it that the redeem cannot be paid as the chain stands.
+func (r *EvmRpc) RedeemSettledInLatestState(nonce *big.Int, registeredAt uint64) (every, any bool, err error) {
+	latest, err := r.redeemViews(nonce, nil)
+	if err != nil {
+		return false, false, err
+	}
+	every = true
+	for _, view := range latest {
+		settled := view.settledAfter(registeredAt)
+		every = every && settled
+		any = any || settled
+	}
+	return every, any, nil
 }
 
 // redeemViews reads one view from every configured endpoint at block, or at

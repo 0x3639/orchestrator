@@ -95,3 +95,93 @@ func TestParseRedeemLogID(t *testing.T) {
 		}
 	}
 }
+
+// memoryIncidentStore keeps incidents in memory; resolved ones stop pending.
+type memoryIncidentStore struct {
+	lossyIncidentStore
+	pending []RedeemIncident
+}
+
+func (s *memoryIncidentStore) RecordRedeemIncident(ev RedeemIncident) (bool, error) {
+	if s.failing {
+		return false, errors.New("write failed")
+	}
+	s.pending = append(s.pending, ev)
+	return true, nil
+}
+func (s *memoryIncidentStore) HasPendingRedeemIncident() (bool, error) {
+	return len(s.pending) > 0, nil
+}
+func (s *memoryIncidentStore) PendingRedeemIncidents() ([]RedeemIncident, error) {
+	return s.pending, nil
+}
+
+// Dispatching the halt can wait only while every stored incident is on a
+// chain whose network vouched for it at the current generation, and nothing
+// else calls for the halt.
+func TestRedeemHaltCanWait(t *testing.T) {
+	start := func(stored uint8) (*GlobalState, *memoryIncidentStore) {
+		t.Helper()
+		store := new(memoryIncidentStore)
+		state := NewGlobalState(&stored)
+		if err := state.RestoreRedeemIncidents(store); err != nil {
+			t.Fatal(err)
+		}
+		return state, store
+	}
+	report := func(state *GlobalState, chain uint32) {
+		t.Helper()
+		if err := state.ReportRedeemIncident(RedeemIncident{ChainID: chain}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	state, _ := start(LiveState)
+	if state.RedeemHaltCanWait() {
+		t.Fatal("waiting without a pending halt")
+	}
+	report(state, 1)
+	report(state, 56)
+	generation := state.RedeemHaltGeneration()
+	state.SetRedeemHaltWait(1, generation, true)
+	if state.RedeemHaltCanWait() {
+		t.Fatal("waiting although no network vouched for chain 56")
+	}
+	state.SetRedeemHaltWait(56, generation, true)
+	if !state.RedeemHaltCanWait() {
+		t.Fatal("every chain vouched for its incidents at this generation")
+	}
+	state.SetRedeemHaltWait(1, generation, false)
+	if state.RedeemHaltCanWait() {
+		t.Fatal("waiting after chain 1 withdrew")
+	}
+	state.SetRedeemHaltWait(1, generation, true)
+	report(state, 1) // a newer incident: what was found before does not cover it
+	if state.RedeemHaltCanWait() {
+		t.Fatal("waiting on findings from an earlier generation")
+	}
+	state.SetRedeemHaltWait(1, generation, true) // a finding that arrives late for the old generation
+	if state.RedeemHaltCanWait() {
+		t.Fatal("a late finding for an earlier generation was accepted")
+	}
+
+	// An emergency recorded for another reason still needs its halt.
+	state, _ = start(EmergencyState)
+	report(state, 1)
+	state.SetRedeemHaltWait(1, state.RedeemHaltGeneration(), true)
+	if state.RedeemHaltCanWait() {
+		t.Fatal("waiting during an emergency recorded for another reason")
+	}
+
+	// So does an incident whose evidence could not be written.
+	state, store := start(LiveState)
+	report(state, 1)
+	store.failing = true
+	if err := state.ReportRedeemIncident(RedeemIncident{ChainID: 1}); err == nil {
+		t.Fatal("failed write was not reported")
+	}
+	state.SetRedeemHaltWait(1, state.RedeemHaltGeneration(), true)
+	if state.RedeemHaltCanWait() {
+		t.Fatal("waiting although an incident could not be stored")
+	}
+}

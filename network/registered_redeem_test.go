@@ -121,6 +121,9 @@ func (p *redeemProvider) Call(call map[string]any, block string) (hexutil.Bytes,
 		}
 		p.contract.reads.Add(1)
 		result = make([]byte, 64)
+		if !strings.HasSuffix(input, ecommon.HexToHash("0x31").Hex()[2:]) {
+			break // Another nonce was never registered.
+		}
 		if closed := p.contract.closedAt.Load(); closed != 0 && closed <= at {
 			copy(result, bytes.Repeat([]byte{0xff}, 32))
 		} else {

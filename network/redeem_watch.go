@@ -2,11 +2,11 @@ package network
 
 import (
 	"fmt"
-	"slices"
 	"time"
 
 	ecommon "github.com/ethereum/go-ethereum/common"
 	etypes "github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/crypto"
 )
 
 const (
@@ -17,14 +17,19 @@ const (
 	// heldRedeemReportEvery is the time between the repeated lines that tell
 	// the operator a registration is still unchecked.
 	heldRedeemReportEvery = time.Minute
-	// settleIncidentsEvery is how many recheck rounds pass between looks at
-	// whether the chain has settled a stored incident.
-	settleIncidentsEvery = 10
+	// pausedScanRetryRounds is how many recheck intervals pass before a range
+	// scan that stopped for a pending halt is tried again. A released halt
+	// then resumes the scan long before the next ordinary refresh.
+	pausedScanRetryRounds = 5
 )
 
+// A held registration is one observed log: its identity and its content. Two
+// observations with one identity and different content are kept apart, so an
+// answer for one never stands in for the other.
 type heldRedeemKey struct {
 	block, tx ecommon.Hash
 	index     uint
+	content   ecommon.Hash
 }
 
 type heldRedeem struct {
@@ -35,7 +40,19 @@ type heldRedeem struct {
 }
 
 func heldKey(log etypes.Log) heldRedeemKey {
-	return heldRedeemKey{block: log.BlockHash, tx: log.TxHash, index: log.Index}
+	content := make([]byte, 0, len(log.Topics)*ecommon.HashLength+len(log.Data))
+	for _, topic := range log.Topics {
+		content = append(content, topic[:]...)
+	}
+	content = append(content, log.Data...)
+	return heldRedeemKey{block: log.BlockHash, tx: log.TxHash, index: log.Index, content: crypto.Keccak256Hash(content)}
+}
+
+func (eN *evmNetwork) redeemRetryInterval() time.Duration {
+	if eN.heldRetryEvery > 0 {
+		return eN.heldRetryEvery
+	}
+	return heldRedeemRetryInterval
 }
 
 // checkLiveRedeem runs the live check of a young registration. A check that
@@ -62,9 +79,7 @@ func (eN *evmNetwork) noteRedeemCheck(log etypes.Log, err error) {
 	defer eN.heldMu.Unlock()
 	entry := eN.heldRedeems[key]
 	if err == nil {
-		// An answer for other content under the same identity says nothing
-		// about the held log.
-		if entry != nil && slices.Equal(entry.log.Topics, log.Topics) && slices.Equal(entry.log.Data, log.Data) {
+		if entry != nil {
 			delete(eN.heldRedeems, key)
 			eN.logger.Infof("Redeem registration on chain %d, block %d, transaction %s, log %d was checked after %d retries",
 				eN.ChainId(), log.BlockNumber, log.TxHash, log.Index, entry.attempts)
@@ -98,24 +113,39 @@ func (eN *evmNetwork) heldRedeemLogs() []etypes.Log {
 	return logs
 }
 
+// stopping reports that the network, or the worker that owns stop, is ending.
+// A nil stop never ends.
+func (eN *evmNetwork) stopping(stop <-chan struct{}) bool {
+	select {
+	case <-eN.done:
+		return true
+	case <-stop:
+		return true
+	default:
+		return false
+	}
+}
+
 // recheckHeldRedeems repeats the check of every held registration. Once a
 // registration is finality-deep it is checked as the finalized scan would
 // check it, so the same evidence decides it on both paths.
-func (eN *evmNetwork) recheckHeldRedeems() {
+func (eN *evmNetwork) recheckHeldRedeems(stop <-chan struct{}) {
 	for _, log := range eN.heldRedeemLogs() {
-		select {
-		case <-eN.done:
+		if eN.stopping(stop) {
 			return
-		default:
 		}
-		// Without the head the registration's age is unknown, and the age
-		// selects the rules. Decide nothing this round.
+		// The registration's age selects the rules, and the head gives the
+		// age. Without a head at or above the registration, decide nothing
+		// this round.
 		head, err := eN.EvmRpc().BlockNumber()
+		if err == nil && head < log.BlockNumber {
+			err = fmt.Errorf("chain head %d is below the registration", head)
+		}
 		if err != nil {
 			eN.noteRedeemCheck(log, fmt.Errorf("read chain head: %w", err))
 			continue
 		}
-		final := head >= log.BlockNumber && head-log.BlockNumber >= eN.ConfirmationsToFinality()
+		final := head-log.BlockNumber >= eN.ConfirmationsToFinality()
 		err = eN.registerRedeem(log, !final)
 		if err != nil && final {
 			// A block replaced before finality never reaches the finalized
@@ -133,12 +163,22 @@ func (eN *evmNetwork) recheckHeldRedeems() {
 	}
 }
 
-// settlePendingIncidents releases stored incidents on this chain once every
-// endpoint shows, at the final height, the registration canonical, closed, and
-// followed by an administrator unhalt. A signer that was not running during
-// that halt would otherwise wait for the next one.
-func (eN *evmNetwork) settlePendingIncidents() {
-	if eN.state.RedeemHaltGeneration() == 0 {
+// settlePendingIncidents looks at the stored incidents of this chain while a
+// halt is pending.
+//
+// It releases an incident once every endpoint shows, at the final height, the
+// registration canonical, closed, and followed by an administrator unhalt. A
+// signer that was not running during that halt would otherwise wait for the
+// next one.
+//
+// It also records whether every one of them concerns a redeem that all
+// endpoints show closed after a completed halt in their latest state. Such a
+// redeem cannot be paid as the chain stands, so the halt for it need not be
+// dispatched while the final evidence is awaited. One payable redeem, one
+// disagreement or one failed read withdraws that.
+func (eN *evmNetwork) settlePendingIncidents(stop <-chan struct{}) {
+	generation := eN.state.RedeemHaltGeneration()
+	if generation == 0 {
 		return
 	}
 	defer func() {
@@ -148,21 +188,37 @@ func (eN *evmNetwork) settlePendingIncidents() {
 	}()
 	pending, err := eN.state.PendingRedeemIncidents()
 	if err != nil {
+		eN.state.SetRedeemHaltWait(eN.ChainId(), generation, false)
 		eN.logger.Warnf("Cannot list pending redeem incidents for chain %d: %v", eN.ChainId(), err)
 		return
 	}
+	found, canWait := false, true
 	for _, incident := range pending {
 		if incident.ChainID != eN.ChainId() {
 			continue
 		}
+		if eN.stopping(stop) {
+			return
+		}
+		found = true
 		log := incident.Log
+		closed, err := eN.redeemClosedEverywhere(incident)
+		if err != nil {
+			canWait = false
+			eN.logger.Warnf("Cannot read the contract state for the pending redeem incident on chain %d, transaction %s, log %d: %v", eN.ChainId(), log.TxHash, log.Index, err)
+			continue
+		}
+		if !closed {
+			canWait = false // Payable, or the endpoints do not agree that it is not.
+			continue
+		}
 		if _, err := eN.verifyRedeemLog(log, eN.ConfirmationsToFinality()); err != nil {
 			eN.logger.Debugf("Pending redeem incident on chain %d, transaction %s, log %d is not final on every endpoint: %v", eN.ChainId(), log.TxHash, log.Index, err)
 			continue
 		}
 		settled, err := eN.redeemSettled(incident)
 		if err != nil {
-			eN.logger.Warnf("Cannot read the contract state for the pending redeem incident on chain %d, transaction %s, log %d: %v", eN.ChainId(), log.TxHash, log.Index, err)
+			eN.logger.Warnf("The pending redeem incident on chain %d, transaction %s, log %d looks settled but cannot be archived yet: %v", eN.ChainId(), log.TxHash, log.Index, err)
 			continue
 		}
 		if !settled {
@@ -175,18 +231,14 @@ func (eN *evmNetwork) settlePendingIncidents() {
 		eN.logger.Warnf("Released the redeem incident on chain %d, block %d, transaction %s, log %d: the redeem is closed and the bridge was unhalted after it",
 			eN.ChainId(), log.BlockNumber, log.TxHash, log.Index)
 	}
+	eN.state.SetRedeemHaltWait(eN.ChainId(), generation, found && canWait)
 }
 
 // watchRedeems rechecks held registrations and, while a halt is pending, looks
-// for stored incidents the chain has since settled. It ends with the network
-// or when stop is closed.
+// at the stored incidents. It ends with the network or when stop is closed.
 func (eN *evmNetwork) watchRedeems(stop <-chan struct{}) {
-	interval := eN.heldRetryEvery
-	if interval <= 0 {
-		interval = heldRedeemRetryInterval
-	}
-	for round := 1; ; round++ {
-		timer := time.NewTimer(interval)
+	for {
+		timer := time.NewTimer(eN.redeemRetryInterval())
 		select {
 		case <-eN.done:
 			timer.Stop()
@@ -196,15 +248,14 @@ func (eN *evmNetwork) watchRedeems(stop <-chan struct{}) {
 			return
 		case <-timer.C:
 		}
-		eN.recheckHeldRedeems()
-		if round%settleIncidentsEvery == 0 {
-			eN.settlePendingIncidents()
-		}
+		eN.recheckHeldRedeems(stop)
+		eN.settlePendingIncidents(stop)
 	}
 }
 
 // withRedeemWatch runs fn beside the recheck worker and returns once both
-// have ended.
+// have ended. The worker stops between two checks, so the wait is at most one
+// check long.
 func (eN *evmNetwork) withRedeemWatch(fn func()) {
 	stop, watching := make(chan struct{}), make(chan struct{})
 	go func() { defer close(watching); eN.watchRedeems(stop) }()

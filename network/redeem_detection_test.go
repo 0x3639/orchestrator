@@ -69,7 +69,8 @@ func TestCatchUpChecksYoungRegistrations(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			// The fixture log is fixed, so the sources can be built before it.
 			probe := etypes.Log{Topics: []ecommon.Hash{common.RegisteredRedeemSigHash, ecommon.HexToHash("0x31"), ecommon.HexToHash("0x32"), ecommon.HexToHash("0x33")}}
-			n, reg, chain := redeemFixture(t, tc.sources(probe)...)
+			sources := tc.sources(probe)
+			n, reg, chain := redeemFixture(t, sources...)
 			head := reg.BlockNumber + n.ConfirmationsToFinality() - 1
 			chain.setChain(head, reg)
 			if tc.lagging {
@@ -81,8 +82,11 @@ func TestCatchUpChecksYoungRegistrations(t *testing.T) {
 			if halted := n.state.RedeemHaltGeneration() != 0; halted != tc.wantHalt {
 				t.Fatalf("halt pending=%t, want %t", halted, tc.wantHalt)
 			}
-			if held := len(n.heldRedeemLogs()) == 1; held != tc.wantHeld {
-				t.Fatalf("held=%t, want %t", held, tc.wantHeld)
+			if lookups := sources[0].lookups(); lookups == 0 {
+				t.Fatal("the source was never asked about the young registration")
+			}
+			if held, want := len(n.heldRedeemLogs()), map[bool]int{true: 1}[tc.wantHeld]; held != want {
+				t.Fatalf("held=%d, want %d", held, want)
 			}
 			// Durable status and the redeem checkpoint wait for finality.
 			row, err := n.dbManager.ZnnStorage().GetWrapRequestById(types.Hash(reg.Topics[1]))
@@ -240,6 +244,9 @@ func TestOnlySettledHistoryIsArchived(t *testing.T) {
 		{name: "one endpoint has no state at the final height", closedAt: 110, unhaltedAt: 120, wantErr: true,
 			secondary: func(c *redeemContract) { c.closedAt.Store(110); c.unhaltedAt.Store(120); c.pruned.Store(true) }},
 		{name: "one endpoint has not reached the final height", closedAt: 110, unhaltedAt: 120, lagging: 120, wantErr: true},
+		// The final height must be confirmation-deep for every endpoint, not
+		// only for the one that reported the head.
+		{name: "one endpoint is past the final height but behind the head", closedAt: 110, unhaltedAt: 120, lagging: 139, wantErr: true},
 		// What can still be paid is reported without any older state.
 		{name: "payable, no endpoint has state at the final height", unhaltedAt: 120, wantHalt: true,
 			primary: func(c *redeemContract) { c.pruned.Store(true) }},
@@ -356,4 +363,130 @@ func TestSettledRegistrationAboveTheCheckpointLimit(t *testing.T) {
 	if archived, err := n.state.HandledRedeemLog(1, reg); err != nil || !archived {
 		t.Fatalf("settled registration was not kept as evidence: %t %v", archived, err)
 	}
+}
+
+// The live rules are for a registration that can still be paid. A registration
+// that an endpoint already shows closed after a completed halt is history,
+// even when a stale head or a late delivery puts it on the live path. It is
+// held and then decided by the finalized rules.
+func TestLiveRulesDoNotReportSettledHistory(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		behind func(*redeemProvider) // makes one endpoint miss the settlement
+	}{
+		{name: "every endpoint shows it settled"},
+		{name: "one endpoint has not seen the settlement yet",
+			behind: func(p *redeemProvider) { p.contract = new(redeemContract) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			src := &redeemSource{synced: true, err: constants.ErrDataNonExistent.Error()}
+			n, reg, chain := redeemFixture(t, src)
+			chain.contract.closedAt.Store(105)
+			chain.contract.unhaltedAt.Store(110)
+			if tc.behind != nil {
+				tc.behind(chain.primary)
+			}
+			// A late delivery through the subscription.
+			if err := n.InterpretLog(reg, true); err == nil || n.state.RedeemHaltGeneration() != 0 {
+				t.Fatalf("late delivery: err=%v pending=%d", err, n.state.RedeemHaltGeneration())
+			}
+			// A range scan whose endpoint reports a head that makes it look young.
+			n.heldRedeems = nil
+			chain.primary.set(evidenceReceipt(reg), []etypes.Log{reg}, reg.BlockNumber+n.ConfirmationsToFinality()-1)
+			if err := n.Sync(); err != nil {
+				t.Fatal(err)
+			}
+			if n.state.RedeemHaltGeneration() != 0 || len(n.heldRedeemLogs()) != 1 {
+				t.Fatalf("stale head: pending=%d held=%d", n.state.RedeemHaltGeneration(), len(n.heldRedeemLogs()))
+			}
+		})
+	}
+}
+
+// While the redeem behind every stored incident is closed after a completed
+// halt on every endpoint, nothing can be paid on it, so dispatching the halt
+// can wait for the final evidence. One payable redeem, one disagreement, one
+// unreadable contract or one newer incident ends the wait.
+func TestRestoredIncidentWaitsOnlyWhileItsRedeemCannotBePaid(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		closedAt   uint64
+		unhaltedAt uint64
+		secondary  func(*redeemContract)
+		unreadable bool
+		wantWait   bool
+	}{
+		{name: "payable", unhaltedAt: 120},
+		{name: "closed without a later unhalt", closedAt: 110, unhaltedAt: 90},
+		{name: "closed after a completed halt", closedAt: 110, unhaltedAt: 120, wantWait: true},
+		{name: "one endpoint shows it payable", closedAt: 110, unhaltedAt: 120,
+			secondary: func(c *redeemContract) { c.unhaltedAt.Store(120) }},
+		{name: "the contract cannot be read", closedAt: 110, unhaltedAt: 120, unreadable: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			src := &redeemSource{synced: true, err: constants.ErrDataNonExistent.Error()}
+			n, reg, chain := redeemFixture(t, src)
+			if err := n.Sync(); err != nil || n.state.RedeemHaltGeneration() == 0 {
+				t.Fatalf("payable unmatched registration: err=%v pending=%d", err, n.state.RedeemHaltGeneration())
+			}
+			if n.state.RedeemHaltCanWait() {
+				t.Fatal("the halt for a payable redeem can wait")
+			}
+			// No endpoint keeps the older state that would archive the incident.
+			chain.primary.contract.pruned.Store(true)
+			chain.primary.contract.closedAt.Store(tc.closedAt)
+			chain.primary.contract.unhaltedAt.Store(tc.unhaltedAt)
+			chain.primary.contract.failing.Store(tc.unreadable)
+			if tc.secondary != nil {
+				chain.contract = new(redeemContract)
+				chain.contract.pruned.Store(true)
+				tc.secondary(chain.contract)
+			}
+			if err := n.Sync(); err != nil { // the first scan after a restart
+				t.Fatal(err)
+			}
+			if state, _ := n.state.GetState(); n.state.RedeemHaltGeneration() == 0 || state != common.EmergencyState {
+				t.Fatalf("the incident was released without final evidence: pending=%d state=%d", n.state.RedeemHaltGeneration(), state)
+			}
+			if wait := n.state.RedeemHaltCanWait(); wait != tc.wantWait {
+				t.Fatalf("halt can wait=%t, want %t", wait, tc.wantWait)
+			}
+			if !tc.wantWait {
+				return
+			}
+			// A newer incident is not covered by what was found for the old one.
+			other := reg
+			other.Index++
+			if err := n.state.ReportRedeemIncident(common.RedeemIncident{ChainID: 1, Log: other}); err != nil {
+				t.Fatal(err)
+			}
+			if n.state.RedeemHaltCanWait() {
+				t.Fatal("the halt for a newer incident can wait")
+			}
+		})
+	}
+}
+
+// A scan that stopped for a pending halt resumes soon after the halt is
+// released, not at the next ordinary refresh.
+func TestPausedScanResumesWhenTheHaltIsReleased(t *testing.T) {
+	src := &redeemSource{synced: true}
+	n, reg, _ := redeemFixture(t, src)
+	src.wrap = sourceRequestFor(reg)
+	// An incident on another chain holds the bridge.
+	if err := n.state.ReportRedeemIncident(common.RedeemIncident{ChainID: 56, Log: reg}); err != nil {
+		t.Fatal(err)
+	}
+	startRedeemWatch(t, n)
+	waitFor(t, "the scan was never attempted", n.scanPaused.Load)
+	if cursor, _ := n.eventsStore().GetLastUpdateHeight(); cursor != 100 {
+		t.Fatalf("the scan ran while the halt was pending: cursor=%d", cursor)
+	}
+	if err := n.state.CompleteEmergencyHalt(n.state.RedeemHaltGeneration(), map[uint32]bool{56: true}); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the scan did not resume after the halt was released", func() bool {
+		cursor, err := n.eventsStore().GetLastUpdateHeight()
+		return err == nil && cursor == 140
+	})
 }

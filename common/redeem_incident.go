@@ -195,6 +195,48 @@ func (gs *GlobalState) RedeemLogAcknowledged(ev RedeemIncident) bool {
 	return gs.acknowledgedRedeems[redeemLogID(ev)]
 }
 
+// SetRedeemHaltWait records whether, when the halt was at generation, every
+// pending incident on one chain concerned a redeem that cannot be paid as the
+// chain stands. A later generation makes the record stale.
+func (gs *GlobalState) SetRedeemHaltWait(chainID uint32, generation uint64, wait bool) {
+	gs.stateMu.Lock()
+	defer gs.stateMu.Unlock()
+	if !wait {
+		delete(gs.redeemHaltWaits, chainID)
+		return
+	}
+	if gs.redeemHaltWaits == nil {
+		gs.redeemHaltWaits = make(map[uint32]uint64)
+	}
+	gs.redeemHaltWaits[chainID] = generation
+}
+
+// RedeemHaltCanWait reports whether dispatching the pending halt can wait:
+// every stored incident is on a chain whose network last found, for this
+// generation, that none of its redeems can be paid. The signer stays in the
+// emergency state, so transfers remain blocked, while it waits for the final
+// evidence that archives those incidents. Anything else needs the halt now:
+// an incident on a chain no network vouches for, a newer incident, evidence
+// that could not be written, or an emergency recorded for another reason.
+func (gs *GlobalState) RedeemHaltCanWait() bool {
+	gs.stateMu.Lock()
+	defer gs.stateMu.Unlock()
+	generation := gs.RedeemHaltGeneration()
+	if generation == 0 || gs.redeemWriteFailed || gs.redeemIncidents == nil || *gs.state == EmergencyState {
+		return false
+	}
+	pending, err := gs.redeemIncidents.PendingRedeemIncidents()
+	if err != nil || len(pending) == 0 {
+		return false
+	}
+	for _, ev := range pending {
+		if gs.redeemHaltWaits[ev.ChainID] != generation {
+			return false
+		}
+	}
+	return true
+}
+
 // PendingRedeemIncidents lists the evidence that still holds the bridge.
 func (gs *GlobalState) PendingRedeemIncidents() ([]RedeemIncident, error) {
 	if gs.redeemIncidents == nil {

@@ -6,6 +6,7 @@ import (
 	"time"
 
 	ecommon "github.com/ethereum/go-ethereum/common"
+	etypes "github.com/ethereum/go-ethereum/core/types"
 	"github.com/syndtr/goleveldb/leveldb"
 	"github.com/syndtr/goleveldb/leveldb/storage"
 	"github.com/zenon-network/go-zenon/vm/constants"
@@ -175,6 +176,33 @@ func TestHeldRegistrationIsNotReleasedByOtherContent(t *testing.T) {
 	}
 }
 
+// Two unanswered observations under one identity are both kept, so the one
+// observed first cannot keep the other from being rechecked.
+func TestHeldRegistrationsWithOneIdentityAreRecheckedSeparately(t *testing.T) {
+	src := &redeemSource{synced: false, err: constants.ErrDataNonExistent.Error()}
+	n, reg, chain := redeemFixture(t, src)
+	variant := reg
+	variant.Data = ecommon.LeftPadBytes([]byte{22}, 32)
+	young := reg.BlockNumber + n.ConfirmationsToFinality() - 1
+	chain.primary.set(evidenceReceipt(reg), nil, young)
+	chain.set(evidenceReceipt(reg), nil, young)
+	for _, log := range []etypes.Log{variant, reg} {
+		if err := n.InterpretLog(log, true); err == nil {
+			t.Fatal("an unsynced source confirmed a registration")
+		}
+	}
+	if len(n.heldRedeemLogs()) != 2 {
+		t.Fatalf("held=%d, want both observations", len(n.heldRedeemLogs()))
+	}
+	src.synced = true
+	startRedeemWatch(t, n)
+	waitFor(t, "the genuine registration was never decided", func() bool { return n.state.RedeemHaltGeneration() != 0 })
+	waitFor(t, "the decided registration stayed held", func() bool {
+		held := n.heldRedeemLogs()
+		return len(held) == 1 && held[0].Data[31] == variant.Data[31]
+	})
+}
+
 // A stored incident keeps holding the bridge across rechecks while its redeem
 // is payable or its settlement is not final, and is released once every
 // endpoint shows it settled at the final height. An incident on another chain
@@ -204,8 +232,9 @@ func TestStoredIncidentIsReleasedOnceSettled(t *testing.T) {
 	stillHeld("a closed redeem with no unhalt after it")
 	chain.contract.unhaltedAt.Store(129) // head 140, 12 confirmations: final height 128
 	stillHeld("an unhalt that is not final")
-	chain.contract.unhaltedAt.Store(120)
+	// Move the closure first, so no round sees both below the final height.
 	chain.contract.closedAt.Store(129)
+	chain.contract.unhaltedAt.Store(120)
 	stillHeld("a closure that is not final")
 	chain.contract.closedAt.Store(110)
 	waitFor(t, "a settled incident was not archived", func() bool {

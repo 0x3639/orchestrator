@@ -20,6 +20,7 @@ import (
 	"os"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"syscall"
 
 	"math/big"
@@ -69,6 +70,11 @@ type evmNetwork struct {
 	heldMu         sync.Mutex
 	heldRedeems    map[heldRedeemKey]*heldRedeem
 	heldRetryEvery time.Duration // zero selects heldRedeemRetryInterval
+
+	// scanPaused is set when the last Sync stopped for a pending redeem halt.
+	// The subscription loop then tries the scan again soon, so a released
+	// halt does not leave the range unscanned until the next refresh.
+	scanPaused atomic.Bool
 }
 
 // agreedHashForLog returns the endpoint-agreed canonical hash at number,
@@ -332,10 +338,12 @@ const (
 func (eN *evmNetwork) Sync() error {
 	eN.logger.Info("In sync evm")
 	eN.resetCanonicalCache()
+	eN.scanPaused.Store(false)
 	if eN.state.RedeemHaltGeneration() != 0 {
 		// The first scan after a restart runs before anything acts on a
-		// restored incident. Release what the chain has settled since.
-		eN.settlePendingIncidents()
+		// restored incident. Release what the chain has settled since, and
+		// record whether what remains can be paid.
+		eN.settlePendingIncidents(nil)
 	}
 	startHeight, redeemFrom, legacy, err := eN.eventsStore().GetScanHeights(eN.ConfirmationsToFinality())
 	if err != nil {
@@ -390,6 +398,7 @@ func (eN *evmNetwork) Sync() error {
 		// Startup must be able to enter the halt ceremony even when later
 		// ranges are unavailable. Resume this range after the halt completes.
 		if eN.state.RedeemHaltGeneration() != 0 {
+			eN.scanPaused.Store(true)
 			return nil
 		}
 		latestBlock, rpcErr := eN.EvmRpc().BlockNumber()
@@ -479,6 +488,7 @@ func (eN *evmNetwork) Sync() error {
 					if log.Topics[0] == common.RegisteredRedeemSigHash {
 						eN.examineRegistration(log, recent)
 						if eN.state.RedeemHaltGeneration() != 0 {
+							eN.scanPaused.Store(true)
 							return nil
 						}
 					}
@@ -500,6 +510,7 @@ func (eN *evmNetwork) Sync() error {
 				break
 			}
 			if eN.state.RedeemHaltGeneration() != 0 {
+				eN.scanPaused.Store(true)
 				return nil
 			}
 		}
@@ -813,6 +824,15 @@ func (eN *evmNetwork) SubscribeToEvents() {
 	eN.withRedeemWatch(eN.subscribeToEvents)
 }
 
+// refreshInterval is the time to the next catch-up Sync: the ordinary refresh,
+// or a short retry while the last scan stopped for a pending redeem halt.
+func (eN *evmNetwork) refreshInterval() time.Duration {
+	if eN.scanPaused.Load() {
+		return pausedScanRetryRounds * eN.redeemRetryInterval()
+	}
+	return subscriptionRefreshInterval
+}
+
 func (eN *evmNetwork) subscribeToEvents() {
 	eN.logger.Infof("SubscribeToEvents for network with chainId: %d", eN.ChainId())
 	resubscribeBackoff := processEventsBaseBackoff
@@ -821,7 +841,7 @@ func (eN *evmNetwork) subscribeToEvents() {
 		if err := eN.Sync(); err != nil {
 			eN.logger.Errorf("Sync for chainId %d failed and will be retried: %v", eN.ChainId(), err)
 		}
-		nextCatchUp = time.Now().Add(subscriptionRefreshInterval)
+		nextCatchUp = time.Now().Add(eN.refreshInterval())
 	}
 
 	for {
@@ -832,7 +852,7 @@ func (eN *evmNetwork) subscribeToEvents() {
 				catchUp()
 			}
 			eN.logger.Errorf("cannot subscribe to logs for chainId %d: %v; retrying in %s", eN.ChainId(), err, resubscribeBackoff)
-			if !eN.sleep(resubscribeBackoff) {
+			if !eN.sleep(min(resubscribeBackoff, eN.refreshInterval())) {
 				return
 			}
 			resubscribeBackoff *= 2
@@ -843,7 +863,8 @@ func (eN *evmNetwork) subscribeToEvents() {
 		}
 		started := time.Now()
 
-		refresh := time.NewTimer(subscriptionRefreshInterval)
+		refresh := time.NewTimer(eN.refreshInterval())
+		dropped := false
 	consume:
 		for {
 			select {
@@ -853,12 +874,20 @@ func (eN *evmNetwork) subscribeToEvents() {
 				return
 			case subErr := <-logSub.Err():
 				eN.logger.Errorf("log subscription for chainId %d ended: %v; catching up and resubscribing", eN.ChainId(), subErr)
+				dropped = true
 				break consume
 			case newLog := <-logChan:
 				if errInterpret := eN.InterpretLog(newLog, true); errInterpret != nil {
 					eN.logger.Debug(errInterpret)
 				}
 			case <-refresh.C:
+				// A scan that stopped for a pending halt has nothing to do
+				// until the halt is released. Keep this subscription and
+				// look again soon, up to the ordinary refresh.
+				if eN.scanPaused.Load() && eN.state.RedeemHaltGeneration() != 0 && time.Since(started) < subscriptionRefreshInterval {
+					refresh.Reset(eN.refreshInterval())
+					continue
+				}
 				break consume
 			}
 		}
@@ -867,7 +896,7 @@ func (eN *evmNetwork) subscribeToEvents() {
 
 		catchUp()
 
-		if time.Since(started) < subscriptionHealthyAfter {
+		if dropped && time.Since(started) < subscriptionHealthyAfter {
 			// The provider accepted the subscription and dropped it almost
 			// at once; do not spin through subscribe and Sync.
 			eN.logger.Warnf("log subscription for chainId %d lasted only %s; resubscribing in %s", eN.ChainId(), time.Since(started).Round(time.Second), resubscribeBackoff)

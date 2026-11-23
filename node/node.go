@@ -369,6 +369,7 @@ func (node *Node) Wait() {
 
 func (node *Node) processSignatures() {
 	node.logger.Info("in node processSignatures")
+	var lastHaltWaitLog time.Time
 	for {
 		time.Sleep(time.Second)
 		currentState, err := node.state.GetState()
@@ -387,6 +388,18 @@ func (node *Node) processSignatures() {
 			if err != nil {
 				node.logger.Warnf("Cannot confirm bridge halt: %v", err)
 			} else if halted {
+				continue
+			}
+			// Every endpoint shows the redeems behind the stored incidents
+			// closed after a completed halt, so nothing can be paid on them.
+			// Stay in the emergency state, which blocks transfers, and wait
+			// for the final evidence that archives them instead of halting
+			// the bridge again.
+			if node.state.RedeemHaltCanWait() {
+				if time.Since(lastHaltWaitLog) >= time.Minute {
+					lastHaltWaitLog = time.Now()
+					node.logger.Warn("Redeem incident pending: its redeem is closed on every endpoint; waiting for final evidence before resuming. Transfers stay blocked. See --redeem.acknowledge.")
+				}
 				continue
 			}
 		}

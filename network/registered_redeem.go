@@ -74,7 +74,21 @@ func (eN *evmNetwork) registerRedeem(log etypes.Log, live bool) error {
 	incident := common.RedeemIncident{ChainID: eN.ChainId(), Log: confirmed, Wrap: wrap}
 	// An operator acknowledgement is decided by ReportRedeemIncident and does
 	// not wait for contract state.
-	if !live && !eN.state.RedeemLogAcknowledged(incident) {
+	acknowledged := eN.state.RedeemLogAcknowledged(incident)
+	if live && !acknowledged {
+		// The live rules are for a registration that can still be paid. One
+		// that an endpoint already shows closed after a completed halt is
+		// history, whatever head selected these rules. It is decided by the
+		// finalized rules once it is final.
+		_, settled, err := eN.EvmRpc().RedeemSettledInLatestState(redeem.Nonce, log.BlockNumber)
+		if err != nil {
+			return err
+		}
+		if settled {
+			return errors.New("the redeem is closed after a completed halt in the latest contract state; waiting for final evidence")
+		}
+	}
+	if !live && !acknowledged {
 		// A signer replaying history must not halt again for a redeem that can
 		// no longer be paid and that a completed halt already covered.
 		settled, err := eN.redeemSettled(incident)
@@ -103,8 +117,8 @@ func (eN *evmNetwork) registerRedeem(log etypes.Log, live bool) error {
 // redeemSettled asks every endpoint whether, at the confirmation-deep height,
 // the registration in an incident is closed and was followed by an
 // administrator unhalt. The caller has verified the log at that depth, so a
-// head that does not place the registration below the final height is a
-// contradiction and decides nothing.
+// head that does not place the registration at or below the final height is
+// a contradiction and decides nothing.
 func (eN *evmNetwork) redeemSettled(incident common.RedeemIncident) (bool, error) {
 	redeem, err := eN.EvmRpc().Bridge().ParseRegisteredRedeem(incident.Log)
 	if err != nil {
@@ -117,11 +131,21 @@ func (eN *evmNetwork) redeemSettled(incident common.RedeemIncident) (bool, error
 	if err != nil {
 		return false, err
 	}
-	depth := eN.ConfirmationsToFinality()
-	if head < depth || head-depth < incident.Log.BlockNumber {
-		return false, fmt.Errorf("chain head %d does not place the registration at block %d at or below the final height", head, incident.Log.BlockNumber)
+	return eN.EvmRpc().RedeemSettledAfterHalt(redeem.Nonce, incident.Log.BlockNumber, head, eN.ConfirmationsToFinality())
+}
+
+// redeemClosedEverywhere reports whether every endpoint's latest state shows
+// the registration in an incident closed after a completed halt.
+func (eN *evmNetwork) redeemClosedEverywhere(incident common.RedeemIncident) (bool, error) {
+	redeem, err := eN.EvmRpc().Bridge().ParseRegisteredRedeem(incident.Log)
+	if err != nil {
+		return false, err
 	}
-	return eN.EvmRpc().RedeemSettledAfterHalt(redeem.Nonce, incident.Log.BlockNumber, head-depth)
+	if redeem.Nonce == nil {
+		return false, errors.New("incomplete redeem registration log")
+	}
+	every, _, err := eN.EvmRpc().RedeemSettledInLatestState(redeem.Nonce, incident.Log.BlockNumber)
+	return every, err
 }
 
 func isRedeemTopic(topic ecommon.Hash) bool {
