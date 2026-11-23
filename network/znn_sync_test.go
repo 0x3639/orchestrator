@@ -374,6 +374,12 @@ func TestStartupSyncObservesFinalityAfterSyncStatus(t *testing.T) {
 			if err := n.state.SetFrontierMomentum(tc.cached); err != nil {
 				t.Fatal(err)
 			}
+			// A database that already vouches for the account, as on any
+			// start but the first. A first read asks for the sync status once
+			// more, before it reads the receive.
+			if err := n.eventsStore().MarkBridgeWatchStarted(); err != nil {
+				t.Fatal(err)
+			}
 			n.administrator = send.Address.String()
 			dispatched := false
 			n.setBridgeMetadata = func(*common.BridgeMetadata) { dispatched = true }

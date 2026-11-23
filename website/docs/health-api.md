@@ -147,10 +147,10 @@ legacy methods. Keep the Unix socket private when retiring public health RPC.
   listener advances or idles. When it cannot get past one account height it
   carries that `height`, the time the hold began (`since`) and the number of
   `attempts`. The listener reads nothing after a held height, so alert on any
-  hold that lasts more than a few minutes. After ten minutes at one height the
-  signer stops itself; see [Signer states](operations/states.md). The field is
-  absent from snapshots of earlier builds and present, as `null`, in every
-  snapshot of this one. A collector that validates against a copy of the
+  hold that lasts more than a few minutes. After ten minutes at one height a
+  signer that is signing transfers stops itself; see [Signer states](operations/states.md). The field is
+  absent from snapshots of earlier builds and present, as `null` or as an
+  object, in every snapshot of this one. A collector that validates against a copy of the
   earlier schema rejects the extra property, so update the collector's schema
   before upgrading the first signer.
 - **Pending work.** Each direction reports finality waits, unsigned observations,

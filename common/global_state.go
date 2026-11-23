@@ -81,7 +81,8 @@ func (gs *GlobalState) SetStateIf(expected, newState uint8) (bool, error) {
 	if *gs.state != expected {
 		return false, nil
 	}
-	return true, gs.setStateLocked(newState)
+	err := gs.setStateLocked(newState)
+	return *gs.state == newState, err
 }
 
 func (gs *GlobalState) setStateLocked(newState uint8) error {

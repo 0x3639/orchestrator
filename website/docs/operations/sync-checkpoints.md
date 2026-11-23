@@ -38,7 +38,7 @@ sudo -u orchestrator -H orchestrator-checkpoint restore eth-21000000
 sudo systemctl start orchestrator
 ```
 
-After a restore the signer replays the bridge account from the checkpoint's position. If the checkpointed database had already followed the bridge account to its tip, the signer checks the source event of every unwrap request it replays. Start it against EVM endpoints that serve receipts and logs back to the checkpoint. [Signer states](states.md#the-bridge-account-listener)
+After a restore the signer replays the bridge account from the checkpoint's position. A checkpoint taken from a signer that ran this build carries the record that the database vouches for the bridge account, and the signer then checks the source event of every unwrap request it replays. Start it against EVM endpoints that serve receipts and logs back to the checkpoint. A checkpoint taken from an earlier build has no such record and is replayed as a first read. [Signer states](states.md#the-bridge-account-listener)
 
 Restore verifies and stages both trees before replacing either. It keeps the previous active data under `~/.orchestrator/pre-restore-*/previous/` and prints the exact path. Keep the producer key, configuration, TSS key shares and the development branch's `unwrap-pool-votes` database in their usual locations outside the sync directories. The signer needs its current votes even when replaying older sync data. If restore is interrupted, keep the service stopped and repeat the **same** command. During the switch a persistent marker at the signer's instance lock prevents it from starting against a mixture of old and new stores. Leave the lock and recovery directory in place for the helper.
 

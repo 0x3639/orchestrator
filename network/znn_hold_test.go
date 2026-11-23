@@ -16,6 +16,7 @@ import (
 	"go.uber.org/zap/zapcore"
 	"go.uber.org/zap/zaptest/observer"
 
+	"orchestrator/common"
 	"orchestrator/health/snapshot"
 )
 
@@ -45,6 +46,7 @@ type heldListener struct {
 	// The endpoint fails the page read, or answers it without any block.
 	pageFails  atomic.Bool
 	hideBlocks atomic.Bool
+	emergency  bool // the signer is in EmergencyState when the listener starts
 }
 
 func startHeldListener(t *testing.T, prepare ...func(*heldListener)) *heldListener {
@@ -76,6 +78,11 @@ func startHeldListener(t *testing.T, prepare ...func(*heldListener)) *heldListen
 	}
 	h.n = startupNetwork(t, ledger)
 	h.n.state.Health = snapshot.New("test", "")
+	if h.emergency {
+		if err := h.n.state.SetState(common.EmergencyState); err != nil {
+			t.Fatal(err)
+		}
+	}
 	h.n.stopChan = h.stop
 	start := time.Now()
 	h.n.now = func() time.Time { return start.Add(time.Duration(h.elapsed.Load())) }
@@ -201,6 +208,26 @@ func TestHeldBridgeAccountIsLoggedAndStopsTheNode(t *testing.T) {
 		t.Fatalf("the snapshot no longer shows the hold that stopped the node: %+v", hold)
 	}
 	checkStartupCursor(t, h.n, 1)
+}
+
+// A signer in an emergency is signing the halt, not transfers. A held listener
+// does not take it away from that.
+func TestHeldBridgeAccountDoesNotStopASignerInAnEmergency(t *testing.T) {
+	h := startHeldListener(t, func(h *heldListener) { h.emergency = true })
+	waitFor(t, "the hold to be reported", func() bool { return h.reportedHold() != nil })
+	h.elapsed.Store(int64(2 * maxBridgeAccountHold))
+	seen := h.reportedHold().Attempts
+	waitFor(t, "attempts past the limit", func() bool { return h.reportedHold().Attempts >= seen+3 })
+	select {
+	case <-h.stop:
+		t.Fatal("a held listener stopped a signer that is in an emergency")
+	case <-h.exited:
+		t.Fatal("the listener of a signer in an emergency gave up")
+	default:
+	}
+	if len(h.errorLines()) == 0 {
+		t.Fatal("the hold of a signer in an emergency is not reported")
+	}
 }
 
 // A hold at a block the endpoint listed ends when the listener has processed

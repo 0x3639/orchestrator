@@ -41,8 +41,12 @@ type lateNode struct {
 	redeemDelayAbsent atomic.Bool
 	// Called when the listener asks the node for its sync status.
 	onSyncStatus atomic.Pointer[func()]
-	n            *znnNetwork
-	stores       replayStores
+	// Reads of the unwrap request, and whether the node fails to return the
+	// send paired with a receive.
+	requestReads   atomic.Int32
+	sendUnreadable atomic.Bool
+	n              *znnNetwork
+	stores         replayStores
 }
 
 func newLateNode(t *testing.T, register func(*replayBridge)) *lateNode {
@@ -62,7 +66,13 @@ func newLateNode(t *testing.T, register func(*replayBridge)) *lateNode {
 			if l.syncing.Load() {
 				return &protocol.SyncInfo{State: protocol.Syncing}, nil
 			}
+		case "ledger.getAccountBlockByHash":
+			var hash types.Hash
+			if len(params) == 1 && json.Unmarshal(params[0], &hash) == nil && hash[1] == 1 && l.sendUnreadable.Load() {
+				return nil, &replayRPCError{-32000, "upstream timeout"}
+			}
 		case "embedded.bridge.getUnwrapTokenRequestByHashAndLog":
+			l.requestReads.Add(1)
 			if l.redeemDelayAbsent.Load() {
 				return l.bridge.request, nil
 			}
@@ -204,6 +214,20 @@ func (l *lateNode) alteredLogs() *evmSource {
 	return &evmSource{
 		receipt: func() (interface{}, *replayRPCError) { return receipt, nil },
 		logs:    func() (interface{}, *replayRPCError) { return []etypes.Log{altered}, nil },
+	}
+}
+
+// anotherHeight is an endpoint whose log query returns the receipt's bridge
+// log under another block number.
+func (l *lateNode) anotherHeight() *evmSource {
+	log := l.bridge.sourceLog(l.t, l.bridge.recipient.String())
+	receipt := l.bridge.receipt()
+	receipt.Logs = []*etypes.Log{&log}
+	moved := log
+	moved.BlockNumber++
+	return &evmSource{
+		receipt: func() (interface{}, *replayRPCError) { return receipt, nil },
+		logs:    func() (interface{}, *replayRPCError) { return []etypes.Log{moved}, nil },
 	}
 }
 
@@ -412,6 +436,11 @@ func TestFirstReadOfTheAccountChecksRequestsInsideTheirRedeemDelay(t *testing.T)
 			if lookups := l.evmCalls.Load(); (lookups != 0) != tc.lookups {
 				t.Fatalf("%d source lookups, want lookups %v", lookups, tc.lookups)
 			}
+			// The request and its delay come from one reply. Two reads could
+			// see the delay run out between them.
+			if reads := l.requestReads.Load(); !tc.fails && reads != 1 {
+				t.Fatalf("%d reads of the request, want 1", reads)
+			}
 		})
 	}
 }
@@ -437,22 +466,67 @@ func TestFirstReadWaitsForTheRedeemDelay(t *testing.T) {
 	l.expect("delay known", common.EmergencyState, 2)
 }
 
-// The node works a request's remaining delay out from its own frontier. While
-// it is syncing that says nothing, and startup waits instead of taking on
-// every later receive as new.
-func TestFirstReadDoesNotTrustTheRedeemDelayOfASyncingNode(t *testing.T) {
-	l := newLateNode(t, nil)
-	l.redeemableIn.Store(30)
-	l.syncing.Store(true)
-	l.at(5000, acceptedReceive)
-	if err := l.n.Sync(); err == nil {
-		t.Fatal("startup decided by the redeem delay of a node that is syncing")
+// The node works a request's remaining delay out from its own frontier and
+// settings. While it is syncing neither a remaining delay nor an expired one
+// says anything, and startup waits. It does not take the receive, or every
+// later one, as new on that node's word.
+func TestFirstReadDoesNotDecideOnASyncingNode(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		frontier     uint64
+		redeemableIn uint64
+	}{
+		{"delay remaining", 5000, 30},
+		{"delay expired", 5000, 0},
+		{"receive within finality", 104, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			l := newLateNode(t, nil)
+			l.redeemableIn.Store(tc.redeemableIn)
+			l.syncing.Store(true)
+			l.at(tc.frontier, acceptedReceive)
+			if err := l.n.Sync(); err == nil {
+				t.Fatal("startup decided about a request on a node that is syncing")
+			}
+			l.expect("syncing", common.LiveState, 1)
+			started, err := l.stores.znn.BridgeWatchStarted()
+			if err != nil || started || l.evmCalls.Load() != 0 || l.row() != nil {
+				t.Fatalf("on a node that is syncing: watch recorded %v (err %v), %d source lookups, row %v", started, err, l.evmCalls.Load(), l.row())
+			}
+		})
 	}
-	l.expect("syncing", common.LiveState, 1)
-	started, err := l.stores.znn.BridgeWatchStarted()
-	if err != nil || started || l.evmCalls.Load() != 0 {
-		t.Fatalf("watch recorded %v (err %v), %d source lookups, on a node that is syncing", started, err, l.evmCalls.Load())
-	}
+}
+
+// The bridge returned the request, so its network exists there. A node with
+// no client for that network cannot check a request it has to vouch for, and
+// holds it. Old history on a first read is passed over as before.
+func TestCheckedRegistrationWaitsForItsNetworkClient(t *testing.T) {
+	elsewhere := func(b *replayBridge) { b.request.ChainId = 7 }
+	t.Run("read by the listener", func(t *testing.T) {
+		l := newLateNode(t, elsewhere)
+		l.at(5000, acceptedReceive)
+		if err := l.listen(); err == nil {
+			t.Fatal("the listener passed a request on a network it has no client for")
+		}
+		l.expect("listener", common.LiveState, 1)
+	})
+	t.Run("first read, past the delay", func(t *testing.T) {
+		l := newLateNode(t, elsewhere)
+		l.at(5000, acceptedReceive)
+		if err := l.n.Sync(); err != nil {
+			t.Fatal(err)
+		}
+		l.expect("startup", common.LiveState, 2)
+	})
+	t.Run("first read, inside the delay", func(t *testing.T) {
+		l := newLateNode(t, elsewhere)
+		l.redeemableIn.Store(30)
+		l.at(5000, acceptedReceive)
+		if err := l.n.Sync(); err == nil {
+			t.Fatal("startup passed a request it has to check on a network it has no client for")
+		}
+		l.expect("startup", common.LiveState, 1)
+	})
 }
 
 // A request the node already has to vouch for is not decided by its delay.
@@ -474,14 +548,17 @@ func TestFirstReadKeepsACheckItCouldNotFinish(t *testing.T) {
 		name         string
 		frontier     uint64
 		redeemableIn uint64
+		sendFails    bool
 	}{
-		{"request inside its redeem delay", 5000, 30},
-		{"receive within finality", 104, 0},
+		{"request inside its redeem delay", 5000, 30, false},
+		{"receive within finality", 104, 0, false},
+		{"receive within finality whose send cannot be read", 104, 0, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			l := newLateNode(t, nil)
 			l.redeemableIn.Store(tc.redeemableIn)
 			l.source.Store(l.receiptFails("upstream timeout"))
+			l.sendUnreadable.Store(tc.sendFails)
 			l.at(tc.frontier, acceptedReceive)
 			if err := l.n.Sync(); err == nil {
 				t.Fatal("startup passed a request whose source it could not read")
@@ -489,6 +566,7 @@ func TestFirstReadKeepsACheckItCouldNotFinish(t *testing.T) {
 			l.expect("first start", common.LiveState, 1)
 
 			l.restart()
+			l.sendUnreadable.Store(false)
 			l.redeemableIn.Store(0)
 			l.source.Store(l.noTransaction())
 			l.at(9000, acceptedReceive)
@@ -536,6 +614,7 @@ func TestCheckedRegistrationWaitsForAReadableSource(t *testing.T) {
 		{"endpoint has no archive logs", func(l *lateNode) *evmSource { return l.logsFail("archive data is not supported on this plan") }},
 		{"endpoint omits the block's logs", (*lateNode).incompleteLogs},
 		{"endpoint's logs differ from its receipt", (*lateNode).alteredLogs},
+		{"endpoint's logs put the event at another height", (*lateNode).anotherHeight},
 	} {
 		for name, frontier := range map[string]uint64{"live": 104, "late": 5000} {
 			t.Run(name+", "+tc.name, func(t *testing.T) {
@@ -559,7 +638,7 @@ func TestCheckedRegistrationWaitsForAReadableSource(t *testing.T) {
 // keyGenNetwork is a signer in key generation whose ledger holds one
 // administrator send at account height 2, confirmed at momentum 100, and
 // serves the bridge's current settings.
-func keyGenNetwork(t *testing.T, frontier uint64, data []byte, info func() (*definition.BridgeInfoVariable, error)) *znnNetwork {
+func keyGenNetwork(t *testing.T, frontier uint64, data []byte, info func() (*definition.BridgeInfoVariable, error), syncing ...bool) *znnNetwork {
 	t.Helper()
 	receive := startupReceive(2)
 	receive.Data = acceptedReceive
@@ -582,6 +661,9 @@ func keyGenNetwork(t *testing.T, frontier uint64, data []byte, info func() (*def
 			return &api.Momentum{Momentum: &nom.Momentum{Height: frontier, Hash: types.Hash{1}}}
 		},
 		bridgeInfo: info,
+	}
+	if len(syncing) == 1 && syncing[0] {
+		ledger.syncStatus = func() *protocol.SyncInfo { return &protocol.SyncInfo{State: protocol.Syncing} }
 	}
 	if info == nil {
 		ledger.bridgeInfo = func() (*definition.BridgeInfoVariable, error) {
@@ -760,5 +842,49 @@ func TestStartupLeavesKeyGenerationTheBridgeHasEnded(t *testing.T) {
 				t.Fatalf("state %s, want %s", common.StateToText(got), common.StateToText(tc.want))
 			}
 		})
+	}
+}
+
+// The bridge's settings as a syncing node reports them may be old ones. A
+// late receive about key generation waits for the node.
+func TestLateKeyGenExitWaitsForASyncedNode(t *testing.T) {
+	data, err := definition.ABIBridge.PackMethod(definition.SetAllowKeygenMethodName, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ended := func() (*definition.BridgeInfoVariable, error) { return &definition.BridgeInfoVariable{}, nil }
+	n := keyGenNetwork(t, 105, data, ended, true)
+	if _, _, err := n.processBridgeAccountPage(n.listenerCtx, 1, n.refreshSettings); err == nil {
+		t.Fatal("the listener followed the bridge settings of a node that is syncing")
+	}
+	if got := replayState(t, n); got != common.KeyGenState {
+		t.Fatalf("state %s", common.StateToText(got))
+	}
+	checkStartupCursor(t, n, 1)
+}
+
+// A node whose bridge account ends below the checkpoint is behind what this
+// signer has already processed. Startup does not take its empty page for the
+// tip.
+func TestStartupRejectsANodeBehindTheCheckpoint(t *testing.T) {
+	ledger := &startupLedger{page: func(uint64) *api.AccountBlockListMarshal {
+		return &api.AccountBlockListMarshal{List: []*api.AccountBlockMarshal{}, Count: 3}
+	}}
+	n := startupNetwork(t, ledger)
+	if err := n.eventsStore().SetLastUpdateHeight(5); err != nil {
+		t.Fatal(err)
+	}
+	if err := n.Sync(); err == nil {
+		t.Fatal("startup finished on a node whose bridge account is behind the checkpoint")
+	}
+	if started, err := n.eventsStore().BridgeWatchStarted(); err != nil || started {
+		t.Fatalf("watch recorded %v, err %v", started, err)
+	}
+	// At the checkpoint, the same node is at the tip.
+	if err := n.eventsStore().SetLastUpdateHeight(3); err != nil {
+		t.Fatal(err)
+	}
+	if err := n.Sync(); err != nil {
+		t.Fatal(err)
 	}
 }

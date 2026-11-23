@@ -20,7 +20,7 @@ func TestSetStateIfChangesOnlyTheExpectedState(t *testing.T) {
 	if err := gs.SetState(EmergencyState); err != nil {
 		t.Fatal(err)
 	}
-	if changed, err := gs.SetStateIf(EmergencyState, LiveState); err == nil || state != EmergencyState {
+	if changed, err := gs.SetStateIf(EmergencyState, LiveState); err == nil || changed || state != EmergencyState {
 		t.Fatalf("left a pending emergency: changed %v, err %v, state %s", changed, err, StateToText(state))
 	}
 }
