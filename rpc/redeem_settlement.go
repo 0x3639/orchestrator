@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"slices"
 	"sync"
 
 	"github.com/ethereum/go-ethereum/accounts/abi/bind"
@@ -26,9 +27,9 @@ func (v redeemView) settledAfter(registeredAt uint64) bool {
 	return v.closedAt.Cmp(math.MaxBig256) == 0 && v.unhaltedAt.Cmp(new(big.Int).SetUint64(registeredAt)) > 0
 }
 
-// RedeemSettledAfterHalt reports whether, in the contract state at
-// finalHeight on every configured endpoint, a redeem registered at
-// registeredAt is both
+// RedeemSettledAfterHalt reports whether a redeem registered at registeredAt
+// is settled: in the contract state at finalHeight on every configured
+// endpoint it is both
 //
 //   - closed, so it was paid or revoked and can never be paid again, and
 //   - followed by an administrator unhalt, so a halt covered the registration
@@ -38,58 +39,72 @@ func (v redeemView) settledAfter(registeredAt uint64) bool {
 // accepts no registration while halted. An unhalt height above registeredAt
 // therefore proves a halt began after the registration.
 //
-// The caller passes a finalHeight that is confirmation-deep. Reading the
-// state at that height, on a block every endpoint agrees on, means a later
-// reorganization cannot undo what the answer rests on. The endpoints must
-// report identical state there. When the state at finalHeight is not settled
-// but an endpoint's latest state is, the closing transaction or the unhalt is
-// not final yet: that is an error, so the caller retries instead of deciding.
-// An endpoint that fails, or that cannot serve state at finalHeight, also
-// makes the answer an error.
+// Both facts are permanent once they hold, so a redeem that is settled at
+// finalHeight is also settled in every endpoint's latest state. The latest
+// state is read first. When no endpoint shows the redeem settled there, it is
+// not settled, and that answer needs nothing more: a redeem that can still be
+// paid is reported even by endpoints that keep no older state.
+//
+// Only the answer "settled" releases a registration, and it is given on
+// confirmation-deep evidence alone: the endpoints must agree on the block at
+// finalHeight and report identical state at it. A later reorganization then
+// cannot undo what the answer rests on. A closure or unhalt that is visible
+// in the latest state but not yet at finalHeight, an endpoint that cannot
+// serve state at finalHeight, and any failed read are errors, so the caller
+// retries instead of deciding.
 func (r *EvmRpc) RedeemSettledAfterHalt(nonce *big.Int, registeredAt, finalHeight uint64) (bool, error) {
-	urls := r.Urls.Urls
-	if len(urls) == 0 {
-		return false, errors.New("no EVM endpoints configured")
-	}
 	if finalHeight < registeredAt {
 		return false, errors.New("the redeem registration is not final yet")
+	}
+	latest, err := r.redeemViews(nonce, nil)
+	if err != nil {
+		return false, err
+	}
+	if !slices.ContainsFunc(latest, func(v redeemView) bool { return v.settledAfter(registeredAt) }) {
+		return false, nil
 	}
 	if _, err := r.CanonicalHash(finalHeight); err != nil {
 		return false, err
 	}
-	final := make([]redeemView, len(urls))
-	latest := make([]redeemView, len(urls))
+	final, err := r.redeemViews(nonce, new(big.Int).SetUint64(finalHeight))
+	if err != nil {
+		return false, fmt.Errorf("at block %d: %w", finalHeight, err)
+	}
+	for _, view := range final {
+		if view.closedAt.Cmp(final[0].closedAt) != 0 || view.unhaltedAt.Cmp(final[0].unhaltedAt) != 0 {
+			return false, fmt.Errorf("EVM endpoints disagree on the redeem state at block %d", finalHeight)
+		}
+	}
+	if !final[0].settledAfter(registeredAt) {
+		return false, fmt.Errorf("the redeem is settled in the latest state but not yet at block %d", finalHeight)
+	}
+	return true, nil
+}
+
+// redeemViews reads one view from every configured endpoint at block, or at
+// the latest block when block is nil. Any endpoint error fails the read.
+func (r *EvmRpc) redeemViews(nonce, block *big.Int) ([]redeemView, error) {
+	urls := r.Urls.Urls
+	if len(urls) == 0 {
+		return nil, errors.New("no EVM endpoints configured")
+	}
+	views := make([]redeemView, len(urls))
 	errs := make([]error, len(urls))
 	var wg sync.WaitGroup
 	for i := range urls {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			if final[i], errs[i] = r.redeemViewAt(i, nonce, new(big.Int).SetUint64(finalHeight)); errs[i] != nil {
-				errs[i] = fmt.Errorf("at block %d: %w", finalHeight, errs[i])
-				return
-			}
-			latest[i], errs[i] = r.redeemViewAt(i, nonce, nil)
+			views[i], errs[i] = r.redeemViewAt(i, nonce, block)
 		}(i)
 	}
 	wg.Wait()
 	for i := range urls {
 		if errs[i] != nil {
-			return false, fmt.Errorf("redeem state from endpoint #%d: %s", i, config.RedactErrorForURL(errs[i], urls[i]))
-		}
-		if final[i].closedAt.Cmp(final[0].closedAt) != 0 || final[i].unhaltedAt.Cmp(final[0].unhaltedAt) != 0 {
-			return false, fmt.Errorf("EVM endpoints disagree on the redeem state at block %d", finalHeight)
+			return nil, fmt.Errorf("redeem state from endpoint #%d: %s", i, config.RedactErrorForURL(errs[i], urls[i]))
 		}
 	}
-	if final[0].settledAfter(registeredAt) {
-		return true, nil
-	}
-	for i := range urls {
-		if latest[i].settledAfter(registeredAt) {
-			return false, fmt.Errorf("the redeem is settled in the latest state but not yet at block %d", finalHeight)
-		}
-	}
-	return false, nil
+	return views, nil
 }
 
 // redeemViewAt reads the redeem entry and the unhalt height from one endpoint

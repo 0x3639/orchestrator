@@ -191,7 +191,8 @@ func TestStoredIncidentIsReleasedOnceSettled(t *testing.T) {
 	startRedeemWatch(t, n)
 	stillHeld := func(why string) {
 		t.Helper()
-		// Each settlement round reads the entry at two blocks on two endpoints.
+		// Each settlement round reads the entry on two endpoints, at one or
+		// two blocks, so this spans at least three rounds.
 		waitForMore(t, chain.contract.reads.Load, 12)
 		pending, err := n.state.PendingRedeemIncidents()
 		if state, _ := n.state.GetState(); err != nil || len(pending) != 2 || n.state.RedeemHaltGeneration() == 0 || state != common.EmergencyState {

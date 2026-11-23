@@ -240,6 +240,13 @@ func TestOnlySettledHistoryIsArchived(t *testing.T) {
 		{name: "one endpoint has no state at the final height", closedAt: 110, unhaltedAt: 120, wantErr: true,
 			secondary: func(c *redeemContract) { c.closedAt.Store(110); c.unhaltedAt.Store(120); c.pruned.Store(true) }},
 		{name: "one endpoint has not reached the final height", closedAt: 110, unhaltedAt: 120, lagging: 120, wantErr: true},
+		// What can still be paid is reported without any older state.
+		{name: "payable, no endpoint has state at the final height", unhaltedAt: 120, wantHalt: true,
+			primary: func(c *redeemContract) { c.pruned.Store(true) }},
+		{name: "closed without a later unhalt, no endpoint has state at the final height", closedAt: 110, unhaltedAt: 90, wantHalt: true,
+			primary: func(c *redeemContract) { c.pruned.Store(true) }},
+		{name: "settled, no endpoint has state at the final height", closedAt: 110, unhaltedAt: 120, wantErr: true,
+			primary: func(c *redeemContract) { c.pruned.Store(true) }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			src := &redeemSource{synced: true, err: constants.ErrDataNonExistent.Error()}
