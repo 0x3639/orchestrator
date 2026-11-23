@@ -85,8 +85,14 @@ func TestHeldRegistrationIsReleasedWhenItsBlockIsReplaced(t *testing.T) {
 	if err := n.InterpretLog(orphan, true); err == nil || len(n.heldRedeemLogs()) != 1 {
 		t.Fatalf("orphan was not held: %v", err)
 	}
+	// The canonical block at that height carries no such log. While that
+	// height is young the block can still change, so the entry stays held.
+	chain.setChain(reg.BlockNumber + n.ConfirmationsToFinality() - 2)
 	startRedeemWatch(t, n)
-	// The canonical block at that height carries no such log.
+	waitForMore(t, func() uint64 { return uint64(src.lookups()) }, 6)
+	if len(n.heldRedeemLogs()) != 1 {
+		t.Fatal("a registration was released while its height was not final")
+	}
 	chain.setChain(reg.BlockNumber + n.ConfirmationsToFinality() + 5)
 	waitFor(t, "a replaced registration stayed held", func() bool { return len(n.heldRedeemLogs()) == 0 })
 	// Nothing rechecks a released entry, so there is no later round to wait for.

@@ -2,8 +2,10 @@ package rpc
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"math/big"
 
 	"github.com/zenon-network/go-zenon/common/types"
 	"github.com/zenon-network/go-zenon/protocol"
@@ -13,6 +15,36 @@ import (
 
 	"orchestrator/common/config"
 )
+
+// decodeRedeemWrap reads a wrap request reply for the redeem check. The Zenon
+// type turns a missing or malformed amount or fee into zero, which would read
+// as a real request with other numbers. Here both must be present as decimal
+// integers; a fee of "0" is valid. A null reply decodes to nil.
+func decodeRedeemWrap(raw json.RawMessage) (*definition.WrapTokenRequest, error) {
+	if len(raw) == 0 || string(raw) == "null" {
+		return nil, nil
+	}
+	var wire struct {
+		Amount *string `json:"amount"`
+		Fee    *string `json:"fee"`
+	}
+	if err := json.Unmarshal(raw, &wire); err != nil {
+		return nil, err
+	}
+	for _, field := range []*string{wire.Amount, wire.Fee} {
+		if field == nil {
+			return nil, errors.New("wrap request reply without an amount or a fee")
+		}
+		if value, ok := new(big.Int).SetString(*field, 10); !ok || value.Sign() < 0 {
+			return nil, errors.New("wrap request reply with an invalid amount or fee")
+		}
+	}
+	wrap := new(definition.WrapTokenRequest)
+	if err := json.Unmarshal(raw, wrap); err != nil {
+		return nil, err
+	}
+	return wrap, nil
+}
 
 func WrapNotFound(err error) bool {
 	return errors.Is(err, constants.ErrDataNonExistent) || (err != nil && err.Error() == constants.ErrDataNonExistent.Error())
@@ -45,11 +77,15 @@ func confirmRedeemWrapAt(url string, id types.Hash, observed *definition.WrapTok
 	if info == nil || info.State != protocol.SyncDone {
 		return errors.New("source node is not synced")
 	}
-	var wrap *definition.WrapTokenRequest
-	err = client.CallContext(ctx, &wrap, "embedded.bridge.getWrapTokenRequestById", id)
+	var raw json.RawMessage
+	err = client.CallContext(ctx, &raw, "embedded.bridge.getWrapTokenRequestById", id)
 	if observed == nil && WrapNotFound(err) {
 		return nil
 	}
+	if err != nil {
+		return err
+	}
+	wrap, err := decodeRedeemWrap(raw)
 	if err != nil {
 		return err
 	}

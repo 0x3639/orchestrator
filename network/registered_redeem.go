@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"math/big"
 	"slices"
-	"strings"
 
 	ecommon "github.com/ethereum/go-ethereum/common"
 	etypes "github.com/ethereum/go-ethereum/core/types"
@@ -41,9 +40,11 @@ func (eN *evmNetwork) registerRedeem(log etypes.Log, live bool) error {
 			return fmt.Errorf("incomplete Zenon wrap response for redeem %s", id)
 		}
 		netAmount := new(big.Int).Sub(wrap.Amount, wrap.Fee)
+		// Zenon stores a destination as the user wrote it, with or without the
+		// 0x prefix, so the addresses are compared by value and not as text.
 		if wrap.ChainId == eN.ChainId() && wrap.NetworkClass == eN.NetworkClass() &&
-			netAmount.Cmp(redeem.Amount) == 0 && strings.EqualFold(wrap.ToAddress, redeem.To.Hex()) &&
-			strings.EqualFold(wrap.TokenAddress, redeem.Token.Hex()) {
+			netAmount.Cmp(redeem.Amount) == 0 && ecommon.HexToAddress(wrap.ToAddress) == redeem.To &&
+			ecommon.HexToAddress(wrap.TokenAddress) == redeem.Token {
 			if live {
 				return nil // The finalized scan owns durable wrap status.
 			}
@@ -67,19 +68,16 @@ func (eN *evmNetwork) registerRedeem(log etypes.Log, live bool) error {
 	if err := eN.rpcManager.Znn().ConfirmRedeemWrap(id, wrap); err != nil {
 		return err
 	}
-	confirmed, err := eN.verifyRedeemLog(log, confirmations)
-	if err != nil {
-		return err
-	}
-	incident := common.RedeemIncident{ChainID: eN.ChainId(), Log: confirmed, Wrap: wrap}
 	// An operator acknowledgement is decided by ReportRedeemIncident and does
 	// not wait for contract state.
-	acknowledged := eN.state.RedeemLogAcknowledged(incident)
+	acknowledged := eN.state.RedeemLogAcknowledged(common.RedeemIncident{ChainID: eN.ChainId(), Log: log})
 	if live && !acknowledged {
 		// The live rules are for a registration that can still be paid. One
 		// that an endpoint already shows closed after a completed halt is
 		// history, whatever head selected these rules. It is decided by the
-		// finalized rules once it is final.
+		// finalized rules once it is final. This read comes before the
+		// canonical check, so that check is the last look at the chain
+		// before a live report.
 		settled, err := eN.EvmRpc().RedeemSettledInLatestState(redeem.Nonce, log.BlockNumber)
 		if err != nil {
 			return err
@@ -88,6 +86,11 @@ func (eN *evmNetwork) registerRedeem(log etypes.Log, live bool) error {
 			return errors.New("the redeem is closed after a completed halt in the latest contract state; waiting for final evidence")
 		}
 	}
+	confirmed, err := eN.verifyRedeemLog(log, confirmations)
+	if err != nil {
+		return err
+	}
+	incident := common.RedeemIncident{ChainID: eN.ChainId(), Log: confirmed, Wrap: wrap}
 	if !live && !acknowledged {
 		// A signer replaying history must not halt again for a redeem that can
 		// no longer be paid and that a completed halt already covered.

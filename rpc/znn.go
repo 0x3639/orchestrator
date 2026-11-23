@@ -3,6 +3,7 @@ package rpc
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	sdk_rpc_client "github.com/MoonBaZZe/znn-sdk-go/rpc_client"
 	"github.com/MoonBaZZe/znn-sdk-go/zenon"
 	ic "github.com/libp2p/go-libp2p-core/crypto"
@@ -236,11 +237,11 @@ func (r *ZnnRpc) GetWrapTokenRequestById(id types.Hash) (*definition.WrapTokenRe
 func (r *ZnnRpc) RedeemWrapRequestById(id types.Hash) (*definition.WrapTokenRequest, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), ZnnLedgerTimeout)
 	defer cancel()
-	var wrap *definition.WrapTokenRequest
-	if err := r.settingsClient.CallContext(ctx, &wrap, "embedded.bridge.getWrapTokenRequestById", id); err != nil {
+	var raw json.RawMessage
+	if err := r.settingsClient.CallContext(ctx, &raw, "embedded.bridge.getWrapTokenRequestById", id); err != nil {
 		return nil, err
 	}
-	return wrap, nil
+	return decodeRedeemWrap(raw)
 }
 
 func (r *ZnnRpc) GetUnwrapTokenRequestByHashAndLog(txHash types.Hash, logIndex uint32) (*definition.UnwrapTokenRequest, error) {

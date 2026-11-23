@@ -394,9 +394,10 @@ func (node *Node) processSignatures() {
 				continue
 			}
 			// The recheck worker can archive the last incident while the
-			// flags above are being read. Decide from the state as it is now,
-			// not from the emergency this iteration began with.
-			if node.state.RedeemHaltGeneration() != generation {
+			// flags above are being read. Then there is nothing to halt for:
+			// look again from the state as it is now. A newer incident keeps
+			// the generation set, and the halt goes ahead.
+			if node.state.RedeemHaltGeneration() == 0 {
 				continue
 			}
 		}
@@ -850,6 +851,10 @@ func (node *Node) processSignatures() {
 			// todo when to exit this state in case we don't halt the network after some time
 			node.logger.Debug("Process in emergency state")
 			time.Sleep(5 * time.Second)
+			// The emergency can have ended during the wait.
+			if state, err := node.state.GetState(); err == nil && state != common.EmergencyState {
+				continue
+			}
 			znnTssNonce, err := node.networksManager.GetTssNonceZnn()
 			if err != nil {
 				node.logger.Debug(err)
@@ -939,6 +944,12 @@ func (node *Node) processSignatures() {
 						node.logger.Debug("[send halt evm tx] this is me")
 						// todo discuss using concurrent send for different networks with different senders
 						if changed, err := node.networksManager.SendHaltEvm(evmFullSignatures, node.ecdsaPrivateKey, node.evmAddress); err != nil {
+							if errors.Is(err, network.ErrHaltMembershipChanged) {
+								// End this round. The state still calls for a halt,
+								// so the next round signs for the current networks.
+								node.logger.Warn(err)
+								break
+							}
 							node.logger.Debug(err)
 							continue
 						} else if changed {

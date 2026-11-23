@@ -22,6 +22,16 @@ type redeemView struct {
 	unhaltedAt *big.Int
 }
 
+// check rejects a view whose entry is neither closed nor the registration at
+// registeredAt. The registration is then not in the state that was read, for
+// example because its block was replaced, and the view answers nothing.
+func (v redeemView) check(registeredAt uint64) error {
+	if v.closedAt.Cmp(math.MaxBig256) == 0 || v.closedAt.Cmp(new(big.Int).SetUint64(registeredAt)) == 0 {
+		return nil
+	}
+	return fmt.Errorf("the contract shows block %s for this redeem, not its registration block %d", v.closedAt, registeredAt)
+}
+
 // settledAfter reports a closed entry and an administrator unhalt above registeredAt.
 func (v redeemView) settledAfter(registeredAt uint64) bool {
 	return v.closedAt.Cmp(math.MaxBig256) == 0 && v.unhaltedAt.Cmp(new(big.Int).SetUint64(registeredAt)) > 0
@@ -92,6 +102,9 @@ func (r *EvmRpc) RedeemSettledAfterHalt(nonce *big.Int, registeredAt, confirmati
 		}
 	}
 	for _, view := range final {
+		if err := view.check(registeredAt); err != nil {
+			return false, err
+		}
 		if view.closedAt.Cmp(final[0].closedAt) != 0 || view.unhaltedAt.Cmp(final[0].unhaltedAt) != 0 {
 			return false, fmt.Errorf("EVM endpoints disagree on the redeem state at block %d", finalHeight)
 		}
@@ -105,18 +118,21 @@ func (r *EvmRpc) RedeemSettledAfterHalt(nonce *big.Int, registeredAt, confirmati
 // RedeemSettledInLatestState reports whether any endpoint shows the redeem
 // closed and followed by an administrator unhalt in its latest state. It
 // archives nothing. A true answer tells the caller that the registration is
-// not, or may no longer be, a live discrepancy.
+// not, or may no longer be, a live discrepancy. An endpoint whose state does
+// not hold this registration at all makes the answer an error.
 func (r *EvmRpc) RedeemSettledInLatestState(nonce *big.Int, registeredAt uint64) (bool, error) {
 	latest, err := r.redeemViews(nonce, ecommon.Hash{})
 	if err != nil {
 		return false, err
 	}
+	settled := false
 	for _, view := range latest {
-		if view.settledAfter(registeredAt) {
-			return true, nil
+		if err := view.check(registeredAt); err != nil {
+			return false, err
 		}
+		settled = settled || view.settledAfter(registeredAt)
 	}
-	return false, nil
+	return settled, nil
 }
 
 // lowestHead returns the lowest chain head among the configured endpoints.

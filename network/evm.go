@@ -343,7 +343,7 @@ func (eN *evmNetwork) Sync() error {
 		// The first scan after a restart runs before anything acts on a
 		// restored incident. Release what the chain has settled since, and
 		// record whether what remains can be paid.
-		eN.settlePendingIncidents(nil)
+		eN.settlePendingIncidents(nil, true)
 	}
 	startHeight, redeemFrom, legacy, err := eN.eventsStore().GetScanHeights(eN.ConfirmationsToFinality())
 	if err != nil {
@@ -471,6 +471,7 @@ func (eN *evmNetwork) Sync() error {
 		depth := eN.ConfirmationsToFinality()
 		finalizedTip = min(finalizedTip, latestBlock-min(latestBlock, depth))
 		interpretFailed := false
+		redeemApplied := false // a finalized redeem log of this range was applied
 		for _, log := range logs {
 			recent := latestBlock-log.BlockNumber < depth
 			if len(log.Topics) > 0 && isRedeemTopic(log.Topics[0]) {
@@ -513,6 +514,7 @@ func (eN *evmNetwork) Sync() error {
 				eN.scanPaused.Store(true)
 				return nil
 			}
+			redeemApplied = redeemApplied || (len(log.Topics) > 0 && isRedeemTopic(log.Topics[0]))
 		}
 		if interpretFailed {
 			continue
@@ -528,6 +530,13 @@ func (eN *evmNetwork) Sync() error {
 
 		through := max(startHeight, rangeEnd)
 		redeemFrom = max(redeemFrom, min(rangeEnd, finalizedTip))
+		// The statuses live in another database. They must be on disk before
+		// a checkpoint says the scan is past the logs they came from.
+		if redeemApplied {
+			if err := eN.dbManager.ZnnStorage().SyncRedeemStatuses(); err != nil {
+				return fmt.Errorf("sync redeem statuses before the scan checkpoint: %w", err)
+			}
+		}
 		if err := eN.eventsStore().SetScanHeights(through, redeemFrom); err != nil {
 			return err
 		}
@@ -638,7 +647,11 @@ func (eN *evmNetwork) InterpretLog(log etypes.Log, live bool) error {
 		if live {
 			return eN.checkLiveRedeem(log)
 		}
-		return eN.registerRedeem(log, false)
+		err := eN.registerRedeem(log, false)
+		if err == nil {
+			eN.noteRedeemCheck(log, nil) // The finalized scan answered a held check.
+		}
+		return err
 	case common.RedeemedSigHash.Hex(), common.RevokedRedeemSigHash.Hex():
 		return eN.applyRedeemOutcome(log, live)
 	case common.HaltedSigHash.Hex():
@@ -900,7 +913,7 @@ func (eN *evmNetwork) subscribeToEvents() {
 			// The provider accepted the subscription and dropped it almost
 			// at once; do not spin through subscribe and Sync.
 			eN.logger.Warnf("log subscription for chainId %d lasted only %s; resubscribing in %s", eN.ChainId(), time.Since(started).Round(time.Second), resubscribeBackoff)
-			if !eN.sleep(resubscribeBackoff) {
+			if !eN.sleep(min(resubscribeBackoff, eN.refreshInterval())) {
 				return
 			}
 			resubscribeBackoff *= 2

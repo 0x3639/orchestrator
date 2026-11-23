@@ -1,7 +1,9 @@
 package network
 
 import (
+	"errors"
 	"math/big"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -14,8 +16,10 @@ import (
 	"github.com/zenon-network/go-zenon/common/types"
 	"github.com/zenon-network/go-zenon/vm/constants"
 	"github.com/zenon-network/go-zenon/vm/embedded/definition"
+	"go.uber.org/zap"
 
 	"orchestrator/common"
+	"orchestrator/db"
 	"orchestrator/db/unwrap"
 	"orchestrator/db/wrap"
 )
@@ -102,6 +106,135 @@ func TestCatchUpChecksYoungRegistrations(t *testing.T) {
 				t.Fatalf("scan height %d, want %d", through, wantThrough)
 			}
 		})
+	}
+}
+
+// Zenon stores a destination as the user wrote it, with or without the 0x
+// prefix and in any case. Both spell the same address and match.
+func TestRegistrationMatchesAnUnprefixedSourceAddress(t *testing.T) {
+	src := &redeemSource{synced: true}
+	n, reg, _ := redeemFixture(t, src)
+	src.wrap = sourceRequestFor(reg)
+	src.wrap.ToAddress = strings.ToLower(src.wrap.ToAddress[2:])
+	src.wrap.TokenAddress = strings.ToUpper(src.wrap.TokenAddress[2:])
+	for _, live := range []bool{true, false} {
+		if err := n.InterpretLog(reg, live); err != nil || n.state.RedeemHaltGeneration() != 0 || len(n.heldRedeemLogs()) != 0 {
+			t.Fatalf("live=%t: err=%v pending=%d held=%d", live, err, n.state.RedeemHaltGeneration(), len(n.heldRedeemLogs()))
+		}
+	}
+	row, err := n.dbManager.ZnnStorage().GetWrapRequestById(src.wrap.Id)
+	if err != nil || row == nil || row.RedeemStatus != common.PendingRedeemStatus {
+		t.Fatalf("matched registration row=%+v err=%v", row, err)
+	}
+	// Another address still does not match.
+	src.wrap.ToAddress = "ff" + src.wrap.ToAddress[2:]
+	if err := n.InterpretLog(reg, true); err != nil || n.state.RedeemHaltGeneration() == 0 {
+		t.Fatalf("other destination: err=%v pending=%d", err, n.state.RedeemHaltGeneration())
+	}
+}
+
+// A source request for another token is not a match.
+func TestRegistrationForAnotherTokenDoesNotMatch(t *testing.T) {
+	src := &redeemSource{synced: true}
+	n, reg, _ := redeemFixture(t, src)
+	src.wrap = sourceRequestFor(reg)
+	src.wrap.TokenAddress = "ff" + src.wrap.TokenAddress[4:]
+	if err := n.InterpretLog(reg, true); err != nil || n.state.RedeemHaltGeneration() == 0 {
+		t.Fatalf("other token: err=%v pending=%d", err, n.state.RedeemHaltGeneration())
+	}
+}
+
+// A source reply without a usable amount or fee is not a request with other
+// numbers. It decides nothing.
+func TestSourceReplyWithoutAmountOrFeeDecidesNothing(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		mangle func(map[string]any)
+		amount int64 // gross amount in the source request; the log carries 19
+		fee    int64
+		wantOK bool
+	}{
+		{name: "fee missing", amount: 20, fee: 1, mangle: func(r map[string]any) { delete(r, "fee") }},
+		{name: "fee not a number", amount: 20, fee: 1, mangle: func(r map[string]any) { r["fee"] = "one" }},
+		{name: "fee negative", amount: 20, fee: 1, mangle: func(r map[string]any) { r["fee"] = "-1" }},
+		{name: "amount missing", amount: 20, fee: 1, mangle: func(r map[string]any) { delete(r, "amount") }},
+		{name: "amount not a string", amount: 20, fee: 1, mangle: func(r map[string]any) { r["amount"] = 20 }},
+		{name: "explicit zero fee", amount: 19, fee: 0, mangle: func(map[string]any) {}, wantOK: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			src := &redeemSource{synced: true, mangle: tc.mangle}
+			n, reg, _ := redeemFixture(t, src)
+			src.wrap = sourceRequestFor(reg)
+			src.wrap.Amount, src.wrap.Fee = big.NewInt(tc.amount), big.NewInt(tc.fee)
+			for _, live := range []bool{true, false} {
+				err := n.InterpretLog(reg, live)
+				if (err == nil) != tc.wantOK || n.state.RedeemHaltGeneration() != 0 {
+					t.Fatalf("live=%t: err=%v pending=%d", live, err, n.state.RedeemHaltGeneration())
+				}
+			}
+			row, err := n.dbManager.ZnnStorage().GetWrapRequestById(src.wrap.Id)
+			if err != nil || (row != nil) != tc.wantOK {
+				t.Fatalf("row=%+v err=%v", row, err)
+			}
+		})
+	}
+}
+
+// failingSync is a wrap store whose writes cannot be made durable.
+type failingSync struct {
+	db.ZnnStorage
+	err error
+}
+
+func (s *failingSync) SyncRedeemStatuses() error { return s.err }
+
+// The scan checkpoint is stored in another database than the redeem
+// statuses. It must not move past a range whose statuses are not on disk.
+func TestScanCheckpointWaitsForDurableStatuses(t *testing.T) {
+	src := &redeemSource{synced: true}
+	n, reg, _ := redeemFixture(t, src)
+	src.wrap = sourceRequestFor(reg)
+	stores := n.dbManager.(unwrapTestStores)
+	store := &failingSync{ZnnStorage: stores.znn, err: errors.New("disk full")}
+	stores.znn = store
+	n.dbManager = stores
+	if err := n.Sync(); err == nil {
+		t.Fatal("the scan succeeded although the statuses could not be synced")
+	}
+	if cursor, _ := n.eventsStore().GetLastUpdateHeight(); cursor != 100 {
+		t.Fatalf("checkpoint moved to %d past statuses that are not durable", cursor)
+	}
+	store.err = nil
+	if err := n.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	row, err := store.GetWrapRequestById(src.wrap.Id)
+	if cursor, _ := n.eventsStore().GetLastUpdateHeight(); cursor != 140 || err != nil || row == nil || row.RedeemStatus != common.PendingRedeemStatus {
+		t.Fatalf("after the sync worked: cursor=%d row=%+v err=%v", cursor, row, err)
+	}
+}
+
+// Halt signatures are matched to networks by position. When the networks are
+// not the ones the messages were signed for, sending must stop and report
+// it instead of using a signature for another network or none at all.
+func TestHaltSignaturesNeedTheNetworksTheyWereSignedFor(t *testing.T) {
+	src := &redeemSource{synced: true}
+	n, _, chain := redeemFixture(t, src)
+	m := &NetworksManager{evmNetworks: []*evmNetwork{n}, logger: zap.NewNop().Sugar()}
+	// Signed while there was no EVM network; one was published since.
+	if _, err := m.SendHaltEvm(nil, nil, ecommon.Address{}); !errors.Is(err, ErrHaltMembershipChanged) {
+		t.Fatalf("a network without a signature: %v", err)
+	}
+	// Signed for another network in the same position.
+	m.haltChains = []uint32{56}
+	if _, err := m.SendHaltEvm([][]byte{{1}}, nil, ecommon.Address{}); !errors.Is(err, ErrHaltMembershipChanged) {
+		t.Fatalf("a signature for another network: %v", err)
+	}
+	// Signed for this network: sending goes on, here to a chain already halted.
+	m.haltChains = []uint32{1}
+	*chain.halted = true
+	if halted, err := m.SendHaltEvm([][]byte{{1}}, nil, ecommon.Address{}); err != nil || !halted {
+		t.Fatalf("matching networks: halted=%t err=%v", halted, err)
 	}
 }
 
@@ -218,7 +351,7 @@ func TestOnlySettledHistoryIsArchived(t *testing.T) {
 		primary    func(*redeemContract) // extra condition on the first endpoint
 		secondary  func(*redeemContract) // nil: both endpoints report the same contract
 		lagging    uint64                // head of the second endpoint, when it is behind
-		reorg      bool                  // the chain is replaced while the older state is read
+		reorgAt    uint64                // height whose block is replaced while the older state is read
 		wantHalt   bool
 		wantErr    bool
 		wantStored bool
@@ -250,7 +383,12 @@ func TestOnlySettledHistoryIsArchived(t *testing.T) {
 		{name: "one endpoint is a block behind", closedAt: 110, unhaltedAt: 120, lagging: 139, wantStored: true},
 		{name: "the unhalt is not final for the endpoint that is behind", closedAt: 110, unhaltedAt: 120, lagging: 131, wantErr: true},
 		{name: "the closure is not final for the endpoint that is behind", closedAt: 110, unhaltedAt: 120, lagging: 120, wantErr: true},
-		{name: "the block at the final height changes during the read", closedAt: 110, unhaltedAt: 120, reorg: true, wantErr: true},
+		{name: "the block at the final height changes during the read", closedAt: 110, unhaltedAt: 120, reorgAt: 128, wantErr: true},
+		{name: "the block at the lowest head changes during the read", closedAt: 110, unhaltedAt: 120, reorgAt: 140, wantErr: true},
+		{name: "one endpoint does not hold the registration", closedAt: 110, unhaltedAt: 120, wantErr: true,
+			secondary: func(c *redeemContract) { c.registered.Store(0); c.unhaltedAt.Store(120) }},
+		{name: "no endpoint holds the registration", wantErr: true,
+			primary: func(c *redeemContract) { c.registered.Store(0) }},
 		// What can still be paid is reported without any older state.
 		{name: "payable, no endpoint has state at the final height", unhaltedAt: 120, wantHalt: true,
 			primary: func(c *redeemContract) { c.pruned.Store(true) }},
@@ -268,16 +406,16 @@ func TestOnlySettledHistoryIsArchived(t *testing.T) {
 				tc.primary(chain.primary.contract)
 			}
 			if tc.secondary != nil {
-				chain.contract = new(redeemContract)
+				chain.contract = contractWith(reg.BlockNumber)
 				tc.secondary(chain.contract)
 			}
 			if tc.lagging != 0 {
 				chain.set(evidenceReceipt(reg), []etypes.Log{reg}, tc.lagging)
 			}
-			if tc.reorg {
+			if tc.reorgAt != 0 {
 				chain.primary.contract.onOldRead = sync.OnceFunc(func() {
-					chain.primary.setReplacement(ecommon.HexToHash("0xbeef"))
-					chain.setReplacement(ecommon.HexToHash("0xbeef"))
+					chain.primary.replaced.Store(tc.reorgAt, ecommon.HexToHash("0xbeef"))
+					chain.replaced.Store(tc.reorgAt, ecommon.HexToHash("0xbeef"))
 				})
 			}
 			err := n.InterpretLog(reg, false)
@@ -347,6 +485,44 @@ func TestRestoredIncidentIsReleasedByTheFirstScan(t *testing.T) {
 	}
 }
 
+// Before the signing loop exists the scan settles what it can, but it does not
+// work through the whole backlog once one incident is known to stay pending:
+// that incident needs its halt.
+func TestStartupSweepStopsAtTheFirstIncidentThatStaysPending(t *testing.T) {
+	src := &redeemSource{synced: true, err: constants.ErrDataNonExistent.Error()}
+	n, reg, chain := redeemFixture(t, src)
+	// Stored first: an incident whose log no endpoint serves any more.
+	gone := reg
+	gone.BlockHash = ecommon.HexToHash("0x01")
+	for _, log := range []etypes.Log{gone, reg} {
+		if err := n.state.ReportRedeemIncident(common.RedeemIncident{ChainID: 1, Log: log}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	chain.contract.closedAt.Store(110)
+	chain.contract.unhaltedAt.Store(120)
+	pendingCount := func() int {
+		t.Helper()
+		pending, err := n.state.PendingRedeemIncidents()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return len(pending)
+	}
+	if err := n.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	if pendingCount() != 2 {
+		t.Fatalf("the startup sweep went past an incident that stays pending: %d left", pendingCount())
+	}
+	// The worker checks the rest.
+	startRedeemWatch(t, n)
+	waitFor(t, "the worker did not settle the incident behind it", func() bool { return pendingCount() == 1 })
+	if n.state.RedeemHaltGeneration() == 0 {
+		t.Fatal("the incident that stays pending no longer holds the bridge")
+	}
+}
+
 // In a long pass the checkpoint limit is fixed by the first range. A
 // registration above that limit that is final under the current head is
 // decided by the finalized rules, so settled history is archived there too.
@@ -355,6 +531,7 @@ func TestSettledRegistrationAboveTheCheckpointLimit(t *testing.T) {
 	n, reg, chain := redeemFixture(t, src)
 	reg.BlockNumber = 110
 	reg.BlockHash = canonicalHeader(110).Hash()
+	chain.contract.registered.Store(110)
 	chain.setChain(112, reg) // the pass starts here: checkpoint limit 100
 	chain.contract.closedAt.Store(115)
 	chain.contract.unhaltedAt.Store(120)
@@ -386,7 +563,7 @@ func TestLiveRulesDoNotReportSettledHistory(t *testing.T) {
 	}{
 		{name: "every endpoint shows it settled"},
 		{name: "one endpoint has not seen the settlement yet",
-			behind: func(p *redeemProvider) { p.contract = new(redeemContract) }},
+			behind: func(p *redeemProvider) { p.contract = contractWith(100) }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			src := &redeemSource{synced: true, err: constants.ErrDataNonExistent.Error()}
@@ -431,8 +608,15 @@ func TestPausedScanResumesWhenTheHaltIsReleased(t *testing.T) {
 	if err := n.state.CompleteEmergencyHalt(n.state.RedeemHaltGeneration(), map[uint32]bool{56: true}); err != nil {
 		t.Fatal(err)
 	}
-	waitFor(t, "the scan did not resume after the halt was released", func() bool {
-		cursor, err := n.eventsStore().GetLastUpdateHeight()
-		return err == nil && cursor == 140
-	})
+	// The ordinary first retry of a failed subscription is five seconds away.
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		if cursor, err := n.eventsStore().GetLastUpdateHeight(); err == nil && cursor == 140 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the scan did not resume soon after the halt was released")
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
 }

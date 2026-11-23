@@ -40,6 +40,7 @@ import (
 // redeemContract is the bridge storage one fixture endpoint reports. A read
 // at a block sees only what had happened by that block.
 type redeemContract struct {
+	registered atomic.Uint64 // block of the registration; 0 if the contract never saw it
 	closedAt   atomic.Uint64 // block that paid or revoked the redeem entry; 0 while payable
 	unhaltedAt atomic.Uint64 // block of the last administrator unhalt
 	failing    atomic.Bool   // every contract read fails on this endpoint
@@ -75,6 +76,13 @@ func (c *redeemContract) stateAt(block gethrpc.BlockNumberOrHash) (uint64, error
 	return 0, errors.New("header for hash not found")
 }
 
+// contractWith is a contract that holds a registration made at the given block.
+func contractWith(registered uint64) *redeemContract {
+	c := new(redeemContract)
+	c.registered.Store(registered)
+	return c
+}
+
 type redeemProvider struct {
 	primary *redeemProvider // companion endpoint for advancing the fixture chain
 	*unwrapProvider
@@ -84,6 +92,7 @@ type redeemProvider struct {
 	headFails  atomic.Bool   // eth_blockNumber fails on this endpoint
 	headReads  atomic.Uint64 // eth_blockNumber requests received
 	blockReads atomic.Uint64 // eth_getBlockByNumber requests received
+	replaced   sync.Map      // height to the hash of a block that replaced the fixture block there
 }
 
 func (p *redeemProvider) BlockNumber() (hexutil.Uint64, error) {
@@ -96,7 +105,11 @@ func (p *redeemProvider) BlockNumber() (hexutil.Uint64, error) {
 
 func (p *redeemProvider) GetBlockByNumber(n hexutil.Uint64, full bool) map[string]interface{} {
 	p.blockReads.Add(1)
-	return p.unwrapProvider.GetBlockByNumber(n, full)
+	block := p.unwrapProvider.GetBlockByNumber(n, full)
+	if hash, ok := p.replaced.Load(uint64(n)); ok && block != nil {
+		block["hash"] = hash
+	}
+	return block
 }
 
 func (p *redeemProvider) setChain(head uint64, logs ...etypes.Log) {
@@ -142,8 +155,8 @@ func (p *redeemProvider) Call(call map[string]any, block gethrpc.BlockNumberOrHa
 		}
 		if closed := p.contract.closedAt.Load(); closed != 0 && closed <= at {
 			copy(result, bytes.Repeat([]byte{0xff}, 32))
-		} else {
-			result[31] = 100
+		} else if registered := p.contract.registered.Load(); registered <= at {
+			binary.BigEndian.PutUint64(result[24:], registered)
 		}
 	case input == "0x69d11381": // unhaltedAt()
 		at, err := p.contract.stateAt(block)
@@ -167,9 +180,27 @@ type redeemSource struct {
 	bridgeErr string
 	err       string
 	wrap      *definition.WrapTokenRequest
+	mangle    func(reply map[string]any) // alters the wrap reply on the wire
 	synced    bool
 	failures  int
 	calls     int
+}
+
+// wrapReply is the wire form of the source's wrap, after mangle.
+func (s *redeemSource) wrapReply() (any, error) {
+	if s.wrap == nil || s.mangle == nil {
+		return s.wrap, nil
+	}
+	data, err := json.Marshal(s.wrap)
+	if err != nil {
+		return nil, err
+	}
+	reply := map[string]any{}
+	if err := json.Unmarshal(data, &reply); err != nil {
+		return nil, err
+	}
+	s.mangle(reply)
+	return reply, nil
 }
 
 func (s *redeemSource) update(change func(*redeemSource)) {
@@ -198,6 +229,7 @@ func (tr redeemTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	var call struct {
 		ID     json.RawMessage
 		Method string
+		Params []json.RawMessage
 	}
 	if err := json.NewDecoder(req.Body).Decode(&call); err != nil {
 		return nil, err
@@ -219,6 +251,10 @@ func (tr redeemTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 		}
 		result["result"] = protocol.SyncInfo{State: state, CurrentHeight: 990, TargetHeight: 990}
 	case "embedded.bridge.getWrapTokenRequestById":
+		// Every fixture registration carries the same nonce.
+		if want, _ := json.Marshal(types.Hash(ecommon.HexToHash("0x31"))); len(call.Params) != 1 || string(call.Params[0]) != string(want) {
+			return nil, fmt.Errorf("wrap lookup with unexpected parameters %s", call.Params)
+		}
 		src.calls++
 		message := src.err
 		if src.failures > 0 {
@@ -228,7 +264,11 @@ func (tr redeemTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 		if message != "" {
 			result["error"] = map[string]any{"code": -32000, "message": message}
 		} else {
-			result["result"] = src.wrap
+			reply, err := src.wrapReply()
+			if err != nil {
+				return nil, err
+			}
+			result["result"] = reply
 		}
 	default:
 		return nil, fmt.Errorf("unexpected method %s", call.Method)
@@ -247,7 +287,7 @@ func redeemFixture(t *testing.T, sources ...*redeemSource) (*evmNetwork, etypes.
 	log := etypes.Log{Address: testContract, BlockNumber: 100, BlockHash: ev.BlockHash, TxHash: ev.TransactionHash, Index: 3,
 		Topics: []ecommon.Hash{common.RegisteredRedeemSigHash, ecommon.HexToHash("0x31"), ecommon.HexToHash("0x32"), ecommon.HexToHash("0x33")},
 		Data:   ecommon.LeftPadBytes([]byte{19}, 32)}
-	flag, contract := new(bool), new(redeemContract)
+	flag, contract := new(bool), contractWith(log.BlockNumber)
 	primary := &redeemProvider{halted: flag, contract: contract, unwrapProvider: &unwrapProvider{head: 140, receipt: evidenceReceipt(log), filtered: []etypes.Log{log}}}
 	secondary := &redeemProvider{primary: primary, halted: flag, contract: contract, unwrapProvider: &unwrapProvider{head: 140, receipt: evidenceReceipt(log), filtered: []etypes.Log{log}}}
 	evmCfg := evidenceEndpoints(t, primary, secondary)
@@ -558,6 +598,7 @@ func TestCatchupRedeemRetainsGapWhenHeadAdvances(t *testing.T) {
 	n, reg, chain := redeemFixture(t, src)
 	reg.BlockNumber++
 	reg.BlockHash = canonicalHeader(reg.BlockNumber).Hash()
+	chain.contract.registered.Store(reg.BlockNumber)
 	chain.setChain(reg.BlockNumber+n.ConfirmationsToFinality()-1, reg)
 	n.queryRange = newQueryRangeAdapter(5)
 	chain.primary.afterRange = sync.OnceFunc(func() { chain.setChain(140, reg) })
@@ -574,6 +615,9 @@ func TestCatchupRedeemRetainsGapWhenHeadAdvances(t *testing.T) {
 	}
 	if n.state.RedeemHaltGeneration() == 0 {
 		t.Fatal("scan skipped the block deferred in the earlier range")
+	}
+	if len(n.heldRedeemLogs()) != 0 {
+		t.Fatal("the registration stayed held after the finalized scan decided it")
 	}
 }
 

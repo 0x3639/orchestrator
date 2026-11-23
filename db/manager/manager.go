@@ -34,7 +34,7 @@ func NewDbManager(stop chan os.Signal) (*Manager, error) {
 
 	newDbManager := &Manager{
 		redeemIncidents: wrap.NewRedeemIncidentStore(newZnnLdb),
-		znnStorage:      wrap.NewZnnStorage(zdb.NewLevelDBWrapper(newZnnLdb), stop),
+		znnStorage:      wrap.NewDurableZnnStorage(newZnnLdb, stop),
 		evmStorage:      make(map[uint32]db.EvmStorage),
 		stopChan:        stop,
 		logger:          newLogger,

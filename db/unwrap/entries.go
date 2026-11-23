@@ -368,9 +368,22 @@ func (es *evmStorage) SetScanHeights(through, redeem uint64) error {
 	return err
 }
 
-// An explicit rewind resets the finalized checkpoint as well.
+// An explicit rewind resets the finalized checkpoint as well. A redeem
+// checkpoint that is already below the target is kept: the blocks between it
+// and the target have not been through the finalized redeem scan yet.
 func (es *evmStorage) SetLastUpdateHeight(height uint64) error {
-	err := es.DB.Put(getLastUpdateKey(), binary.LittleEndian.AppendUint64(nil, height))
+	data := binary.LittleEndian.AppendUint64(nil, height)
+	stored, err := es.DB.Get(getLastUpdateKey())
+	if err != nil && !errors.Is(err, leveldb.ErrNotFound) {
+		es.SendSigInt()
+		return err
+	}
+	if len(stored) == 16 {
+		if redeem := binary.LittleEndian.Uint64(stored[8:]); redeem < height {
+			data = binary.LittleEndian.AppendUint64(data, redeem)
+		}
+	}
+	err = es.DB.Put(getLastUpdateKey(), data)
 	if err != nil {
 		es.SendSigInt()
 	}

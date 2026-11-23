@@ -33,8 +33,11 @@ type NetworksManager struct {
 	znnNetwork  *znnNetwork
 	networksMu  sync.RWMutex
 	evmNetworks []*evmNetwork
-	stopChan    chan os.Signal
-	logger      *zap.SugaredLogger
+	// haltChains are the chain ids, in order, that GetHaltMessages last built
+	// messages for; guarded by networksMu.
+	haltChains []uint32
+	stopChan   chan os.Signal
+	logger     *zap.SugaredLogger
 }
 
 func NewNetworksManager(stopChan chan os.Signal) (*NetworksManager, error) {
@@ -484,10 +487,36 @@ func (m *NetworksManager) CheckNewTssEcdsaPubKeyEvm(newCompressedPubKey string) 
 	return ok, nil
 }
 
+// ErrHaltMembershipChanged reports that the EVM networks are no longer the
+// ones the halt messages were signed for. The signatures are matched to
+// networks by position, so the ceremony has to sign again.
+var ErrHaltMembershipChanged = errors.New("EVM networks changed since the halt messages were signed")
+
+func (m *NetworksManager) haltNetworks(signatures int) ([]*evmNetwork, error) {
+	m.networksMu.RLock()
+	defer m.networksMu.RUnlock()
+	networks := slices.Clone(m.evmNetworks)
+	if len(networks) != signatures {
+		return nil, ErrHaltMembershipChanged
+	}
+	if m.haltChains != nil {
+		for idx, network := range networks {
+			if idx >= len(m.haltChains) || m.haltChains[idx] != network.ChainId() {
+				return nil, ErrHaltMembershipChanged
+			}
+		}
+	}
+	return networks, nil
+}
+
 func (m *NetworksManager) SendHaltEvm(signatures [][]byte, ecdsaPrivateKey *ecdsa.PrivateKey, evmAddress ecommon.Address) (bool, error) {
+	networks, err := m.haltNetworks(len(signatures))
+	if err != nil {
+		return false, err
+	}
 	// true means that all evm networks are halted
 	ok := true
-	for idx, network := range m.Networks() {
+	for idx, network := range networks {
 		halted, err := network.EvmRpc().HaltFlagSet()
 		if err != nil {
 			return false, err
@@ -518,13 +547,18 @@ func (m *NetworksManager) SendHaltEvm(signatures [][]byte, ecdsaPrivateKey *ecds
 
 func (m *NetworksManager) GetHaltMessages() ([][]byte, error) {
 	ans := make([][]byte, 0)
+	chains := make([]uint32, 0)
 	for _, network := range m.Networks() {
 		msg, err := network.GetHaltEvmMessage()
 		if err != nil {
 			return nil, err
 		}
 		ans = append(ans, msg)
+		chains = append(chains, network.ChainId())
 	}
+	m.networksMu.Lock()
+	m.haltChains = chains
+	m.networksMu.Unlock()
 	return ans, nil
 }
 

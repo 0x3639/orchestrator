@@ -7,6 +7,8 @@ import (
 	ecommon "github.com/ethereum/go-ethereum/common"
 	etypes "github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
+
+	"orchestrator/common"
 )
 
 const (
@@ -171,7 +173,11 @@ func (eN *evmNetwork) recheckHeldRedeems(stop <-chan struct{}) {
 // registration canonical, closed, and followed by an administrator unhalt. A
 // signer that was not running during that halt would otherwise wait for the
 // next one. Until then the incident holds the bridge like any other.
-func (eN *evmNetwork) settlePendingIncidents(stop <-chan struct{}) {
+//
+// With untilPending the sweep ends at the first incident that stays pending.
+// The scan uses that before the signing loop exists: once one incident needs
+// the halt, checking the others must not delay it.
+func (eN *evmNetwork) settlePendingIncidents(stop <-chan struct{}, untilPending bool) {
 	if eN.state.RedeemHaltGeneration() == 0 {
 		return
 	}
@@ -192,26 +198,38 @@ func (eN *evmNetwork) settlePendingIncidents(stop <-chan struct{}) {
 		if eN.stopping(stop) {
 			return
 		}
-		log := incident.Log
-		if _, err := eN.verifyRedeemLog(log, eN.ConfirmationsToFinality()); err != nil {
-			eN.logger.Debugf("Pending redeem incident on chain %d, transaction %s, log %d is not final on every endpoint: %v", eN.ChainId(), log.TxHash, log.Index, err)
+		if eN.settleIncident(incident) {
 			continue
 		}
-		settled, err := eN.redeemSettled(incident)
-		if err != nil {
-			eN.logger.Warnf("The pending redeem incident on chain %d, transaction %s, log %d cannot be archived: %v", eN.ChainId(), log.TxHash, log.Index, err)
-			continue
+		if untilPending {
+			return
 		}
-		if !settled {
-			continue
-		}
-		if err := eN.state.ArchiveSettledRedeem(incident); err != nil {
-			eN.logger.Errorf("Cannot archive the settled redeem incident on chain %d, transaction %s, log %d: %v", eN.ChainId(), log.TxHash, log.Index, err)
-			continue
-		}
-		eN.logger.Warnf("Released the redeem incident on chain %d, block %d, transaction %s, log %d: the redeem is closed and the bridge was unhalted after it",
-			eN.ChainId(), log.BlockNumber, log.TxHash, log.Index)
 	}
+}
+
+// settleIncident archives one stored incident if it is settled, and reports
+// whether it did.
+func (eN *evmNetwork) settleIncident(incident common.RedeemIncident) bool {
+	log := incident.Log
+	if _, err := eN.verifyRedeemLog(log, eN.ConfirmationsToFinality()); err != nil {
+		eN.logger.Debugf("Pending redeem incident on chain %d, transaction %s, log %d is not final on every endpoint: %v", eN.ChainId(), log.TxHash, log.Index, err)
+		return false
+	}
+	settled, err := eN.redeemSettled(incident)
+	if err != nil {
+		eN.logger.Warnf("The pending redeem incident on chain %d, transaction %s, log %d cannot be archived: %v", eN.ChainId(), log.TxHash, log.Index, err)
+		return false
+	}
+	if !settled {
+		return false
+	}
+	if err := eN.state.ArchiveSettledRedeem(incident); err != nil {
+		eN.logger.Errorf("Cannot archive the settled redeem incident on chain %d, transaction %s, log %d: %v", eN.ChainId(), log.TxHash, log.Index, err)
+		return false
+	}
+	eN.logger.Warnf("Released the redeem incident on chain %d, block %d, transaction %s, log %d: the redeem is closed and the bridge was unhalted after it",
+		eN.ChainId(), log.BlockNumber, log.TxHash, log.Index)
+	return true
 }
 
 // watchRedeems rechecks held registrations and, while a halt is pending, looks
@@ -229,7 +247,7 @@ func (eN *evmNetwork) watchRedeems(stop <-chan struct{}) {
 		case <-timer.C:
 		}
 		eN.recheckHeldRedeems(stop)
-		eN.settlePendingIncidents(stop)
+		eN.settlePendingIncidents(stop, false)
 	}
 }
 
