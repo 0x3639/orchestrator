@@ -12,8 +12,8 @@ var (
 	// Private monitoring checkpoint, outside the wrap event iterator.
 	receiveCoverageKey = []byte{3}
 
-	// Set once this database has reached the part of the bridge account it
-	// must vouch for. Outside the wrap event iterator, so a build that does
-	// not know the key never reads it.
+	// The first bridge account height this database vouches for. Outside the
+	// wrap event iterator, so a build that does not know the key never reads
+	// it.
 	bridgeWatchKey = []byte{4}
 )

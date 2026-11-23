@@ -261,27 +261,32 @@ func (es *eventStore) SaveReceiveCoverageCheckpoint(height uint64) error {
 	return es.DB.Put(receiveCoverageKey, data[:])
 }
 
-// BridgeWatchStarted reports whether this database has reached the part of
-// the bridge account it must vouch for: its tip, or a receive startup had to
-// check on the way there. Receives it reads afterwards are new to this node
-// whenever it reads them.
-func (es *eventStore) BridgeWatchStarted() (bool, error) {
+// BridgeWatchFrom returns the first bridge account height this database
+// vouches for, or zero while it vouches for none. A receive at or above it is
+// new to this node whenever it is read. Startup sets it when it reaches the
+// tip, or lower when it meets a receive it has to check on the way there.
+func (es *eventStore) BridgeWatchFrom() (uint64, error) {
 	data, err := es.DB.Get(bridgeWatchKey)
 	if err == leveldb.ErrNotFound {
-		return false, nil
+		return 0, nil
 	}
 	if err != nil {
 		es.SendSigInt()
-		return false, err
+		return 0, err
 	}
-	if len(data) != 1 || data[0] != 1 {
-		return false, errors.New("invalid bridge watch record")
+	if len(data) != 8 || binary.LittleEndian.Uint64(data) == 0 {
+		return 0, errors.New("invalid bridge watch record")
 	}
-	return true, nil
+	return binary.LittleEndian.Uint64(data), nil
 }
 
-func (es *eventStore) MarkBridgeWatchStarted() error {
-	if err := es.DB.Put(bridgeWatchKey, []byte{1}); err != nil {
+func (es *eventStore) SaveBridgeWatchFrom(height uint64) error {
+	if height == 0 {
+		return errors.New("bridge watch record needs an account height")
+	}
+	var data [8]byte
+	binary.LittleEndian.PutUint64(data[:], height)
+	if err := es.DB.Put(bridgeWatchKey, data[:]); err != nil {
 		es.SendSigInt()
 		return err
 	}

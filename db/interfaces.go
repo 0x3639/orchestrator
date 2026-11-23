@@ -60,8 +60,8 @@ type ZnnStorage interface {
 	HasReceiveCoverageCheckpoint(uint64) bool
 	SaveReceiveCoverageCheckpoint(uint64) error
 	SetLastUpdateHeight(uint64) error
-	BridgeWatchStarted() (bool, error)
-	MarkBridgeWatchStarted() error
+	BridgeWatchFrom() (uint64, error)
+	SaveBridgeWatchFrom(uint64) error
 
 	GetResignStatus(types.Hash) (bool, error)
 	SetResignStatus(types.Hash, bool) error

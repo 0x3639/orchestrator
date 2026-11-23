@@ -35,6 +35,9 @@ type startupLedger struct {
 	syncStatus func() *protocol.SyncInfo
 	tip        func() *api.Momentum
 	bridgeInfo func() (*definition.BridgeInfoVariable, error)
+	// Serve the page's Count as the fixture gives it. Otherwise a page with
+	// no count ends the account at its last listed block.
+	exactCount bool
 }
 
 func (l *startupLedger) GetAccountBlocksByHeight(ctx context.Context, _ types.Address, height, _ uint64) *api.AccountBlockListMarshal {
@@ -44,7 +47,11 @@ func (l *startupLedger) GetAccountBlocksByHeight(ctx context.Context, _ types.Ad
 		<-ctx.Done()
 		return nil
 	}
-	return l.page(height)
+	page := l.page(height)
+	if page != nil && page.List != nil && page.Count == 0 && !l.exactCount {
+		page.Count = int(height) - 1 + len(page.List)
+	}
+	return page
 }
 
 func (l *startupLedger) GetAccountBlockByHash(hash types.Hash) (*api.AccountBlockMarshal, error) {
@@ -377,7 +384,7 @@ func TestStartupSyncObservesFinalityAfterSyncStatus(t *testing.T) {
 			// A database that already vouches for the account, as on any
 			// start but the first. A first read asks for the sync status once
 			// more, before it reads the receive.
-			if err := n.eventsStore().MarkBridgeWatchStarted(); err != nil {
+			if err := n.eventsStore().SaveBridgeWatchFrom(2); err != nil {
 				t.Fatal(err)
 			}
 			n.administrator = send.Address.String()

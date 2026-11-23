@@ -46,7 +46,7 @@ type heldListener struct {
 	// The endpoint fails the page read, or answers it without any block.
 	pageFails  atomic.Bool
 	hideBlocks atomic.Bool
-	emergency  bool // the signer is in EmergencyState when the listener starts
+	state      uint8 // the signer's state when the listener starts, if not live
 }
 
 func startHeldListener(t *testing.T, prepare ...func(*heldListener)) *heldListener {
@@ -78,8 +78,8 @@ func startHeldListener(t *testing.T, prepare ...func(*heldListener)) *heldListen
 	}
 	h.n = startupNetwork(t, ledger)
 	h.n.state.Health = snapshot.New("test", "")
-	if h.emergency {
-		if err := h.n.state.SetState(common.EmergencyState); err != nil {
+	if h.state != common.LiveState {
+		if err := h.n.state.SetState(h.state); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -210,23 +210,27 @@ func TestHeldBridgeAccountIsLoggedAndStopsTheNode(t *testing.T) {
 	checkStartupCursor(t, h.n, 1)
 }
 
-// A signer in an emergency is signing the halt, not transfers. A held listener
-// does not take it away from that.
-func TestHeldBridgeAccountDoesNotStopASignerInAnEmergency(t *testing.T) {
-	h := startHeldListener(t, func(h *heldListener) { h.emergency = true })
-	waitFor(t, "the hold to be reported", func() bool { return h.reportedHold() != nil })
-	h.elapsed.Store(int64(2 * maxBridgeAccountHold))
-	seen := h.reportedHold().Attempts
-	waitFor(t, "attempts past the limit", func() bool { return h.reportedHold().Attempts >= seen+3 })
-	select {
-	case <-h.stop:
-		t.Fatal("a held listener stopped a signer that is in an emergency")
-	case <-h.exited:
-		t.Fatal("the listener of a signer in an emergency gave up")
-	default:
-	}
-	if len(h.errorLines()) == 0 {
-		t.Fatal("the hold of a signer in an emergency is not reported")
+// A signer in an emergency is signing the halt, and a halted one signs
+// nothing. A held listener does not stop either.
+func TestHeldBridgeAccountDoesNotStopASignerThatIsNotSigningTransfers(t *testing.T) {
+	for _, state := range []uint8{common.EmergencyState, common.HaltedState} {
+		t.Run(common.StateToText(state), func(t *testing.T) {
+			h := startHeldListener(t, func(h *heldListener) { h.state = state })
+			waitFor(t, "the hold to be reported", func() bool { return h.reportedHold() != nil })
+			h.elapsed.Store(int64(2 * maxBridgeAccountHold))
+			seen := h.reportedHold().Attempts
+			waitFor(t, "attempts past the limit", func() bool { return h.reportedHold().Attempts >= seen+3 })
+			select {
+			case <-h.stop:
+				t.Fatal("a held listener stopped a signer that is not signing transfers")
+			case <-h.exited:
+				t.Fatal("the listener gave up")
+			default:
+			}
+			if len(h.errorLines()) == 0 {
+				t.Fatal("the hold is not reported")
+			}
+		})
 	}
 }
 
@@ -275,7 +279,8 @@ func TestHoldFromAFailedPageReadEndsWhenThePageReads(t *testing.T) {
 }
 
 // Startup hands over to the listener, which treats every receive as new, only
-// from a node that is synced. Reaching the tip is recorded once and kept.
+// from a node that is synced. Reaching the tip, it records the next account
+// height as the first one this database vouches for, once.
 func TestStartupRecordsReachingTheTipOnASyncedNode(t *testing.T) {
 	state := protocol.SyncDone
 	ledger := &startupLedger{
@@ -283,20 +288,20 @@ func TestStartupRecordsReachingTheTipOnASyncedNode(t *testing.T) {
 		syncStatus: func() *protocol.SyncInfo { return &protocol.SyncInfo{State: state} },
 	}
 	n := startupNetwork(t, ledger)
-	recorded := func() bool {
+	recorded := func() uint64 {
 		t.Helper()
-		started, err := n.eventsStore().BridgeWatchStarted()
+		from, err := n.eventsStore().BridgeWatchFrom()
 		if err != nil {
 			t.Fatal(err)
 		}
-		return started
+		return from
 	}
 
 	state = protocol.Syncing
 	if err := n.Sync(); err == nil {
 		t.Fatal("startup handed over to the listener on a node that is syncing")
 	}
-	if n.watching || recorded() {
+	if n.watchFrom != 0 || recorded() != 0 {
 		t.Fatal("startup recorded reaching the tip on a node that is syncing")
 	}
 
@@ -304,18 +309,21 @@ func TestStartupRecordsReachingTheTipOnASyncedNode(t *testing.T) {
 	if err := n.Sync(); err != nil {
 		t.Fatal(err)
 	}
-	if !n.watching || !recorded() {
-		t.Fatalf("after reaching the tip: watching %v, recorded %v", n.watching, recorded())
+	if n.watchFrom != 2 || recorded() != 2 {
+		t.Fatalf("after reaching the tip at height 1: watching from %d, recorded %d, want 2", n.watchFrom, recorded())
 	}
 
-	// A later start reads the record.
+	// A later start, further along, reads the record and leaves it.
 	restarted := startupNetwork(t, ledger)
 	restarted.dbManager = n.dbManager
+	if err := restarted.eventsStore().SetLastUpdateHeight(7); err != nil {
+		t.Fatal(err)
+	}
 	if err := restarted.Sync(); err != nil {
 		t.Fatal(err)
 	}
-	if !restarted.watching || !recorded() {
-		t.Fatalf("after a restart: watching %v, recorded %v", restarted.watching, recorded())
+	if restarted.watchFrom != 2 || recorded() != 2 {
+		t.Fatalf("after a restart: watching from %d, recorded %d, want 2", restarted.watchFrom, recorded())
 	}
 
 	// It also still refuses to hand over while the node is syncing.

@@ -439,7 +439,9 @@ func (l *replayLedger) answer(t *testing.T, method string, params []json.RawMess
 				page = append(page, receive)
 			}
 		}
-		return startupPage(page...), true
+		listed := startupPage(page...)
+		listed.Count = int(height) - 1 + len(page)
+		return listed, true
 	case "ledger.getAccountBlockByHash":
 		var hash types.Hash
 		if len(params) < 1 || json.Unmarshal(params[0], &hash) != nil {

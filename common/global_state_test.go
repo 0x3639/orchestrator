@@ -16,6 +16,10 @@ func TestSetStateIfChangesOnlyTheExpectedState(t *testing.T) {
 	if changed, err := gs.SetStateIf(KeyGenState, LiveState); err != nil || changed || state != HaltedState {
 		t.Fatalf("from another state: changed %v, err %v, state %s", changed, err, StateToText(state))
 	}
+	// Asked for the state it is already in, nothing changes.
+	if changed, err := gs.SetStateIf(HaltedState, HaltedState); err != nil || changed || state != HaltedState {
+		t.Fatalf("to the same state: changed %v, err %v, state %s", changed, err, StateToText(state))
+	}
 	// The rules of SetState still apply to the change itself.
 	if err := gs.SetState(EmergencyState); err != nil {
 		t.Fatal(err)

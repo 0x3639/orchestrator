@@ -105,7 +105,12 @@ func newLateNode(t *testing.T, register func(*replayBridge)) *lateNode {
 // status, from account height 2.
 func (l *lateNode) at(frontier uint64, statuses ...[]byte) {
 	l.t.Helper()
-	l.ledger.Store(newReplayLedger(l.t, l.bridge, frontier, statuses...))
+	ledger := newReplayLedger(l.t, l.bridge, frontier, statuses...)
+	for _, receive := range ledger.receives {
+		// As the node lists it: the confirming momentum counts as one.
+		receive.ConfirmationDetail.NumConfirmations = frontier - receive.ConfirmationDetail.MomentumHeight + 1
+	}
+	l.ledger.Store(ledger)
 	if err := l.n.state.SetFrontierMomentum(frontier); err != nil {
 		l.t.Fatal(err)
 	}
@@ -143,12 +148,14 @@ func (l *lateNode) row() *eventsRow {
 	if row == nil {
 		return nil
 	}
-	return &eventsRow{status: row.RedeemStatus, signature: row.Signature}
+	return &eventsRow{status: row.RedeemStatus, signature: row.Signature, blockHash: row.BlockHash, from: row.From}
 }
 
 type eventsRow struct {
 	status    uint32
 	signature string
+	blockHash ecommon.Hash
+	from      ecommon.Address
 }
 
 func (l *lateNode) expect(step string, state uint8, cursor uint64) {
@@ -579,9 +586,10 @@ func TestFirstReadDoesNotDecideOnASyncingNode(t *testing.T) {
 				t.Fatal("startup decided about a request on a node that is syncing")
 			}
 			l.expect("syncing", common.LiveState, 1)
-			started, err := l.stores.znn.BridgeWatchStarted()
-			if err != nil || started || l.evmCalls.Load() != 0 || l.row() != nil {
-				t.Fatalf("on a node that is syncing: watch recorded %v (err %v), %d source lookups, row %v", started, err, l.evmCalls.Load(), l.row())
+			from, err := l.stores.znn.BridgeWatchFrom()
+			if err != nil || from != 0 || l.evmCalls.Load() != 0 || l.requestReads.Load() != 0 || l.row() != nil {
+				t.Fatalf("on a node that is syncing: watch recorded from %d (err %v), %d source lookups, %d request reads, row %v",
+					from, err, l.evmCalls.Load(), l.requestReads.Load(), l.row())
 			}
 		})
 	}
@@ -969,8 +977,8 @@ func TestStartupRejectsANodeBehindTheCheckpoint(t *testing.T) {
 	if err := n.Sync(); err == nil {
 		t.Fatal("startup finished on a node whose bridge account is behind the checkpoint")
 	}
-	if started, err := n.eventsStore().BridgeWatchStarted(); err != nil || started {
-		t.Fatalf("watch recorded %v, err %v", started, err)
+	if from, err := n.eventsStore().BridgeWatchFrom(); err != nil || from != 0 {
+		t.Fatalf("watch recorded from %d, err %v", from, err)
 	}
 	// At the checkpoint, the same node is at the tip.
 	if err := n.eventsStore().SetLastUpdateHeight(3); err != nil {
@@ -978,6 +986,17 @@ func TestStartupRejectsANodeBehindTheCheckpoint(t *testing.T) {
 	}
 	if err := n.Sync(); err != nil {
 		t.Fatal(err)
+	}
+	// A node that reports an empty account is behind any checkpoint. (This
+	// fixture replaces the one above.)
+	empty := startupNetwork(t, &startupLedger{exactCount: true, page: func(uint64) *api.AccountBlockListMarshal {
+		return &api.AccountBlockListMarshal{List: []*api.AccountBlockMarshal{}}
+	}})
+	if err := empty.eventsStore().SetLastUpdateHeight(5); err != nil {
+		t.Fatal(err)
+	}
+	if err := empty.Sync(); err == nil {
+		t.Fatal("startup finished on a node that reports an empty bridge account")
 	}
 }
 
@@ -1058,4 +1077,151 @@ func TestNullRequestReplyIsNotARequestWithZeroIdentity(t *testing.T) {
 			t.Fatalf("startup %v: checkpoint %d", startup, cursor)
 		}
 	}
+}
+
+// A startup page can hold an old receive ahead of a recent one. The obligation
+// for the recent one is recorded when the page arrives, so a start that fails
+// on the old receive does not lose it, and the old receive keeps the treatment
+// of a first read.
+func TestStartupRecordsARecentReceiveBehindAnOlderOneOnTheSamePage(t *testing.T) {
+	l := newLateNode(t, nil)
+	l.at(5000, acceptedReceive, acceptedReceive)
+	recent := l.ledger.Load().receives[1].ConfirmationDetail
+	recent.MomentumHeight, recent.NumConfirmations = 4999, 2
+	l.sendUnreadable.Store(true)
+	if err := l.n.Sync(); err == nil {
+		t.Fatal("startup passed a receive whose send it could not read")
+	}
+	l.expect("first start", common.LiveState, 1)
+	if from, err := l.stores.znn.BridgeWatchFrom(); err != nil || from != 3 {
+		t.Fatalf("watch recorded from height %d (err %v), want 3, the recent receive", from, err)
+	}
+
+	// The next start comes long after both are final.
+	l.restart()
+	l.sendUnreadable.Store(false)
+	l.source.Store(l.anotherEvent())
+	l.at(9000, acceptedReceive, acceptedReceive)
+	if err := l.n.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	l.expect("second start", common.EmergencyState, 3)
+	if l.evmCalls.Load() != 2 {
+		t.Fatalf("%d source lookups, want the two of the one recent registration", l.evmCalls.Load())
+	}
+}
+
+// The confirmations a page lists and the block read by hash can disagree. A
+// receive that classifies as live when it is read is recorded then, whatever
+// the page said.
+func TestStartupRecordsAReceiveThatIsLiveWhenRead(t *testing.T) {
+	l := newLateNode(t, nil)
+	l.source.Store(l.receiptFails("upstream timeout"))
+	l.at(104, acceptedReceive)
+	ledger := l.ledger.Load()
+	listed, detail := *ledger.receives[0], *ledger.receives[0].ConfirmationDetail
+	detail.NumConfirmations = 4000
+	listed.ConfirmationDetail = &detail
+	ledger.receives[0] = &listed
+	if err := l.n.Sync(); err == nil {
+		t.Fatal("startup passed a request whose source it could not read")
+	}
+	l.expect("startup", common.LiveState, 1)
+	if from, err := l.stores.znn.BridgeWatchFrom(); err != nil || from != 2 {
+		t.Fatalf("watch recorded from height %d (err %v), want 2", from, err)
+	}
+}
+
+// The node says how many momentums confirm a receive it lists. An old frontier
+// in this signer's memory does not make old history recent.
+func TestStartupAgesAReceiveByTheConfirmationsTheNodeLists(t *testing.T) {
+	l := newLateNode(t, nil)
+	l.at(5000, acceptedReceive)
+	if err := l.n.state.SetFrontierMomentum(104); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.n.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	l.expect("startup", common.LiveState, 2)
+	if l.evmCalls.Load() != 0 || l.row() == nil {
+		t.Fatalf("old history was not read as a first read: %d source lookups, row %v", l.evmCalls.Load(), l.row())
+	}
+}
+
+// Checking a registration keeps the block this node recorded for its event.
+// If the receive is read again before its checkpoint is written, a missing
+// receipt is still answered from that block.
+func TestCheckedRegistrationKeepsTheRecordedBlockForAReplay(t *testing.T) {
+	for name, frontier := range map[string]uint64{"live": 104, "late": 5000} {
+		t.Run(name, func(t *testing.T) {
+			l := newLateNode(t, nil)
+			l.recordEvent()
+			l.source.Store(l.droppedFromIndex())
+			l.at(frontier, acceptedReceive)
+			if err := l.listen(); err != nil {
+				t.Fatal(err)
+			}
+			l.expect("first read", common.LiveState, 2)
+			row := l.row()
+			if row == nil || row.blockHash != l.bridge.blockHash || row.from != ecommon.HexToAddress("0x03") ||
+				row.status != common.PendingRedeemStatus || row.signature != "test-signature" {
+				t.Fatalf("stored row %+v, want the registered request with the recorded block and sender", row)
+			}
+			// The checkpoint write was lost; the same receive is read again.
+			if err := l.stores.znn.SetLastUpdateHeight(1); err != nil {
+				t.Fatal(err)
+			}
+			if err := l.listen(); err != nil {
+				t.Fatal(err)
+			}
+			l.expect("replay", common.LiveState, 2)
+		})
+	}
+}
+
+// Startup rejects a page entry without its own hash before it acts on the
+// entry or on anything after it.
+func TestStartupRequiresTheHashOfEveryPageEntry(t *testing.T) {
+	l := newLateNode(t, nil)
+	l.at(104, acceptedReceive)
+	l.ledger.Load().receives[0].Hash = types.ZeroHash
+	if err := l.n.Sync(); err == nil {
+		t.Fatal("startup processed a bridge account block without a hash")
+	}
+	l.expect("no hash", common.LiveState, 1)
+	if from, err := l.stores.znn.BridgeWatchFrom(); err != nil || from != 0 || l.requestReads.Load() != 0 {
+		t.Fatalf("watch recorded from %d (err %v), %d request reads, for an entry without a hash", from, err, l.requestReads.Load())
+	}
+}
+
+// The same holds for an entry that is not a receive. Without its hash it is
+// not a block startup can count as read, and the receive after it must not
+// carry the checkpoint past it.
+func TestStartupRequiresTheHashOfAContractSend(t *testing.T) {
+	send, receive := startupReceive(2), startupReceive(3)
+	send.BlockType = nom.BlockTypeContractSend
+	send.Hash = types.ZeroHash
+	ledger := &startupLedger{
+		page: func(height uint64) *api.AccountBlockListMarshal {
+			switch height {
+			case 2:
+				return startupPage(send, receive)
+			case 3:
+				return startupPage(receive)
+			}
+			return startupPage()
+		},
+		lookup: func(hash types.Hash) (*api.AccountBlockMarshal, error) {
+			if hash == receive.Hash {
+				return receive, nil
+			}
+			return startupSend(receive), nil
+		},
+	}
+	n := startupNetwork(t, ledger)
+	if err := n.Sync(); err == nil {
+		t.Fatal("startup read past a bridge account block without a hash")
+	}
+	checkStartupCursor(t, n, 1)
 }
