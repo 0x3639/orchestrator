@@ -28,3 +28,18 @@ func TestSetStateIfChangesOnlyTheExpectedState(t *testing.T) {
 		t.Fatalf("left a pending emergency: changed %v, err %v, state %s", changed, err, StateToText(state))
 	}
 }
+
+// The stop a held listener asks for is decided under the state lock: it runs
+// in the states that sign transfers and never in an emergency or a halt.
+func TestWhileSigningTransfersRunsOnlyOutsideEmergencyAndHalt(t *testing.T) {
+	for state, runs := range map[uint8]bool{
+		LiveState: true, KeyGenState: true, ReSignState: true, EmergencyState: false, HaltedState: false,
+	} {
+		value := state
+		gs := NewGlobalState(&value)
+		ran := false
+		if got := gs.WhileSigningTransfers(func() { ran = true }); got != runs || ran != runs {
+			t.Fatalf("%s: reported %v, ran %v, want %v", StateToText(state), got, ran, runs)
+		}
+	}
+}

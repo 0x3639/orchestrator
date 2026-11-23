@@ -141,11 +141,15 @@ func TestHeldBridgeAccountShowsInTheHealthSnapshot(t *testing.T) {
 	// A hold at the next height is a new hold. The time spent at the height
 	// before does not count towards stopping the node.
 	h.elapsed.Store(int64(maxBridgeAccountHold - time.Minute))
+	atHeightTwo := h.reportedHold().Attempts
 	h.through.Store(2)
 	waitFor(t, "a hold at the next height", func() bool { hold := h.reportedHold(); return hold != nil && hold.Height == 3 })
 	next := h.reportedHold()
-	if next.Since.Sub(first.Since) < maxBridgeAccountHold-time.Minute || next.Attempts != 1 {
-		t.Fatalf("the hold at height 3 continues the one at height 2: %+v after %+v", next, first)
+	// The listener may have retried at the new height before this read, so
+	// the count is not required to be exactly one. It restarted with the new
+	// hold, well below the attempts spent at height 2.
+	if next.Since.Sub(first.Since) < maxBridgeAccountHold-time.Minute || next.Attempts >= atHeightTwo {
+		t.Fatalf("the hold at height 3 continues the one at height 2 (%d attempts there): %+v after %+v", atHeightTwo, next, first)
 	}
 	h.elapsed.Store(int64(maxBridgeAccountHold + time.Minute))
 	waitFor(t, "a retry at the next height", func() bool { return h.reportedHold().Attempts >= 2 })

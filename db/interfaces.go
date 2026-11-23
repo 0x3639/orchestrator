@@ -16,6 +16,9 @@ type EvmStorage interface {
 	SendSigInt()
 
 	AddUnwrapRequest(events.UnwrapRequestEvm) error
+	// AddRegisteredUnwrapRequest stores a request read from the bridge and
+	// keeps the source block and sender an existing record already holds.
+	AddRegisteredUnwrapRequest(events.UnwrapRequestEvm) error
 	UpdateUnwrapRequestBlockNumber(events.UnwrapRequestEvm) error
 	HydrateUnsignedUnwrap(before, verified events.UnwrapRequestEvm) error
 	UnwrapAffiliatePolicy(ecommon.Hash) (common.AffiliatePolicy, bool, error)

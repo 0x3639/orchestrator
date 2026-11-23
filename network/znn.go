@@ -246,7 +246,7 @@ func (rC *znnNetwork) Sync() error {
 		// Record the obligation for the first recent receive on the page
 		// before any entry is processed. A start that fails on an earlier
 		// entry still leaves it for the next one.
-		if err := rC.watchRecentReceive(ctx, page.List); err != nil {
+		if err := rC.watchRecentReceive(ctx, page.List, height+1); err != nil {
 			return err
 		}
 		for _, block := range page.List {
@@ -463,10 +463,10 @@ func (rC *znnNetwork) requireSyncedNode(ctx context.Context) error {
 // lists it with. It runs before any entry on the page is read, so a start
 // that fails on the way still leaves the obligation for the next one.
 // Receives below that height keep the treatment of a first read.
-func (rC *znnNetwork) watchRecentReceive(ctx context.Context, page []*api.AccountBlock) error {
+func (rC *znnNetwork) watchRecentReceive(ctx context.Context, page []*api.AccountBlock, first uint64) error {
 	finality := uint64(rC.ConfirmationsToFinality())
-	for _, listed := range page {
-		if listed == nil || listed.Hash == types.ZeroHash {
+	for i, listed := range page {
+		if listed == nil || listed.Hash == types.ZeroHash || listed.Address != types.BridgeContract || listed.Height != first+uint64(i) {
 			return nil // the page is rejected when this entry is reached
 		}
 		if listed.BlockType != nom.BlockTypeContractReceive {
@@ -1094,8 +1094,8 @@ func (rC *znnNetwork) unwrapSource(ctx context.Context, param *definition.Unwrap
 		// the other is not serving this block, and its answer says nothing
 		// about the request.
 		if index, missing := receiptLogMissingFrom(logs, tx, evm.BridgeAddress()); missing {
-			return sourceUnknown, errors.Errorf("the endpoint's logs for block %s do not contain bridge log %d as the receipt of %s lists it",
-				tx.BlockHash, index, param.TransactionHash)
+			return sourceUnknown, errors.Errorf("the endpoint's receipt of %s and its logs for block %s disagree on bridge log %d",
+				param.TransactionHash, tx.BlockHash, index)
 		}
 	}
 	found := false
@@ -1238,8 +1238,10 @@ func (rC *znnNetwork) recordedUnwrapLog(evm *rpc.EvmRpc, param *definition.Unwra
 	return &log, nil
 }
 
-// receiptLogMissingFrom returns the index of a bridge log the receipt lists
-// that the block's logs do not contain as the receipt has it.
+// receiptLogMissingFrom returns the index of a bridge log of the receipt's
+// transaction that the receipt and the block's logs do not both contain with
+// the same content. Other transactions in the block and other contracts in the
+// receipt are not compared.
 func receiptLogMissingFrom(blockLogs []etypes.Log, receipt *etypes.Receipt, bridge ecommon.Address) (uint, bool) {
 	for _, listed := range receipt.Logs {
 		if listed == nil || listed.Address != bridge {
@@ -1249,7 +1251,7 @@ func receiptLogMissingFrom(blockLogs []etypes.Log, receipt *etypes.Receipt, brid
 		for i := range blockLogs {
 			log := &blockLogs[i]
 			if log.TxHash == listed.TxHash && log.Index == listed.Index {
-				served = !log.Removed && log.Address == listed.Address && log.BlockHash == receipt.BlockHash &&
+				served = log.Removed == listed.Removed && log.Address == listed.Address && log.BlockHash == receipt.BlockHash &&
 					receipt.BlockNumber != nil && receipt.BlockNumber.IsUint64() && log.BlockNumber == receipt.BlockNumber.Uint64() &&
 					slices.Equal(log.Topics, listed.Topics) && bytes.Equal(log.Data, listed.Data)
 				break
@@ -1257,6 +1259,22 @@ func receiptLogMissingFrom(blockLogs []etypes.Log, receipt *etypes.Receipt, brid
 		}
 		if !served {
 			return listed.Index, true
+		}
+	}
+	for i := range blockLogs {
+		log := &blockLogs[i]
+		if log.Address != bridge || log.TxHash != receipt.TxHash {
+			continue
+		}
+		listed := false
+		for _, entry := range receipt.Logs {
+			if entry != nil && entry.Address == bridge && entry.TxHash == log.TxHash && entry.Index == log.Index {
+				listed = true
+				break
+			}
+		}
+		if !listed {
+			return log.Index, true
 		}
 	}
 	return 0, false
@@ -1342,17 +1360,9 @@ func (rC *znnNetwork) recordUnwrapRegistration(ctx context.Context, param *defin
 	// block and sender this node's own scan recorded for it stay: if this
 	// receive is read again before its checkpoint is written, they are what a
 	// missing receipt is answered from.
-	store := rC.dbManager.EvmStorage(rpcZnnEvent.ChainId)
 	registered := common.ZnnUnwrapToOrchestatorUnwrap(rpcZnnEvent)
 	registered.RedeemStatus = common.PendingRedeemStatus
-	recorded, err := store.GetUnwrapRequestByHashAndLog(ecommon.Hash(param.TransactionHash), param.LogIndex)
-	if err != nil {
-		return err
-	}
-	if recorded != nil && recorded.BlockHash != (ecommon.Hash{}) {
-		registered.BlockNumber, registered.BlockHash, registered.From = recorded.BlockNumber, recorded.BlockHash, recorded.From
-	}
-	if storageErr := store.AddUnwrapRequest(registered); storageErr != nil {
+	if storageErr := rC.dbManager.EvmStorage(rpcZnnEvent.ChainId).AddRegisteredUnwrapRequest(registered); storageErr != nil {
 		return storageErr
 	}
 	rC.logger.Debug("Successfully added unwrap request")
@@ -1582,10 +1592,18 @@ func (rC *znnNetwork) followBridgeAccount(ctx context.Context, hints <-chan []su
 		delay := 30 * time.Second
 		notifications := hints
 		if err != nil {
-			if rC.holdBridgeAccount(height+1, err, listed) && rC.signsTransfers() {
-				rC.stopBridgeListener(ctx, errors.Wrapf(err, "the bridge account listener could not pass height %d for %s; stopping instead of signing without it",
-					height+1, maxBridgeAccountHold))
-				return
+			if rC.holdBridgeAccount(height+1, err, listed) {
+				// In an emergency the signer is signing the halt, and halted
+				// it signs nothing, so stopping it would only take it away
+				// from the halt. The state is checked and the stop requested
+				// under one lock.
+				stopping := rC.state.WhileSigningTransfers(func() {
+					rC.stopBridgeListener(ctx, errors.Wrapf(err, "the bridge account listener could not pass height %d for %s; stopping instead of signing without it",
+						height+1, maxBridgeAccountHold))
+				})
+				if stopping {
+					return
+				}
 			}
 			delay = 4 * time.Second
 			if rC.retryPause != 0 {
@@ -1647,14 +1665,6 @@ func (rC *znnNetwork) clock() time.Time {
 		return rC.now()
 	}
 	return time.Now()
-}
-
-// signsTransfers reports whether the signer is in a state in which it signs
-// wraps and unwraps. In an emergency it is signing the halt, and halted it
-// signs nothing, so stopping it would only take it away from the halt.
-func (rC *znnNetwork) signsTransfers() bool {
-	state, err := rC.state.GetState()
-	return err != nil || (state != common.EmergencyState && state != common.HaltedState)
 }
 
 // holdBridgeAccount records a failed pass at height and reports whether the

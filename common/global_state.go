@@ -129,6 +129,20 @@ func (gs *GlobalState) SaveConfig(save func() error) error {
 	return save()
 }
 
+// WhileSigningTransfers runs do unless the signer is in EmergencyState or
+// HaltedState, and reports whether it ran. The state lock is held throughout,
+// so no transition can fall between the check and do. do must not touch the
+// state.
+func (gs *GlobalState) WhileSigningTransfers(do func()) bool {
+	gs.stateMu.Lock()
+	defer gs.stateMu.Unlock()
+	if *gs.state == EmergencyState || *gs.state == HaltedState {
+		return false
+	}
+	do()
+	return true
+}
+
 func (gs *GlobalState) GetState() (uint8, error) {
 	gs.stateMu.Lock()
 	defer gs.stateMu.Unlock()

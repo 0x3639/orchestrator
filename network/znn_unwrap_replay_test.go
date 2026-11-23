@@ -93,8 +93,14 @@ func (b *replayBridge) sourceLog(t *testing.T, to string) etypes.Log {
 	}
 }
 
-func (b *replayBridge) receipt() *etypes.Receipt {
-	return &etypes.Receipt{Status: etypes.ReceiptStatusSuccessful, TxHash: b.txHash, BlockHash: b.blockHash, BlockNumber: big.NewInt(100), Logs: []*etypes.Log{}}
+// receipt is the transaction's receipt, listing the given logs as the
+// endpoint's block log query returns them.
+func (b *replayBridge) receipt(logs ...etypes.Log) *etypes.Receipt {
+	receipt := &etypes.Receipt{Status: etypes.ReceiptStatusSuccessful, TxHash: b.txHash, BlockHash: b.blockHash, BlockNumber: big.NewInt(100), Logs: []*etypes.Log{}}
+	for i := range logs {
+		receipt.Logs = append(receipt.Logs, &logs[i])
+	}
+	return receipt
 }
 
 func (b *replayBridge) send(t *testing.T, chainID uint32, amount *big.Int, signature string) *api.AccountBlock {
@@ -202,7 +208,7 @@ func TestResentUnwrapNamingAnotherChainIsCheckedOnTheRegisteredChain(t *testing.
 			return b.request
 		case "eth_getTransactionReceipt":
 			chain1Receipts.Add(1)
-			return b.receipt()
+			return b.receipt(log)
 		case "eth_getLogs":
 			return []etypes.Log{log}
 		}
@@ -703,7 +709,7 @@ func TestStartupSyncRecordsAnAcceptedUnwrapAndSkipsARejectedOne(t *testing.T) {
 				case "embedded.bridge.getUnwrapTokenRequestByHashAndLog":
 					return withRedeemDelay(b.request, 0)
 				case "eth_getTransactionReceipt":
-					return b.receipt()
+					return b.receipt(log)
 				case "eth_getLogs":
 					return []etypes.Log{log}
 				}
@@ -797,7 +803,7 @@ func TestUnwrapRecipientIsComparedByValue(t *testing.T) {
 				case "embedded.bridge.getUnwrapTokenRequestByHashAndLog":
 					return b.request
 				case "eth_getTransactionReceipt":
-					return b.receipt()
+					return b.receipt(log)
 				case "eth_getLogs":
 					return []etypes.Log{log}
 				}
@@ -860,7 +866,7 @@ func TestRegistrationPayingAnEmbeddedBeneficiaryIsNotASourceMatch(t *testing.T) 
 				case "embedded.bridge.getUnwrapTokenRequestByHashAndLog":
 					return b.request
 				case "eth_getTransactionReceipt":
-					return b.receipt()
+					return b.receipt(log)
 				case "eth_getLogs":
 					return []etypes.Log{log}
 				}

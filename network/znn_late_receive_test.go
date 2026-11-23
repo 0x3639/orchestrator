@@ -198,6 +198,16 @@ func (l *lateNode) noTransaction() *evmSource {
 func (l *lateNode) matchingEvent() *evmSource {
 	log := l.bridge.sourceLog(l.t, l.bridge.recipient.String())
 	return &evmSource{
+		receipt: func() (interface{}, *replayRPCError) { return l.bridge.receipt(log), nil },
+		logs:    func() (interface{}, *replayRPCError) { return []etypes.Log{log}, nil },
+	}
+}
+
+// omittedFromReceipt is an endpoint whose log query returns the matching
+// bridge log for a transaction whose receipt lists none.
+func (l *lateNode) omittedFromReceipt() *evmSource {
+	log := l.bridge.sourceLog(l.t, l.bridge.recipient.String())
+	return &evmSource{
 		receipt: func() (interface{}, *replayRPCError) { return l.bridge.receipt(), nil },
 		logs:    func() (interface{}, *replayRPCError) { return []etypes.Log{log}, nil },
 	}
@@ -224,7 +234,7 @@ func (l *lateNode) besideAnotherContract() *evmSource {
 func (l *lateNode) anotherEvent() *evmSource {
 	log := l.bridge.sourceLog(l.t, "z1qpp8g8v4hrd5ernfrgsn86jmv09ra6zrvhvmr7")
 	return &evmSource{
-		receipt: func() (interface{}, *replayRPCError) { return l.bridge.receipt(), nil },
+		receipt: func() (interface{}, *replayRPCError) { return l.bridge.receipt(log), nil },
 		logs:    func() (interface{}, *replayRPCError) { return []etypes.Log{log}, nil },
 	}
 }
@@ -712,6 +722,7 @@ func TestCheckedRegistrationWaitsForAReadableSource(t *testing.T) {
 		{"endpoint has pruned the receipt", func(l *lateNode) *evmSource { return l.receiptFails("pruned history unavailable") }},
 		{"endpoint has no archive logs", func(l *lateNode) *evmSource { return l.logsFail("archive data is not supported on this plan") }},
 		{"endpoint omits the block's logs", (*lateNode).incompleteLogs},
+		{"endpoint's receipt omits the block's bridge log", (*lateNode).omittedFromReceipt},
 		{"endpoint's logs differ from its receipt", (*lateNode).alteredLogs},
 		{"endpoint's logs put the event at another height", (*lateNode).anotherHeight},
 	} {
@@ -1224,4 +1235,26 @@ func TestStartupRequiresTheHashOfAContractSend(t *testing.T) {
 		t.Fatal("startup read past a bridge account block without a hash")
 	}
 	checkStartupCursor(t, n, 1)
+}
+
+// The watch record is derived only from page entries startup would accept: on
+// the bridge account, at consecutive heights from the checkpoint.
+func TestStartupDoesNotRecordTheWatchFromARejectedPage(t *testing.T) {
+	for name, spoil := range map[string]func(*api.AccountBlockMarshal){
+		"entry of another account":                              func(b *api.AccountBlockMarshal) { b.Address = types.PillarContract },
+		"entry at a height that does not follow the checkpoint": func(b *api.AccountBlockMarshal) { b.Height = 9 },
+	} {
+		t.Run(name, func(t *testing.T) {
+			l := newLateNode(t, nil)
+			l.at(104, acceptedReceive)
+			spoil(l.ledger.Load().receives[0])
+			if err := l.n.Sync(); err == nil {
+				t.Fatal("startup accepted the page")
+			}
+			l.expect("startup", common.LiveState, 1)
+			if from, err := l.stores.znn.BridgeWatchFrom(); err != nil || from != 0 {
+				t.Fatalf("watch recorded from %d (err %v) for a page startup rejects", from, err)
+			}
+		})
+	}
 }

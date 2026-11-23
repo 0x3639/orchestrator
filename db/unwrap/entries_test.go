@@ -219,3 +219,53 @@ func TestSendSigIntNeverBlocks(t *testing.T) {
 	close(stop)
 	store.SendSigInt() // closed: must not panic
 }
+
+// A registration read from the bridge carries no source block or sender. The
+// store keeps the ones its record already holds, and inserts the registration
+// as it is when there is no record or the record has no block.
+func TestAddRegisteredUnwrapRequestKeepsTheRecordedBlock(t *testing.T) {
+	tx, block, sender := ecommon.HexToHash("0xaa"), ecommon.HexToHash("0xab"), ecommon.HexToAddress("0x03")
+	registered := events.UnwrapRequestEvm{
+		NetworkClass: 2, ChainId: 1, TransactionHash: tx, LogIndex: 4, To: "z1qqjnwjjpnue8xmmpanz6csze6tcmtzzdtfsww7",
+		Token: ecommon.HexToAddress("0x02"), Amount: big.NewInt(100), Signature: "signature", RedeemStatus: common.PendingRedeemStatus,
+	}
+	for _, tc := range []struct {
+		name     string
+		existing *events.UnwrapRequestEvm
+		keeps    bool
+	}{
+		{"no record", nil, false},
+		{"record from the node's own scan", &events.UnwrapRequestEvm{
+			NetworkClass: 2, ChainId: 1, BlockNumber: 100, BlockHash: block, TransactionHash: tx, LogIndex: 4, From: sender,
+			To: "z1qqjnwjjpnue8xmmpanz6csze6tcmtzzdtfsww7", Token: ecommon.HexToAddress("0x02"), Amount: big.NewInt(100)}, true},
+		{"record without a block", &events.UnwrapRequestEvm{
+			NetworkClass: 2, ChainId: 1, TransactionHash: tx, LogIndex: 4, From: sender,
+			To: "z1qqjnwjjpnue8xmmpanz6csze6tcmtzzdtfsww7", Token: ecommon.HexToAddress("0x02"), Amount: big.NewInt(100)}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := NewEvmStorage(zdb.NewMemDB(), make(chan os.Signal, 1), 1)
+			if tc.existing != nil {
+				if err := store.AddUnwrapRequest(*tc.existing); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := store.AddRegisteredUnwrapRequest(registered); err != nil {
+				t.Fatal(err)
+			}
+			got, err := store.GetUnwrapRequestByHashAndLog(tx, 4)
+			if err != nil || got == nil {
+				t.Fatalf("stored record %v, err %v", got, err)
+			}
+			if got.Signature != "signature" || got.RedeemStatus != common.PendingRedeemStatus {
+				t.Fatalf("stored record is not the registration: %+v", got)
+			}
+			wantBlock, wantNumber, wantSender := ecommon.Hash{}, uint64(0), ecommon.Address{}
+			if tc.keeps {
+				wantBlock, wantNumber, wantSender = block, 100, sender
+			}
+			if got.BlockHash != wantBlock || got.BlockNumber != wantNumber || got.From != wantSender {
+				t.Fatalf("block %s at %d from %s, want %s at %d from %s", got.BlockHash, got.BlockNumber, got.From, wantBlock, wantNumber, wantSender)
+			}
+		})
+	}
+}
