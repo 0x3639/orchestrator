@@ -8,6 +8,7 @@ import (
 	"sync"
 
 	"github.com/ethereum/go-ethereum/accounts/abi/bind"
+	ecommon "github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/math"
 	"github.com/ethereum/go-ethereum/ethclient"
 
@@ -49,13 +50,16 @@ func (v redeemView) settledAfter(registeredAt uint64) bool {
 // the lowest head any endpoint reports, so it is that deep for each of them
 // and not only for the endpoint that is furthest ahead. The endpoints must
 // agree on the block at that lowest head and on the block at the final
-// height, before and after the read, and report identical state at it. A
-// later reorganization then cannot undo what the answer rests on. A closure
-// or unhalt that is visible in the latest state but not yet at the final
-// height, an endpoint that cannot serve state at the final height, and any
-// failed read are errors, so the caller retries instead of deciding.
+// height. The state is read by the hash of that final block, so an endpoint
+// cannot answer from another block at the same height, and both blocks must
+// still be the agreed ones after the read. The endpoints must report
+// identical state. A later reorganization then cannot undo what the answer
+// rests on. A closure or unhalt that is visible in the latest state but not
+// yet at the final height, an endpoint that cannot serve state at the final
+// block, and any failed read are errors, so the caller retries instead of
+// deciding.
 func (r *EvmRpc) RedeemSettledAfterHalt(nonce *big.Int, registeredAt, confirmations uint64) (bool, error) {
-	_, anySettled, err := r.RedeemSettledInLatestState(nonce, registeredAt)
+	anySettled, err := r.RedeemSettledInLatestState(nonce, registeredAt)
 	if err != nil || !anySettled {
 		return false, err
 	}
@@ -67,19 +71,25 @@ func (r *EvmRpc) RedeemSettledAfterHalt(nonce *big.Int, registeredAt, confirmati
 		return false, errors.New("the redeem registration is not final on every endpoint yet")
 	}
 	finalHeight := head - confirmations
-	if _, err := r.CanonicalHash(head); err != nil {
-		return false, err
-	}
-	before, err := r.CanonicalHash(finalHeight)
+	headHash, err := r.CanonicalHash(head)
 	if err != nil {
 		return false, err
 	}
-	final, err := r.redeemViews(nonce, new(big.Int).SetUint64(finalHeight))
+	finalHash, err := r.CanonicalHash(finalHeight)
 	if err != nil {
-		return false, fmt.Errorf("at block %d: %w", finalHeight, err)
+		return false, err
 	}
-	if after, err := r.CanonicalHash(finalHeight); err != nil || after != before {
-		return false, fmt.Errorf("block %d changed while its state was read: %v", finalHeight, err)
+	final, err := r.redeemViews(nonce, finalHash)
+	if err != nil {
+		return false, fmt.Errorf("at block %d (%s): %w", finalHeight, finalHash, err)
+	}
+	for _, at := range []struct {
+		height uint64
+		hash   ecommon.Hash
+	}{{finalHeight, finalHash}, {head, headHash}} {
+		if after, err := r.CanonicalHash(at.height); err != nil || after != at.hash {
+			return false, fmt.Errorf("block %d changed while the redeem state was read: %v", at.height, err)
+		}
 	}
 	for _, view := range final {
 		if view.closedAt.Cmp(final[0].closedAt) != 0 || view.unhaltedAt.Cmp(final[0].unhaltedAt) != 0 {
@@ -92,23 +102,21 @@ func (r *EvmRpc) RedeemSettledAfterHalt(nonce *big.Int, registeredAt, confirmati
 	return true, nil
 }
 
-// RedeemSettledInLatestState reports whether every endpoint, and whether any
-// endpoint, shows the redeem closed and followed by an administrator unhalt
-// in its latest state. Neither answer archives anything. "Any" tells a caller
-// that the registration is not, or may no longer be, a live discrepancy.
-// "Every" tells it that the redeem cannot be paid as the chain stands.
-func (r *EvmRpc) RedeemSettledInLatestState(nonce *big.Int, registeredAt uint64) (every, any bool, err error) {
-	latest, err := r.redeemViews(nonce, nil)
+// RedeemSettledInLatestState reports whether any endpoint shows the redeem
+// closed and followed by an administrator unhalt in its latest state. It
+// archives nothing. A true answer tells the caller that the registration is
+// not, or may no longer be, a live discrepancy.
+func (r *EvmRpc) RedeemSettledInLatestState(nonce *big.Int, registeredAt uint64) (bool, error) {
+	latest, err := r.redeemViews(nonce, ecommon.Hash{})
 	if err != nil {
-		return false, false, err
+		return false, err
 	}
-	every = true
 	for _, view := range latest {
-		settled := view.settledAfter(registeredAt)
-		every = every && settled
-		any = any || settled
+		if view.settledAfter(registeredAt) {
+			return true, nil
+		}
 	}
-	return every, any, nil
+	return false, nil
 }
 
 // lowestHead returns the lowest chain head among the configured endpoints.
@@ -142,9 +150,10 @@ func (r *EvmRpc) lowestHead() (uint64, error) {
 	return lowest, nil
 }
 
-// redeemViews reads one view from every configured endpoint at block, or at
-// the latest block when block is nil. Any endpoint error fails the read.
-func (r *EvmRpc) redeemViews(nonce, block *big.Int) ([]redeemView, error) {
+// redeemViews reads one view from every configured endpoint at the block with
+// the given hash, or at the latest block when the hash is zero. Any endpoint
+// error fails the read.
+func (r *EvmRpc) redeemViews(nonce *big.Int, block ecommon.Hash) ([]redeemView, error) {
 	urls := r.Urls.Urls
 	if len(urls) == 0 {
 		return nil, errors.New("no EVM endpoints configured")
@@ -169,8 +178,8 @@ func (r *EvmRpc) redeemViews(nonce, block *big.Int) ([]redeemView, error) {
 }
 
 // redeemViewAt reads the redeem entry and the unhalt height from one endpoint
-// at block, or at the latest block when block is nil.
-func (r *EvmRpc) redeemViewAt(endpoint int, nonce, block *big.Int) (redeemView, error) {
+// at the block with the given hash, or at the latest block when it is zero.
+func (r *EvmRpc) redeemViewAt(endpoint int, nonce *big.Int, block ecommon.Hash) (redeemView, error) {
 	var view redeemView
 	// One call per request keeps each endpoint's rate limit accurate.
 	if err := r.callEndpoint(endpoint, func(ctx context.Context, c *ethclient.Client) error {
@@ -178,7 +187,7 @@ func (r *EvmRpc) redeemViewAt(endpoint int, nonce, block *big.Int) (redeemView, 
 		if err != nil {
 			return err
 		}
-		info, err := caller.RedeemsInfo(&bind.CallOpts{Context: ctx, BlockNumber: block}, nonce)
+		info, err := caller.RedeemsInfo(&bind.CallOpts{Context: ctx, BlockHash: block}, nonce)
 		view.closedAt = info.BlockNumber
 		return err
 	}); err != nil {
@@ -189,7 +198,7 @@ func (r *EvmRpc) redeemViewAt(endpoint int, nonce, block *big.Int) (redeemView, 
 		if err != nil {
 			return err
 		}
-		view.unhaltedAt, err = caller.UnhaltedAt(&bind.CallOpts{Context: ctx, BlockNumber: block})
+		view.unhaltedAt, err = caller.UnhaltedAt(&bind.CallOpts{Context: ctx, BlockHash: block})
 		return err
 	}); err != nil {
 		return redeemView{}, err

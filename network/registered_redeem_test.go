@@ -20,6 +20,7 @@ import (
 	ecommon "github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/hexutil"
 	etypes "github.com/ethereum/go-ethereum/core/types"
+	gethrpc "github.com/ethereum/go-ethereum/rpc"
 	"github.com/syndtr/goleveldb/leveldb"
 	"github.com/syndtr/goleveldb/leveldb/storage"
 	zdb "github.com/zenon-network/go-zenon/common/db"
@@ -47,11 +48,16 @@ type redeemContract struct {
 	onOldRead  func()        // runs when state at a numbered block is read
 }
 
-func (c *redeemContract) stateAt(block string) (uint64, error) {
+// stateAt resolves the block of a contract read to a height. Older state is
+// asked for by the hash of a canonical fixture block.
+func (c *redeemContract) stateAt(block gethrpc.BlockNumberOrHash) (uint64, error) {
 	if c.failing.Load() {
 		return 0, errors.New("contract state unavailable")
 	}
-	if block == "latest" {
+	if number, ok := block.Number(); ok {
+		if number != gethrpc.LatestBlockNumber {
+			return 0, fmt.Errorf("unexpected contract read by block number %d", number)
+		}
 		return math.MaxUint64, nil
 	}
 	if c.pruned.Load() {
@@ -60,7 +66,13 @@ func (c *redeemContract) stateAt(block string) (uint64, error) {
 	if c.onOldRead != nil {
 		c.onOldRead()
 	}
-	return hexutil.DecodeUint64(block)
+	hash, _ := block.Hash()
+	for height := uint64(0); height < 400; height++ {
+		if canonicalHeader(height).Hash() == hash {
+			return height, nil
+		}
+	}
+	return 0, errors.New("header for hash not found")
 }
 
 type redeemProvider struct {
@@ -108,7 +120,7 @@ func (p *redeemProvider) GetLogs(q scanQuery) []etypes.Log {
 	return result
 }
 
-func (p *redeemProvider) Call(call map[string]any, block string) (hexutil.Bytes, error) {
+func (p *redeemProvider) Call(call map[string]any, block gethrpc.BlockNumberOrHash) (hexutil.Bytes, error) {
 	result := make([]byte, 32)
 	input, _ := call["input"].(string)
 	switch {

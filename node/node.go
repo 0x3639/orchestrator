@@ -369,9 +369,12 @@ func (node *Node) Wait() {
 
 func (node *Node) processSignatures() {
 	node.logger.Info("in node processSignatures")
-	var lastHaltWaitLog time.Time
 	for {
 		time.Sleep(time.Second)
+		// Read the generation first: a halt released between the two reads
+		// then shows as a stale generation, which is checked again below,
+		// and never as an emergency without one.
+		generation := node.state.RedeemHaltGeneration()
 		currentState, err := node.state.GetState()
 		if err != nil {
 			node.logger.Debug("currentState error in processSig")
@@ -380,7 +383,7 @@ func (node *Node) processSignatures() {
 			continue
 		}
 
-		if generation := node.state.RedeemHaltGeneration(); generation != 0 {
+		if generation != 0 {
 			currentState = common.EmergencyState
 			// The durable incident can outlive the process that submitted the
 			// halt transactions. Verify the actual flags before clearing it.
@@ -390,16 +393,10 @@ func (node *Node) processSignatures() {
 			} else if halted {
 				continue
 			}
-			// Every endpoint shows the redeems behind the stored incidents
-			// closed after a completed halt, so nothing can be paid on them.
-			// Stay in the emergency state, which blocks transfers, and wait
-			// for the final evidence that archives them instead of halting
-			// the bridge again.
-			if node.state.RedeemHaltCanWait() {
-				if time.Since(lastHaltWaitLog) >= time.Minute {
-					lastHaltWaitLog = time.Now()
-					node.logger.Warn("Redeem incident pending: its redeem is closed on every endpoint; waiting for final evidence before resuming. Transfers stay blocked. See --redeem.acknowledge.")
-				}
+			// The recheck worker can archive the last incident while the
+			// flags above are being read. Decide from the state as it is now,
+			// not from the emergency this iteration began with.
+			if node.state.RedeemHaltGeneration() != generation {
 				continue
 			}
 		}

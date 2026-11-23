@@ -140,10 +140,15 @@ func TestHeldRegistrationWaitsWhileTheHeadIsUnknown(t *testing.T) {
 	chain.set(evidenceReceipt(reg), nil, 142)
 	src.synced = true
 	chain.primary.headFails.Store(true)
+	lookups := src.lookups()
 	startRedeemWatch(t, n)
 	waitForMore(t, chain.primary.headReads.Load, 8)
 	if held := len(n.heldRedeemLogs()); held != 1 || n.state.RedeemHaltGeneration() != 0 {
 		t.Fatalf("head unknown: held=%d pending=%d", held, n.state.RedeemHaltGeneration())
+	}
+	// No rules were chosen, so the registration was not looked up at all.
+	if src.lookups() != lookups {
+		t.Fatalf("the registration was checked %d times while its age was unknown", src.lookups()-lookups)
 	}
 	chain.primary.headFails.Store(false)
 	waitFor(t, "the registration stayed held after the head returned", func() bool { return len(n.heldRedeemLogs()) == 0 })
@@ -176,8 +181,9 @@ func TestHeldRegistrationIsNotReleasedByOtherContent(t *testing.T) {
 	}
 }
 
-// Two unanswered observations under one identity are both kept, so the one
-// observed first cannot keep the other from being rechecked.
+// Unanswered observations that share an identity but differ in content or
+// reported height are all kept, so the one observed first cannot keep the
+// genuine one from being rechecked.
 func TestHeldRegistrationsWithOneIdentityAreRecheckedSeparately(t *testing.T) {
 	src := &redeemSource{synced: false, err: constants.ErrDataNonExistent.Error()}
 	n, reg, chain := redeemFixture(t, src)
@@ -186,20 +192,28 @@ func TestHeldRegistrationsWithOneIdentityAreRecheckedSeparately(t *testing.T) {
 	young := reg.BlockNumber + n.ConfirmationsToFinality() - 1
 	chain.primary.set(evidenceReceipt(reg), nil, young)
 	chain.set(evidenceReceipt(reg), nil, young)
-	for _, log := range []etypes.Log{variant, reg} {
+	// The same log reported at another height is a third observation.
+	misplaced := reg
+	misplaced.BlockNumber++
+	for _, log := range []etypes.Log{variant, misplaced, reg} {
 		if err := n.InterpretLog(log, true); err == nil {
 			t.Fatal("an unsynced source confirmed a registration")
 		}
 	}
-	if len(n.heldRedeemLogs()) != 2 {
-		t.Fatalf("held=%d, want both observations", len(n.heldRedeemLogs()))
+	if len(n.heldRedeemLogs()) != 3 {
+		t.Fatalf("held=%d, want every observation", len(n.heldRedeemLogs()))
 	}
 	src.synced = true
 	startRedeemWatch(t, n)
 	waitFor(t, "the genuine registration was never decided", func() bool { return n.state.RedeemHaltGeneration() != 0 })
 	waitFor(t, "the decided registration stayed held", func() bool {
 		held := n.heldRedeemLogs()
-		return len(held) == 1 && held[0].Data[31] == variant.Data[31]
+		for _, log := range held {
+			if log.BlockNumber == reg.BlockNumber && log.Data[31] == reg.Data[31] {
+				return false
+			}
+		}
+		return len(held) == 2
 	})
 }
 
@@ -221,19 +235,22 @@ func TestStoredIncidentIsReleasedOnceSettled(t *testing.T) {
 		t.Helper()
 		// Each settlement round reads the entry on two endpoints, at one or
 		// two blocks, so this spans at least three rounds.
-		waitForMore(t, chain.contract.reads.Load, 12)
+		waitForMore(t, chain.contract.reads.Load, 14)
 		pending, err := n.state.PendingRedeemIncidents()
 		if state, _ := n.state.GetState(); err != nil || len(pending) != 2 || n.state.RedeemHaltGeneration() == 0 || state != common.EmergencyState {
 			t.Fatalf("%s released the incident: pending=%d err=%v", why, len(pending), err)
 		}
 	}
+	// One value changes per step and whole rounds pass between steps, so a
+	// round that reads the two values around a change never sees a settled
+	// pair before the last step.
 	stillHeld("a payable redeem")
 	chain.contract.closedAt.Store(110)
 	stillHeld("a closed redeem with no unhalt after it")
 	chain.contract.unhaltedAt.Store(129) // head 140, 12 confirmations: final height 128
 	stillHeld("an unhalt that is not final")
-	// Move the closure first, so no round sees both below the final height.
 	chain.contract.closedAt.Store(129)
+	stillHeld("a closure and an unhalt that are not final")
 	chain.contract.unhaltedAt.Store(120)
 	stillHeld("a closure that is not final")
 	chain.contract.closedAt.Store(110)

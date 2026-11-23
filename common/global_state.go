@@ -37,7 +37,6 @@ type GlobalState struct {
 	emergencyWritePending  bool
 	redeemIncidents        RedeemIncidentStore
 	acknowledgedRedeems    map[RedeemLogID]bool // fixed before RestoreRedeemIncidents
-	redeemHaltWaits        map[uint32]uint64    // chain to halt generation; guarded by stateMu
 	redeemHaltPending      atomic.Uint64
 	redeemWriteFailed      bool
 	redeemGeneration       uint64 // guarded by stateMu

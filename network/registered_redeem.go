@@ -80,7 +80,7 @@ func (eN *evmNetwork) registerRedeem(log etypes.Log, live bool) error {
 		// that an endpoint already shows closed after a completed halt is
 		// history, whatever head selected these rules. It is decided by the
 		// finalized rules once it is final.
-		_, settled, err := eN.EvmRpc().RedeemSettledInLatestState(redeem.Nonce, log.BlockNumber)
+		settled, err := eN.EvmRpc().RedeemSettledInLatestState(redeem.Nonce, log.BlockNumber)
 		if err != nil {
 			return err
 		}
@@ -93,7 +93,10 @@ func (eN *evmNetwork) registerRedeem(log etypes.Log, live bool) error {
 		// no longer be paid and that a completed halt already covered.
 		settled, err := eN.redeemSettled(incident)
 		if err != nil {
-			return err
+			// This holds the range. Say what ends it: evidence at the final
+			// height from every endpoint, or the operator's review.
+			return fmt.Errorf("unmatched redeem looks settled but cannot be archived yet (after review it can be acknowledged with --redeem.acknowledge %d:%s:%d): %w",
+				eN.ChainId(), log.TxHash, log.Index, err)
 		}
 		if settled {
 			if err := eN.state.ArchiveSettledRedeem(incident); err != nil {
@@ -126,20 +129,6 @@ func (eN *evmNetwork) redeemSettled(incident common.RedeemIncident) (bool, error
 		return false, errors.New("incomplete redeem registration log")
 	}
 	return eN.EvmRpc().RedeemSettledAfterHalt(redeem.Nonce, incident.Log.BlockNumber, eN.ConfirmationsToFinality())
-}
-
-// redeemClosedEverywhere reports whether every endpoint's latest state shows
-// the registration in an incident closed after a completed halt.
-func (eN *evmNetwork) redeemClosedEverywhere(incident common.RedeemIncident) (bool, error) {
-	redeem, err := eN.EvmRpc().Bridge().ParseRegisteredRedeem(incident.Log)
-	if err != nil {
-		return false, err
-	}
-	if redeem.Nonce == nil {
-		return false, errors.New("incomplete redeem registration log")
-	}
-	every, _, err := eN.EvmRpc().RedeemSettledInLatestState(redeem.Nonce, incident.Log.BlockNumber)
-	return every, err
 }
 
 func isRedeemTopic(topic ecommon.Hash) bool {
