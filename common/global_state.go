@@ -36,6 +36,7 @@ type GlobalState struct {
 	persistEmergency       func(uint8) error
 	emergencyWritePending  bool
 	redeemIncidents        RedeemIncidentStore
+	acknowledgedRedeems    map[RedeemLogID]bool // fixed before RestoreRedeemIncidents
 	redeemHaltPending      atomic.Uint64
 	redeemWriteFailed      bool
 	redeemGeneration       uint64 // guarded by stateMu

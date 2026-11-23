@@ -67,13 +67,49 @@ func (eN *evmNetwork) registerRedeem(log etypes.Log, live bool) error {
 	if err != nil {
 		return err
 	}
-	if err := eN.state.ReportRedeemIncident(common.RedeemIncident{ChainID: eN.ChainId(), Log: confirmed, Wrap: wrap}); err != nil {
+	incident := common.RedeemIncident{ChainID: eN.ChainId(), Log: confirmed, Wrap: wrap}
+	if !live {
+		// A signer replaying history must not halt again for a redeem that can
+		// no longer be paid and that a completed halt already covered.
+		settled, err := eN.redeemSettled(incident)
+		if err != nil {
+			return err
+		}
+		if settled {
+			if err := eN.state.ArchiveSettledRedeem(incident); err != nil {
+				eN.requestStop()
+				return fmt.Errorf("archive settled redeem: %w", err)
+			}
+			eN.logger.Warnf("Archived unmatched redeem without a halt, it is closed and the bridge was unhalted after it: chain %d, block %d (%s), transaction %s, log %d, wrap %s",
+				eN.ChainId(), log.BlockNumber, log.BlockHash, log.TxHash, log.Index, id)
+			return nil
+		}
+	}
+	if err := eN.state.ReportRedeemIncident(incident); err != nil {
 		eN.requestStop()
 		return fmt.Errorf("persist redeem incident: %w", err)
 	}
 	eN.logger.Warnf("Verified unmatched redeem: chain %d, block %d (%s), transaction %s, log %d, wrap %s, halt pending %v",
 		eN.ChainId(), log.BlockNumber, log.BlockHash, log.TxHash, log.Index, id, eN.state.RedeemHaltGeneration() != 0)
 	return nil
+}
+
+// redeemSettled asks every endpoint whether the registration in an incident is
+// closed and was followed by a finalized administrator unhalt.
+func (eN *evmNetwork) redeemSettled(incident common.RedeemIncident) (bool, error) {
+	redeem, err := eN.EvmRpc().Bridge().ParseRegisteredRedeem(incident.Log)
+	if err != nil {
+		return false, err
+	}
+	head, err := eN.EvmRpc().BlockNumber()
+	if err != nil {
+		return false, err
+	}
+	depth := eN.ConfirmationsToFinality()
+	if head < depth {
+		return false, nil
+	}
+	return eN.EvmRpc().RedeemSettledAfterHalt(redeem.Nonce, incident.Log.BlockNumber, head-depth)
 }
 
 func isRedeemTopic(topic ecommon.Hash) bool {

@@ -18,6 +18,8 @@ import (
 // Reserved outside the wrap, cursor, resign and health keys in the Zenon DB.
 // Keep the original evidence immutable after the bridge is halted.
 const redeemEvidencePrefix byte = 4
+
+// The marker's value is the common.RedeemResolution that released the incident.
 const redeemHaltConfirmedPrefix byte = 5
 
 type RedeemIncidentStore struct{ db *leveldb.DB }
@@ -116,5 +118,55 @@ func (s *RedeemIncidentStore) ConfirmRedeemHalt(checkedChains map[uint32]bool) e
 	if err := it.Error(); err != nil {
 		return err
 	}
+	return s.db.Write(batch, &opt.WriteOptions{Sync: true})
+}
+
+// PendingRedeemIncidents returns the evidence that still holds the bridge.
+func (s *RedeemIncidentStore) PendingRedeemIncidents() ([]common.RedeemIncident, error) {
+	it := s.db.NewIterator(util.BytesPrefix([]byte{redeemEvidencePrefix}), nil)
+	defer it.Release()
+	var pending []common.RedeemIncident
+	for it.Next() {
+		done, err := s.db.Has(confirmedKey(it.Key()), nil)
+		if err != nil {
+			return nil, err
+		}
+		if done {
+			continue
+		}
+		var ev common.RedeemIncident
+		if err := json.Unmarshal(it.Value(), &ev); err != nil {
+			return nil, err
+		}
+		pending = append(pending, ev)
+	}
+	return pending, it.Error()
+}
+
+// ResolveRedeemIncident archives the evidence, if it is new, together with the
+// reason it does not hold the bridge. An earlier resolution is kept.
+func (s *RedeemIncidentStore) ResolveRedeemIncident(ev common.RedeemIncident, reason common.RedeemResolution) error {
+	if reason != common.RedeemSettledOnChain && reason != common.RedeemOperatorAcknowledged {
+		return errors.New("invalid redeem incident resolution")
+	}
+	key := redeemEvidenceKey(ev)
+	batch := new(leveldb.Batch)
+	exists, err := s.db.Has(key, nil)
+	if err != nil {
+		return err
+	}
+	if !exists {
+		data, err := json.Marshal(ev)
+		if err != nil {
+			return err
+		}
+		batch.Put(key, data)
+	}
+	marker := confirmedKey(key)
+	done, err := s.db.Has(marker, nil)
+	if err != nil || done {
+		return err
+	}
+	batch.Put(marker, []byte{byte(reason)})
 	return s.db.Write(batch, &opt.WriteOptions{Sync: true})
 }

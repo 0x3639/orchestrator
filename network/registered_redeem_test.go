@@ -1,14 +1,18 @@
 package network
 
 import (
+	"bytes"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math/big"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -31,10 +35,18 @@ import (
 	"orchestrator/rpc"
 )
 
+// redeemContract is the bridge storage one fixture endpoint reports.
+type redeemContract struct {
+	closed     atomic.Bool   // the redeem entry was paid or revoked
+	unhaltedAt atomic.Uint64 // height of the last administrator unhalt
+	failing    atomic.Bool   // contract reads fail on this endpoint
+}
+
 type redeemProvider struct {
 	primary *redeemProvider // companion endpoint for advancing the fixture chain
 	*unwrapProvider
 	halted     *bool
+	contract   *redeemContract
 	afterRange func()
 }
 
@@ -61,20 +73,39 @@ func (p *redeemProvider) GetLogs(q scanQuery) []etypes.Log {
 
 func (p *redeemProvider) Call(call map[string]any, _ string) (hexutil.Bytes, error) {
 	result := make([]byte, 32)
-	switch call["input"] {
-	case "0xc7ff1584": // isHalted() includes the unhalt delay.
+	input, _ := call["input"].(string)
+	switch {
+	case input == "0xc7ff1584": // isHalted() includes the unhalt delay.
 		result[31] = 1
-	case "0xb9b8af0b": // halted() is the explicit flag.
+	case input == "0xb9b8af0b": // halted() is the explicit flag.
 		if *p.halted {
 			result[31] = 1
 		}
+	case strings.HasPrefix(input, "0xa75f8096"): // redeemsInfo(nonce): block number, params hash.
+		if p.contract.failing.Load() {
+			return nil, errors.New("contract state unavailable")
+		}
+		result = make([]byte, 64)
+		if p.contract.closed.Load() {
+			copy(result, bytes.Repeat([]byte{0xff}, 32))
+		} else {
+			result[31] = 100
+		}
+	case input == "0x69d11381": // unhaltedAt()
+		if p.contract.failing.Load() {
+			return nil, errors.New("contract state unavailable")
+		}
+		binary.BigEndian.PutUint64(result[24:], p.contract.unhaltedAt.Load())
 	default:
 		return nil, fmt.Errorf("unexpected contract call %v", call["input"])
 	}
 	return result, nil
 }
 
+// The transport serves a source from the scan and from the recheck worker.
+// Tests change a source only while neither runs, or through update.
 type redeemSource struct {
+	mu        sync.Mutex
 	halted    bool
 	bridgeErr string
 	err       string
@@ -82,6 +113,18 @@ type redeemSource struct {
 	synced    bool
 	failures  int
 	calls     int
+}
+
+func (s *redeemSource) update(change func(*redeemSource)) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	change(s)
+}
+
+func (s *redeemSource) lookups() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.calls
 }
 
 type redeemTransport struct {
@@ -103,6 +146,8 @@ func (tr redeemTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 		return nil, err
 	}
 	result := map[string]any{"jsonrpc": "2.0", "id": call.ID}
+	src.mu.Lock()
+	defer src.mu.Unlock()
 	switch call.Method {
 	case "embedded.bridge.getBridgeInfo":
 		if src.bridgeErr != "" {
@@ -145,9 +190,9 @@ func redeemFixture(t *testing.T, sources ...*redeemSource) (*evmNetwork, etypes.
 	log := etypes.Log{Address: testContract, BlockNumber: 100, BlockHash: ev.BlockHash, TxHash: ev.TransactionHash, Index: 3,
 		Topics: []ecommon.Hash{common.RegisteredRedeemSigHash, ecommon.HexToHash("0x31"), ecommon.HexToHash("0x32"), ecommon.HexToHash("0x33")},
 		Data:   ecommon.LeftPadBytes([]byte{19}, 32)}
-	flag := new(bool)
-	primary := &redeemProvider{halted: flag, unwrapProvider: &unwrapProvider{head: 140, receipt: evidenceReceipt(log), filtered: []etypes.Log{log}}}
-	secondary := &redeemProvider{primary: primary, halted: flag, unwrapProvider: &unwrapProvider{head: 140, receipt: evidenceReceipt(log), filtered: []etypes.Log{log}}}
+	flag, contract := new(bool), new(redeemContract)
+	primary := &redeemProvider{halted: flag, contract: contract, unwrapProvider: &unwrapProvider{head: 140, receipt: evidenceReceipt(log), filtered: []etypes.Log{log}}}
+	secondary := &redeemProvider{primary: primary, halted: flag, contract: contract, unwrapProvider: &unwrapProvider{head: 140, receipt: evidenceReceipt(log), filtered: []etypes.Log{log}}}
 	evmCfg := evidenceEndpoints(t, primary, secondary)
 	saved := http.DefaultTransport
 	handlers := map[string]*redeemSource{}
@@ -399,11 +444,13 @@ func TestCatchupRedeemWaitsForFinalityAcrossRestart(t *testing.T) {
 	db := open()
 	head := reg.BlockNumber + n.ConfirmationsToFinality() - 1
 	chain.setChain(head, reg)
+	// The young registration cannot be checked yet: the source is not synced.
+	src.synced = false
 	if err := n.Sync(); err != nil {
 		t.Fatal(err)
 	}
-	if src.calls != 0 || n.state.RedeemHaltGeneration() != 0 {
-		t.Fatal("unfinalized range opened a halt")
+	if n.state.RedeemHaltGeneration() != 0 {
+		t.Fatal("an unchecked young registration opened a halt")
 	}
 	through, from, _, err := stores.evm.GetScanHeights(n.ConfirmationsToFinality())
 	if err != nil || through != head || from != reg.BlockNumber {
@@ -414,6 +461,8 @@ func TestCatchupRedeemWaitsForFinalityAcrossRestart(t *testing.T) {
 	}
 	db = open()
 	defer db.Close()
+	n.heldRedeems = nil // a restart keeps nothing in memory
+	src.synced = true
 	chain.setChain(head+1, reg)
 	if err := n.Sync(); err != nil {
 		t.Fatal(err)
@@ -447,7 +496,8 @@ func TestRedeemHaltWaitsForRuntimeNetworkPublication(t *testing.T) {
 }
 
 func TestCatchupRedeemRetainsGapWhenHeadAdvances(t *testing.T) {
-	src := &redeemSource{synced: true, err: constants.ErrDataNonExistent.Error()}
+	// The young registration cannot be checked during the first pass.
+	src := &redeemSource{synced: false, err: constants.ErrDataNonExistent.Error()}
 	n, reg, chain := redeemFixture(t, src)
 	reg.BlockNumber++
 	reg.BlockHash = canonicalHeader(reg.BlockNumber).Hash()
@@ -458,9 +508,10 @@ func TestCatchupRedeemRetainsGapWhenHeadAdvances(t *testing.T) {
 		t.Fatal(err)
 	}
 	through, from, _, err := n.eventsStore().GetScanHeights(n.ConfirmationsToFinality())
-	if err != nil || through != 140 || from >= reg.BlockNumber || src.calls != 0 {
-		t.Fatalf("through=%d redeem=%d lookups=%d err=%v", through, from, src.calls, err)
+	if err != nil || through != 140 || from >= reg.BlockNumber || n.state.RedeemHaltGeneration() != 0 {
+		t.Fatalf("through=%d redeem=%d pending=%d err=%v", through, from, n.state.RedeemHaltGeneration(), err)
 	}
+	src.synced = true
 	if err := n.Sync(); err != nil {
 		t.Fatal(err)
 	}
@@ -559,7 +610,8 @@ func TestLegacyRedeemReplayFindsRegistrationBeforeLastProvisionalEvent(t *testin
 }
 
 func TestRedeemFinalizesWhileSubscriptionIsUnavailable(t *testing.T) {
-	src := &redeemSource{synced: true, err: constants.ErrDataNonExistent.Error()}
+	// While the registration is young the source cannot confirm anything.
+	src := &redeemSource{synced: false, err: constants.ErrDataNonExistent.Error()}
 	n, reg, chain := redeemFixture(t, src)
 	head := reg.BlockNumber + n.ConfirmationsToFinality()
 	chain.setChain(head-1, reg)
@@ -567,8 +619,10 @@ func TestRedeemFinalizesWhileSubscriptionIsUnavailable(t *testing.T) {
 		t.Fatal(err)
 	}
 	if n.state.RedeemHaltGeneration() != 0 {
-		t.Fatal("unfinalized registration halted bridge")
+		t.Fatal("an unchecked young registration halted the bridge")
 	}
+	n.heldRedeems = nil // leave the finalized scan as the only path
+	src.synced = true
 	chain.setChain(head, reg)
 	// Both HTTP endpoints support range scans, but no log subscriptions.
 	stopped := make(chan struct{})

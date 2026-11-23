@@ -61,6 +61,14 @@ type evmNetwork struct {
 	// one agreement check. It is never used for deletions.
 	canonicalMu    sync.Mutex
 	canonicalCache map[uint64]ecommon.Hash
+
+	// heldRedeems are registrations whose check has not produced an answer.
+	// watchRedeems rechecks them. After a restart the range scan meets them
+	// again: the redeem checkpoint does not pass a registration the scan
+	// could not check.
+	heldMu         sync.Mutex
+	heldRedeems    map[heldRedeemKey]*heldRedeem
+	heldRetryEvery time.Duration // zero selects heldRedeemRetryInterval
 }
 
 // agreedHashForLog returns the endpoint-agreed canonical hash at number,
@@ -448,8 +456,22 @@ func (eN *evmNetwork) Sync() error {
 		for _, log := range logs {
 			recent := latestBlock-log.BlockNumber < depth
 			if len(log.Topics) > 0 && isRedeemTopic(log.Topics[0]) {
-				if recent || log.BlockNumber > finalizedTip || log.BlockNumber < redeemFrom {
-					continue // Revisit the unfinalized tail on the next sync.
+				if log.BlockNumber < redeemFrom {
+					continue
+				}
+				if recent || log.BlockNumber > finalizedTip {
+					// The finalized scan revisits this tail and owns its
+					// durable status. A young registration is still checked
+					// now, as the subscription would check it; a check
+					// without an answer is held for retry and does not stall
+					// the range.
+					if log.Topics[0] == common.RegisteredRedeemSigHash {
+						_ = eN.InterpretLog(log, true)
+						if eN.state.RedeemHaltGeneration() != 0 {
+							return nil
+						}
+					}
+					continue
 				}
 			} else if log.BlockNumber < startHeight {
 				continue // Only redeem verification trails the ordinary scan.
@@ -591,7 +613,10 @@ func (eN *evmNetwork) InterpretLog(log etypes.Log, live bool) error {
 			}
 		}
 	case common.RegisteredRedeemSigHash.Hex():
-		return eN.registerRedeem(log, live)
+		if live {
+			return eN.checkLiveRedeem(log)
+		}
+		return eN.registerRedeem(log, false)
 	case common.RedeemedSigHash.Hex(), common.RevokedRedeemSigHash.Hex():
 		return eN.applyRedeemOutcome(log, live)
 	case common.HaltedSigHash.Hex():
@@ -771,9 +796,14 @@ const (
 // refreshes it every subscriptionRefreshInterval after a catch-up Sync, and
 // re-establishes it with backoff when the provider drops it. A failed Sync
 // is logged and retried at the next refresh; it never leaves the node
-// without a subscription.
+// without a subscription. Registrations whose live check gave no answer are
+// rechecked beside it, at their own pace, while a Sync or a resubscribe waits.
+// The recheck worker ends with this loop, and the loop returns after it has.
 func (eN *evmNetwork) SubscribeToEvents() {
 	eN.logger.Infof("SubscribeToEvents for network with chainId: %d", eN.ChainId())
+	stopWatch, watching := make(chan struct{}), make(chan struct{})
+	go func() { defer close(watching); eN.watchRedeems(stopWatch) }()
+	defer func() { close(stopWatch); <-watching }()
 	resubscribeBackoff := processEventsBaseBackoff
 	var nextCatchUp time.Time
 	catchUp := func() {

@@ -110,6 +110,15 @@ func NewNode(config *oconfig.Config, logger *zap.Logger) (_ *Node, initErr error
 	if node.dbManager, err = manager.NewDbManager(node.stopChan); err != nil {
 		return nil, err
 	}
+	acknowledged := make([]common.RedeemLogID, 0, len(config.AcknowledgedRedeems))
+	for _, text := range config.AcknowledgedRedeems {
+		id, err := common.ParseRedeemLogID(text)
+		if err != nil {
+			return nil, err
+		}
+		acknowledged = append(acknowledged, id)
+	}
+	node.state.AcknowledgeRedeemLogs(acknowledged)
 	if err := node.state.RestoreRedeemIncidents(node.dbManager.RedeemIncidents()); err != nil {
 		return nil, err
 	}
