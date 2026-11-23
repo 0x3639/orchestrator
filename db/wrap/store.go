@@ -6,7 +6,6 @@ import (
 	"orchestrator/db"
 	"os"
 	"sync"
-	"sync/atomic"
 
 	"github.com/syndtr/goleveldb/leveldb"
 	"github.com/syndtr/goleveldb/leveldb/opt"
@@ -21,21 +20,16 @@ type eventStore struct {
 	zdb.DB
 	stopChan chan os.Signal
 	mu       *sync.Mutex
-	// durable is nil for a store without a file behind it.
-	durable *durability
-}
-
-// durability flushes unsynced writes of the Zenon database on request.
-type durability struct {
-	sync  func() error
-	dirty atomic.Bool // a wrap row or redeem status was written since the last sync
+	// raw is the file behind DB, when there is one. Wrap rows and redeem
+	// statuses are then written through it with a sync. A snapshot has none.
+	raw *leveldb.DB
 }
 
 func (es *eventStore) Storage() zdb.DB {
 	return zdb.DisableNotFound(es.DB.Subset(getStorageIterator()))
 }
 func (es *eventStore) Snapshot() db.ZnnStorage {
-	return &eventStore{DB: es.DB.Snapshot(), stopChan: es.stopChan, mu: es.mu, durable: es.durable}
+	return &eventStore{DB: es.DB.Snapshot(), stopChan: es.stopChan, mu: es.mu}
 }
 
 func (es *eventStore) SendSigInt() {
@@ -53,31 +47,30 @@ func NewZnnStorage(db zdb.DB, stopChan chan os.Signal) db.ZnnStorage {
 	}
 }
 
-// NewDurableZnnStorage is NewZnnStorage over a LevelDB file. SyncRedeemStatuses
-// then forces what was written to disk.
+// NewDurableZnnStorage is NewZnnStorage over a LevelDB file. Its wrap rows and
+// redeem statuses are synced as they are written.
 func NewDurableZnnStorage(raw *leveldb.DB, stopChan chan os.Signal) db.ZnnStorage {
 	store := NewZnnStorage(zdb.NewLevelDBWrapper(raw), stopChan).(*eventStore)
-	store.durable = &durability{sync: func() error {
-		// A synced write flushes the journal, and with it every earlier
-		// write that was not synced.
-		return raw.Put(redeemSyncKey, []byte{1}, &opt.WriteOptions{Sync: true})
-	}}
+	store.raw = raw
 	return store
 }
 
-func (es *eventStore) noteRedeemWrite() {
-	if es.durable != nil {
-		es.durable.dirty.Store(true)
-	}
-}
-
-func (es *eventStore) SyncRedeemStatuses() error {
-	if es.durable == nil || !es.durable.dirty.Swap(false) {
-		return nil
-	}
-	if err := es.durable.sync(); err != nil {
-		es.durable.dirty.Store(true)
+// putDurable writes a wrap row or a redeem status. The EVM scan stores its
+// checkpoint in another database once it is past the log such a write came
+// from, so the write itself has to be on disk first. Syncing some later write
+// would not do: an earlier one can sit in a journal file that LevelDB has
+// already closed without a sync.
+//
+// The value goes through DB first, which owns the stored encoding, and the
+// stored bytes are then written again with a sync. Callers hold mu, so no
+// other write to the key comes between the two.
+func (es *eventStore) putDurable(key, value []byte) error {
+	if err := es.DB.Put(key, value); err != nil || es.raw == nil {
 		return err
 	}
-	return nil
+	stored, err := es.raw.Get(key, nil)
+	if err != nil {
+		return err
+	}
+	return es.raw.Put(key, stored, &opt.WriteOptions{Sync: true})
 }

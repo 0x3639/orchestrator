@@ -3,6 +3,7 @@ package network
 import (
 	"errors"
 	"math/big"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -19,7 +20,6 @@ import (
 	"go.uber.org/zap"
 
 	"orchestrator/common"
-	"orchestrator/db"
 	"orchestrator/db/unwrap"
 	"orchestrator/db/wrap"
 )
@@ -113,7 +113,12 @@ func TestCatchUpChecksYoungRegistrations(t *testing.T) {
 // prefix and in any case. Both spell the same address and match.
 func TestRegistrationMatchesAnUnprefixedSourceAddress(t *testing.T) {
 	src := &redeemSource{synced: true}
-	n, reg, _ := redeemFixture(t, src)
+	n, reg, chain := redeemFixture(t, src)
+	// Addresses with letters, so that their case matters.
+	reg.Topics = append([]ecommon.Hash(nil), reg.Topics...)
+	reg.Topics[2] = ecommon.HexToHash("0x00000000000000000000000000000000000000000000000000000000abcdef01")
+	reg.Topics[3] = ecommon.HexToHash("0x000000000000000000000000000000000000000000000000000000000fedcba9")
+	chain.setChain(140, reg)
 	src.wrap = sourceRequestFor(reg)
 	src.wrap.ToAddress = strings.ToLower(src.wrap.ToAddress[2:])
 	src.wrap.TokenAddress = strings.ToUpper(src.wrap.TokenAddress[2:])
@@ -141,6 +146,28 @@ func TestRegistrationForAnotherTokenDoesNotMatch(t *testing.T) {
 	src.wrap.TokenAddress = "ff" + src.wrap.TokenAddress[4:]
 	if err := n.InterpretLog(reg, true); err != nil || n.state.RedeemHaltGeneration() == 0 {
 		t.Fatalf("other token: err=%v pending=%d", err, n.state.RedeemHaltGeneration())
+	}
+}
+
+// The same holds for the reply of an endpoint that is asked to confirm a
+// mismatch the first endpoint reported.
+func TestConfirmingReplyWithoutAFeeDecidesNothing(t *testing.T) {
+	first := &redeemSource{synced: true}
+	second := &redeemSource{synced: true, mangle: func(r map[string]any) { delete(r, "fee") }}
+	n, reg, _ := redeemFixture(t, first, second)
+	// Both hold the same request, for another amount than the registration.
+	first.wrap = sourceRequestFor(reg)
+	first.wrap.Amount = big.NewInt(30)
+	second.wrap = first.wrap
+	for _, live := range []bool{true, false} {
+		if err := n.InterpretLog(reg, live); err == nil || n.state.RedeemHaltGeneration() != 0 {
+			t.Fatalf("live=%t: err=%v pending=%d", live, err, n.state.RedeemHaltGeneration())
+		}
+	}
+	// With the fee present the mismatch is confirmed.
+	second.mangle = nil
+	if err := n.InterpretLog(reg, false); err != nil || n.state.RedeemHaltGeneration() == 0 {
+		t.Fatalf("complete confirmation: err=%v pending=%d", err, n.state.RedeemHaltGeneration())
 	}
 }
 
@@ -180,43 +207,10 @@ func TestSourceReplyWithoutAmountOrFeeDecidesNothing(t *testing.T) {
 	}
 }
 
-// failingSync is a wrap store whose writes cannot be made durable.
-type failingSync struct {
-	db.ZnnStorage
-	err error
-}
-
-func (s *failingSync) SyncRedeemStatuses() error { return s.err }
-
-// The scan checkpoint is stored in another database than the redeem
-// statuses. It must not move past a range whose statuses are not on disk.
-func TestScanCheckpointWaitsForDurableStatuses(t *testing.T) {
-	src := &redeemSource{synced: true}
-	n, reg, _ := redeemFixture(t, src)
-	src.wrap = sourceRequestFor(reg)
-	stores := n.dbManager.(unwrapTestStores)
-	store := &failingSync{ZnnStorage: stores.znn, err: errors.New("disk full")}
-	stores.znn = store
-	n.dbManager = stores
-	if err := n.Sync(); err == nil {
-		t.Fatal("the scan succeeded although the statuses could not be synced")
-	}
-	if cursor, _ := n.eventsStore().GetLastUpdateHeight(); cursor != 100 {
-		t.Fatalf("checkpoint moved to %d past statuses that are not durable", cursor)
-	}
-	store.err = nil
-	if err := n.Sync(); err != nil {
-		t.Fatal(err)
-	}
-	row, err := store.GetWrapRequestById(src.wrap.Id)
-	if cursor, _ := n.eventsStore().GetLastUpdateHeight(); cursor != 140 || err != nil || row == nil || row.RedeemStatus != common.PendingRedeemStatus {
-		t.Fatalf("after the sync worked: cursor=%d row=%+v err=%v", cursor, row, err)
-	}
-}
-
-// Halt signatures are matched to networks by position. When the networks are
-// not the ones the messages were signed for, sending must stop and report
-// it instead of using a signature for another network or none at all.
+// Halt signatures are matched to networks by position and cover the
+// network's contract. When the networks are not the ones the messages were
+// built for, sending must stop and say so instead of using a signature for
+// another network or none at all.
 func TestHaltSignaturesNeedTheNetworksTheyWereSignedFor(t *testing.T) {
 	src := &redeemSource{synced: true}
 	n, _, chain := redeemFixture(t, src)
@@ -225,16 +219,32 @@ func TestHaltSignaturesNeedTheNetworksTheyWereSignedFor(t *testing.T) {
 	if _, err := m.SendHaltEvm(nil, nil, ecommon.Address{}); !errors.Is(err, ErrHaltMembershipChanged) {
 		t.Fatalf("a network without a signature: %v", err)
 	}
-	// Signed for another network in the same position.
-	m.haltChains = []uint32{56}
-	if _, err := m.SendHaltEvm([][]byte{{1}}, nil, ecommon.Address{}); !errors.Is(err, ErrHaltMembershipChanged) {
-		t.Fatalf("a signature for another network: %v", err)
+	messages, err := m.GetHaltMessages()
+	if err != nil || len(messages) != 1 {
+		t.Fatalf("halt messages: %d %v", len(messages), err)
 	}
-	// Signed for this network: sending goes on, here to a chain already halted.
-	m.haltChains = []uint32{1}
+	signatures := [][]byte{{1}}
+	// The same networks: sending goes on, here to a chain already halted.
 	*chain.halted = true
-	if halted, err := m.SendHaltEvm([][]byte{{1}}, nil, ecommon.Address{}); err != nil || !halted {
+	if halted, err := m.SendHaltEvm(signatures, nil, ecommon.Address{}); err != nil || !halted {
 		t.Fatalf("matching networks: halted=%t err=%v", halted, err)
+	}
+	// The network was removed and published again under the same chain id.
+	replacement := &evmNetwork{EvmParams: n.EvmParams, rpcManager: n.rpcManager, logger: n.logger, done: make(chan struct{})}
+	if replacement.ChainId() != n.ChainId() {
+		t.Fatal("fixture: the replacement must share the chain id")
+	}
+	m.RemoveEvmNetwork(n.ChainId())
+	m.AddEvmNetwork(replacement)
+	if _, err := m.SendHaltEvm(signatures, nil, ecommon.Address{}); !errors.Is(err, ErrHaltMembershipChanged) {
+		t.Fatalf("a replaced network: %v", err)
+	}
+	// New messages are for the current networks.
+	if _, err := m.GetHaltMessages(); err != nil {
+		t.Fatal(err)
+	}
+	if halted, err := m.SendHaltEvm(signatures, nil, ecommon.Address{}); err != nil || !halted {
+		t.Fatalf("after signing again: halted=%t err=%v", halted, err)
 	}
 }
 
@@ -491,33 +501,42 @@ func TestRestoredIncidentIsReleasedByTheFirstScan(t *testing.T) {
 func TestStartupSweepStopsAtTheFirstIncidentThatStaysPending(t *testing.T) {
 	src := &redeemSource{synced: true, err: constants.ErrDataNonExistent.Error()}
 	n, reg, chain := redeemFixture(t, src)
-	// Stored first: an incident whose log no endpoint serves any more.
-	gone := reg
-	gone.BlockHash = ecommon.HexToHash("0x01")
-	for _, log := range []etypes.Log{gone, reg} {
+	// Three stored incidents, in store order: settled, one whose log no
+	// endpoint serves any more, and settled again.
+	gone, last := reg, reg
+	gone.Index, last.Index = reg.Index+1, reg.Index+2
+	for _, log := range []etypes.Log{reg, gone, last} {
 		if err := n.state.ReportRedeemIncident(common.RedeemIncident{ChainID: 1, Log: log}); err != nil {
 			t.Fatal(err)
 		}
 	}
+	chain.setChain(140, reg, last)
 	chain.contract.closedAt.Store(110)
 	chain.contract.unhaltedAt.Store(120)
-	pendingCount := func() int {
+	pendingIndexes := func() []uint {
 		t.Helper()
 		pending, err := n.state.PendingRedeemIncidents()
 		if err != nil {
 			t.Fatal(err)
 		}
-		return len(pending)
+		indexes := make([]uint, 0, len(pending))
+		for _, incident := range pending {
+			indexes = append(indexes, incident.Log.Index)
+		}
+		return indexes
 	}
 	if err := n.Sync(); err != nil {
 		t.Fatal(err)
 	}
-	if pendingCount() != 2 {
-		t.Fatalf("the startup sweep went past an incident that stays pending: %d left", pendingCount())
+	// The first was settled; the sweep stopped at the second.
+	if left := pendingIndexes(); !slices.Equal(left, []uint{gone.Index, last.Index}) {
+		t.Fatalf("pending after the startup sweep: %v", left)
 	}
 	// The worker checks the rest.
 	startRedeemWatch(t, n)
-	waitFor(t, "the worker did not settle the incident behind it", func() bool { return pendingCount() == 1 })
+	waitFor(t, "the worker did not settle the incident behind it", func() bool {
+		return slices.Equal(pendingIndexes(), []uint{gone.Index})
+	})
 	if n.state.RedeemHaltGeneration() == 0 {
 		t.Fatal("the incident that stays pending no longer holds the bridge")
 	}

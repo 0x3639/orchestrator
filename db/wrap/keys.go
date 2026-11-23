@@ -4,9 +4,6 @@ package wrap
 const legacyRedeemStatusPrefix byte = 6 // Included provisional events in earlier PR builds.
 const redeemStatusPrefix byte = 7
 
-// Written with a sync to flush earlier unsynced writes; it carries no data.
-var redeemSyncKey = []byte{8}
-
 var (
 	wrapEventPrefix = []byte{0}
 

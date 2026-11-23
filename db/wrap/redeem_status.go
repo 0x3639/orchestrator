@@ -60,8 +60,7 @@ func (es *eventStore) ApplyRedeemLog(chainID uint32, id types.Hash, block uint64
 	}
 	b := binary.BigEndian.AppendUint64(nil, block)
 	b = binary.BigEndian.AppendUint64(b, uint64(index))
-	es.noteRedeemWrite()
-	return es.DB.Put(key, binary.BigEndian.AppendUint32(b, status))
+	return es.putDurable(key, binary.BigEndian.AppendUint32(b, status))
 }
 
 func (es *eventStore) decodeWrap(data []byte) (*events.WrapRequestZnn, error) {

@@ -50,10 +50,6 @@ type ZnnStorage interface {
 	AddWrapRequest(events.WrapRequestZnn) error
 	HasLegacyRedeemStatuses(chainID uint32) (bool, error)
 	ApplyRedeemLog(chainID uint32, id types.Hash, block uint64, index uint, status uint32) error
-	// SyncRedeemStatuses makes the wrap rows and redeem statuses written so
-	// far durable. The EVM scan calls it before it stores a checkpoint past
-	// the logs they came from.
-	SyncRedeemStatuses() error
 	SetWrapRequestStatus(types.Hash, uint32) error
 	SetWrapRequestSignature(types.Hash, string) error
 	SetWrapRequestSentSignature(types.Hash, bool) error

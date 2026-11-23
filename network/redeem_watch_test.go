@@ -1,6 +1,7 @@
 package network
 
 import (
+	"errors"
 	"math/big"
 	"testing"
 	"time"
@@ -93,7 +94,15 @@ func TestHeldRegistrationIsReleasedWhenItsBlockIsReplaced(t *testing.T) {
 	if len(n.heldRedeemLogs()) != 1 {
 		t.Fatal("a registration was released while its height was not final")
 	}
-	chain.setChain(reg.BlockNumber + n.ConfirmationsToFinality() + 5)
+	// Final for the endpoint that reports the head, but the other has not
+	// come that far: it could still be on a branch that is about to lose.
+	final := reg.BlockNumber + n.ConfirmationsToFinality() + 5
+	chain.primary.set(nil, nil, final)
+	waitForMore(t, func() uint64 { return uint64(src.lookups()) }, 6)
+	if len(n.heldRedeemLogs()) != 1 {
+		t.Fatal("a registration was released before every endpoint had reached finality")
+	}
+	chain.setChain(final)
 	waitFor(t, "a replaced registration stayed held", func() bool { return len(n.heldRedeemLogs()) == 0 })
 	// Nothing rechecks a released entry, so there is no later round to wait for.
 	src.update(func(s *redeemSource) { s.synced = true })
@@ -160,6 +169,27 @@ func TestHeldRegistrationWaitsWhileTheHeadIsUnknown(t *testing.T) {
 	waitFor(t, "the registration stayed held after the head returned", func() bool { return len(n.heldRedeemLogs()) == 0 })
 	if state, _ := n.state.GetState(); n.state.RedeemHaltGeneration() != 0 || state != common.LiveState {
 		t.Fatalf("settled registration: pending=%d state=%d", n.state.RedeemHaltGeneration(), state)
+	}
+}
+
+// A recheck that fails after the entry was answered and released does not
+// bring the entry back.
+func TestLateRecheckDoesNotHoldAnAnsweredRegistration(t *testing.T) {
+	src := &redeemSource{synced: true}
+	n, reg, _ := redeemFixture(t, src)
+	n.noteRedeemCheck(reg, errors.New("timed out"), false)
+	if len(n.heldRedeemLogs()) != 0 {
+		t.Fatal("a recheck result created a held entry")
+	}
+	n.noteRedeemCheck(reg, errors.New("no answer"), true)
+	n.noteRedeemCheck(reg, errors.New("timed out"), false)
+	if len(n.heldRedeemLogs()) != 1 {
+		t.Fatal("a first observation was not held")
+	}
+	n.noteRedeemCheck(reg, nil, false)
+	n.noteRedeemCheck(reg, errors.New("timed out"), false)
+	if len(n.heldRedeemLogs()) != 0 {
+		t.Fatal("a late recheck brought back an answered registration")
 	}
 }
 

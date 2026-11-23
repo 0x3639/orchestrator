@@ -1,10 +1,10 @@
 package wrap
 
 import (
-	"errors"
 	"math/big"
 	"os"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/syndtr/goleveldb/leveldb"
@@ -75,66 +75,77 @@ func TestRedeemStatusPreservesLegacyRowsAndConcurrentWrites(t *testing.T) {
 	}
 }
 
-// Wrap rows and redeem statuses are flushed to disk on request, once per
-// batch of writes, and a failed flush is tried again.
-func TestSyncRedeemStatuses(t *testing.T) {
-	raw, err := leveldb.Open(storage.NewMemStorage(), nil)
+// journalSyncs counts the syncs LevelDB issues on its journal files.
+type journalSyncs struct {
+	storage.Storage
+	count *atomic.Int64
+}
+
+func (s journalSyncs) Create(fd storage.FileDesc) (storage.Writer, error) {
+	w, err := s.Storage.Create(fd)
+	if err != nil || fd.Type != storage.TypeJournal {
+		return w, err
+	}
+	return syncCounter{w, s.count}, nil
+}
+
+type syncCounter struct {
+	storage.Writer
+	count *atomic.Int64
+}
+
+func (w syncCounter) Sync() error {
+	w.count.Add(1)
+	return w.Writer.Sync()
+}
+
+// Wrap rows and redeem statuses are written with a sync when the store has a
+// file behind it. The scan checkpoint lives in another database, and it must
+// not survive a power loss that these writes do not.
+func TestWrapRowsAndRedeemStatusesAreSynced(t *testing.T) {
+	syncs := new(atomic.Int64)
+	raw, err := leveldb.Open(journalSyncs{storage.NewMemStorage(), syncs}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer raw.Close()
-	store := NewDurableZnnStorage(raw, make(chan os.Signal, 1))
-	if err := store.SyncRedeemStatuses(); err != nil {
-		t.Fatal(err)
-	}
-	if synced, _ := raw.Has(redeemSyncKey, nil); synced {
-		t.Fatal("synced although nothing was written")
-	}
-	if err := store.ApplyRedeemLog(1, types.Hash{1}, 10, 0, common.PendingRedeemStatus); err != nil {
-		t.Fatal(err)
-	}
-	if err := store.SyncRedeemStatuses(); err != nil {
-		t.Fatal(err)
-	}
-	if synced, _ := raw.Has(redeemSyncKey, nil); !synced {
-		t.Fatal("a written status was not synced")
+	stop := make(chan os.Signal, 1)
+	wrap := events.WrapRequestZnn{Id: types.Hash{2}, NetworkClass: 2, ChainId: 1, Amount: big.NewInt(2), Fee: big.NewInt(1)}
+	synced := func(write func() error) int64 {
+		t.Helper()
+		before := syncs.Load()
+		if err := write(); err != nil {
+			t.Fatal(err)
+		}
+		return syncs.Load() - before
 	}
 
-	// Count the flushes and make one fail.
-	flushes, fail := 0, false
-	store.(*eventStore).durable.sync = func() error {
-		flushes++
-		if fail {
-			return errors.New("disk full")
-		}
-		return nil
+	plain := NewZnnStorage(zdb.NewLevelDBWrapper(raw), stop)
+	if n := synced(func() error { return plain.ApplyRedeemLog(1, types.Hash{9}, 10, 0, common.PendingRedeemStatus) }); n != 0 {
+		t.Fatalf("a store without durability synced %d times", n)
 	}
-	if err := store.SyncRedeemStatuses(); err != nil || flushes != 0 {
-		t.Fatalf("flushed %d times with nothing new: %v", flushes, err)
+
+	durable := NewDurableZnnStorage(raw, stop)
+	if n := synced(func() error { return durable.ApplyRedeemLog(1, types.Hash{1}, 10, 0, common.PendingRedeemStatus) }); n == 0 {
+		t.Fatal("a redeem status was written without a sync")
 	}
-	if err := store.AddWrapRequest(events.WrapRequestZnn{Id: types.Hash{2}, NetworkClass: 2, ChainId: 1, Amount: big.NewInt(2), Fee: big.NewInt(1)}); err != nil {
-		t.Fatal(err)
+	if n := synced(func() error { return durable.AddWrapRequest(wrap) }); n == 0 {
+		t.Fatal("a wrap row was written without a sync")
 	}
-	fail = true
-	if err := store.SyncRedeemStatuses(); err == nil || flushes != 1 {
-		t.Fatalf("failed flush: flushes=%d err=%v", flushes, err)
+	// Nothing is written for a log position that is not newer.
+	if n := synced(func() error { return durable.ApplyRedeemLog(1, types.Hash{1}, 9, 0, common.RedeemedStatus) }); n != 0 {
+		t.Fatalf("an ignored status synced %d times", n)
 	}
-	fail = false
-	if err := store.SyncRedeemStatuses(); err != nil || flushes != 2 {
-		t.Fatalf("flush after a failure: flushes=%d err=%v", flushes, err)
+	row, err := durable.GetWrapRequestById(wrap.Id)
+	if err != nil || row == nil {
+		t.Fatalf("synced wrap row=%+v err=%v", row, err)
 	}
-	if err := store.SyncRedeemStatuses(); err != nil || flushes != 2 {
-		t.Fatalf("flush with nothing new: flushes=%d err=%v", flushes, err)
+	// A snapshot is an overlay in memory and leaves the file alone.
+	snapshot := durable.Snapshot()
+	if n := synced(func() error { return snapshot.ApplyRedeemLog(1, types.Hash{3}, 10, 0, common.PendingRedeemStatus) }); n != 0 {
+		t.Fatalf("a snapshot write synced %d times", n)
 	}
-	// A snapshot shares the pending flush with its store.
-	if err := store.Snapshot().ApplyRedeemLog(1, types.Hash{1}, 11, 0, common.RedeemedStatus); err != nil {
-		t.Fatal(err)
-	}
-	if err := store.SyncRedeemStatuses(); err != nil || flushes != 3 {
-		t.Fatalf("flush after a snapshot write: flushes=%d err=%v", flushes, err)
-	}
-	// A store without a file has nothing to flush.
-	if err := NewZnnStorage(zdb.NewMemDB(), make(chan os.Signal, 1)).SyncRedeemStatuses(); err != nil {
-		t.Fatal(err)
+	if has, _ := raw.Has(redeemStatusKey(1, types.Hash{3}), nil); has {
+		t.Fatal("a snapshot write reached the file")
 	}
 }

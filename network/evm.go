@@ -471,7 +471,6 @@ func (eN *evmNetwork) Sync() error {
 		depth := eN.ConfirmationsToFinality()
 		finalizedTip = min(finalizedTip, latestBlock-min(latestBlock, depth))
 		interpretFailed := false
-		redeemApplied := false // a finalized redeem log of this range was applied
 		for _, log := range logs {
 			recent := latestBlock-log.BlockNumber < depth
 			if len(log.Topics) > 0 && isRedeemTopic(log.Topics[0]) {
@@ -514,7 +513,6 @@ func (eN *evmNetwork) Sync() error {
 				eN.scanPaused.Store(true)
 				return nil
 			}
-			redeemApplied = redeemApplied || (len(log.Topics) > 0 && isRedeemTopic(log.Topics[0]))
 		}
 		if interpretFailed {
 			continue
@@ -530,13 +528,6 @@ func (eN *evmNetwork) Sync() error {
 
 		through := max(startHeight, rangeEnd)
 		redeemFrom = max(redeemFrom, min(rangeEnd, finalizedTip))
-		// The statuses live in another database. They must be on disk before
-		// a checkpoint says the scan is past the logs they came from.
-		if redeemApplied {
-			if err := eN.dbManager.ZnnStorage().SyncRedeemStatuses(); err != nil {
-				return fmt.Errorf("sync redeem statuses before the scan checkpoint: %w", err)
-			}
-		}
 		if err := eN.eventsStore().SetScanHeights(through, redeemFrom); err != nil {
 			return err
 		}
@@ -649,7 +640,7 @@ func (eN *evmNetwork) InterpretLog(log etypes.Log, live bool) error {
 		}
 		err := eN.registerRedeem(log, false)
 		if err == nil {
-			eN.noteRedeemCheck(log, nil) // The finalized scan answered a held check.
+			eN.noteRedeemCheck(log, nil, false) // The finalized scan answered a held check.
 		}
 		return err
 	case common.RedeemedSigHash.Hex(), common.RevokedRedeemSigHash.Hex():

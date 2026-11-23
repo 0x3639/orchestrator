@@ -139,6 +139,7 @@ func (p *redeemProvider) Call(call map[string]any, block gethrpc.BlockNumberOrHa
 	switch {
 	case input == "0xc7ff1584": // isHalted() includes the unhalt delay.
 		result[31] = 1
+	case input == "0xa4c04bb7": // actionsNonce()
 	case input == "0xb9b8af0b": // halted() is the explicit flag.
 		if *p.halted {
 			result[31] = 1

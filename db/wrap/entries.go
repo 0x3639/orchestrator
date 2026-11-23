@@ -49,8 +49,7 @@ func (es *eventStore) AddWrapRequest(event events.WrapRequestZnn) error {
 func (es *eventStore) putWrap(event *events.WrapRequestZnn) error {
 	data, err := event.Serialize()
 	if err == nil {
-		es.noteRedeemWrite()
-		err = es.DB.Put(getWrapEventKey(event.Id), data)
+		err = es.putDurable(getWrapEventKey(event.Id), data)
 	}
 	if err != nil {
 		es.SendSigInt()

@@ -33,9 +33,9 @@ type NetworksManager struct {
 	znnNetwork  *znnNetwork
 	networksMu  sync.RWMutex
 	evmNetworks []*evmNetwork
-	// haltChains are the chain ids, in order, that GetHaltMessages last built
+	// haltSigned are the networks, in order, that GetHaltMessages last built
 	// messages for; guarded by networksMu.
-	haltChains []uint32
+	haltSigned []*evmNetwork
 	stopChan   chan os.Signal
 	logger     *zap.SugaredLogger
 }
@@ -489,7 +489,9 @@ func (m *NetworksManager) CheckNewTssEcdsaPubKeyEvm(newCompressedPubKey string) 
 
 // ErrHaltMembershipChanged reports that the EVM networks are no longer the
 // ones the halt messages were signed for. The signatures are matched to
-// networks by position, so the ceremony has to sign again.
+// networks by position and cover the network's contract address, so the
+// ceremony has to sign again, also when a network was replaced by another
+// with the same chain id.
 var ErrHaltMembershipChanged = errors.New("EVM networks changed since the halt messages were signed")
 
 func (m *NetworksManager) haltNetworks(signatures int) ([]*evmNetwork, error) {
@@ -499,12 +501,8 @@ func (m *NetworksManager) haltNetworks(signatures int) ([]*evmNetwork, error) {
 	if len(networks) != signatures {
 		return nil, ErrHaltMembershipChanged
 	}
-	if m.haltChains != nil {
-		for idx, network := range networks {
-			if idx >= len(m.haltChains) || m.haltChains[idx] != network.ChainId() {
-				return nil, ErrHaltMembershipChanged
-			}
-		}
+	if m.haltSigned != nil && !slices.Equal(networks, m.haltSigned) {
+		return nil, ErrHaltMembershipChanged
 	}
 	return networks, nil
 }
@@ -547,17 +545,16 @@ func (m *NetworksManager) SendHaltEvm(signatures [][]byte, ecdsaPrivateKey *ecds
 
 func (m *NetworksManager) GetHaltMessages() ([][]byte, error) {
 	ans := make([][]byte, 0)
-	chains := make([]uint32, 0)
-	for _, network := range m.Networks() {
+	networks := m.Networks()
+	for _, network := range networks {
 		msg, err := network.GetHaltEvmMessage()
 		if err != nil {
 			return nil, err
 		}
 		ans = append(ans, msg)
-		chains = append(chains, network.ChainId())
 	}
 	m.networksMu.Lock()
-	m.haltChains = chains
+	m.haltSigned = networks
 	m.networksMu.Unlock()
 	return ans, nil
 }

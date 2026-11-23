@@ -25,6 +25,7 @@ import (
 	"path/filepath"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -905,6 +906,10 @@ func (node *Node) processSignatures() {
 			}
 
 			node.logger.Debug("Halt signatures are valid!")
+			// Set when the EVM networks are no longer the ones these messages
+			// were signed for. Both senders then stop, and the round ends
+			// without recording a halt, so the next one signs again.
+			var aborted atomic.Bool
 			var senders sync.WaitGroup
 			senders.Add(2)
 			go func() {
@@ -913,7 +918,7 @@ func (node *Node) processSignatures() {
 				if !node.networksManager.Znn().IsHalted() {
 					for {
 						index = (index + 1) % node.getParticipantsLength()
-						if node.networksManager.Znn().IsHalted() {
+						if node.networksManager.Znn().IsHalted() || aborted.Load() {
 							break
 						}
 						producerPubKey := base64.StdEncoding.EncodeToString(node.producerKeyPair.Public)
@@ -945,9 +950,8 @@ func (node *Node) processSignatures() {
 						// todo discuss using concurrent send for different networks with different senders
 						if changed, err := node.networksManager.SendHaltEvm(evmFullSignatures, node.ecdsaPrivateKey, node.evmAddress); err != nil {
 							if errors.Is(err, network.ErrHaltMembershipChanged) {
-								// End this round. The state still calls for a halt,
-								// so the next round signs for the current networks.
 								node.logger.Warn(err)
+								aborted.Store(true)
 								break
 							}
 							node.logger.Debug(err)
@@ -963,6 +967,9 @@ func (node *Node) processSignatures() {
 				}
 			}()
 			senders.Wait()
+			if aborted.Load() {
+				continue // Still an emergency: sign for the current networks.
+			}
 
 			if err := node.state.SetState(common.HaltedState); err != nil {
 				node.logger.Error(err)

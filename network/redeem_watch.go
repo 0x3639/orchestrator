@@ -65,7 +65,7 @@ func (eN *evmNetwork) redeemRetryInterval() time.Duration {
 // until it matches, is reported, or its block is replaced.
 func (eN *evmNetwork) checkLiveRedeem(log etypes.Log) error {
 	err := eN.registerRedeem(log, true)
-	eN.noteRedeemCheck(log, err)
+	eN.noteRedeemCheck(log, err, true)
 	return err
 }
 
@@ -75,10 +75,14 @@ func (eN *evmNetwork) examineRegistration(log etypes.Log, young bool) {
 	if log.Removed || log.Address != *eN.ContractAddress() {
 		return // InterpretLog rejects these once the finalized scan reaches them.
 	}
-	eN.noteRedeemCheck(log, eN.registerRedeem(log, young))
+	eN.noteRedeemCheck(log, eN.registerRedeem(log, young), true)
 }
 
-func (eN *evmNetwork) noteRedeemCheck(log etypes.Log, err error) {
+// noteRedeemCheck records the outcome of a check. A first observation that
+// got no answer starts a hold. A recheck passes hold=false: its result only
+// counts for an entry that is still held, so a recheck that fails late cannot
+// bring back an entry that was answered in the meantime.
+func (eN *evmNetwork) noteRedeemCheck(log etypes.Log, err error, hold bool) {
 	key := heldKey(log)
 	eN.heldMu.Lock()
 	defer eN.heldMu.Unlock()
@@ -92,6 +96,9 @@ func (eN *evmNetwork) noteRedeemCheck(log etypes.Log, err error) {
 		return
 	}
 	if entry == nil {
+		if !hold {
+			return
+		}
 		if eN.heldRedeems == nil {
 			eN.heldRedeems = make(map[heldRedeemKey]*heldRedeem)
 		}
@@ -147,25 +154,35 @@ func (eN *evmNetwork) recheckHeldRedeems(stop <-chan struct{}) {
 			err = fmt.Errorf("chain head %d is below the registration", head)
 		}
 		if err != nil {
-			eN.noteRedeemCheck(log, fmt.Errorf("read chain head: %w", err))
+			eN.noteRedeemCheck(log, fmt.Errorf("read chain head: %w", err), false)
 			continue
 		}
-		final := head-log.BlockNumber >= eN.ConfirmationsToFinality()
+		depth := eN.ConfirmationsToFinality()
+		final := head-log.BlockNumber >= depth
 		err = eN.registerRedeem(log, !final)
-		if err != nil && final {
-			// A block replaced before finality never reaches the finalized
-			// scan, so nothing else would release this entry.
-			if canonical, hashErr := eN.EvmRpc().CanonicalHash(log.BlockNumber); hashErr == nil && canonical != log.BlockHash {
-				eN.heldMu.Lock()
-				delete(eN.heldRedeems, heldKey(log))
-				eN.heldMu.Unlock()
-				eN.logger.Infof("Redeem registration on chain %d, transaction %s, log %d left the canonical chain at block %d and is no longer held",
-					eN.ChainId(), log.TxHash, log.Index, log.BlockNumber)
-				continue
-			}
+		if err != nil && final && eN.redeemBlockReplaced(log, depth) {
+			eN.heldMu.Lock()
+			delete(eN.heldRedeems, heldKey(log))
+			eN.heldMu.Unlock()
+			eN.logger.Infof("Redeem registration on chain %d, transaction %s, log %d left the canonical chain at block %d and is no longer held",
+				eN.ChainId(), log.TxHash, log.Index, log.BlockNumber)
+			continue
 		}
-		eN.noteRedeemCheck(log, err)
+		eN.noteRedeemCheck(log, err, false)
 	}
+}
+
+// redeemBlockReplaced reports that every endpoint has the chain depth blocks
+// past the log's height and agrees that another block is canonical there. A
+// block replaced before finality never reaches the finalized scan, so nothing
+// else would release a registration held from it.
+func (eN *evmNetwork) redeemBlockReplaced(log etypes.Log, depth uint64) bool {
+	canonical, err := eN.EvmRpc().CanonicalHash(log.BlockNumber)
+	if err != nil || canonical == log.BlockHash {
+		return false
+	}
+	_, err = eN.EvmRpc().CanonicalHash(log.BlockNumber + depth)
+	return err == nil
 }
 
 // settlePendingIncidents releases stored incidents of this chain, while a
