@@ -1,0 +1,45 @@
+package common
+
+import "testing"
+
+// A transition that depends on the current state compares and changes it in
+// one step, so it cannot replace a state set in between.
+func TestSetStateIfChangesOnlyTheExpectedState(t *testing.T) {
+	state := KeyGenState
+	gs := NewGlobalState(&state)
+	if changed, err := gs.SetStateIf(KeyGenState, LiveState); err != nil || !changed || state != LiveState {
+		t.Fatalf("from the expected state: changed %v, err %v, state %s", changed, err, StateToText(state))
+	}
+	if err := gs.SetState(HaltedState); err != nil {
+		t.Fatal(err)
+	}
+	if changed, err := gs.SetStateIf(KeyGenState, LiveState); err != nil || changed || state != HaltedState {
+		t.Fatalf("from another state: changed %v, err %v, state %s", changed, err, StateToText(state))
+	}
+	// Asked for the state it is already in, nothing changes.
+	if changed, err := gs.SetStateIf(HaltedState, HaltedState); err != nil || changed || state != HaltedState {
+		t.Fatalf("to the same state: changed %v, err %v, state %s", changed, err, StateToText(state))
+	}
+	// The rules of SetState still apply to the change itself.
+	if err := gs.SetState(EmergencyState); err != nil {
+		t.Fatal(err)
+	}
+	if changed, err := gs.SetStateIf(EmergencyState, LiveState); err == nil || changed || state != EmergencyState {
+		t.Fatalf("left a pending emergency: changed %v, err %v, state %s", changed, err, StateToText(state))
+	}
+}
+
+// The stop a held listener asks for is decided under the state lock: it runs
+// in the states that sign transfers and never in an emergency or a halt.
+func TestWhileSigningTransfersRunsOnlyOutsideEmergencyAndHalt(t *testing.T) {
+	for state, runs := range map[uint8]bool{
+		LiveState: true, KeyGenState: true, ReSignState: true, EmergencyState: false, HaltedState: false,
+	} {
+		value := state
+		gs := NewGlobalState(&value)
+		ran := false
+		if got := gs.WhileSigningTransfers(func() { ran = true }); got != runs || ran != runs {
+			t.Fatalf("%s: reported %v, ran %v, want %v", StateToText(state), got, ran, runs)
+		}
+	}
+}

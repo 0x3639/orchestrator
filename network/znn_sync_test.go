@@ -35,6 +35,9 @@ type startupLedger struct {
 	syncStatus func() *protocol.SyncInfo
 	tip        func() *api.Momentum
 	bridgeInfo func() (*definition.BridgeInfoVariable, error)
+	// Serve the page's Count as the fixture gives it. Otherwise a page with
+	// no count ends the account at its last listed block.
+	exactCount bool
 }
 
 func (l *startupLedger) GetAccountBlocksByHeight(ctx context.Context, _ types.Address, height, _ uint64) *api.AccountBlockListMarshal {
@@ -44,7 +47,11 @@ func (l *startupLedger) GetAccountBlocksByHeight(ctx context.Context, _ types.Ad
 		<-ctx.Done()
 		return nil
 	}
-	return l.page(height)
+	page := l.page(height)
+	if page != nil && page.List != nil && page.Count == 0 && !l.exactCount {
+		page.Count = int(height) - 1 + len(page.List)
+	}
+	return page
 }
 
 func (l *startupLedger) GetAccountBlockByHash(hash types.Hash) (*api.AccountBlockMarshal, error) {
@@ -55,8 +62,22 @@ func (l *startupLedger) GetAccountBlockByHash(hash types.Hash) (*api.AccountBloc
 func (l *startupLedger) GetBridgeInfo() (*definition.BridgeInfoVariable, error) {
 	return l.bridgeInfo()
 }
-func (l *startupLedger) SyncInfo() *protocol.SyncInfo       { return l.syncStatus() }
-func (l *startupLedger) GetFrontierMomentum() *api.Momentum { return l.tip() }
+
+// A ledger that does not say otherwise is synced, with its frontier at the
+// momentum that confirms the fixture receives.
+func (l *startupLedger) SyncInfo() *protocol.SyncInfo {
+	if l.syncStatus == nil {
+		return &protocol.SyncInfo{State: protocol.SyncDone}
+	}
+	return l.syncStatus()
+}
+
+func (l *startupLedger) GetFrontierMomentum() *api.Momentum {
+	if l.tip == nil {
+		return startupMomentum(100)
+	}
+	return l.tip()
+}
 
 type startupTransport struct{ handler http.Handler }
 
@@ -106,6 +127,10 @@ func startupSend(receive *api.AccountBlockMarshal) *api.AccountBlockMarshal {
 	return &api.AccountBlockMarshal{AccountBlockMarshal: nom.AccountBlockMarshal{
 		BlockType: nom.BlockTypeUserSend, Hash: receive.FromBlockHash, ToAddress: types.BridgeContract, Amount: "0", Data: []byte{0, 0, 0, 0},
 	}}
+}
+
+func startupMomentum(height uint64) *api.Momentum {
+	return &api.Momentum{Momentum: &nom.Momentum{Height: height, Hash: types.Hash{1}}}
 }
 
 func startupPage(blocks ...*api.AccountBlockMarshal) *api.AccountBlockListMarshal {
@@ -224,7 +249,8 @@ func TestStartupSyncSendReadPreservesCheckpoint(t *testing.T) {
 				t.Fatal(err)
 			}
 			checkStartupCursor(t, n, 3)
-			if want := []uint64{2, 3, 4}; !reflect.DeepEqual(l.starts, want) {
+			// Startup reads the tip a second time after the node says it is synced.
+			if want := []uint64{2, 3, 4, 4}; !reflect.DeepEqual(l.starts, want) {
 				t.Fatalf("requested pages %v, want %v", l.starts, want)
 			}
 		})
@@ -355,6 +381,12 @@ func TestStartupSyncObservesFinalityAfterSyncStatus(t *testing.T) {
 			if err := n.state.SetFrontierMomentum(tc.cached); err != nil {
 				t.Fatal(err)
 			}
+			// A database that already vouches for the account, as on any
+			// start but the first. A first read asks for the sync status once
+			// more, before it reads the receive.
+			if err := n.eventsStore().SaveBridgeWatchFrom(2); err != nil {
+				t.Fatal(err)
+			}
 			n.administrator = send.Address.String()
 			dispatched := false
 			n.setBridgeMetadata = func(*common.BridgeMetadata) { dispatched = true }
@@ -373,7 +405,9 @@ func TestStartupSyncObservesFinalityAfterSyncStatus(t *testing.T) {
 			if err := n.Sync(); (err != nil) != tc.fail {
 				t.Fatalf("sync error %v", err)
 			}
-			if !reflect.DeepEqual(reads, []string{"sync", "frontier"}) || dispatched != tc.live {
+			// The receive is classified from the first two reads. Startup then
+			// reads both once more when it reaches the tip.
+			if len(reads) < 2 || !reflect.DeepEqual(reads[:2], []string{"sync", "frontier"}) || dispatched != tc.live {
 				t.Fatalf("read order %v, dispatched live=%v, want %v", reads, dispatched, tc.live)
 			}
 			if tc.fail {
