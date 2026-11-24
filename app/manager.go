@@ -7,13 +7,16 @@ import (
 	"orchestrator/node"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 )
 
 type Manager struct {
-	ctx    *cli.Context
-	node   *node.Node
-	logger *zap.Logger
+	ctx      *cli.Context
+	node     *node.Node
+	logger   *zap.Logger
+	stopOnce sync.Once
+	stopErr  error
 }
 
 func NewNodeManager(ctx *cli.Context) (*Manager, error) {
@@ -54,14 +57,12 @@ func (nodeManager *Manager) Start() error {
 		nodeManager.logger.Info("orchestrator successfully started")
 	}
 
-	signalFromOutside := false
 	// Listening event closes the node
 	go func() {
 		c := make(chan os.Signal, 1)
 		signal.Notify(c, syscall.SIGINT, syscall.SIGTERM, syscall.SIGKILL)
 		defer signal.Stop(c)
 		<-c
-		signalFromOutside = true
 		nodeManager.logger.Info("Shutting down orchestrator from go func")
 
 		go func() {
@@ -78,30 +79,35 @@ func (nodeManager *Manager) Start() error {
 		}
 	}()
 
-	// Waiting for node to close
+	// Waiting for node to close. Wait can return on an internal stop signal
+	// while a shutdown started by an OS signal is still running, so always
+	// call Stop: it runs once, and a second caller waits for the first.
 	nodeManager.node.Wait()
-	nodeManager.logger.Info("signalFromOutside: ", zap.Bool("value: ", signalFromOutside))
-	if signalFromOutside == false {
-		if err := nodeManager.Stop(); err != nil {
-			nodeManager.logger.Info(err.Error())
-		}
-	}
-
-	return nil
+	// An incomplete shutdown makes the process exit non-zero.
+	return nodeManager.Stop()
 }
+
+// Stop saves the config and stops the node once. Concurrent and later calls
+// wait for the first one to finish and return its node.Stop error.
 func (nodeManager *Manager) Stop() error {
+	nodeManager.stopOnce.Do(func() { nodeManager.stopErr = nodeManager.stop() })
+	return nodeManager.stopErr
+}
+
+func (nodeManager *Manager) stop() error {
 	nodeManager.logger.Warn("Stopping orchestrator ...")
 
 	if err := nodeManager.SaveConfig(); err != nil {
 		nodeManager.logger.Info("Failed to save config", zap.String("reason", err.Error()))
 	}
 
-	if err := nodeManager.node.Stop(); err != nil {
+	err := nodeManager.node.Stop()
+	if err != nil {
 		nodeManager.logger.Info("Failed to stop node", zap.String("reason", err.Error()))
 	} else {
 		nodeManager.logger.Info("successfully stopped node")
 	}
-	return nil
+	return err
 }
 
 func (nodeManager *Manager) SaveConfig() error {
