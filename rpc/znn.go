@@ -3,6 +3,7 @@ package rpc
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	sdk_rpc_client "github.com/MoonBaZZe/znn-sdk-go/rpc_client"
 	"github.com/MoonBaZZe/znn-sdk-go/zenon"
 	ic "github.com/libp2p/go-libp2p-core/crypto"
@@ -231,6 +232,31 @@ func (r *ZnnRpc) GetWrapTokenRequestById(id types.Hash) (*definition.WrapTokenRe
 
 func (r *ZnnRpc) GetUnwrapTokenRequestByHashAndLog(txHash types.Hash, logIndex uint32) (*definition.UnwrapTokenRequest, error) {
 	return r.rpcClient.BridgeApi.GetUnwrapTokenRequestByHashAndLog(txHash, logIndex)
+}
+
+// UnwrapTokenRequestContext reads an unwrap request and, from the same reply,
+// how many momentums remain before the bridge lets it be redeemed (zero once
+// its redeem delay has passed). The request is nil when the node returns none,
+// and the delay is nil when the reply leaves it out.
+func (r *ZnnRpc) UnwrapTokenRequestContext(ctx context.Context, txHash types.Hash, logIndex uint32) (*definition.UnwrapTokenRequest, *uint64, error) {
+	var reply json.RawMessage
+	if err := r.settingsClient.CallContext(ctx, &reply, "embedded.bridge.getUnwrapTokenRequestByHashAndLog", txHash, logIndex); err != nil {
+		return nil, nil, err
+	}
+	if len(reply) == 0 || string(reply) == "null" {
+		return nil, nil, nil
+	}
+	request := new(definition.UnwrapTokenRequest)
+	if err := json.Unmarshal(reply, request); err != nil {
+		return nil, nil, err
+	}
+	var delay struct {
+		RedeemableIn *uint64 `json:"redeemableIn"`
+	}
+	if err := json.Unmarshal(reply, &delay); err != nil {
+		return nil, nil, err
+	}
+	return request, delay.RedeemableIn, nil
 }
 
 func (r *ZnnRpc) GetAllWrapTokenRequests(pageIndex, pageSize uint32) (*embedded.WrapTokenRequestList, error) {
