@@ -11,6 +11,7 @@ import (
 	etypes "github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/pkg/errors"
+	"github.com/zenon-network/go-zenon/chain/nom"
 	"github.com/zenon-network/go-zenon/common/types"
 	"github.com/zenon-network/go-zenon/rpc/api/embedded"
 	"github.com/zenon-network/go-zenon/vm/embedded/definition"
@@ -46,8 +47,51 @@ type NetworksManager struct {
 	// Tests shorten the pause before a network that failed to start in the
 	// background is started again.
 	evmStartRetry time.Duration
-	stopChan      chan os.Signal
-	logger        *zap.SugaredLogger
+	// The networks Start began with, and until when the signer waits for
+	// their first scans to look at restored redeem incidents. Set by Start
+	// before the signing loop runs. See RestoredIncidentsChecked.
+	restoreCheck    []*evmNetwork
+	restoreDeadline time.Time
+	restoreWait     time.Duration // zero selects restoredIncidentWait
+	restoreTimedOut atomic.Bool
+	stopChan        chan os.Signal
+	logger          *zap.SugaredLogger
+}
+
+// restoredIncidentWait bounds how long a signer that restarts with pending
+// redeem incidents waits for its EVM scans to look at them before it acts on
+// them. Endpoints that do not answer cannot keep a real incident from its
+// halt longer than this.
+const restoredIncidentWait = time.Minute
+
+// RestoredIncidentsChecked reports whether the signer may act on redeem
+// incidents it restored at startup: once the first scan of every EVM network
+// Start began with has looked at them, which can release the ones the chain
+// shows settled, or once restoredIncidentWait has passed since Start.
+func (m *NetworksManager) RestoredIncidentsChecked() bool {
+	if m.restoreDeadline.IsZero() {
+		return true
+	}
+	for _, eNetwork := range m.restoreCheck {
+		if eNetwork.settleChecked.Load() || !m.hasNetwork(eNetwork) {
+			continue
+		}
+		if time.Now().Before(m.restoreDeadline) {
+			return false
+		}
+		if m.restoreTimedOut.CompareAndSwap(false, true) {
+			m.logger.Errorf("EVM network %d has not looked at the restored redeem incidents after %s; acting on them now", eNetwork.ChainId(), m.restoredIncidentWait())
+		}
+		return true
+	}
+	return true
+}
+
+func (m *NetworksManager) restoredIncidentWait() time.Duration {
+	if m.restoreWait != 0 {
+		return m.restoreWait
+	}
+	return restoredIncidentWait
 }
 
 func NewNetworksManager(stopChan chan os.Signal) (*NetworksManager, error) {
@@ -137,7 +181,9 @@ func (m *NetworksManager) Init(networksInfo map[string]config.BaseNetworkConfig,
 			return errors.New("wrong network initializers 4")
 		}
 	}
+	m.evmMu.Lock()
 	m.evmNetworks = newEvmNetworks
+	m.evmMu.Unlock()
 	return nil
 }
 
@@ -162,6 +208,9 @@ func (m *NetworksManager) Start() error {
 	if err != nil {
 		return err
 	}
+	// The wait for the first scans starts when they can: the read of the
+	// bridge account above can take long after a signer was down.
+	m.restoreCheck, m.restoreDeadline = initial, time.Now().Add(m.restoredIncidentWait())
 	state := m.znnNetwork.state
 	if held || !signsTransfers(state) {
 		for _, eNetwork := range initial {
@@ -187,7 +236,46 @@ func (m *NetworksManager) Start() error {
 			return err
 		}
 	}
+	// A scan that stopped for a pending redeem halt has not reached the head.
+	// Startup then completes once the scans have, after the halt is released.
+	if !m.startupScansDone(initial) {
+		m.completesLater = true
+		m.evmStartup.Add(1)
+		go func() {
+			defer m.evmStartup.Done()
+			m.finishStartup(initial)
+		}()
+	}
 	return nil
+}
+
+// startupScansDone reports whether every network of initial that the bridge
+// still lists has scanned to the head without stopping for a redeem halt.
+func (m *NetworksManager) startupScansDone(initial []*evmNetwork) bool {
+	for _, eNetwork := range initial {
+		if !eNetwork.scanned.Load() && m.hasNetwork(eNetwork) {
+			return false
+		}
+	}
+	return true
+}
+
+// startupScanPoll is how often a startup waiting for its scans looks again.
+const startupScanPoll = time.Second
+
+// waitForStartupScans waits until startupScansDone, and reports false when
+// the node stops first. A scan that stopped for a redeem halt goes on once
+// the halt is released: the subscription loop scans again soon.
+func (m *NetworksManager) waitForStartupScans(initial []*evmNetwork) bool {
+	stopping := m.znnNetwork.listenerCtx.Done()
+	for !m.startupScansDone(initial) {
+		select {
+		case <-stopping:
+			return false
+		case <-time.After(startupScanPoll):
+		}
+	}
+	return true
 }
 
 // CompletesStartupLater reports whether Start returned before the EVM scans
@@ -246,7 +334,6 @@ const evmStartRetryPause = 30 * time.Second
 func (m *NetworksManager) startEvmNetworksInBackground(initial []*evmNetwork) {
 	defer m.evmStartup.Done()
 	znn := m.znnNetwork
-	stopping := znn.listenerCtx.Done()
 	var starts sync.WaitGroup
 	var ended atomic.Bool
 	for _, eNetwork := range initial {
@@ -262,7 +349,23 @@ func (m *NetworksManager) startEvmNetworksInBackground(initial []*evmNetwork) {
 	if ended.Load() {
 		return
 	}
+	// A startup scan that stopped for a pending redeem halt has not reached
+	// the head yet, so the scans are not over.
+	if !m.waitForStartupScans(initial) {
+		return
+	}
 	znn.scans.end(znn.clock())
+	m.finishStartup(initial)
+}
+
+// finishStartup completes startup once the scans of initial have reached the
+// head and the bridge account has been read to its tip.
+func (m *NetworksManager) finishStartup(initial []*evmNetwork) {
+	znn := m.znnNetwork
+	stopping := znn.listenerCtx.Done()
+	if !m.waitForStartupScans(initial) {
+		return
+	}
 	select {
 	case <-stopping:
 		return
@@ -512,6 +615,32 @@ func (m *NetworksManager) batchTargets(batch EvmBatch, signatures ...[][]byte) (
 
 ///////// state
 
+// ConfirmRedeemHalt acknowledges the incident only after observing the explicit
+// halt flags on Zenon and each EVM network in the same membership snapshot.
+func (m *NetworksManager) ConfirmRedeemHalt(state *common.GlobalState, generation uint64) (bool, error) {
+	networks := m.Networks()
+	info, err := m.Znn().GetBridgeInfo()
+	if err != nil || info == nil || !info.Halted {
+		return false, err
+	}
+	checked := make(map[uint32]bool, len(networks))
+	for _, network := range networks {
+		if halted, err := network.EvmRpc().HaltFlagSet(); err != nil || !halted {
+			return false, err
+		}
+		checked[network.ChainId()] = true
+	}
+
+	// Runtime network startup can report an incident before publication. Keep
+	// membership stable while the store checks every pending incident's chain.
+	m.evmMu.RLock()
+	defer m.evmMu.RUnlock()
+	if !slices.Equal(m.evmNetworks, networks) {
+		return false, nil
+	}
+	return state.CompleteEmergencyHalt(generation, checked)
+}
+
 func (m *NetworksManager) CountNetworksHaltState() (int, int, error) {
 	halted, unhalted := 0, 0
 	for _, network := range m.networks() {
@@ -539,20 +668,92 @@ func (m *NetworksManager) Znn() *znnNetwork {
 
 // Account blocks
 
-func (m *NetworksManager) UpdateWrapRequest(id types.Hash, signature string, keyPair *wallet.KeyPair) error {
-	return m.Znn().UpdateWrapRequest(id, signature, keyPair)
+// WhileLive runs send, which publishes a transfer, only while the signer is
+// live for transfers, and reports whether it ran. GlobalState.WhileLive is one.
+type WhileLive func(send func() error) (bool, error)
+
+// ErrNotLive is returned when the signer left LiveState before a transfer
+// was published.
+var ErrNotLive = errors.New("the bridge is no longer live for transfers")
+
+// UpdateWrapRequest adds signature to wrap request id on Zenon. The block is
+// prepared first, proof of work included, and published through while.
+func (m *NetworksManager) UpdateWrapRequest(id types.Hash, signature string, keyPair *wallet.KeyPair, while WhileLive) error {
+	tx, err := m.Znn().ZnnRpc().PrepareWrapUpdate(id, signature, keyPair)
+	if err != nil {
+		return err
+	}
+	return m.publishTransfer(tx, while)
+}
+
+// publishTransfer publishes tx through while, and returns ErrNotLive when it
+// was not published.
+func (m *NetworksManager) publishTransfer(tx *nom.AccountBlock, while WhileLive) error {
+	sent, err := submit(while, func() error { return m.Znn().ZnnRpc().PublishTransaction(tx) })
+	if err != nil {
+		return err
+	}
+	if !sent {
+		return ErrNotLive
+	}
+	return nil
 }
 
 func (m *NetworksManager) ChangeTssEcdsaPubKeyZnn(pubKey, signature, newSignature string, keyPair *wallet.KeyPair) error {
 	return m.Znn().ChangeTssEcdsaPubKey(pubKey, signature, newSignature, keyPair)
 }
 
-func (m *NetworksManager) SendUnwrapRequest(event *events.UnwrapRequestEvm, keyPair *wallet.KeyPair) error {
-	return m.Znn().SendUnwrapRequest(event, keyPair)
+// SendUnwrapRequest registers event on Zenon, prepared and published as
+// UpdateWrapRequest does.
+func (m *NetworksManager) SendUnwrapRequest(event *events.UnwrapRequestEvm, keyPair *wallet.KeyPair, while WhileLive) error {
+	tx, err := m.Znn().ZnnRpc().PrepareUnwrap(event, keyPair)
+	if err != nil {
+		return err
+	}
+	return m.publishTransfer(tx, while)
 }
 
-func (m *NetworksManager) HaltZnn(signature string, keyPair *wallet.KeyPair) error {
-	return m.Znn().Halt(signature, keyPair)
+// WhileEmergency runs send, which submits a halt, only while the signer is in
+// its emergency, and reports whether it ran. GlobalState.WhileEmergency is
+// one. A nil WhileEmergency always runs send.
+type WhileEmergency func(send func() error) (bool, error)
+
+// ErrEmergencyEnded is returned when the emergency a halt was signed for ended
+// before the halt was sent.
+var ErrEmergencyEnded = errors.New("the emergency ended before the halt was sent")
+
+// submitTimeout bounds how long one submission can hold off the change of
+// state it waits on: the release of a halt's emergency, or the end of
+// LiveState for a transfer. A submission still running then may yet land.
+const submitTimeout = 30 * time.Second
+
+// submit runs send through while, and waits for it at most submitTimeout. A
+// nil while always runs send.
+func submit(while func(send func() error) (bool, error), send func() error) (bool, error) {
+	bounded := func() error {
+		done := make(chan error, 1)
+		go func() { done <- send() }()
+		select {
+		case err := <-done:
+			return err
+		case <-time.After(submitTimeout):
+			return errors.New("the submission did not answer in time")
+		}
+	}
+	if while == nil {
+		return true, bounded()
+	}
+	return while(bounded)
+}
+
+// HaltZnn sends the halt to Zenon and reports whether it was sent. The block
+// is prepared first, proof of work included, and published through while.
+func (m *NetworksManager) HaltZnn(signature string, keyPair *wallet.KeyPair, while WhileEmergency) (bool, error) {
+	tx, err := m.Znn().ZnnRpc().PrepareHalt(signature, keyPair)
+	if err != nil {
+		return false, err
+	}
+	return submit(while, func() error { return m.Znn().ZnnRpc().PublishTransaction(tx) })
 }
 
 //// RPC Calls
@@ -803,8 +1004,10 @@ func (m *NetworksManager) CheckNewTssEcdsaPubKeyEvm(newCompressedPubKey string) 
 }
 
 // SendHaltEvm sends the halt, signed for the networks in batch, to the first
-// of them that the bridge still lists and that is not halted yet.
-func (m *NetworksManager) SendHaltEvm(batch EvmBatch, signatures [][]byte, ecdsaPrivateKey *ecdsa.PrivateKey, evmAddress ecommon.Address) (bool, error) {
+// of them that the bridge still lists and whose halt flag is not set yet. The
+// transaction is submitted through while; ErrEmergencyEnded is returned when
+// while did not run it.
+func (m *NetworksManager) SendHaltEvm(batch EvmBatch, signatures [][]byte, ecdsaPrivateKey *ecdsa.PrivateKey, evmAddress ecommon.Address, while WhileEmergency) (bool, error) {
 	targets, err := m.targets(batch, signatures)
 	if err != nil {
 		return false, err
@@ -813,7 +1016,7 @@ func (m *NetworksManager) SendHaltEvm(batch EvmBatch, signatures [][]byte, ecdsa
 	ok := true
 	for _, target := range targets {
 		network, idx := target.network, target.index
-		halted, err := network.IsHalted()
+		halted, err := network.EvmRpc().HaltFlagSet()
 		if err != nil {
 			return false, err
 		}
@@ -833,8 +1036,11 @@ func (m *NetworksManager) SendHaltEvm(batch EvmBatch, signatures [][]byte, ecdsa
 			m.logger.Error(err)
 			continue
 		}
-		if err = network.SendTransaction(tx); err != nil {
+		sent, err := submit(while, func() error { return network.SendTransaction(tx) })
+		if err != nil {
 			m.logger.Error(err)
+		} else if !sent {
+			return false, ErrEmergencyEnded
 		}
 		break
 	}
@@ -874,8 +1080,10 @@ func (m *NetworksManager) GetHaltEvmTxs(batch EvmBatch, signatures [][]byte, tss
 
 // SendHaltEvmAdministrator sends the administrator's halt to the network at
 // idx in batch. It reports whether that network is halted, and reports true
-// for a network the bridge no longer lists, which needs no halt.
-func (m *NetworksManager) SendHaltEvmAdministrator(batch EvmBatch, idx int, ecdsaPrivateKey *ecdsa.PrivateKey, evmAddress ecommon.Address) (bool, error) {
+// for a network the bridge no longer lists, which needs no halt. The
+// transaction is submitted through while; ErrEmergencyEnded is returned when
+// while did not run it.
+func (m *NetworksManager) SendHaltEvmAdministrator(batch EvmBatch, idx int, ecdsaPrivateKey *ecdsa.PrivateKey, evmAddress ecommon.Address, while WhileEmergency) (bool, error) {
 	if idx < 0 || idx >= len(batch.networks) {
 		return false, errors.New("network index non existent")
 	}
@@ -884,7 +1092,7 @@ func (m *NetworksManager) SendHaltEvmAdministrator(batch EvmBatch, idx int, ecds
 		m.logger.Infof("network with chainId %d was removed by the bridge; it needs no halt", network.ChainId())
 		return true, nil
 	}
-	halted, err := network.IsHalted()
+	halted, err := network.EvmRpc().HaltFlagSet()
 	if err != nil {
 		return false, err
 	}
@@ -901,10 +1109,13 @@ func (m *NetworksManager) SendHaltEvmAdministrator(batch EvmBatch, idx int, ecds
 	if err != nil {
 		return false, err
 	}
-	if err = network.SendTransaction(tx); err != nil {
+	sent, err := submit(while, func() error { return network.SendTransaction(tx) })
+	if err != nil {
 		return false, err
 	}
-
+	if !sent {
+		return false, ErrEmergencyEnded
+	}
 	return false, nil
 }
 

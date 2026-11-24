@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 
@@ -36,11 +37,23 @@ import (
 type replayStores struct {
 	znn db.ZnnStorage
 	evm map[uint32]db.EvmStorage
+	// Guards evm, as the database manager guards its stores: a test can add
+	// a network while the networks already running read theirs.
+	evmMu *sync.RWMutex
 }
 
-func (s replayStores) ZnnStorage() db.ZnnStorage          { return s.znn }
-func (s replayStores) EvmStorage(id uint32) db.EvmStorage { return s.evm[id] }
-func (s replayStores) HasEvmStorage(id uint32) bool       { _, ok := s.evm[id]; return ok }
+func (s replayStores) ZnnStorage() db.ZnnStorage { return s.znn }
+func (s replayStores) EvmStorage(id uint32) db.EvmStorage {
+	s.evmMu.RLock()
+	defer s.evmMu.RUnlock()
+	return s.evm[id]
+}
+func (s replayStores) HasEvmStorage(id uint32) bool {
+	s.evmMu.RLock()
+	defer s.evmMu.RUnlock()
+	_, ok := s.evm[id]
+	return ok
+}
 func (s replayStores) AddEvmEventStore(uint32, string, uint64) (func(), error) {
 	panic("unexpected runtime network")
 }
@@ -171,7 +184,7 @@ func replayNetwork(t *testing.T, b *replayBridge, znnURL string, evmURLs map[uin
 	if err != nil {
 		t.Fatal(err)
 	}
-	stores := replayStores{znn: wrap.NewZnnStorage(zdb.NewMemDB(), stop), evm: map[uint32]db.EvmStorage{}}
+	stores := replayStores{znn: wrap.NewZnnStorage(zdb.NewMemDB(), stop), evm: map[uint32]db.EvmStorage{}, evmMu: new(sync.RWMutex)}
 	for id, url := range evmURLs {
 		if err := rpcs.AddEvmClient(config.BaseNetworkConfig{Urls: []string{url}}, id, "replay-test", b.contract); err != nil {
 			t.Fatal(err)

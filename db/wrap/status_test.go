@@ -41,8 +41,10 @@ func TestAddWrapRequestKeepingStatusKeepsARecordedRedeem(t *testing.T) {
 		if err != nil || row == nil {
 			t.Fatalf("stored record %v, err %v", row, err)
 		}
-		if row.RedeemStatus != status || row.Signature != "from the bridge" {
-			t.Fatalf("status %d and signature %q, want status %d and the bridge's signature", row.RedeemStatus, row.Signature, status)
+		// The signature this node wrote stays too: only a missing one is
+		// taken from the bridge.
+		if row.RedeemStatus != status || row.Signature != "local" {
+			t.Fatalf("status %d and signature %q, want status %d and the local signature", row.RedeemStatus, row.Signature, status)
 		}
 	}
 }

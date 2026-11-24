@@ -6,6 +6,7 @@ import (
 	"maps"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/zenon-network/go-zenon/common/types"
 	"golang.org/x/sync/semaphore"
@@ -35,6 +36,19 @@ type GlobalState struct {
 	stateMu               sync.Mutex
 	persistEmergency      func(uint8) error
 	emergencyWritePending bool
+	redeemIncidents       RedeemIncidentStore
+	acknowledgedRedeems   map[RedeemLogID]bool // fixed before RestoreRedeemIncidents
+	redeemHaltPending     atomic.Uint64
+	redeemWriteFailed     bool
+	redeemGeneration      uint64 // guarded by stateMu
+	restoredGeneration    uint64 // the generation restored at startup; guarded by stateMu
+	// Held for reading while a halt transaction is submitted, and for
+	// writing, before stateMu, by whatever can release a redeem halt.
+	haltSendMu sync.RWMutex
+	// Held for reading while a transfer is published, and for writing, before
+	// haltSendMu and stateMu, by every change that can take the signer out of
+	// LiveState. No transfer is published once the signer has left it.
+	transferSendMu sync.RWMutex
 	// Closed once startup has read the bridge account to its tip and every
 	// EVM network has finished its startup scan.
 	startupDone chan struct{}
@@ -88,8 +102,13 @@ func NewPersistentGlobalState(state *uint8, persistEmergency func(uint8) error) 
 }
 
 func (gs *GlobalState) SetState(newState uint8) error {
+	unlock := gs.lockTransfersFor(newState)
+	defer unlock()
 	gs.stateMu.Lock()
 	defer gs.stateMu.Unlock()
+	if gs.RedeemHaltGeneration() != 0 && newState != EmergencyState {
+		return nil // The incident owns the halt until all explicit flags are set.
+	}
 	return gs.setStateLocked(newState)
 }
 
@@ -97,8 +116,13 @@ func (gs *GlobalState) SetState(newState uint8) error {
 // whether it did. The comparison and the change happen under one lock, so a
 // state another goroutine set in between is never overwritten.
 func (gs *GlobalState) SetStateIf(expected, newState uint8) (bool, error) {
+	unlock := gs.lockTransfersFor(newState)
+	defer unlock()
 	gs.stateMu.Lock()
 	defer gs.stateMu.Unlock()
+	if gs.RedeemHaltGeneration() != 0 && newState != EmergencyState {
+		return false, nil // The incident owns the halt until all explicit flags are set.
+	}
 	if *gs.state != expected {
 		return false, nil
 	}
@@ -107,6 +131,7 @@ func (gs *GlobalState) SetStateIf(expected, newState uint8) (bool, error) {
 }
 
 func (gs *GlobalState) setStateLocked(newState uint8) error {
+	oldEffective := gs.effectiveStateLocked()
 	previous := *gs.state
 	if previous == EmergencyState && newState != EmergencyState && newState != HaltedState {
 		return errors.New("emergency halt is still pending")
@@ -122,19 +147,33 @@ func (gs *GlobalState) setStateLocked(newState uint8) error {
 		}
 	}
 	gs.emergencyWritePending = persistErr != nil
-	GlobalLogger.Infof("Old state: %s, New state: %s\n", StateToText(*gs.state), StateToText(newState))
 	*gs.state = newState
-	gs.Health.SetBridgeState(StateToText(newState))
+	gs.publishStateLocked(oldEffective)
 	return persistErr
+}
+
+func (gs *GlobalState) effectiveStateLocked() uint8 {
+	if gs.RedeemHaltGeneration() != 0 {
+		return EmergencyState
+	}
+	return *gs.state
+}
+
+func (gs *GlobalState) publishStateLocked(oldState uint8) {
+	current := StateToText(gs.effectiveStateLocked())
+	GlobalLogger.Infof("Old state: %s, New state: %s", StateToText(oldState), current)
+	gs.Health.SetBridgeState(current)
 }
 
 // HaltSigning moves a signer in LiveState, KeyGenState or ReSignState to
 // HaltedState, as a halt the bridge listener reads does, and reports whether
 // it did. A signer in EmergencyState or HaltedState stays where it is.
 func (gs *GlobalState) HaltSigning() (bool, error) {
+	gs.transferSendMu.Lock()
+	defer gs.transferSendMu.Unlock()
 	gs.stateMu.Lock()
 	defer gs.stateMu.Unlock()
-	switch *gs.state {
+	switch gs.effectiveStateLocked() {
 	case LiveState, KeyGenState, ReSignState:
 		return true, gs.setStateLocked(HaltedState)
 	}
@@ -170,7 +209,7 @@ func (gs *GlobalState) SaveConfig(save func() error) error {
 func (gs *GlobalState) WhileSigningTransfers(do func()) bool {
 	gs.stateMu.Lock()
 	defer gs.stateMu.Unlock()
-	if *gs.state == EmergencyState || *gs.state == HaltedState {
+	if state := gs.effectiveStateLocked(); state == EmergencyState || state == HaltedState {
 		return false
 	}
 	do()
@@ -206,7 +245,7 @@ func (gs *GlobalState) StartupDone() <-chan struct{} {
 func (gs *GlobalState) UnlessInEmergency(do func()) bool {
 	gs.stateMu.Lock()
 	defer gs.stateMu.Unlock()
-	if *gs.state == EmergencyState {
+	if gs.effectiveStateLocked() == EmergencyState {
 		return false
 	}
 	do()
@@ -252,10 +291,34 @@ func (gs *GlobalState) WhileSettingsCurrent(do func() error) (bool, error) {
 	return true, do()
 }
 
+// lockTransfersFor takes transferSendMu when a move to newState can take the
+// signer out of LiveState, and returns what releases it.
+func (gs *GlobalState) lockTransfersFor(newState uint8) func() {
+	if newState == LiveState {
+		return func() {}
+	}
+	gs.transferSendMu.Lock()
+	return gs.transferSendMu.Unlock
+}
+
+// WhileLive runs send, which publishes a transfer, if the signer is in
+// LiveState, and reports whether it ran. No change of state takes the signer
+// out of LiveState while send runs, so no transfer is published after the
+// signer left it. send must not touch the state, and has to be bounded in
+// time: such a change waits for it.
+func (gs *GlobalState) WhileLive(send func() error) (bool, error) {
+	gs.transferSendMu.RLock()
+	defer gs.transferSendMu.RUnlock()
+	if state, err := gs.GetState(); err != nil || state != LiveState {
+		return false, err
+	}
+	return true, send()
+}
+
 func (gs *GlobalState) GetState() (uint8, error) {
 	gs.stateMu.Lock()
 	defer gs.stateMu.Unlock()
-	return *gs.state, nil
+	return gs.effectiveStateLocked(), nil
 }
 
 func (gs *GlobalState) SetFrontierMomentum(frMom uint64) error {

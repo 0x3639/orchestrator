@@ -2087,14 +2087,6 @@ func (rC *znnNetwork) processBridgeAccountPage(ctx context.Context, height uint6
 
 // Transactions
 
-func (rC *znnNetwork) UpdateWrapRequest(id types.Hash, signature string, keyPair *wallet.KeyPair) error {
-	return rC.ZnnRpc().UpdateWrapRequest(id, signature, keyPair)
-}
-
-func (rC *znnNetwork) SendUnwrapRequest(event *events.UnwrapRequestEvm, keyPair *wallet.KeyPair) error {
-	return rC.ZnnRpc().SendUnwrapRequest(event, keyPair)
-}
-
 func (rC *znnNetwork) Halt(signature string, keyPair *wallet.KeyPair) error {
 	return rC.ZnnRpc().Halt(signature, keyPair)
 }
@@ -2190,6 +2182,21 @@ func (rC *znnNetwork) GetAllNetworks() ([]*definition.NetworkInfo, error) {
 
 func (rC *znnNetwork) GetBridgeInfo() (*definition.BridgeInfoVariable, error) {
 	return rC.ZnnRpc().GetBridgeInfo()
+}
+
+// HaltFlagSet reports whether the bridge on Zenon has its halt flag set.
+// Unlike IsHalted it does not count the wait that follows an unhalt, during
+// which a new halt is still needed, and a failed read is an error, not a
+// halt.
+func (rC *znnNetwork) HaltFlagSet() (bool, error) {
+	info, err := rC.GetBridgeInfo()
+	if err != nil {
+		return false, err
+	}
+	if info == nil {
+		return false, errors.New("missing Zenon bridge info")
+	}
+	return info.Halted, nil
 }
 
 func (rC *znnNetwork) GetOrchestratorInfo() (*definition.OrchestratorInfo, error) {

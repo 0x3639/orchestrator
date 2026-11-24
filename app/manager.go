@@ -23,6 +23,7 @@ func NewNodeManager(ctx *cli.Context) (*Manager, error) {
 		return nil, err
 	}
 	nodeConfig.EvmBackfillBlocks = ctx.GlobalUint64(EvmBackfillBlocksFlag.Name)
+	nodeConfig.AcknowledgedRedeems = ctx.GlobalStringSlice(AcknowledgeRedeemFlag.Name)
 
 	logger, err := common.CreateLogger()
 	if err != nil {

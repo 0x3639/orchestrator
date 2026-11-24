@@ -23,8 +23,28 @@ import (
 // The caller checks the canonical hash at the event height. All endpoints must
 // also be able to serve the canonical height at the required confirmation depth.
 func (r *EvmRpc) AgreedUnwrapLog(height uint64, block, tx ecommon.Hash, index uint32, confirmations uint64) (etypes.Log, error) {
+	return r.agreedBridgeLog(height, block, tx, uint64(index), confirmations, common.UnwrapSigHash, 3)
+}
+
+// AgreedRedeemLog checks the receipt or single-block log on each endpoint.
+func (r *EvmRpc) AgreedRedeemLog(log etypes.Log, confirmations uint64) (etypes.Log, error) {
+	if len(log.Topics) == 0 {
+		return etypes.Log{}, errors.New("missing redeem log topic")
+	}
+	count := 4
+	switch log.Topics[0] {
+	case common.RegisteredRedeemSigHash, common.RedeemedSigHash:
+	case common.RevokedRedeemSigHash:
+		count = 2
+	default:
+		return etypes.Log{}, errors.New("unexpected redeem log topic")
+	}
+	return r.agreedBridgeLog(log.BlockNumber, log.BlockHash, log.TxHash, uint64(log.Index), confirmations, log.Topics[0], count)
+}
+
+func (r *EvmRpc) agreedBridgeLog(height uint64, block, tx ecommon.Hash, index, confirmations uint64, topic ecommon.Hash, topicCount int) (etypes.Log, error) {
 	if len(r.Urls.Urls) == 0 || height > math.MaxUint64-confirmations {
-		return etypes.Log{}, errors.New("cannot establish unwrap confirmation depth")
+		return etypes.Log{}, errors.New("cannot establish bridge log confirmation depth")
 	}
 	if confirmations > 0 {
 		if _, err := r.CanonicalHash(height + confirmations); err != nil {
@@ -38,26 +58,26 @@ func (r *EvmRpc) AgreedUnwrapLog(height uint64, block, tx ecommon.Hash, index ui
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			logs[i], errs[i] = r.readUnwrapLog(i, height, block, tx, index)
+			logs[i], errs[i] = r.readBridgeLog(i, height, block, tx, index, topic, topicCount)
 		}(i)
 	}
 	wg.Wait()
 	for i, log := range logs {
 		if errs[i] != nil {
-			return etypes.Log{}, fmt.Errorf("unwrap evidence from endpoint #%d: %s", i, config.RedactErrorForURL(errs[i], r.Urls.Urls[i]))
+			return etypes.Log{}, fmt.Errorf("bridge log evidence from endpoint #%d: %s", i, config.RedactErrorForURL(errs[i], r.Urls.Urls[i]))
 		}
 		if !slices.Equal(log.Topics, logs[0].Topics) || !bytes.Equal(log.Data, logs[0].Data) {
-			return etypes.Log{}, errors.New("EVM endpoints disagree on the unwrap log payload")
+			return etypes.Log{}, errors.New("EVM endpoints disagree on the bridge log payload")
 		}
 	}
 	return logs[0], nil
 }
 
-func (r *EvmRpc) readUnwrapLog(endpoint int, height uint64, block, tx ecommon.Hash, index uint32) (etypes.Log, error) {
+func (r *EvmRpc) readBridgeLog(endpoint int, height uint64, block, tx ecommon.Hash, index uint64, topic ecommon.Hash, topicCount int) (etypes.Log, error) {
 	matches := func(log *etypes.Log) bool {
 		return log != nil && !log.Removed && log.Address == r.bridgeAddress &&
-			log.BlockNumber == height && log.BlockHash == block && log.TxHash == tx && uint64(log.Index) == uint64(index) &&
-			len(log.Topics) == 3 && log.Topics[0] == common.UnwrapSigHash
+			log.BlockNumber == height && log.BlockHash == block && log.TxHash == tx && uint64(log.Index) == index &&
+			len(log.Topics) == topicCount && log.Topics[0] == topic
 	}
 	var receipt *etypes.Receipt
 	receiptErr := r.callEndpoint(endpoint, func(ctx context.Context, c *ethclient.Client) error {
@@ -79,7 +99,7 @@ func (r *EvmRpc) readUnwrapLog(endpoint int, height uint64, block, tx ecommon.Ha
 	// Pruned and inconsistent receipts can be resolved by querying just the
 	// event height. Some providers do not support block-hash log filters.
 	number := new(big.Int).SetUint64(height)
-	query := ethereum.FilterQuery{FromBlock: number, ToBlock: number, Addresses: []ecommon.Address{r.bridgeAddress}, Topics: [][]ecommon.Hash{{common.UnwrapSigHash}}}
+	query := ethereum.FilterQuery{FromBlock: number, ToBlock: number, Addresses: []ecommon.Address{r.bridgeAddress}, Topics: [][]ecommon.Hash{{topic}}}
 	var logs []etypes.Log
 	err := r.callEndpoint(endpoint, func(ctx context.Context, c *ethclient.Client) error {
 		var err error
@@ -94,5 +114,5 @@ func (r *EvmRpc) readUnwrapLog(endpoint int, height uint64, block, tx ecommon.Ha
 			return logs[i], nil
 		}
 	}
-	return etypes.Log{}, errors.Join(receiptErr, errors.New("canonical unwrap log unavailable"))
+	return etypes.Log{}, errors.Join(receiptErr, errors.New("canonical bridge log unavailable"))
 }

@@ -77,6 +77,11 @@ type Config struct {
 	// every EVM network's sync cursor by this many blocks at startup. It is
 	// never persisted so it cannot re-trigger on the next start.
 	EvmBackfillBlocks uint64 `json:"-"`
+	// AcknowledgedRedeems is the command-line only list of unmatched redeem
+	// registrations the operator has reviewed, as chainId:txHash:logIndex.
+	// The acknowledgement itself is stored with the evidence, so the list is
+	// never persisted here.
+	AcknowledgedRedeems []string `json:"-"`
 
 	Networks  map[string]BaseNetworkConfig
 	TssConfig TssManagerConfig

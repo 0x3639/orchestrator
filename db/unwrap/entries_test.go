@@ -220,6 +220,44 @@ func TestSendSigIntNeverBlocks(t *testing.T) {
 	store.SendSigInt() // closed: must not panic
 }
 
+// An explicit rewind keeps a redeem checkpoint that is already below the
+// target, and otherwise moves it to the target. A database that holds the
+// pair keeps the pair; only one without it gets the single-height record.
+func TestExplicitRewindKeepsALowerRedeemCheckpoint(t *testing.T) {
+	const depth = 20
+	for _, tc := range []struct {
+		name            string
+		through, redeem uint64 // stored pair; through 0 stores nothing
+		target          uint64
+		wantRedeem      uint64
+		wantLegacy      bool
+	}{
+		{name: "redeem checkpoint far below the target", through: 1000, redeem: 800, target: 990, wantRedeem: 800},
+		{name: "redeem checkpoint just below the target", through: 1000, redeem: 989, target: 990, wantRedeem: 989},
+		// The pair stays a pair, so the rewind is not read as a database of
+		// an earlier build, which would replay from contract deployment.
+		{name: "redeem checkpoint at the target", through: 1000, redeem: 990, target: 990, wantRedeem: 990},
+		{name: "redeem checkpoint above the target", through: 1000, redeem: 995, target: 990, wantRedeem: 990},
+		{name: "nothing stored", target: 500, wantRedeem: 480, wantLegacy: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := NewEvmStorage(zdb.NewMemDB(), make(chan os.Signal, 8), 1)
+			if tc.through != 0 {
+				if err := store.SetScanHeights(tc.through, tc.redeem); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := store.SetLastUpdateHeight(tc.target); err != nil {
+				t.Fatal(err)
+			}
+			through, redeem, legacy, err := store.GetScanHeights(depth)
+			if err != nil || through != tc.target || redeem != tc.wantRedeem || legacy != tc.wantLegacy {
+				t.Fatalf("through=%d redeem=%d legacy=%t err=%v, want %d/%d/%t", through, redeem, legacy, err, tc.target, tc.wantRedeem, tc.wantLegacy)
+			}
+		})
+	}
+}
+
 // A registration read from the bridge carries no source block or sender. The
 // store keeps the ones its record already holds, and inserts the registration
 // as it is when there is no record or the record has no block.

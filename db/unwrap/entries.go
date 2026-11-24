@@ -399,30 +399,61 @@ func getLastUpdateKey() []byte {
 }
 
 func (es *evmStorage) GetLastUpdateHeight() (uint64, error) {
-	data, err := es.DB.Get(getLastUpdateKey())
-	if err == leveldb.ErrNotFound {
-		return es.contractDeploymentHeight, nil
-	}
-
-	if err != nil {
-		es.SendSigInt()
-		return 0, err
-	}
-
-	return binary.LittleEndian.Uint64(data), nil
+	through, _, _, err := es.GetScanHeights(0)
+	return through, err
 }
 
-func (es *evmStorage) SetLastUpdateHeight(blockHeight uint64) error {
-	if _, err := es.GetLastUpdateHeight(); err != nil {
+func (es *evmStorage) GetScanHeights(depth uint64) (through, redeem uint64, legacy bool, err error) {
+	data, err := es.DB.Get(getLastUpdateKey())
+	if errors.Is(err, leveldb.ErrNotFound) {
+		return es.contractDeploymentHeight, es.contractDeploymentHeight, false, nil
+	}
+	if err != nil {
 		es.SendSigInt()
-		return err
-	} else {
-		bytes := make([]byte, 8)
-		binary.LittleEndian.PutUint64(bytes, blockHeight)
-		if err := es.DB.Put(getLastUpdateKey(), bytes); err != nil {
-			es.SendSigInt()
-			return err
+		return 0, 0, false, err
+	}
+	switch len(data) {
+	case 8:
+		through = binary.LittleEndian.Uint64(data)
+		return through, min(through, max(es.contractDeploymentHeight, through-min(through, depth))), true, nil
+	case 16:
+		through, redeem = binary.LittleEndian.Uint64(data), binary.LittleEndian.Uint64(data[8:])
+		if redeem <= through {
+			return through, redeem, false, nil
 		}
 	}
-	return nil
+	return 0, 0, false, errors.New("invalid EVM scan checkpoint")
+}
+
+func (es *evmStorage) SetScanHeights(through, redeem uint64) error {
+	data := binary.LittleEndian.AppendUint64(nil, through)
+	err := es.DB.Put(getLastUpdateKey(), binary.LittleEndian.AppendUint64(data, redeem))
+	if err != nil {
+		es.SendSigInt()
+	}
+	return err
+}
+
+// An explicit rewind resets the finalized checkpoint as well. A database
+// that holds both checkpoints keeps both: the redeem checkpoint moves down to
+// the target, or stays where it is when it is already below it, since the
+// blocks between it and the target have not been through the finalized
+// redeem scan yet. Only a database without the pair gets the single-height
+// record that earlier builds wrote.
+func (es *evmStorage) SetLastUpdateHeight(height uint64) error {
+	data := binary.LittleEndian.AppendUint64(nil, height)
+	stored, err := es.DB.Get(getLastUpdateKey())
+	if err != nil && !errors.Is(err, leveldb.ErrNotFound) {
+		es.SendSigInt()
+		return err
+	}
+	if len(stored) == 16 {
+		redeem := binary.LittleEndian.Uint64(stored[8:])
+		data = binary.LittleEndian.AppendUint64(data, min(redeem, height))
+	}
+	err = es.DB.Put(getLastUpdateKey(), data)
+	if err != nil {
+		es.SendSigInt()
+	}
+	return err
 }

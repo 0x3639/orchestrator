@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"strings"
@@ -17,6 +18,7 @@ import (
 	ecommon "github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/hexutil"
 	etypes "github.com/ethereum/go-ethereum/core/types"
+	"github.com/gorilla/websocket"
 	"github.com/zenon-network/go-zenon/chain/nom"
 	zdb "github.com/zenon-network/go-zenon/common/db"
 	"github.com/zenon-network/go-zenon/common/types"
@@ -63,6 +65,10 @@ type heldZenon struct {
 	allowKeyGen bool
 	// The node returns no bridge info.
 	noBridgeInfo bool
+	// The bridge's halt flag, and an unhalt whose wait has not passed.
+	halted, unhaltWait bool
+	// A read of the bridge info fails.
+	bridgeInfoFails bool
 	// A read of the account waits here once it has said so on stalled.
 	stall, stalled chan struct{}
 	// The requests the bridge holds by log index, when a test sets them
@@ -72,6 +78,39 @@ type heldZenon struct {
 	// Heights the node lists without their confirmation, which a lookup by
 	// hash returns.
 	listedUnconfirmed map[uint64]bool
+	// Blocks published to the node.
+	published int
+	// Runs, once, when the node is asked how much proof of work a block
+	// needs, which a transaction's preparation asks last.
+	onPrepare func()
+}
+
+func (z *heldZenon) GetFrontierAccountBlock(types.Address) (*nom.AccountBlock, error) {
+	return nil, nil
+}
+
+func (z *heldZenon) GetRequiredPoWForAccountBlock(embedded.GetRequiredParam) (*embedded.GetRequiredResult, error) {
+	z.mu.Lock()
+	hook := z.onPrepare
+	z.onPrepare = nil
+	z.mu.Unlock()
+	if hook != nil {
+		hook()
+	}
+	return &embedded.GetRequiredResult{AvailablePlasma: 21000, BasePlasma: 21000}, nil
+}
+
+func (z *heldZenon) PublishRawTransaction(*nom.AccountBlock) error {
+	z.mu.Lock()
+	defer z.mu.Unlock()
+	z.published++
+	return nil
+}
+
+func (z *heldZenon) publishedBlocks() int {
+	z.mu.Lock()
+	defer z.mu.Unlock()
+	return z.published
 }
 
 func (z *heldZenon) GetAccountBlocksByHeight(_ types.Address, height, _ uint64) (*api.AccountBlockListMarshal, error) {
@@ -164,13 +203,20 @@ func (z *heldZenon) GetNetworkInfo(_, id uint32) (*definition.NetworkInfo, error
 	return nil, constants.ErrUnknownNetwork
 }
 
-func (z *heldZenon) GetBridgeInfo() *definition.BridgeInfoVariable {
+func (z *heldZenon) GetBridgeInfo() (*definition.BridgeInfoVariable, error) {
 	z.mu.Lock()
 	defer z.mu.Unlock()
-	if z.noBridgeInfo {
-		return nil
+	if z.bridgeInfoFails {
+		return nil, errors.New("upstream timeout")
 	}
-	return &definition.BridgeInfoVariable{Metadata: z.metadata, AllowKeyGen: z.allowKeyGen}
+	if z.noBridgeInfo {
+		return nil, nil
+	}
+	info := &definition.BridgeInfoVariable{Metadata: z.metadata, AllowKeyGen: z.allowKeyGen, Halted: z.halted}
+	if z.unhaltWait {
+		info.UnhaltedAt, info.UnhaltDurationInMomentums = z.frontier, 1000
+	}
+	return info, nil
 }
 
 func (z *heldZenon) Momentums(ctx context.Context) (*zserver.Subscription, error) {
@@ -226,6 +272,9 @@ type heldEvm struct {
 	eventTo atomic.Pointer[string]
 	syncing atomic.Bool
 	halted  atomic.Bool // the bridge contract on this chain is halted
+	// The halt flag is clear, but isHalted still reports true: an unhalt
+	// whose delay has not passed yet.
+	unhaltDelay atomic.Bool
 	// The halt flag cannot be read.
 	haltedFails atomic.Bool
 	// Runs, once, when the signer first asks for the halt flag.
@@ -277,6 +326,16 @@ func contractSelector(t *testing.T, method string) []byte {
 	return contract.Methods[method].ID
 }
 
+// isHaltRead reports whether selector reads whether the contract is halted:
+// isHalted, or the halt flag itself, which the halt senders read.
+func isHaltRead(t *testing.T, selector []byte) bool {
+	contract, err := bridge.BridgeMetaData.GetAbi()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(selector) == string(haltedSelector(t)) || string(selector) == string(contract.Methods["halted"].ID)
+}
+
 func (e *heldEvm) answer(method string, params []json.RawMessage) (interface{}, *replayRPCError) {
 	e.calls.Add(1)
 	switch method {
@@ -294,14 +353,17 @@ func (e *heldEvm) answer(method string, params []json.RawMessage) (interface{}, 
 		if len(params) < 1 || json.Unmarshal(params[0], &call) != nil {
 			e.t.Errorf("unexpected call %s", params)
 		}
-		if selector := append(call.Data, call.Input...); len(selector) >= 4 && string(selector[:4]) == string(haltedSelector(e.t)) {
-			if hook := e.onHaltedRead.Swap(nil); hook != nil {
-				(*hook)()
+		if selector := append(call.Data, call.Input...); len(selector) >= 4 && isHaltRead(e.t, selector[:4]) {
+			// The hook is for the startup check, which reads isHalted.
+			if string(selector[:4]) == string(haltedSelector(e.t)) {
+				if hook := e.onHaltedRead.Swap(nil); hook != nil {
+					(*hook)()
+				}
 			}
 			if e.haltedFails.Load() {
 				return nil, &replayRPCError{-32000, "upstream timeout"}
 			}
-			if e.halted.Load() {
+			if e.halted.Load() || e.unhaltDelay.Load() && string(selector[:4]) == string(haltedSelector(e.t)) {
 				return "0x" + strings.Repeat("0", 63) + "1", nil
 			}
 			return "0x" + strings.Repeat("0", 64), nil
@@ -375,6 +437,63 @@ func (e *heldEvm) answer(method string, params []json.RawMessage) (interface{}, 
 	return nil, nil
 }
 
+// pendingSubscriptionServer serves answer over a WebSocket, as an EVM node
+// does, but never answers a subscription, whose setup stays pending. It
+// returns the URL and counts the subscriptions asked for.
+func pendingSubscriptionServer(t *testing.T, answer func(string, []json.RawMessage) (interface{}, *replayRPCError)) (string, *atomic.Int32) {
+	return subscriptionServer(t, answer, func(int32) (interface{}, *replayRPCError, bool) { return nil, nil, false })
+}
+
+// subscriptionServer is pendingSubscriptionServer with the n-th subscription
+// (from 1) answered as subscribe says: with a result or an error, or not at
+// all when ok is false.
+func subscriptionServer(t *testing.T, answer func(string, []json.RawMessage) (interface{}, *replayRPCError),
+	subscribe func(n int32) (result interface{}, rpcErr *replayRPCError, ok bool)) (string, *atomic.Int32) {
+	t.Helper()
+	subscribes := new(atomic.Int32)
+	var upgrader websocket.Upgrader
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		for {
+			var call struct {
+				ID     json.RawMessage   `json:"id"`
+				Method string            `json:"method"`
+				Params []json.RawMessage `json:"params"`
+			}
+			if err := conn.ReadJSON(&call); err != nil {
+				return
+			}
+			reply := map[string]interface{}{"jsonrpc": "2.0", "id": call.ID}
+			result, rpcErr := interface{}(nil), (*replayRPCError)(nil)
+			switch call.Method {
+			case "eth_subscribe":
+				var ok bool
+				if result, rpcErr, ok = subscribe(subscribes.Add(1)); !ok {
+					continue
+				}
+			case "eth_unsubscribe":
+				result = true
+			default:
+				result, rpcErr = answer(call.Method, call.Params)
+			}
+			if rpcErr != nil {
+				reply["error"] = rpcErr
+			} else {
+				reply["result"] = result
+			}
+			if err := conn.WriteJSON(reply); err != nil {
+				return
+			}
+		}
+	}))
+	t.Cleanup(func() { server.CloseClientConnections(); server.Close() })
+	return "ws" + strings.TrimPrefix(server.URL, "http"), subscribes
+}
+
 var heldAdministrator = types.Address{7}
 
 // heldStart is a signer with one EVM network (chain 1) whose networks are
@@ -406,7 +525,7 @@ func newHeldStart(t *testing.T) *heldStart {
 	h.zenon = &heldZenon{frontier: 5000, sends: map[types.Hash]*api.AccountBlockMarshal{}, unreadable: map[uint64]bool{},
 		listed: -1, request: h.bridge.request, metadata: "{}"}
 	srv := zserver.NewServer()
-	for _, name := range []string{"ledger", "stats", "embedded.bridge"} {
+	for _, name := range []string{"ledger", "stats", "embedded.bridge", "embedded.plasma"} {
 		if err := srv.RegisterName(name, h.zenon); err != nil {
 			t.Fatal(err)
 		}
@@ -420,7 +539,7 @@ func newHeldStart(t *testing.T) *heldStart {
 	if err != nil {
 		t.Fatal(err)
 	}
-	h.stores = replayStores{znn: wrap.NewZnnStorage(zdb.NewMemDB(), h.stop), evm: map[uint32]db.EvmStorage{}}
+	h.stores = replayStores{znn: wrap.NewZnnStorage(zdb.NewMemDB(), h.stop), evm: map[uint32]db.EvmStorage{}, evmMu: new(sync.RWMutex)}
 	state := common.NewGlobalState(new(uint8))
 	state.Health = snapshot.New("test", "")
 	if err := state.SetFrontierMomentum(h.zenon.frontier); err != nil {
@@ -461,7 +580,9 @@ func (h *heldStart) addEvmNetwork(id uint32, url string) *evmNetwork {
 	if err := h.n.rpcManager.AddEvmClient(config.BaseNetworkConfig{Urls: []string{url}}, id, name, h.bridge.contract); err != nil {
 		h.t.Fatal(err)
 	}
+	h.stores.evmMu.Lock()
 	h.stores.evm[id] = unwrap.NewEvmStorage(zdb.NewMemDB(), h.stop, 90)
+	h.stores.evmMu.Unlock()
 	params, err := config.NewEvmParams(&definition.NetworkInfo{NetworkClass: definition.EvmClass, Id: id, Name: name, ContractAddress: h.bridge.contract.Hex()})
 	if err != nil {
 		h.t.Fatal(err)

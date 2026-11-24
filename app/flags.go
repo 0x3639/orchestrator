@@ -33,6 +33,13 @@ var (
 		Value: 0,
 	}
 
+	// AcknowledgeRedeemFlag names unmatched redeem registrations the operator
+	// has reviewed. Each is archived as evidence and no longer stops this node.
+	AcknowledgeRedeemFlag = cli.StringSliceFlag{
+		Name:  "redeem.acknowledge",
+		Usage: "Archive a reviewed unmatched redeem so it no longer holds this node in the emergency state, as chainId:transactionHash:logIndex (repeatable; does not change anything on chain)",
+	}
+
 	AllFlags = []cli.Flag{
 
 		// pprof
@@ -41,5 +48,6 @@ var (
 		PprofAddrFlag,
 
 		EvmBackfillBlocksFlag,
+		AcknowledgeRedeemFlag,
 	}
 )
