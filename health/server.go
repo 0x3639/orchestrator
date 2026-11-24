@@ -107,19 +107,25 @@ func (s *Handler) GetStatus(params []interface{}) (interface{}, error) {
 		return nil, fmt.Errorf("this method does not accept parameters")
 	}
 
-	cachedStatus := s.StatusCache.GetStatusResult()
-	if cachedStatus != nil {
-		return cachedStatus, nil
-	}
-
-	state, err := s.state.GetState()
+	// Concurrent handlers share one cache refresh.
+	status, err := s.StatusCache.GetOrRefresh(s.buildStatus)
 	if err != nil {
 		return nil, err
+	}
+	return status, nil
+}
+
+// buildStatus reads the current status from the node. Use GetStatus, which
+// caches the result.
+func (s *Handler) buildStatus() (Status, error) {
+	state, err := s.state.GetState()
+	if err != nil {
+		return Status{}, err
 	}
 
 	frontierMomentum, err := s.state.GetFrontierMomentum()
 	if err != nil {
-		return nil, err
+		return Status{}, err
 	}
 
 	wrapsData := make(map[uint32][]byte)
@@ -135,7 +141,7 @@ func (s *Handler) GetStatus(params []interface{}) (interface{}, error) {
 
 	wraps, errWraps := s.networksManager.GetUnsignedWrapRequests()
 	if errWraps != nil {
-		return nil, errWraps
+		return Status{}, errWraps
 	} else if len(wraps) != 0 {
 		sort.Slice(wraps, func(i, j int) bool {
 			return wraps[i].Id.String() < wraps[j].Id.String()
@@ -148,7 +154,7 @@ func (s *Handler) GetStatus(params []interface{}) (interface{}, error) {
 
 	unwraps, err := s.networksManager.GetUnsignedUnwrapRequests()
 	if err != nil {
-		return nil, err
+		return Status{}, err
 	} else if len(unwraps) != 0 {
 		sort.Slice(unwraps, func(i, j int) bool {
 			if unwraps[i].TransactionHash.String() == unwraps[j].TransactionHash.String() {
@@ -169,7 +175,7 @@ func (s *Handler) GetStatus(params []interface{}) (interface{}, error) {
 	for _, evmNetwork := range s.networksManager.Networks() {
 		lastUpdateHeight, err := s.dbManager.EvmStorage(evmNetwork.ChainId()).GetLastUpdateHeight()
 		if err != nil {
-			return nil, err
+			return Status{}, err
 		}
 
 		hasher := sha3.NewLegacyKeccak256()
@@ -231,7 +237,6 @@ func (s *Handler) GetStatus(params []interface{}) (interface{}, error) {
 		Peers:            peers,
 	}
 
-	s.StatusCache.SetStatusResult(status)
 	return status, nil
 }
 

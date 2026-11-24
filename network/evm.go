@@ -34,8 +34,11 @@ type evmNetwork struct {
 	client        *rpc.EvmRpc
 	startupDone   <-chan struct{}
 	rollbackStore func()
-	stopHealth    func()
-	health        *snapshot.Store
+	// stopHealth is set by Start and read by Stop and by a runtime removal,
+	// which can run on other goroutines; healthMu guards it.
+	healthMu   sync.Mutex
+	stopHealth func()
+	health     *snapshot.Store
 	config.EvmParams
 	unconfirmedQueue *dque.DQue
 	dbManager        networkEventStores
@@ -183,13 +186,16 @@ func (eN *evmNetwork) Start() (startErr error) {
 		}
 	}
 	if eN.health != nil {
-		eN.stopHealth = eN.health.Poll(func(ctx context.Context) {
+		stopHealth, ok := eN.startHealthPoll(func(ctx context.Context) {
 			eN.observeQueueDepth()
 			eN.recordSync(client.SampleSyncState(ctx))
 		})
+		if !ok {
+			return context.Canceled
+		}
 		defer func() {
 			if startErr != nil {
-				eN.stopHealth()
+				stopHealth()
 			}
 		}()
 	}
@@ -1071,11 +1077,34 @@ func (eN *evmNetwork) observeQueueDepth() {
 	eN.health.UpdateNetwork(eN.ChainId(), func(n *snapshot.Network) { n.Unwrap.AwaitingFinality = snapshot.Measure(depth) })
 }
 
-func (eN *evmNetwork) Stop() {
-	if eN.stopHealth != nil {
-		eN.stopHealth()
+// startHealthPoll starts the health poller unless the network was already
+// stopped or removed, so a removal during Start never leaves a poller behind.
+func (eN *evmNetwork) startHealthPoll(sample func(context.Context)) (func(), bool) {
+	eN.healthMu.Lock()
+	defer eN.healthMu.Unlock()
+	select {
+	case <-eN.done:
+		return nil, false
+	default:
 	}
+	eN.stopHealth = eN.health.Poll(sample)
+	return eN.stopHealth, true
+}
+
+// halt closes done and stops the health poller. It is safe to call more than
+// once and from any goroutine. It waits for an in-flight health sample.
+func (eN *evmNetwork) halt() {
+	eN.healthMu.Lock()
 	eN.stopOnce.Do(func() { close(eN.done) })
+	stopHealth := eN.stopHealth
+	eN.healthMu.Unlock()
+	if stopHealth != nil {
+		stopHealth()
+	}
+}
+
+func (eN *evmNetwork) Stop() {
+	eN.halt()
 	eN.EvmRpc().Stop()
 	_ = eN.unconfirmedQueue.Close()
 }
