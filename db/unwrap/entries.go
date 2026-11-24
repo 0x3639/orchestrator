@@ -3,6 +3,7 @@ package unwrap
 import (
 	"encoding/binary"
 	"errors"
+	"fmt"
 	ecommon "github.com/ethereum/go-ethereum/common"
 	"github.com/syndtr/goleveldb/leveldb"
 	zcommon "github.com/zenon-network/go-zenon/common"
@@ -39,6 +40,23 @@ func (es *evmStorage) putUnwrapRequest(event events.UnwrapRequestEvm) error {
 		}
 	}
 	return nil
+}
+
+// AddRegisteredUnwrapRequest stores a request as the bridge registered it. A
+// registration carries no source block or sender, so the block and sender an
+// existing record holds from this node's own scan of the source chain are
+// kept. The read and the write are one operation under the record lock.
+func (es *evmStorage) AddRegisteredUnwrapRequest(event events.UnwrapRequestEvm) error {
+	es.mu.Lock()
+	defer es.mu.Unlock()
+	existing, err := es.GetUnwrapRequestByHashAndLog(event.TransactionHash, event.LogIndex)
+	if err != nil {
+		return err
+	}
+	if existing != nil && existing.BlockHash != (ecommon.Hash{}) {
+		event.BlockNumber, event.BlockHash, event.From = existing.BlockNumber, existing.BlockHash, existing.From
+	}
+	return es.putUnwrapRequest(event)
 }
 
 func (es *evmStorage) AddUnwrapRequestIfMissing(event events.UnwrapRequestEvm) (bool, error) {
@@ -95,6 +113,25 @@ func (es *evmStorage) UpdateUnwrapRequestBlockNumber(event events.UnwrapRequestE
 	return es.putUnwrapRequest(*localEvent)
 }
 
+func (es *evmStorage) FillUnwrapRequestBlock(event events.UnwrapRequestEvm) error {
+	es.mu.Lock()
+	defer es.mu.Unlock()
+	localEvent, err := es.GetUnwrapRequestByHashAndLog(event.TransactionHash, event.LogIndex)
+	if err != nil {
+		es.SendSigInt()
+		return err
+	}
+	if localEvent == nil || localEvent.BlockHash != (ecommon.Hash{}) {
+		return nil
+	}
+	localEvent.BlockNumber = event.BlockNumber
+	localEvent.BlockHash = event.BlockHash
+	if localEvent.From == (ecommon.Address{}) && localEvent.SameTransfer(&event) {
+		localEvent.From = event.From
+	}
+	return es.putUnwrapRequest(*localEvent)
+}
+
 // Fill a legacy row only if it is still the unsigned candidate that was checked.
 func (es *evmStorage) HydrateUnsignedUnwrap(before, verified events.UnwrapRequestEvm) error {
 	es.mu.Lock()
@@ -109,6 +146,36 @@ func (es *evmStorage) HydrateUnsignedUnwrap(before, verified events.UnwrapReques
 	}
 	current.From, current.BlockHash, current.BlockNumber = verified.From, verified.BlockHash, verified.BlockNumber
 	return es.putUnwrapRequest(*current)
+}
+
+func sourceLocationKey(txHash ecommon.Hash, logIndex uint32) []byte {
+	return zcommon.JoinBytes(sourceLocationPrefix, txHash.Bytes(), binary.BigEndian.AppendUint32(nil, logIndex))
+}
+
+func (es *evmStorage) SaveUnwrapSourceLocation(txHash ecommon.Hash, logIndex uint32, blockNumber uint64, blockHash ecommon.Hash) error {
+	if blockHash == (ecommon.Hash{}) {
+		return errors.New("a source location needs a block hash")
+	}
+	value := append(binary.BigEndian.AppendUint64(nil, blockNumber), blockHash.Bytes()...)
+	if err := es.DB.Put(sourceLocationKey(txHash, logIndex), value); err != nil {
+		es.SendSigInt()
+		return err
+	}
+	return nil
+}
+
+func (es *evmStorage) UnwrapSourceLocation(txHash ecommon.Hash, logIndex uint32) (uint64, ecommon.Hash, bool, error) {
+	value, err := es.DB.Get(sourceLocationKey(txHash, logIndex))
+	if errors.Is(err, leveldb.ErrNotFound) {
+		return 0, ecommon.Hash{}, false, nil
+	}
+	if err != nil {
+		return 0, ecommon.Hash{}, false, err
+	}
+	if len(value) != 8+ecommon.HashLength {
+		return 0, ecommon.Hash{}, false, errors.New("invalid stored unwrap source location")
+	}
+	return binary.BigEndian.Uint64(value[:8]), ecommon.BytesToHash(value[8:]), true, nil
 }
 
 func (es *evmStorage) UnwrapAffiliatePolicy(key ecommon.Hash) (common.AffiliatePolicy, bool, error) {
@@ -334,34 +401,71 @@ func getLastUpdateKey() []byte {
 }
 
 func (es *evmStorage) GetLastUpdateHeight() (uint64, error) {
-	data, err := es.DB.Get(getLastUpdateKey())
-	if err == leveldb.ErrNotFound {
-		return es.contractDeploymentHeight, nil
-	}
-
-	if err != nil {
-		es.SendSigInt()
-		return 0, err
-	}
-	if err := db.CheckFixedWidth("EVM sync cursor lastUpdateHeight (key 0x01)", data, 8); err != nil {
-		es.SendSigInt()
-		return 0, err
-	}
-
-	return binary.LittleEndian.Uint64(data), nil
+	through, _, _, err := es.GetScanHeights(0)
+	return through, err
 }
 
-func (es *evmStorage) SetLastUpdateHeight(blockHeight uint64) error {
-	if _, err := es.GetLastUpdateHeight(); err != nil {
+func (es *evmStorage) GetScanHeights(depth uint64) (through, redeem uint64, legacy bool, err error) {
+	data, err := es.DB.Get(getLastUpdateKey())
+	if errors.Is(err, leveldb.ErrNotFound) {
+		return es.contractDeploymentHeight, es.contractDeploymentHeight, false, nil
+	}
+	if err != nil {
+		es.SendSigInt()
+		return 0, 0, false, err
+	}
+	switch len(data) {
+	case 8:
+		through = binary.LittleEndian.Uint64(data)
+		return through, min(through, max(es.contractDeploymentHeight, through-min(through, depth))), true, nil
+	case 16:
+		through, redeem = binary.LittleEndian.Uint64(data), binary.LittleEndian.Uint64(data[8:])
+		if redeem <= through {
+			return through, redeem, false, nil
+		}
+		es.SendSigInt()
+		return 0, 0, false, fmt.Errorf("%w: EVM scan checkpoint (key 0x01) has redeem height %d above scan height %d. "+
+			"The stored value was left unchanged; keep the orchestrator stopped and restore a known-good local sync checkpoint "+
+			"(operator guide: Local sync checkpoints)", db.ErrCorruptCursor, redeem, through)
+	}
+	es.SendSigInt()
+	return 0, 0, false, &db.CorruptCursorError{Key: "EVM scan checkpoint (key 0x01)", Got: len(data), Want: 16}
+}
+
+func (es *evmStorage) SetScanHeights(through, redeem uint64) error {
+	data := binary.LittleEndian.AppendUint64(nil, through)
+	err := es.DB.Put(getLastUpdateKey(), binary.LittleEndian.AppendUint64(data, redeem))
+	if err != nil {
+		es.SendSigInt()
+	}
+	return err
+}
+
+// An explicit rewind resets the finalized checkpoint as well. A database
+// that holds both checkpoints keeps both: the redeem checkpoint moves down to
+// the target, or stays where it is when it is already below it, since the
+// blocks between it and the target have not been through the finalized
+// redeem scan yet. Only a database without the pair gets the single-height
+// record that earlier builds wrote.
+func (es *evmStorage) SetLastUpdateHeight(height uint64) error {
+	data := binary.LittleEndian.AppendUint64(nil, height)
+	stored, err := es.DB.Get(getLastUpdateKey())
+	if err != nil && !errors.Is(err, leveldb.ErrNotFound) {
 		es.SendSigInt()
 		return err
-	} else {
-		bytes := make([]byte, 8)
-		binary.LittleEndian.PutUint64(bytes, blockHeight)
-		if err := es.DB.Put(getLastUpdateKey(), bytes); err != nil {
-			es.SendSigInt()
-			return err
-		}
 	}
-	return nil
+	if err == nil && len(stored) != 8 && len(stored) != 16 {
+		// Leave a damaged checkpoint on disk for the operator to inspect.
+		es.SendSigInt()
+		return &db.CorruptCursorError{Key: "EVM scan checkpoint (key 0x01)", Got: len(stored), Want: 16}
+	}
+	if len(stored) == 16 {
+		redeem := binary.LittleEndian.Uint64(stored[8:])
+		data = binary.LittleEndian.AppendUint64(data, min(redeem, height))
+	}
+	err = es.DB.Put(getLastUpdateKey(), data)
+	if err != nil {
+		es.SendSigInt()
+	}
+	return err
 }

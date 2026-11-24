@@ -3,6 +3,7 @@ package rpc
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	sdk_rpc_client "github.com/MoonBaZZe/znn-sdk-go/rpc_client"
 	"github.com/MoonBaZZe/znn-sdk-go/zenon"
 	ic "github.com/libp2p/go-libp2p-core/crypto"
@@ -123,6 +124,15 @@ func (r *ZnnRpc) SubscribeToAccountBlocks(address types.Address) (*server.Client
 /// Transactions
 
 func (r *ZnnRpc) BroadcastTransaction(tx *nom.AccountBlock, keyPair *wallet.KeyPair) error {
+	if err := r.prepareTransaction(tx, keyPair); err != nil {
+		return err
+	}
+	return r.PublishTransaction(tx)
+}
+
+// prepareTransaction fills in the account fields and the proof of work, and
+// signs the block.
+func (r *ZnnRpc) prepareTransaction(tx *nom.AccountBlock, keyPair *wallet.KeyPair) error {
 	if err := zenon.CheckAndSetFields(r.rpcClient, tx, keyPair.Address, keyPair.Public); err != nil {
 		return err
 	}
@@ -132,20 +142,34 @@ func (r *ZnnRpc) BroadcastTransaction(tx *nom.AccountBlock, keyPair *wallet.KeyP
 
 	tx.Hash = tx.ComputeHash()
 	tx.Signature = keyPair.Sign(tx.Hash.Bytes())
+	return nil
+}
 
+// PublishTransaction publishes a block that prepareTransaction made.
+func (r *ZnnRpc) PublishTransaction(tx *nom.AccountBlock) error {
 	return r.rpcClient.LedgerApi.PublishRawTransaction(tx)
 }
 
-func (r *ZnnRpc) UpdateWrapRequest(id types.Hash, signature string, keyPair *wallet.KeyPair) error {
+// PrepareWrapUpdate makes the signed block that adds signature to wrap
+// request id, proof of work included, without publishing it.
+func (r *ZnnRpc) PrepareWrapUpdate(id types.Hash, signature string, keyPair *wallet.KeyPair) (*nom.AccountBlock, error) {
 	tx := r.rpcClient.BridgeApi.UpdateWrapRequest(id, signature)
-	return r.BroadcastTransaction(tx, keyPair)
+	if err := r.prepareTransaction(tx, keyPair); err != nil {
+		return nil, err
+	}
+	return tx, nil
 }
 
-func (r *ZnnRpc) SendUnwrapRequest(event *events.UnwrapRequestEvm, keyPair *wallet.KeyPair) error {
+// PrepareUnwrap makes the signed block that registers event, proof of work
+// included, without publishing it.
+func (r *ZnnRpc) PrepareUnwrap(event *events.UnwrapRequestEvm, keyPair *wallet.KeyPair) (*nom.AccountBlock, error) {
 	hash := types.BytesToHashPanic(event.TransactionHash.Bytes())
 	toAddress := types.ParseAddressPanic(event.To)
 	tx := r.rpcClient.BridgeApi.UnwrapToken(event.NetworkClass, event.ChainId, event.Token.String(), hash, event.LogIndex, event.Amount, toAddress, event.Signature)
-	return r.BroadcastTransaction(tx, keyPair)
+	if err := r.prepareTransaction(tx, keyPair); err != nil {
+		return nil, err
+	}
+	return tx, nil
 }
 
 func (r *ZnnRpc) ChangeTssEcdsaPubKey(pubKey, signature, newSignature string, keyPair *wallet.KeyPair) error {
@@ -156,6 +180,16 @@ func (r *ZnnRpc) ChangeTssEcdsaPubKey(pubKey, signature, newSignature string, ke
 func (r *ZnnRpc) Halt(signature string, keyPair *wallet.KeyPair) error {
 	tx := r.rpcClient.BridgeApi.Halt(signature)
 	return r.BroadcastTransaction(tx, keyPair)
+}
+
+// PrepareHalt makes the signed halt block, proof of work included, without
+// publishing it.
+func (r *ZnnRpc) PrepareHalt(signature string, keyPair *wallet.KeyPair) (*nom.AccountBlock, error) {
+	tx := r.rpcClient.BridgeApi.Halt(signature)
+	if err := r.prepareTransaction(tx, keyPair); err != nil {
+		return nil, err
+	}
+	return tx, nil
 }
 
 /// RPC Calls
@@ -229,8 +263,47 @@ func (r *ZnnRpc) GetWrapTokenRequestById(id types.Hash) (*definition.WrapTokenRe
 	return r.rpcClient.BridgeApi.GetWrapTokenRequestById(id)
 }
 
+// RedeemWrapRequestById is the source lookup of the redeem check. That check
+// repeats on a timer, so the read is bounded: an endpoint that accepts the
+// request and never answers must not stop the rechecks behind it. An unknown
+// id is reported as an error, see WrapNotFound.
+func (r *ZnnRpc) RedeemWrapRequestById(id types.Hash) (*definition.WrapTokenRequest, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), ZnnLedgerTimeout)
+	defer cancel()
+	var raw json.RawMessage
+	if err := r.settingsClient.CallContext(ctx, &raw, "embedded.bridge.getWrapTokenRequestById", id); err != nil {
+		return nil, err
+	}
+	return decodeRedeemWrap(raw)
+}
+
 func (r *ZnnRpc) GetUnwrapTokenRequestByHashAndLog(txHash types.Hash, logIndex uint32) (*definition.UnwrapTokenRequest, error) {
 	return r.rpcClient.BridgeApi.GetUnwrapTokenRequestByHashAndLog(txHash, logIndex)
+}
+
+// UnwrapTokenRequestContext reads an unwrap request and, from the same reply,
+// how many momentums remain before the bridge lets it be redeemed (zero once
+// its redeem delay has passed). The request is nil when the node returns none,
+// and the delay is nil when the reply leaves it out.
+func (r *ZnnRpc) UnwrapTokenRequestContext(ctx context.Context, txHash types.Hash, logIndex uint32) (*definition.UnwrapTokenRequest, *uint64, error) {
+	var reply json.RawMessage
+	if err := r.settingsClient.CallContext(ctx, &reply, "embedded.bridge.getUnwrapTokenRequestByHashAndLog", txHash, logIndex); err != nil {
+		return nil, nil, err
+	}
+	if len(reply) == 0 || string(reply) == "null" {
+		return nil, nil, nil
+	}
+	request := new(definition.UnwrapTokenRequest)
+	if err := json.Unmarshal(reply, request); err != nil {
+		return nil, nil, err
+	}
+	var delay struct {
+		RedeemableIn *uint64 `json:"redeemableIn"`
+	}
+	if err := json.Unmarshal(reply, &delay); err != nil {
+		return nil, nil, err
+	}
+	return request, delay.RedeemableIn, nil
 }
 
 func (r *ZnnRpc) GetAllWrapTokenRequests(pageIndex, pageSize uint32) (*embedded.WrapTokenRequestList, error) {

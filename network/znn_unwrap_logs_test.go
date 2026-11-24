@@ -19,6 +19,7 @@ import (
 	"github.com/zenon-network/go-zenon/chain/nom"
 	zdb "github.com/zenon-network/go-zenon/common/db"
 	"github.com/zenon-network/go-zenon/common/types"
+	"github.com/zenon-network/go-zenon/protocol"
 	"github.com/zenon-network/go-zenon/rpc/api"
 	"github.com/zenon-network/go-zenon/vm/embedded/definition"
 	"go.uber.org/zap"
@@ -56,6 +57,9 @@ func TestInterpretUnwrapSelectsLogByIdentity(t *testing.T) {
 		missingReceipt bool
 		change         func(etypes.Log) []etypes.Log
 		valid          bool
+		// held: the endpoint's answers do not describe one block, so the
+		// receive is held instead of judged.
+		held bool
 	}{
 		{name: "shutdown during receipt", stallRPC: "eth_getTransactionReceipt"},
 		{name: "shutdown during log query", stallRPC: "eth_getLogs"},
@@ -75,7 +79,7 @@ func TestInterpretUnwrapSelectsLogByIdentity(t *testing.T) {
 			log.TxHash = ecommon.HexToHash("0xbb")
 			return []etypes.Log{log}
 		}},
-		{name: "wrong block", change: func(log etypes.Log) []etypes.Log {
+		{name: "wrong block", held: true, change: func(log etypes.Log) []etypes.Log {
 			log.BlockHash = ecommon.HexToHash("0xcc")
 			return []etypes.Log{log}
 		}},
@@ -165,17 +169,33 @@ func TestInterpretUnwrapSelectsLogByIdentity(t *testing.T) {
 				}
 				var result interface{}
 				switch call.Method {
+				case "stats.syncInfo":
+					result = &protocol.SyncInfo{State: protocol.SyncDone}
 				case "embedded.bridge.getUnwrapTokenRequestByHashAndLog":
-					result = request
+					// The historical case reads a request the bridge still
+					// withholds, which startup checks like a live one.
+					remaining := uint64(0)
+					if tc.historical {
+						remaining = 1
+					}
+					result = withRedeemDelay(request, remaining)
 				case "eth_getTransactionReceipt":
 					if tc.missingReceipt {
 						break
 					}
-					result = &etypes.Receipt{
+					// The receipt lists the transaction's bridge logs as the
+					// block query returns them.
+					receipt := &etypes.Receipt{
 						Status: etypes.ReceiptStatusSuccessful, TxHash: txHash,
 						BlockHash: blockHash, BlockNumber: big.NewInt(100),
 						Logs: []*etypes.Log{},
 					}
+					for i := range logs {
+						if logs[i].TxHash == txHash {
+							receipt.Logs = append(receipt.Logs, &logs[i])
+						}
+					}
+					result = receipt
 				case "eth_getLogs":
 					filteredCalls.Add(1)
 					var filter struct {
@@ -265,11 +285,18 @@ func TestInterpretUnwrapSelectsLogByIdentity(t *testing.T) {
 				checkStartupCursor(t, network, initial)
 				return
 			}
-			if err := network.InterpretSendBlockData(send, !tc.historical, 42); err != nil {
-				t.Fatal(err)
+			if err := network.InterpretSendBlockData(send, !tc.historical, 42); (err != nil) != tc.held {
+				t.Fatalf("error %v, want held %v", err, tc.held)
 			}
 			if filteredCalls.Load() != 1 {
 				t.Fatalf("expected one filtered block query, got %d", filteredCalls.Load())
+			}
+			if tc.held {
+				if got, _ := state.GetState(); got != common.LiveState {
+					t.Fatalf("held receive changed node state to %d", got)
+				}
+				checkStartupCursor(t, network, 1)
+				return
 			}
 			gotState, err := state.GetState()
 			if err != nil {

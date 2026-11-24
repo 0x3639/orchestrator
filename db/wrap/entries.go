@@ -20,93 +20,122 @@ func getWrapEventKey(id types.Hash) []byte {
 	return zcommon.JoinBytes(getWrapEventPrefix(), id.Bytes())
 }
 
-// AddWrapRequest stores the event only if no record exists for its id. Every
-// caller wants a missing record created, and the stored record is newer than
-// any copy built from a Zenon receive or RPC response: a late or replayed
-// WrapToken receive, or a caller that saw the record missing before another
-// goroutine added and updated it, must not reset its signature, sent flag or
-// redeem status.
+// AddWrapRequest stores a wrap request read from the bridge. A record that
+// exists keeps what this node wrote to it, its redeem status included. Only a
+// missing signature is filled in from the bridge's.
 func (es *eventStore) AddWrapRequest(event events.WrapRequestZnn) error {
 	es.mu.Lock()
 	defer es.mu.Unlock()
-	existing, err := es.GetWrapRequestById(event.Id)
+	data, err := es.DB.Get(getWrapEventKey(event.Id))
+	if errors.Is(err, leveldb.ErrNotFound) {
+		return es.putWrap(&event)
+	}
 	if err != nil {
-		return err
-	}
-	if existing != nil {
-		return nil
-	}
-	return es.putWrapRequest(&event)
-}
-
-// putWrapRequest writes the whole record. Callers must hold es.mu.
-func (es *eventStore) putWrapRequest(event *events.WrapRequestZnn) error {
-	if eventBytes, err := event.Serialize(); err != nil {
 		es.SendSigInt()
 		return err
-	} else {
-		if err := es.DB.Put(getWrapEventKey(event.Id), eventBytes); err != nil {
+	}
+	// A repeated Zenon observation can supply a missing signature. Other
+	// signature changes go through the explicit update and resign paths.
+	if event.Signature != "" {
+		current, err := events.DeserializeWrapEventZnn(data)
+		if err != nil {
 			es.SendSigInt()
 			return err
+		}
+		if current.Signature == "" {
+			current.Signature = event.Signature
+			current.SentSignature = current.SentSignature || event.SentSignature
+			return es.putWrap(current)
 		}
 	}
 	return nil
 }
 
-func (es *eventStore) GetWrapRequestById(id types.Hash) (*events.WrapRequestZnn, error) {
-	data, err := es.DB.Get(getWrapEventKey(id))
-	if err == leveldb.ErrNotFound {
-		return nil, nil
-	}
-	if err != nil {
-		es.SendSigInt()
-		return nil, err
-	}
-
-	event, err := events.DeserializeWrapEventZnn(data)
-	if err != nil {
-		es.SendSigInt()
-		return nil, err
-	}
-	return event, nil
+// AddWrapRequestKeepingStatus stores a request read from the bridge and keeps
+// the redeem status of a record that exists. AddWrapRequest already does both.
+func (es *eventStore) AddWrapRequestKeepingStatus(event events.WrapRequestZnn) error {
+	return es.AddWrapRequest(event)
 }
 
-// updateWrapRequest re-reads the record and writes it back with one field
-// changed, all under es.mu. The EVM listener (redeem status), the signing loop
-// (signature, sent flag) and the Zenon listener (sent flag, signature) update
-// the same record from different goroutines; without the lock a stale read in
-// one of them writes back over a field another one set in between.
-func (es *eventStore) updateWrapRequest(id types.Hash, change func(*events.WrapRequestZnn)) error {
+// AddWrapRequestIfMissing stores the request unless a record of it exists,
+// and reports whether it stored it. The read and the write are one operation
+// under the record lock.
+func (es *eventStore) AddWrapRequestIfMissing(event events.WrapRequestZnn) (bool, error) {
 	es.mu.Lock()
 	defer es.mu.Unlock()
-	event, err := es.GetWrapRequestById(id)
+	_, err := es.DB.Get(getWrapEventKey(event.Id))
+	if errors.Is(err, leveldb.ErrNotFound) {
+		return true, es.putWrap(&event)
+	}
+	if err != nil {
+		es.SendSigInt()
+		return false, err
+	}
+	return false, nil
+}
+
+func (es *eventStore) putWrap(event *events.WrapRequestZnn) error {
+	data, err := event.Serialize()
+	if err == nil {
+		err = es.putDurable(getWrapEventKey(event.Id), data)
+	}
+	if err != nil {
+		es.SendSigInt()
+	}
+	return err
+}
+
+func (es *eventStore) GetWrapRequestById(id types.Hash) (*events.WrapRequestZnn, error) {
+	data, err := es.DB.Get(getWrapEventKey(id))
+	if errors.Is(err, leveldb.ErrNotFound) {
+		return nil, nil
+	}
+	if err == nil {
+		var event *events.WrapRequestZnn
+		event, err = es.decodeWrap(data)
+		if err == nil {
+			return event, nil
+		}
+	}
+	es.SendSigInt()
+	return nil, err
+}
+
+// Use the underlying Zenon row here so signature writes never copy an EVM log
+// observation into the legacy, unpositioned status field.
+func (es *eventStore) updateWrap(id types.Hash, update func(*events.WrapRequestZnn)) error {
+	es.mu.Lock()
+	defer es.mu.Unlock()
+	data, err := es.DB.Get(getWrapEventKey(id))
+	if err != nil {
+		if !errors.Is(err, leveldb.ErrNotFound) {
+			es.SendSigInt()
+		}
+		return err
+	}
+	event, err := events.DeserializeWrapEventZnn(data)
 	if err != nil {
 		es.SendSigInt()
 		return err
 	}
-	if event == nil {
-		return leveldb.ErrNotFound
-	}
-	change(event)
-	return es.putWrapRequest(event)
+	update(event)
+	return es.putWrap(event)
 }
 
 func (es *eventStore) SetWrapRequestStatus(id types.Hash, status uint32) error {
-	return es.updateWrapRequest(id, func(event *events.WrapRequestZnn) {
-		event.RedeemStatus = status
+	return es.updateWrap(id, func(event *events.WrapRequestZnn) {
+		// Resign reconciliation starts from an unredeemed wrap and reads the
+		// contract without a log position. Preserve any known terminal status.
+		event.RedeemStatus = max(event.RedeemStatus, status)
 	})
 }
 
 func (es *eventStore) SetWrapRequestSignature(id types.Hash, signature string) error {
-	return es.updateWrapRequest(id, func(event *events.WrapRequestZnn) {
-		event.Signature = signature
-	})
+	return es.updateWrap(id, func(event *events.WrapRequestZnn) { event.Signature = signature })
 }
 
 func (es *eventStore) SetWrapRequestSentSignature(id types.Hash, value bool) error {
-	return es.updateWrapRequest(id, func(event *events.WrapRequestZnn) {
-		event.SentSignature = value
-	})
+	return es.updateWrap(id, func(event *events.WrapRequestZnn) { event.SentSignature = value })
 }
 
 func (es *eventStore) GetUnsentSignedWrapRequests() ([]*events.WrapRequestZnn, error) {
@@ -126,6 +155,7 @@ func (es *eventStore) GetUnsentSignedWrapRequests() ([]*events.WrapRequestZnn, e
 			continue
 		}
 
+		// Filtered on the row alone, before its redeem status is looked up.
 		event, err := events.DeserializeWrapEventZnn(iterator.Value())
 		if err != nil {
 			es.SendSigInt()
@@ -133,6 +163,10 @@ func (es *eventStore) GetUnsentSignedWrapRequests() ([]*events.WrapRequestZnn, e
 		}
 		if event.SentSignature || len(event.Signature) == 0 {
 			continue
+		}
+		if event, err = es.withRedeemStatus(event); err != nil {
+			es.SendSigInt()
+			return nil, err
 		}
 
 		result = append(result, event)
@@ -157,7 +191,7 @@ func (es *eventStore) GetResignableWrapRequests() ([]*events.WrapRequestZnn, err
 			continue
 		}
 
-		event, err := events.DeserializeWrapEventZnn(iterator.Value())
+		event, err := es.decodeWrap(iterator.Value())
 		if err != nil {
 			es.SendSigInt()
 			return nil, err
@@ -193,7 +227,7 @@ func (es *eventStore) GetUnredeemedWrapRequests() ([]*events.WrapRequestZnn, err
 			continue
 		}
 
-		event, err := events.DeserializeWrapEventZnn(iterator.Value())
+		event, err := es.decodeWrap(iterator.Value())
 		if err != nil {
 			es.SendSigInt()
 			return nil, err
@@ -224,7 +258,7 @@ func (es *eventStore) GetUnsignedWrapRequests() ([]*events.WrapRequestZnn, error
 			continue
 		}
 
-		event, err := events.DeserializeWrapEventZnn(iterator.Value())
+		event, err := es.decodeWrap(iterator.Value())
 		if err != nil {
 			es.SendSigInt()
 			return nil, err
@@ -253,6 +287,38 @@ func (es *eventStore) SaveReceiveCoverageCheckpoint(height uint64) error {
 	var data [8]byte
 	binary.LittleEndian.PutUint64(data[:], height)
 	return es.DB.Put(receiveCoverageKey, data[:])
+}
+
+// BridgeWatchFrom returns the first bridge account height this database
+// vouches for, or zero while it vouches for none. A receive at or above it is
+// new to this node whenever it is read. Startup sets it when it reaches the
+// tip, or lower when it meets a receive it has to check on the way there.
+func (es *eventStore) BridgeWatchFrom() (uint64, error) {
+	data, err := es.DB.Get(bridgeWatchKey)
+	if err == leveldb.ErrNotFound {
+		return 0, nil
+	}
+	if err != nil {
+		es.SendSigInt()
+		return 0, err
+	}
+	if len(data) != 8 || binary.LittleEndian.Uint64(data) == 0 {
+		return 0, errors.New("invalid bridge watch record")
+	}
+	return binary.LittleEndian.Uint64(data), nil
+}
+
+func (es *eventStore) SaveBridgeWatchFrom(height uint64) error {
+	if height == 0 {
+		return errors.New("bridge watch record needs an account height")
+	}
+	var data [8]byte
+	binary.LittleEndian.PutUint64(data[:], height)
+	if err := es.DB.Put(bridgeWatchKey, data[:]); err != nil {
+		es.SendSigInt()
+		return err
+	}
+	return nil
 }
 
 func (es *eventStore) GetLastUpdateHeight() (uint64, error) {

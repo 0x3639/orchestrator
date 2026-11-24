@@ -134,6 +134,11 @@ describes the object in `result`. The TCP listener continues to serve the three
 legacy methods. Keep the Unix socket private when retiring public health RPC.
 
 - **Startup and sync.** Read `phase`, `bridgeState`, and build version and commit.
+  `phase` stays `syncingBridge` until the bridge account has been read to its
+  tip and every EVM network has finished its startup scan, including while a
+  [startup is held](operations/states.md#a-held-startup). Until it is `running`
+  the signer signs no transfer; with `bridgeState` `EmergencyState` it is
+  signing the halt.
   Zenon reports provider sync state, the observed frontier momentum, and the
   processed bridge-account receive height. These heights have different units.
   Each EVM chain reports provider sync state, observed head and the inclusive
@@ -143,6 +148,17 @@ legacy methods. Keep the Unix socket private when retiring public health RPC.
   receive coverage. An orderly shutdown saves a complete receive checkpoint
   independently of the bridge cursor. Matching checkpoints retain coverage
   across restarts.
+- **Held listener.** `zenon.receiveHold` is `null` while the bridge-account
+  listener advances or idles. When it cannot get past one account height it
+  carries that `height`, the time the hold began (`since`) and the number of
+  `attempts`. The listener reads nothing after a held height, so alert on any
+  hold that lasts more than a few minutes. After ten minutes at one height a
+  signer that is signing transfers stops itself; see [Signer states](operations/states.md). A
+  receive that holds startup is reported in the same field. The field is
+  absent from snapshots of earlier builds and present, as `null` or as an
+  object, in every snapshot of this one. A collector that validates against a copy of the
+  earlier schema rejects the extra property, so update the collector's schema
+  before upgrading the first signer.
 - **Pending work.** Each direction reports finality waits, unsigned observations,
   the actual selection for a signing window, signed records awaiting submission,
   and the last successfully persisted signing window. Each measurement carries

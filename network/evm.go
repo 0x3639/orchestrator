@@ -4,14 +4,15 @@ import (
 	"context"
 	"crypto/ecdsa"
 	"fmt"
+	"github.com/ethereum/go-ethereum"
 	ecommon "github.com/ethereum/go-ethereum/common"
 	etypes "github.com/ethereum/go-ethereum/core/types"
 	"github.com/joncrlsn/dque"
 	"github.com/pkg/errors"
 	"github.com/zenon-network/go-zenon/common/types"
-	"github.com/zenon-network/go-zenon/vm/constants"
 	"github.com/zenon-network/go-zenon/vm/embedded/definition"
 	"go.uber.org/zap"
+	"math"
 	"orchestrator/common/config"
 	"orchestrator/common/storage"
 	"orchestrator/db"
@@ -19,8 +20,8 @@ import (
 	"orchestrator/rpc"
 	"os"
 	"slices"
-	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 
 	"math/big"
@@ -31,8 +32,12 @@ import (
 
 type evmNetwork struct {
 	// A runtime addition uses its own client until startup succeeds.
-	client        *rpc.EvmRpc
-	startupDone   <-chan struct{}
+	client      *rpc.EvmRpc
+	startupDone <-chan struct{}
+	// When set, closed once this start has read the bridge account to its
+	// tip. Until then a scan can be ahead of that read: see
+	// aheadOfBridgeAccount.
+	bridgeRead    <-chan struct{}
 	rollbackStore func()
 	// stopHealth is set by Start and read by Stop and by a runtime removal,
 	// which can run on other goroutines; healthMu guards it.
@@ -65,6 +70,30 @@ type evmNetwork struct {
 	// one agreement check. It is never used for deletions.
 	canonicalMu    sync.Mutex
 	canonicalCache map[uint64]ecommon.Hash
+
+	// heldRedeems are registrations whose check has not produced an answer.
+	// watchRedeems rechecks them. After a restart the range scan meets them
+	// again: the redeem checkpoint does not pass a registration the scan
+	// could not check.
+	heldMu         sync.Mutex
+	heldRedeems    map[heldRedeemKey]*heldRedeem
+	heldRetryEvery time.Duration // zero selects heldRedeemRetryInterval
+
+	// scanPaused is set when the last Sync stopped for a pending redeem halt.
+	// The subscription loop then tries the scan again soon, so a released
+	// halt does not leave the range unscanned until the next refresh.
+	scanPaused atomic.Bool
+	// settleChecked is set once a scan has looked at the restored redeem
+	// incidents of this chain, or found none pending. See
+	// NetworksManager.RestoredIncidentsChecked.
+	settleChecked atomic.Bool
+	// scanned is set once a scan has reached the head without stopping for a
+	// pending redeem halt and without a final registration left unchecked.
+	// Startup completes only after that.
+	scanned atomic.Bool
+	// finalUnchecked is set when the last Sync held a final registration,
+	// above its redeem checkpoint limit, that it could not check.
+	finalUnchecked atomic.Bool
 }
 
 // agreedHashForLog returns the endpoint-agreed canonical hash at number,
@@ -232,13 +261,20 @@ func (eN *evmNetwork) Start() (startErr error) {
 		}
 		eN.backfillBlocks = 0
 	}
-	if err := eN.Sync(); err != nil {
-		eN.logger.Debug(err)
-		return err
+	// A registration held during this first scan is rechecked while the scan
+	// is still working through later ranges.
+	var syncErr error
+	eN.withRedeemWatch(func() { syncErr = eN.Sync() })
+	if syncErr != nil {
+		eN.logger.Debug(syncErr)
+		return syncErr
 	}
 
 	select {
 	case <-eN.startupDone:
+		return context.Canceled
+	case <-eN.done:
+		// Stopped or removed while it was starting.
 		return context.Canceled
 	default:
 	}
@@ -324,16 +360,51 @@ const (
 	syncProgressEvery = 25
 )
 
+// Sync scans from the stored checkpoints to the head. It returns nil also
+// when it stopped early for a pending redeem halt; scanPaused then says so.
+// A pass that held a final registration it could not check does not count
+// as having scanned the chain: a later pass, which the redeem checkpoint
+// makes revisit it, has to.
 func (eN *evmNetwork) Sync() error {
+	err := eN.sync()
+	if err == nil && !eN.scanPaused.Load() && !eN.finalUnchecked.Load() {
+		eN.scanned.Store(true)
+	}
+	return err
+}
+
+func (eN *evmNetwork) sync() error {
 	eN.logger.Info("In sync evm")
 	eN.resetCanonicalCache()
-	startHeight, err := eN.eventsStore().GetLastUpdateHeight()
+	eN.scanPaused.Store(false)
+	eN.finalUnchecked.Store(false)
+	if eN.state.RedeemHaltGeneration() != 0 {
+		// The first scan after a restart runs before anything acts on a
+		// restored incident. Release what the chain has settled since, and
+		// record whether what remains can be paid.
+		eN.settlePendingIncidents(nil, true)
+	}
+	eN.settleChecked.Store(true)
+	startHeight, redeemFrom, legacy, err := eN.eventsStore().GetScanHeights(eN.ConfirmationsToFinality())
 	if err != nil {
 		return errors.Wrapf(err, "read sync cursor for chainId %d", eN.ChainId())
 	}
 	eN.logger.Info("updateHeight: ", startHeight)
 
-	fromBlock := startHeight
+	if legacy {
+		provisional, err := eN.dbManager.ZnnStorage().HasLegacyRedeemStatuses(eN.ChainId())
+		if err != nil {
+			return err
+		}
+		if provisional {
+			redeemFrom = min(redeemFrom, eN.ContractDeploymentHeight())
+		}
+	}
+	scanStart := redeemFrom
+	fromBlock := scanStart
+	// Once a range defers a near-tip block, later ranges cannot move the
+	// redeem checkpoint past that gap, even if the head advances mid-pass.
+	finalizedTip := uint64(math.MaxUint64)
 	startedAt := time.Now()
 	ranges := 0
 	attempts := 0
@@ -364,6 +435,12 @@ func (eN *evmNetwork) Sync() error {
 	}
 
 	for {
+		// Startup must be able to enter the halt ceremony even when later
+		// ranges are unavailable. Resume this range after the halt completes.
+		if eN.state.RedeemHaltGeneration() != 0 {
+			eN.scanPaused.Store(true)
+			return nil
+		}
 		latestBlock, rpcErr := eN.EvmRpc().BlockNumber()
 		eN.health.UpdateNetwork(eN.ChainId(), func(n *snapshot.Network) { n.HeadHeight = snapshot.Reading(latestBlock, rpcErr) })
 		if rpcErr != nil {
@@ -373,7 +450,7 @@ func (eN *evmNetwork) Sync() error {
 			continue
 		}
 
-		if fromBlock > latestBlock {
+		if startHeight > latestBlock || fromBlock > latestBlock {
 			// todo this can happen if we have a fork
 			return errors.Errorf("sync evm problem for network: %s, chainId: %d", eN.NetworkName(), eN.ChainId())
 		}
@@ -431,10 +508,38 @@ func (eN *evmNetwork) Sync() error {
 			}
 			continue
 		}
+		depth := eN.ConfirmationsToFinality()
+		finalizedTip = min(finalizedTip, latestBlock-min(latestBlock, depth))
 		interpretFailed := false
 		for _, log := range logs {
-			// Recent events enter the live confirmation queue.
-			if err := eN.InterpretLog(log, latestBlock-log.BlockNumber < eN.ConfirmationsToFinality()); err != nil {
+			recent := latestBlock-log.BlockNumber < depth
+			if len(log.Topics) > 0 && isRedeemTopic(log.Topics[0]) {
+				if log.BlockNumber < redeemFrom {
+					continue
+				}
+				if recent || log.BlockNumber > finalizedTip {
+					// The redeem checkpoint cannot pass this tail in this
+					// pass, so a later pass revisits it. A registration is
+					// still examined now: by the live rules while it is
+					// young, as the subscription would, and by the finalized
+					// rules when only the checkpoint limit, fixed earlier in
+					// a long pass, keeps it here. A check without an answer
+					// is held for retry and does not stall the range.
+					if log.Topics[0] == common.RegisteredRedeemSigHash {
+						if !eN.examineRegistration(log, recent) && !recent {
+							eN.finalUnchecked.Store(true)
+						}
+						if eN.state.RedeemHaltGeneration() != 0 {
+							eN.scanPaused.Store(true)
+							return nil
+						}
+					}
+					continue
+				}
+			} else if log.BlockNumber < startHeight {
+				continue // Only redeem verification trails the ordinary scan.
+			}
+			if err := eN.InterpretLog(log, recent); err != nil {
 				// Do not advance the cursor past a range with an unprocessed
 				// log; the same range is retried. Skipping it would silently
 				// lose the event on this signer only.
@@ -445,6 +550,10 @@ func (eN *evmNetwork) Sync() error {
 				}
 				interpretFailed = true
 				break
+			}
+			if eN.state.RedeemHaltGeneration() != 0 {
+				eN.scanPaused.Store(true)
+				return nil
 			}
 		}
 		if interpretFailed {
@@ -459,17 +568,19 @@ func (eN *evmNetwork) Sync() error {
 			eN.logger.Infof("Sync for chainId %d: %d consecutive ranges succeeded, widening the eth_getLogs window to %d blocks", eN.ChainId(), growAfterRanges, newSize)
 		}
 
-		if err := eN.eventsStore().SetLastUpdateHeight(rangeEnd); err != nil {
+		through := max(startHeight, rangeEnd)
+		redeemFrom = max(redeemFrom, min(rangeEnd, finalizedTip))
+		if err := eN.eventsStore().SetScanHeights(through, redeemFrom); err != nil {
 			return err
 		}
 		eN.health.UpdateNetwork(eN.ChainId(), func(n *snapshot.Network) {
-			n.ScannedThrough = snapshot.Measure(rangeEnd)
+			n.ScannedThrough = snapshot.Measure(through)
 			n.LastRangeAt = n.ScannedThrough.AsOf
 		})
 		ranges++
 		if ranges%syncProgressEvery == 0 {
-			done := rangeEnd - startHeight
-			total := latestBlock - startHeight
+			done := rangeEnd - scanStart
+			total := latestBlock - scanStart
 			pct := float64(0)
 			if total > 0 {
 				pct = 100 * float64(done) / float64(total)
@@ -539,6 +650,9 @@ func (eN *evmNetwork) InterpretLog(log etypes.Log, live bool) error {
 			if !slices.Equal(source.Topics, log.Topics) || !slices.Equal(source.Data, log.Data) {
 				return errors.New("historical range log differs from the agreed unwrap evidence")
 			}
+			if err := eN.recordSourceLocation(log); err != nil {
+				return err
+			}
 		}
 		eventsToProcess, err := eN.unwrapRequestsFromLog(log, nil)
 		if err != nil {
@@ -566,114 +680,16 @@ func (eN *evmNetwork) InterpretLog(log etypes.Log, live bool) error {
 			}
 		}
 	case common.RegisteredRedeemSigHash.Hex():
-		registeredRedeem, errParse := eN.EvmRpc().Bridge().ParseRegisteredRedeem(log)
-		if errParse != nil {
-			return errParse
-		}
-
-		nonceBytes := ecommon.LeftPadBytes(registeredRedeem.Nonce.Bytes(), 32)
-		id, err := types.BytesToHash(nonceBytes)
-		if err != nil {
-			return err
-		}
-
-		eN.logger.Infof("found RegisteredRedeemSigHash for nonce: %s", id.String())
-
-		if rpcEvent, rpcErr := eN.rpcManager.Znn().GetWrapTokenRequestById(id); rpcErr != nil {
-			eN.logger.Debugf("call: eN.rpcManager.Znn().GetWrapTokenRequestById(id) error: %s", rpcErr.Error())
-			if rpcErr.Error() == constants.ErrDataNonExistent.Error() {
-				if live {
-					if stateErr := eN.state.SetState(common.EmergencyState); stateErr != nil {
-						eN.logger.Info("sent SIGINT from here 4")
-						eN.requestStop()
-						return stateErr
-					}
-				}
-			}
-			return rpcErr
-		} else if rpcEvent == nil {
-			eN.logger.Info("wrap event not found for register redeem id: ", id.String())
-			if live {
-				if stateErr := eN.state.SetState(common.EmergencyState); stateErr != nil {
-					eN.logger.Info("sent SIGINT from here 5")
-					eN.requestStop()
-					return stateErr
-				}
-			}
-		} else {
-			deductedFeeAmount := big.NewInt(0).Set(rpcEvent.Amount)
-			deductedFeeAmount.Sub(deductedFeeAmount, rpcEvent.Fee)
-
-			// We have to check every field here because one that has control over tss can create a redeem and spoof the id, token, amount or destination
-			if deductedFeeAmount.Cmp(registeredRedeem.Amount) != 0 || rpcEvent.ToAddress != strings.ToLower(registeredRedeem.To.String()) ||
-				rpcEvent.TokenAddress != strings.ToLower(registeredRedeem.Token.String()) {
-				if live {
-					if stateErr := eN.state.SetState(common.EmergencyState); stateErr != nil {
-						eN.logger.Info("sent SIGINT from here 8")
-						eN.requestStop()
-						return stateErr
-					}
-				}
-			} else {
-				if event, storageErr := eN.dbManager.ZnnStorage().GetWrapRequestById(id); storageErr != nil {
-					return storageErr
-				} else if event == nil {
-					if storageErr = eN.dbManager.ZnnStorage().AddWrapRequest(common.ZnnWrapToOrchestratorWrap(rpcEvent)); storageErr != nil {
-						return storageErr
-					}
-				}
-				if err := eN.dbManager.ZnnStorage().SetWrapRequestStatus(id, common.PendingRedeemStatus); err != nil {
-					return err
-				}
-			}
-		}
-	case common.RedeemedSigHash.Hex():
-		redeem, errParse := eN.EvmRpc().Bridge().ParseRedeemed(log)
-		if errParse != nil {
-			return errParse
-		}
-
-		nonceBytes := ecommon.LeftPadBytes(redeem.Nonce.Bytes(), 32)
-		id, err := types.BytesToHash(nonceBytes)
-		if err != nil {
-			return err
-		}
-
-		if event, storageErr := eN.dbManager.ZnnStorage().GetWrapRequestById(id); storageErr != nil {
-			return storageErr
-		} else if event == nil {
-			// todo check if event exists on znn otherwise in this case there is not much we can do
-		} else {
-			if err = eN.dbManager.ZnnStorage().SetWrapRequestStatus(id, common.RedeemedStatus); err != nil {
-				return err
-			}
-		}
-	case common.RevokedRedeemSigHash.Hex():
-		revokedRedeem, errParse := eN.EvmRpc().Bridge().ParseRevokedRedeem(log)
-		if errParse != nil {
-			return errParse
-		}
-
-		nonceBytes := ecommon.LeftPadBytes(revokedRedeem.Nonce.Bytes(), 32)
-
-		id, err := types.BytesToHash(nonceBytes)
-		if err != nil {
-			return err
-		}
-
 		if live {
-			common.AdministratorLogger.Infof("RevokedRedeemSigHash %s", id.String())
+			return eN.checkLiveRedeem(log)
 		}
-
-		if event, storageErr := eN.dbManager.ZnnStorage().GetWrapRequestById(id); storageErr != nil {
-			return storageErr
-		} else if event == nil {
-			// todo check if event exists on znn otherwise in this case there is not much we can do
-		} else {
-			if err = eN.dbManager.ZnnStorage().SetWrapRequestStatus(id, common.RevokedStatus); err != nil {
-				return err
-			}
+		err := eN.registerRedeem(log, false)
+		if err == nil {
+			eN.noteRedeemCheck(log, nil, false) // The finalized scan answered a held check.
 		}
+		return err
+	case common.RedeemedSigHash.Hex(), common.RevokedRedeemSigHash.Hex():
+		return eN.applyRedeemOutcome(log, live)
 	case common.HaltedSigHash.Hex():
 		if live {
 			common.AdministratorLogger.Info("HaltedSigHash")
@@ -853,16 +869,78 @@ const (
 // is logged and retried at the next refresh; it never leaves the node
 // without a subscription. The exception is a corrupt local sync cursor,
 // which retrying cannot repair: the store has already requested a stop,
-// and the loop logs the cursor and returns.
+// and the loop logs the cursor and returns. Registrations whose live check gave no answer are
+// rechecked beside it, at their own pace, while a Sync or a resubscribe waits.
 func (eN *evmNetwork) SubscribeToEvents() {
+	eN.withRedeemWatch(eN.subscribeToEvents)
+}
+
+// refreshInterval is the time to the next catch-up Sync: the ordinary refresh,
+// or a short retry while the last scan stopped for a pending redeem halt, or
+// while startup waits for a scan that left a final registration unchecked.
+func (eN *evmNetwork) refreshInterval() time.Duration {
+	if eN.scanPaused.Load() || eN.finalUnchecked.Load() && !eN.scanned.Load() {
+		return pausedScanRetryRounds * eN.redeemRetryInterval()
+	}
+	return subscriptionRefreshInterval
+}
+
+// subscribeToLogs sets up the log subscription. An endpoint can leave the
+// setup unanswered, so it gives up when the next catch-up Sync is due
+// (catchUpDue, or one refresh from now before the first), or when the
+// network stops. The catch-up then runs on the error path.
+func (eN *evmNetwork) subscribeToLogs(catchUpDue time.Time) (ethereum.Subscription, chan etypes.Log, error) {
+	if catchUpDue.IsZero() {
+		catchUpDue = time.Now().Add(eN.refreshInterval())
+	}
+	ctx, cancel := context.WithDeadline(context.Background(), catchUpDue)
+	defer cancel()
+	go func() {
+		select {
+		case <-eN.done:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+	return eN.EvmRpc().SubscribeToLogs(ctx)
+}
+
+func (eN *evmNetwork) subscribeToEvents() {
 	eN.logger.Infof("SubscribeToEvents for network with chainId: %d", eN.ChainId())
 	resubscribeBackoff := processEventsBaseBackoff
+	var nextCatchUp time.Time
+	// catchUp reports false when the loop must stop: a corrupt local sync
+	// cursor cannot be repaired by retrying, and the store has already
+	// requested a stop and kept the bad value.
+	catchUp := func() bool {
+		if err := eN.Sync(); errors.Is(err, db.ErrCorruptCursor) {
+			eN.logger.Errorf("Stopping EVM sync for chainId %d: %v", eN.ChainId(), err)
+			return false
+		} else if err != nil {
+			eN.logger.Errorf("Sync for chainId %d failed and will be retried; the sync cursor did not advance: %v", eN.ChainId(), err)
+		}
+		nextCatchUp = time.Now().Add(eN.refreshInterval())
+		return true
+	}
 
 	for {
-		logSub, logChan, err := eN.EvmRpc().SubscribeToLogs()
+		// A catch-up that fell due during a pause runs first, so the setup
+		// below always has until the next one.
+		if !nextCatchUp.IsZero() && !time.Now().Before(nextCatchUp) {
+			if !catchUp() {
+				return
+			}
+		}
+		logSub, logChan, err := eN.subscribeToLogs(nextCatchUp)
 		if err != nil {
+			// HTTP range queries may still work while subscriptions are down.
+			if !time.Now().Before(nextCatchUp) {
+				if !catchUp() {
+					return
+				}
+			}
 			eN.logger.Errorf("cannot subscribe to logs for chainId %d: %v; retrying in %s", eN.ChainId(), err, resubscribeBackoff)
-			if !eN.sleep(resubscribeBackoff) {
+			if !eN.sleep(min(resubscribeBackoff, eN.refreshInterval())) {
 				return
 			}
 			resubscribeBackoff *= 2
@@ -873,7 +951,8 @@ func (eN *evmNetwork) SubscribeToEvents() {
 		}
 		started := time.Now()
 
-		refresh := time.NewTimer(subscriptionRefreshInterval)
+		refresh := time.NewTimer(eN.refreshInterval())
+		dropped := false
 	consume:
 		for {
 			select {
@@ -883,31 +962,35 @@ func (eN *evmNetwork) SubscribeToEvents() {
 				return
 			case subErr := <-logSub.Err():
 				eN.logger.Errorf("log subscription for chainId %d ended: %v; catching up and resubscribing", eN.ChainId(), subErr)
+				dropped = true
 				break consume
 			case newLog := <-logChan:
 				if errInterpret := eN.InterpretLog(newLog, true); errInterpret != nil {
 					eN.logger.Debug(errInterpret)
 				}
 			case <-refresh.C:
+				// A scan that stopped for a pending halt has nothing to do
+				// until the halt is released. Keep this subscription and
+				// look again soon, up to the ordinary refresh.
+				if eN.scanPaused.Load() && eN.state.RedeemHaltGeneration() != 0 && time.Since(started) < subscriptionRefreshInterval {
+					refresh.Reset(eN.refreshInterval())
+					continue
+				}
 				break consume
 			}
 		}
 		refresh.Stop()
 		logSub.Unsubscribe()
 
-		if errSync := eN.Sync(); errors.Is(errSync, db.ErrCorruptCursor) {
-			// The store has already requested a stop and kept the bad value.
-			eN.logger.Errorf("Stopping EVM sync for chainId %d: %v", eN.ChainId(), errSync)
+		if !catchUp() {
 			return
-		} else if errSync != nil {
-			eN.logger.Errorf("Sync for chainId %d failed and will be retried at the next refresh; the sync cursor did not advance: %v", eN.ChainId(), errSync)
 		}
 
-		if time.Since(started) < subscriptionHealthyAfter {
+		if dropped && time.Since(started) < subscriptionHealthyAfter {
 			// The provider accepted the subscription and dropped it almost
 			// at once; do not spin through subscribe and Sync.
 			eN.logger.Warnf("log subscription for chainId %d lasted only %s; resubscribing in %s", eN.ChainId(), time.Since(started).Round(time.Second), resubscribeBackoff)
-			if !eN.sleep(resubscribeBackoff) {
+			if !eN.sleep(min(resubscribeBackoff, eN.refreshInterval())) {
 				return
 			}
 			resubscribeBackoff *= 2
@@ -1057,11 +1140,42 @@ func (eN *evmNetwork) ProcessEvents() {
 				// signature or a sent status and must not be reset.
 				eN.logger.Infof("Event %s already in persistent storage, keeping the existing record", key)
 			}
+			// A record made from the bridge's registration has no source
+			// block. The confirmed block is recorded on it, keeping its status
+			// and signature, and as the event's location.
+			if err := eN.recordConfirmedBlock(frontEvent); err != nil {
+				eN.logger.Error(err)
+				eN.requestStop()
+				return
+			}
 			if !eN.dropQueuedEvent() {
 				return
 			}
 		}
 	}
+}
+
+// recordConfirmedBlock writes the block of a confirmed event to the stored
+// record of that event when the record has none. A record that names another
+// block keeps it, and the confirmed block is stored as the event's location,
+// which the bridge listener turns to when the record's block has been
+// replaced.
+func (eN *evmNetwork) recordConfirmedBlock(confirmed *events.UnwrapRequestEvm) error {
+	if err := eN.eventsStore().FillUnwrapRequestBlock(*confirmed); err != nil {
+		return err
+	}
+	// The affiliate's request names the same source log under its own index,
+	// whether or not the event was split when it was queued.
+	indexes := []uint32{confirmed.LogIndex}
+	if confirmed.LogIndex < common.AffiliateLogIndexAddition && uint64(confirmed.LogIndex) <= math.MaxUint32-uint64(common.AffiliateLogIndexAddition) {
+		indexes = append(indexes, confirmed.LogIndex+common.AffiliateLogIndexAddition)
+	}
+	for _, index := range indexes {
+		if err := eN.eventsStore().SaveUnwrapSourceLocation(confirmed.TransactionHash, index, confirmed.BlockNumber, confirmed.BlockHash); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // dropQueuedEvent removes the head of the unconfirmed queue. It returns

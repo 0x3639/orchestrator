@@ -1,12 +1,14 @@
 package network
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
 	"github.com/ethereum/go-ethereum"
 	ecommon "github.com/ethereum/go-ethereum/common"
+	etypes "github.com/ethereum/go-ethereum/core/types"
 	"github.com/pkg/errors"
 	"github.com/zenon-network/go-zenon/chain/nom"
 	"github.com/zenon-network/go-zenon/common/types"
@@ -27,6 +29,7 @@ import (
 	"orchestrator/health/snapshot"
 	"orchestrator/rpc"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -47,6 +50,29 @@ type znnNetwork struct {
 	highestSigningHeight uint64
 	stopHealth           func()
 	coverage             receiveCoverage
+	// The first bridge account height this database vouches for, or zero. A
+	// receive at or above it is new to this node whenever it is read. Startup
+	// writes it before the listener goroutine starts.
+	watchFrom uint64
+	// The bridge account height the listener cannot pass, if any, and the
+	// highest confirmed block its last page listed. Only the listener
+	// goroutine reads and writes them.
+	hold       bridgeAccountHold
+	pageListed uint64
+	// Set when a start is held.
+	heldStart bool
+	// This start read a change to what the node takes from the bridge when
+	// it starts as history: see errSettingsRead.
+	skippedSettings bool
+	// The highest confirmed block any page listed to this start.
+	listedThrough uint64
+	// Closed when startup has read the bridge account to its tip.
+	startupRead chan struct{}
+	// The startup scans of the EVM networks beside a held startup.
+	scans startupScans
+	// Tests replace the listener's clock and shorten its retry pause.
+	now        func() time.Time
+	retryPause time.Duration
 	config.ZnnParams
 	dbManager         networkEventStores
 	rpcManager        *rpc.Manager
@@ -129,7 +155,11 @@ func NewZnnNetwork(rpcManager *rpc.Manager, dbManager *manager.Manager, networkM
 
 /// Utils
 
-func (rC *znnNetwork) Start() error {
+// Start reads the bridge account to its tip and then follows it. held says
+// the first read stopped at a block that startupHolds keeps this process for:
+// the read is then retried in the background, the listener follows once it
+// succeeds, and startupRead is closed at that point instead of on return.
+func (rC *znnNetwork) Start() (held bool, err error) {
 	if rC.state.HealthStore() != nil {
 		rC.stopHealth = rC.state.HealthStore().Poll(func(ctx context.Context) {
 			info, err := rC.ZnnRpc().SampleSyncInfo(ctx)
@@ -138,17 +168,90 @@ func (rC *znnNetwork) Start() error {
 	}
 	go rC.ListenForMomentumHeight()
 
-	if err := rC.Sync(); err != nil {
+	rC.startupRead = make(chan struct{})
+	if err := rC.openBridgeAccount(); err != nil {
 		rC.logger.Debugf("error: %s", err.Error())
-		return err
+		return false, err
+	}
+	reached, readErr := rC.readBridgeAccount(rC.listenerCtx)
+	if readErr != nil {
+		if !rC.startupHolds(readErr) {
+			rC.logger.Debugf("error: %s", readErr.Error())
+			return false, readErr
+		}
+		held, rC.heldStart = true, true
+		if rC.skippedSettings {
+			rC.state.MarkSettingsStale()
+		}
+		rC.logger.Errorf("startup could not read the bridge account past height %d and keeps retrying; no transfer is signed until it has: %v", reached, readErr)
+	} else {
+		close(rC.startupRead)
 	}
 
 	rC.listenerWorker.Add(1)
 	go func() {
 		defer rC.listenerWorker.Done()
+		if held {
+			if !rC.finishStartup(rC.listenerCtx, reached, readErr) {
+				return
+			}
+			close(rC.startupRead)
+		}
 		rC.ListenForEmbeddedBridgeAccountBlocks()
 	}()
-	return nil
+	return held, nil
+}
+
+// awaitsSourceRecord is the failure of a checked unwrap request whose
+// transaction the endpoint has no receipt for and which this node's own record
+// of the source chain does not answer. The EVM scan, or a backfill the
+// operator requested, is what writes that record.
+type awaitsSourceRecord struct{ error }
+
+func (e awaitsSourceRecord) Unwrap() error { return e.error }
+
+// startupHolds reports whether a first read of the bridge account that failed
+// with err is retried in this process instead of ending it. That is so for a
+// request that waits for this node's scan of the source chain, which only runs
+// once startup lets it, and for a signer in EmergencyState or HaltedState,
+// which has the halt to sign or to keep and signs no transfer either way.
+func (rC *znnNetwork) startupHolds(err error) bool {
+	if rC.listenerCtx.Err() != nil {
+		return false
+	}
+	// The pass read a change to what the node took from the bridge as
+	// history before it failed. On a start that ends there, the next start
+	// reads the bridge again. A start that went on would judge what it reads
+	// next with the values from before the change, so only a signer with a
+	// halt still to sign is kept: see errSettingsRead.
+	if rC.skippedSettings {
+		return !rC.state.UnlessInEmergency(func() {})
+	}
+	var waiting awaitsSourceRecord
+	if errors.As(err, &waiting) {
+		return true
+	}
+	return !signsTransfers(rC.state)
+}
+
+// readingAtStartup reports whether this start is still reading the bridge
+// account to its tip, as opposed to the listener following it.
+func (rC *znnNetwork) readingAtStartup() bool {
+	if rC.startupRead == nil {
+		return false
+	}
+	select {
+	case <-rC.startupRead:
+		return false
+	default:
+		return true
+	}
+}
+
+// signsTransfers reports whether the signer is in a state other than
+// EmergencyState and HaltedState.
+func signsTransfers(state *common.GlobalState) bool {
+	return state.WhileSigningTransfers(func() {})
 }
 
 // CancelAccountBlockReads interrupts startup even while Node.Start holds its lock.
@@ -178,8 +281,19 @@ func (rC *znnNetwork) ZnnRpc() *rpc.ZnnRpc {
 	return rC.rpcManager.Znn()
 }
 
+// Sync is one start's read of the bridge account from the checkpoint to the
+// tip.
 func (rC *znnNetwork) Sync() error {
-	ctx := rC.listenerCtx
+	if err := rC.openBridgeAccount(); err != nil {
+		return err
+	}
+	_, err := rC.readBridgeAccount(rC.listenerCtx)
+	return err
+}
+
+// openBridgeAccount loads what a start reads once before its first pass over
+// the bridge account.
+func (rC *znnNetwork) openBridgeAccount() error {
 	height, err := rC.eventsStore().GetLastUpdateHeight()
 	if err != nil {
 		return err
@@ -189,42 +303,238 @@ func (rC *znnNetwork) Sync() error {
 		rC.coverage.start(store, height, verified)
 	}
 	rC.logger.Debugf("last account block update height: %d", height)
+	rC.heldStart, rC.skippedSettings, rC.listedThrough = false, false, 0
+	rC.watchFrom, err = rC.eventsStore().BridgeWatchFrom()
+	return err
+}
+
+// readBridgeAccount is one pass of startup over the bridge account, from the
+// checkpoint to the tip. It returns the last height it processed in order,
+// including work done before an error. Only receives write a durable
+// checkpoint, so a later pass starts at or below that height.
+func (rC *znnNetwork) readBridgeAccount(ctx context.Context) (uint64, error) {
+	rC.pageListed = 0
+	height, err := rC.eventsStore().GetLastUpdateHeight()
+	if err != nil {
+		return height, err
+	}
+	// Whether the node said it was synced before the page that came back
+	// empty was read. An empty page read first may be the tip of a node that
+	// was still catching up.
+	synced := false
 	for {
 		read, cancel := context.WithTimeout(ctx, rpc.ZnnLedgerTimeout)
 		page, err := rC.ZnnRpc().GetAccountBlocksByHeightContext(read, types.BridgeContract, height+1, 30)
 		cancel()
 		if ctx.Err() != nil {
-			return ctx.Err()
+			return height, ctx.Err()
 		}
 		if err != nil {
-			return err
+			return height, err
 		}
 		if len(page.List) == 0 {
 			if page.Count > 0 && uint64(page.Count) > height {
-				return errors.Errorf("empty bridge account block page at height %d below frontier %d", height+1, page.Count)
+				return height, errors.Errorf("empty bridge account block page at height %d below frontier %d", height+1, page.Count)
 			}
-			return nil
+			if page.Count < 0 || uint64(page.Count) < height {
+				return height, errors.Errorf("the node's bridge account ends at height %d, below the checkpoint %d", page.Count, height)
+			}
+			// An endpoint that ends below a confirmed block this start was
+			// listed before has not shown the start the tip. Nothing is
+			// recorded for the tip it reports.
+			if height < rC.listedThrough {
+				return height, errors.Errorf("the endpoint ends at bridge account height %d and no longer lists confirmed blocks up to %d", height, rC.listedThrough)
+			}
+			if !synced {
+				if err := rC.requireSyncedNode(ctx); err != nil {
+					return height, err
+				}
+				synced = true
+				continue
+			}
+			if err := rC.markBridgeWatch(height + 1); err != nil {
+				return height, err
+			}
+			// A signer that stopped in key generation has no later receive
+			// to take it out once the bridge has ended it.
+			return height, rC.followKeyGenSetting(ctx)
+		}
+		synced = false
+		// Noted before anything on the page is looked up, so that a pass
+		// which fails on the way still knows the endpoint listed these.
+		rC.noteListed(page.List, height+1)
+		// Record the obligation for the first recent receive on the page
+		// before any entry is processed. A start that fails on an earlier
+		// entry still leaves it for the next one.
+		if err := rC.watchRecentReceive(ctx, page.List, height+1); err != nil {
+			return height, err
 		}
 		for _, block := range page.List {
 			if err := ctx.Err(); err != nil {
-				return err
+				return height, err
 			}
 			if block == nil || block.Address != types.BridgeContract || block.Height != height+1 {
-				return errors.Errorf("missing or unexpected bridge account block at height %d", height+1)
+				return height, errors.Errorf("missing or unexpected bridge account block at height %d", height+1)
+			}
+			if block.Hash == types.ZeroHash {
+				return height, errors.Errorf("bridge account block %d has no hash", block.Height)
 			}
 			receive, err := bridgeAccountReceive(block.BlockType, block.Height)
 			if err != nil {
-				return err
+				return height, err
 			}
 			if receive {
 				if err := rC.syncReceive(ctx, block); err != nil {
-					return err
+					return height, err
 				}
 			}
 			height = block.Height
 			rC.coverage.block(rC.state.HealthStore(), height, receive, true)
+			if rC.heldStart && rC.skippedSettings {
+				return height, errSettingsRead
+			}
 		}
 	}
+}
+
+// A start reads a receive that is already final as history: what the receive
+// changed is taken from what the node read from the bridge when it started.
+// The change may have been made after that. A start that reaches the tip
+// goes on with the settings it loaded when it started. A start that fails on
+// the way ends, and the next one reads the bridge again. A held start goes on instead, with the
+// values from before the change, so once it has read such a change it reads no
+// further receive, which those values would be used to judge, and does not
+// complete. The signer stops and its next start reads the bridge as it is
+// then. The exception is a signer in EmergencyState: a restart could cost it
+// the key it has loaded, so it keeps running until it has signed the halt
+// for the networks it knows and left that state, and stops then. Its next
+// start, in HaltedState, looks at every network the bridge lists.
+var errSettingsRead = errors.New("startup read a change to the bridge's networks, token pairs, administrator, key, settings or halt state as history and reads no further; the next start reads the bridge as it is then")
+
+// finishStartup retries startup's read of the bridge account after a pass
+// that stopped at reached with err, until a pass reaches the tip. It reports
+// false when the node is stopping instead.
+//
+// The block that stopped the read is held as the running listener holds one:
+// it shows in the health snapshot, is logged at error level each minute, and
+// after maxBridgeAccountHold at one height a signer that is signing transfers
+// stops. A request held for its source record may still get one while the EVM
+// networks make their startup scan, so that time does not count. A start that
+// stopped at errSettingsRead waits for nothing: it reads no further, and the
+// signer stops as soon as it is not in EmergencyState.
+func (rC *znnNetwork) finishStartup(ctx context.Context, reached uint64, err error) bool {
+	waiting := false
+	for {
+		// A pass that stopped short of the held block has not passed it.
+		at := reached + 1
+		if rC.hold.attempts != 0 && reached < rC.hold.height {
+			at = rC.hold.height
+		}
+		if rC.skippedSettings {
+			// Reported once: nothing is read at this height while the start
+			// waits, so there are no further attempts to count.
+			if !waiting {
+				waiting, err = true, errSettingsRead
+				rC.holdBridgeAccount(at, err, false, time.Time{})
+				rC.logger.Errorf("the bridge account is not read past height %d: %v", at-1, err)
+			}
+			if rC.state.UnlessInEmergency(func() { rC.stopBridgeListener(ctx, err) }) {
+				return false
+			}
+		} else {
+			scanned, scanning := rC.scans.finished()
+			if rC.holdBridgeAccount(at, err, rC.pageListed >= at, scanned) && !scanning {
+				stopping := rC.state.WhileSigningTransfers(func() {
+					rC.stopBridgeListener(ctx, errors.Wrapf(err, "startup could not pass bridge account height %d for %s; stopping instead of waiting",
+						at, maxBridgeAccountHold))
+				})
+				if stopping {
+					return false
+				}
+			}
+		}
+		delay := 4 * time.Second
+		if rC.retryPause != 0 {
+			delay = rC.retryPause
+		}
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return false
+		case <-timer.C:
+		}
+		if rC.skippedSettings {
+			continue
+		}
+		reached, err = rC.readBridgeAccount(ctx)
+		if ctx.Err() != nil {
+			return false
+		}
+		if err == nil {
+			rC.releaseBridgeAccount()
+			return true
+		}
+	}
+}
+
+// noteListed records the highest confirmed block a page lists: for this pass,
+// which holdBridgeAccount asks about, and for the start. It reads the entries
+// that are in order from first and have a hash, and takes each of them that
+// is confirmed, whatever the entries before it say.
+func (rC *znnNetwork) noteListed(page []*api.AccountBlock, first uint64) {
+	for i, listed := range page {
+		if listed == nil || listed.Address != types.BridgeContract || listed.Height != first+uint64(i) || listed.Hash == types.ZeroHash {
+			return
+		}
+		if listed.ConfirmationDetail == nil || listed.ConfirmationDetail.MomentumHeight == 0 {
+			continue
+		}
+		rC.pageListed = listed.Height
+		rC.listedThrough = max(rC.listedThrough, listed.Height)
+	}
+}
+
+// Bridge methods that change what a node reads from the bridge once when it
+// starts: its networks and their token pairs, the administrator, the signing
+// key, the settings and the halt state.
+var settingsMethods = func() map[string]bool {
+	methods := make(map[string]bool)
+	for _, name := range []string{
+		definition.SetNetworkMethodName, definition.RemoveNetworkMethodName, definition.SetTokenPairMethod, definition.RemoveTokenPairMethodName,
+		definition.HaltMethodName, definition.EmergencyMethodName,
+		definition.ChangeAdministratorMethodName, definition.ProposeAdministratorMethodName, definition.ChangeTssECDSAPubKeyMethodName,
+		definition.SetOrchestratorInfoMethodName, definition.SetBridgeMetadataMethodName,
+	} {
+		methods[base64.StdEncoding.EncodeToString(definition.ABIBridge.Methods[name].Id())] = true
+	}
+	return methods
+}()
+
+// startupScans is whether the EVM networks are still making their startup
+// scan beside a held startup, and when they finished.
+type startupScans struct {
+	mu      sync.Mutex
+	running bool
+	done    time.Time
+}
+
+func (s *startupScans) begin() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.running = true
+}
+
+func (s *startupScans) end(now time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.running, s.done = false, now
+}
+
+func (s *startupScans) finished() (time.Time, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.done, s.running
 }
 
 func bridgeAccountReceive(blockType, height uint64) (bool, error) {
@@ -301,6 +611,9 @@ func (rC *znnNetwork) readReceivePair(ctx context.Context, listed *api.AccountBl
 		receive.BlockType != nom.BlockTypeContractReceive || receive.FromBlockHash != listed.FromBlockHash {
 		return nil, nil, errors.Errorf("bridge receive lookup does not match listed block %s at height %d", listed.Hash, listed.Height)
 	}
+	// The page may have listed it before it was confirmed. It is confirmed
+	// now, whatever becomes of the lookups that follow.
+	rC.listedThrough = max(rC.listedThrough, receive.Height)
 	send, err := rC.readBridgeBlock(ctx, receive.FromBlockHash, false)
 	if err != nil {
 		return nil, nil, errors.Wrapf(err, "reading send %s for bridge receive %s", receive.FromBlockHash, receive.Hash)
@@ -365,14 +678,115 @@ func (rC *znnNetwork) interpretConfirmedReceive(ctx context.Context, receive, se
 		if err != nil {
 			return err
 		}
-		if synced && max(frontier, tip.Height)-confirmed < finality {
+		// A node that is still syncing cannot say how old this receive is.
+		// Wait for it instead of reading the receive as history.
+		if !synced {
+			return errors.Errorf("the Zenon node is not synced; bridge receive %s at height %d waits", receive.Hash, receive.Height)
+		}
+		if max(frontier, tip.Height)-confirmed < finality {
 			mode = liveReceive
 		}
 	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	return rC.interpretSendBlockData(ctx, send, mode, embeddedReceiveOutcome(receive), receive.Height, refresh)
+	// Age separates history from new receives only while a database reads the
+	// bridge account for the first time. The listener starts at the tip, and a
+	// database that has been there keeps a record of it, so whatever either
+	// reads later was registered on this node's watch: after a held receive,
+	// behind one, or across a restart.
+	if history == startupHistory && mode == liveReceive {
+		if err := rC.markBridgeWatch(receive.Height); err != nil {
+			return err
+		}
+	}
+	sourceChecked := mode == liveReceive || history == listenerHistory || rC.watched(receive.Height)
+	return rC.interpretSendBlockData(ctx, send, mode, sourceChecked, embeddedReceiveOutcome(receive), receive.Height, refresh)
+}
+
+// requireSyncedNode fails unless the node reports that it is synced. The
+// listener treats every receive it reads as new, so startup must not hand over
+// while the node may still be serving old history.
+func (rC *znnNetwork) requireSyncedNode(ctx context.Context) error {
+	read, cancel := context.WithTimeout(ctx, rpc.ZnnLedgerTimeout)
+	defer cancel()
+	info, err := rC.ZnnRpc().GetSyncInfoContext(read)
+	synced := rC.recordSync(info, err)
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	if err != nil {
+		return err
+	}
+	if !synced {
+		return errors.New("the Zenon node is not synced; the bridge account it served may be incomplete")
+	}
+	return nil
+}
+
+// watchRecentReceive records the watch from the first receive on a startup
+// page that is unconfirmed or not yet final, by the confirmations the node
+// lists it with. It runs before any entry on the page is read, so a start
+// that fails on the way still leaves the obligation for the next one.
+// Receives below that height keep the treatment of a first read.
+func (rC *znnNetwork) watchRecentReceive(ctx context.Context, page []*api.AccountBlock, first uint64) error {
+	finality := uint64(rC.ConfirmationsToFinality())
+	for i, listed := range page {
+		if listed == nil || listed.Hash == types.ZeroHash || listed.Address != types.BridgeContract || listed.Height != first+uint64(i) {
+			return nil // the page is rejected when this entry is reached
+		}
+		if listed.BlockType != nom.BlockTypeContractReceive {
+			continue
+		}
+		if rC.watched(listed.Height) {
+			return nil
+		}
+		confirmations := uint64(0)
+		if detail := listed.ConfirmationDetail; detail != nil {
+			if detail.MomentumHeight == 0 {
+				return errors.Errorf("bridge account block %d is listed with a confirmation that names no momentum", listed.Height)
+			}
+			// The node counts the confirming momentum itself. A listing
+			// without a count is aged by the frontier this signer has seen.
+			if confirmations = detail.NumConfirmations; confirmations == 0 {
+				frontier, err := rC.state.GetFrontierMomentum()
+				if err != nil {
+					return err
+				}
+				if frontier >= detail.MomentumHeight {
+					confirmations = frontier - detail.MomentumHeight + 1
+				}
+			}
+		}
+		if confirmations > finality {
+			continue
+		}
+		if err := rC.requireSyncedNode(ctx); err != nil {
+			return err
+		}
+		return rC.markBridgeWatch(listed.Height)
+	}
+	return nil
+}
+
+// watched reports whether this database vouches for the bridge account at
+// height.
+func (rC *znnNetwork) watched(height uint64) bool {
+	return rC.watchFrom != 0 && height >= rC.watchFrom
+}
+
+// markBridgeWatch records that this database vouches for the bridge account
+// from height on. It is written before the first check that can fail, so a
+// retry in a later process still makes that check.
+func (rC *znnNetwork) markBridgeWatch(height uint64) error {
+	if rC.watched(height) {
+		return nil
+	}
+	if err := rC.eventsStore().SaveBridgeWatchFrom(height); err != nil {
+		return err
+	}
+	rC.watchFrom = height
+	return nil
 }
 
 type receiveOutcome uint8
@@ -415,16 +829,26 @@ func (rC *znnNetwork) InterpretSendBlockData(sendBlock *api.AccountBlock, live b
 	if live {
 		mode = liveReceive
 	}
-	return rC.interpretSendBlockData(rC.listenerCtx, sendBlock, mode, receiveAccepted, receiveBlockHeight, rC.refreshSettings)
+	return rC.interpretSendBlockData(rC.listenerCtx, sendBlock, mode, live, receiveAccepted, receiveBlockHeight, rC.refreshSettings)
 }
 
-func (rC *znnNetwork) interpretSendBlockData(ctx context.Context, sendBlock *api.AccountBlock, mode receiveMode, outcome receiveOutcome, receiveBlockHeight uint64, refreshSettings func() error) error {
+// sourceChecked says an UnwrapToken registration in this receive must match
+// its source event; see recordUnwrapRegistration.
+func (rC *znnNetwork) interpretSendBlockData(ctx context.Context, sendBlock *api.AccountBlock, mode receiveMode, sourceChecked bool, outcome receiveOutcome, receiveBlockHeight uint64, refreshSettings func() error) error {
 	live := mode == liveReceive
 	rC.logger.Debugf("InterpretSendBlockData, live: %v", live)
 	if len(sendBlock.Data) < 4 {
 		return errors.Errorf("bridge send %s has no complete method selector", sendBlock.Hash)
 	}
 	methodSig := base64.StdEncoding.EncodeToString(sendBlock.Data[:4])
+	if mode == startupHistory && outcome != receiveRejected && settingsMethods[methodSig] {
+		rC.skippedSettings = true
+		// A held start goes on running. Marked before anything that can
+		// fail, so that nothing is fixed with these settings meanwhile.
+		if rC.heldStart {
+			rC.state.MarkSettingsStale()
+		}
+	}
 	switch methodSig {
 	case base64.StdEncoding.EncodeToString(definition.ABIBridge.Methods[definition.WrapTokenMethodName].Id()):
 		rC.logger.Debug("found WrapTokenMethodName")
@@ -444,7 +868,10 @@ func (rC *znnNetwork) interpretSendBlockData(ctx context.Context, sendBlock *api
 			rC.logger.Info("request non existent")
 			break
 		} else {
-			if err = rC.AddWrapEvent(request); err != nil {
+			// This node's scan of the destination chain can be ahead of its
+			// read of the bridge account, and may already have recorded a
+			// redeem of this request. That status stays.
+			if err = rC.eventsStore().AddWrapRequestKeepingStatus(wrapEvent(request)); err != nil {
 				return err
 			}
 		}
@@ -465,13 +892,13 @@ func (rC *znnNetwork) interpretSendBlockData(ctx context.Context, sendBlock *api
 			rC.logger.Info("update request non existent")
 			break
 		} else {
-			if localRequest, err := rC.eventsStore().GetWrapRequestById(param.Id); err != nil {
+			// The record is added only if it is still missing: this node's
+			// scan of the destination chain may have written it, with a
+			// redeem, since the bridge was asked.
+			if added, err := rC.eventsStore().AddWrapRequestIfMissing(wrapEvent(request)); err != nil {
 				return err
-			} else if localRequest == nil {
-				rC.logger.Info("request does not exist locally, will add it")
-				if err := rC.AddWrapEvent(request); err != nil {
-					return err
-				}
+			} else if added {
+				rC.logger.Info("request did not exist locally and was added")
 			}
 			if param.Signature == request.Signature {
 				if err = rC.SetResignStatus(request.Id, false); err != nil {
@@ -553,9 +980,25 @@ func (rC *znnNetwork) interpretSendBlockData(ctx context.Context, sendBlock *api
 		}
 
 		// The registered request names the source chain. The send's own
-		// parameters are only what its sender claimed.
-		if rpcZnnEvent, rpcZnnErr := rC.GetUnwrapTokenRequestByHashAndLog(param.TransactionHash, param.LogIndex); rpcZnnErr != nil {
-			if live && unwrapRequestMissing(rpcZnnErr) {
+		// parameters are only what its sender claimed. One reply carries the
+		// request and how long the bridge still withholds it.
+		if !sourceChecked {
+			// The request's remaining redeem delay decides whether this
+			// registration is checked. The node works it out from its own
+			// frontier and current settings, which say nothing while it is
+			// still syncing.
+			if err := rC.requireSyncedNode(ctx); err != nil {
+				return err
+			}
+		}
+		read, cancel := context.WithTimeout(ctx, rpc.ZnnSettingsTimeout)
+		rpcZnnEvent, redeemableIn, rpcZnnErr := rC.ZnnRpc().UnwrapTokenRequestContext(read, param.TransactionHash, param.LogIndex)
+		cancel()
+		if rpcZnnErr != nil {
+			// The bridge never deletes a request, and this receive registered
+			// one. An endpoint without it is behind the ledger the receive
+			// was read from. Wait for it instead of dropping the source check.
+			if unwrapRequestMissing(rpcZnnErr) {
 				return errors.Errorf("the bridge accepted UnwrapToken send %s but the endpoint has no request for %s/%d yet", sendBlock.Hash, param.TransactionHash.String(), param.LogIndex)
 			}
 			if bridgeObjectGone(rpcZnnErr) {
@@ -569,167 +1012,15 @@ func (rC *znnNetwork) interpretSendBlockData(ctx context.Context, sendBlock *api
 			rC.logger.Debugf("get for tx %s and log :%d rpc error: %s", param.TransactionHash.String(), param.LogIndex, rpcZnnErr.Error())
 			return rpcZnnErr
 		} else if rpcZnnEvent == nil || rpcZnnEvent.TransactionHash != param.TransactionHash || rpcZnnEvent.LogIndex != param.LogIndex {
-			// The receive registered this request, so an endpoint that has
-			// none is behind the ledger it was read from. The client decodes
-			// an empty reply as a request with no identity. While the receive
-			// is live, wait for it instead of dropping the source check.
-			if live {
-				return errors.Errorf("the bridge accepted UnwrapToken send %s but the endpoint returned no request for %s/%d", sendBlock.Hash, param.TransactionHash.String(), param.LogIndex)
-			}
-			rC.logger.Infof("unwrap event non existent: %s", param.TransactionHash.String())
-			break
-		} else if rpcZnnEvent.NetworkClass != definition.EvmClass || !rC.rpcManager.HasEvmNetwork(rpcZnnEvent.ChainId) || !rC.dbManager.HasEvmStorage(rpcZnnEvent.ChainId) {
-			// The bridge still knows the request but this node has no client
-			// or store for its chain; looking either up would stop the node.
+			return errors.Errorf("the bridge accepted UnwrapToken send %s but the endpoint returned no request for %s/%d", sendBlock.Hash, param.TransactionHash.String(), param.LogIndex)
+		} else if rpcZnnEvent.NetworkClass != definition.EvmClass {
 			// Networks are keyed by class and chain ID, and only EVM is served.
-			rC.logger.Infof("skipping unwrap request %s/%d: network class %d, chainId %d is not an EVM network configured on this node",
+			rC.logger.Infof("skipping unwrap request %s/%d: network class %d, chainId %d is not an EVM network",
 				param.TransactionHash.String(), param.LogIndex, rpcZnnEvent.NetworkClass, rpcZnnEvent.ChainId)
 			break
 		} else {
-			if tx, rpcEvmErr := rC.rpcManager.Evm(rpcZnnEvent.ChainId).TransactionReceiptContext(ctx, ecommon.Hash(param.TransactionHash)); rpcEvmErr != nil {
-				rC.logger.Debugf("error: %s", rpcEvmErr.Error())
-				// todo filter errors, maybe just an rpc error
-				if rpcEvmErr.Error() == ethereum.NotFound.Error() || rpcEvmErr.Error() == "server returned transaction without signature" {
-					if live {
-						if stateErr := rC.state.SetState(common.EmergencyState); stateErr != nil {
-							rC.logger.Info("error setting emergency state")
-							rC.stopBridgeListener(rC.listenerCtx, stateErr)
-							return stateErr
-						}
-						break
-					}
-				} else {
-					return rpcEvmErr
-				}
-			} else {
-				found := false
-				if logs, err := rC.rpcManager.Evm(rpcZnnEvent.ChainId).FilterBlockLogsContext(ctx, tx.BlockHash); err != nil {
-					rC.logger.Debug(err)
-					return err
-				} else {
-					event := &events.UnwrapRequestEvm{
-						TransactionHash: ecommon.Hash(param.TransactionHash),
-						LogIndex:        param.LogIndex,
-						BlockHash:       tx.BlockHash,
-					}
-					if log, ok := findUnwrapLog(logs, event, rC.rpcManager.Evm(rpcZnnEvent.ChainId).BridgeAddress()); !ok {
-						rC.logger.Debugf("Matching unwrap log not found for tx %s and log index %d", param.TransactionHash.String(), param.LogIndex)
-					} else {
-						if strings.ToLower(log.Address.String()) != strings.ToLower(rC.rpcManager.Evm(rpcZnnEvent.ChainId).BridgeAddress().String()) {
-							rC.logger.Debugf("Address that generated this log %s is different than contract address %s",
-								strings.ToLower(log.Address.String()), strings.ToLower(rC.rpcManager.Evm(rpcZnnEvent.ChainId).BridgeAddress().String()))
-						} else if log.Topics[0].Hex() != common.UnwrapSigHash.Hex() {
-							rC.logger.Debugf("log Topic hash %s is different than unwrapSigHash %s", log.Topics[0].Hex(), common.UnwrapSigHash.Hex())
-						} else {
-							if unwrapRequest, parseErr := rC.rpcManager.Evm(rpcZnnEvent.ChainId).Bridge().ParseUnwrapped(log); parseErr != nil {
-								rC.logger.Debugf("Could not parse unwrapped event with error: %s", parseErr.Error())
-							} else {
-								addresses := strings.Split(unwrapRequest.To, common.AffiliateProgramAddressSeparator)
-								if beneficiary, errParse := types.ParseAddress(addresses[0]); errParse != nil {
-									rC.logger.Debugf("Could not parse zenon address: %s with error: %s", addresses[0], errParse.Error())
-								} else if types.IsEmbeddedAddress(beneficiary) {
-									// Ingestion creates no request for an embedded
-									// beneficiary, so no signer registers one.
-									rC.logger.Debugf("Source beneficiary %s is an embedded address", addresses[0])
-								} else {
-									// We have to check the proper amounts for the initiator or the affiliate amount
-									parseOk := false
-									if len(addresses) > 1 {
-										if parsedAffiliate, errParseAffiliate := common.ParseAddressString(addresses[1], definition.NoMClass); errParseAffiliate != nil {
-											rC.logger.Debugf("Could not parse affiliate zenon address: %s for tx: %s and logIndex: %d, with error: %s",
-												addresses[1], param.TransactionHash.String(), param.LogIndex, errParseAffiliate.Error())
-										} else {
-											// If affiliate is embedded address, we want to check for usual amounts, without affiliate amount added and also skip the affiliate address
-											parseOk = !types.IsEmbeddedAddress(parsedAffiliate.(types.Address))
-										}
-									}
-
-									var policy common.AffiliatePolicy
-									if parseOk {
-										stored, exists, err := rC.dbManager.EvmStorage(rpcZnnEvent.ChainId).UnwrapAffiliatePolicy(affiliateEvidenceKey(log))
-										if err != nil {
-											return err
-										}
-										policy = stored
-										if !exists {
-											policy = rC.state.AffiliatePolicyAt(rpcZnnEvent.ChainId, unwrapRequest.Token.Hex(), log.BlockNumber)
-										}
-									}
-									isAffiliateProgramActive := policy&common.VerifyAffiliate != 0
-
-									// Here we check the zts because the checks on evm only might not be active
-									if len(addresses) == 1 || !parseOk || !isAffiliateProgramActive {
-										if param.LogIndex >= common.AffiliateLogIndexAddition {
-											rC.logger.Debugf("Found affiliate logIndex but this is a non affiliate unwrap - len(addresses): %d, !parseOk: %t,"+
-												"!isAffiliateProgramActive: %t", len(addresses), !parseOk, !isAffiliateProgramActive)
-										} else if !sameZenonAddress(addresses[0], rpcZnnEvent.ToAddress) {
-											rC.logger.Debugf("Normal unwrap event address %s different than znn unwrap toAddress %s", addresses[0], rpcZnnEvent.ToAddress.String())
-										} else if unwrapRequest.Amount.Cmp(rpcZnnEvent.Amount) != 0 {
-											rC.logger.Debugf("Normal unwrap event amount %s different than znn unwrap amount %s", unwrapRequest.Amount.String(), rpcZnnEvent.Amount.String())
-										} else if strings.ToLower(unwrapRequest.Token.String()) != rpcZnnEvent.TokenAddress {
-											rC.logger.Debugf("Normal unwrap event Token %s different than znn unwrap TokenAddress %s", unwrapRequest.Token.String(), rpcZnnEvent.TokenAddress)
-										} else {
-											found = true
-										}
-									} else {
-										addressToCheck := addresses[0]
-										amountToCheck := big.NewInt(0).Set(unwrapRequest.Amount)
-										fee := big.NewInt(0).Div(amountToCheck, big.NewInt(100)) // 1%
-										amountToCheck.Add(amountToCheck, fee)                    // 101%
-
-										// we check the affiliate tx
-										if param.LogIndex >= common.AffiliateLogIndexAddition {
-											affiliateAmount := big.NewInt(0).Set(unwrapRequest.Amount)
-											affiliateAmount.Mul(affiliateAmount, big.NewInt(2))
-											affiliateAmount.Div(affiliateAmount, big.NewInt(100)) // 2%
-
-											amountToCheck.Set(affiliateAmount)
-											addressToCheck = addresses[1] // we checked that we have this address
-										}
-
-										rC.logger.Infof("addressToCheck: %s", addressToCheck)
-										rC.logger.Infof("amountToCheck: %s", amountToCheck.String())
-										if !sameZenonAddress(addressToCheck, rpcZnnEvent.ToAddress) {
-											rC.logger.Debugf("Affiliate unwrap event address %s different than znn unwrap toAddress %s", addressToCheck, rpcZnnEvent.ToAddress.String())
-										} else if strings.ToLower(unwrapRequest.Token.String()) != rpcZnnEvent.TokenAddress {
-											rC.logger.Debugf("Affiliate unwrap event Token %s different than znn unwrap TokenAddress %s", unwrapRequest.Token.String(), rpcZnnEvent.TokenAddress)
-										} else if amountToCheck.Cmp(rpcZnnEvent.Amount) != 0 {
-											// If affiliate program is active and the address is correct, but somehow the amount is the same as the unwrap, we move on
-											if param.LogIndex < common.AffiliateLogIndexAddition {
-												if rpcZnnEvent.Amount.Cmp(unwrapRequest.Amount) == 0 {
-													found = true
-													rC.logger.Debugf("Affiliate unwrap event %s (amountToCheck %s) equal to znn unwrap amount %s", unwrapRequest.Amount.String(), amountToCheck.String(), rpcZnnEvent.Amount.String())
-												}
-											}
-											if !found {
-												rC.logger.Debugf("Affiliate amountToCheck %s (unwrap event %s) different than znn unwrap amount %s", amountToCheck.String(), unwrapRequest.Amount.String(), rpcZnnEvent.Amount.String())
-											}
-										} else {
-											found = true
-										}
-									}
-								}
-							}
-						}
-					}
-				}
-				rC.logger.Infof("found: %t", found)
-				if !found && live {
-					if stateErr := rC.state.SetState(common.EmergencyState); stateErr != nil {
-						rC.stopBridgeListener(rC.listenerCtx, stateErr)
-						return stateErr
-					}
-					break
-				}
-				rC.logger.Debug("Trying to add unwrap request")
-				// we just overwrite the event and set it's status as pending redeem, we don't care about block number anymore
-				if storageErr := rC.dbManager.EvmStorage(rpcZnnEvent.ChainId).AddUnwrapRequest(common.ZnnUnwrapToOrchestatorUnwrap(rpcZnnEvent)); storageErr != nil {
-					return storageErr
-				}
-				rC.logger.Debug("Successfully added unwrap request")
-				if err := rC.dbManager.EvmStorage(rpcZnnEvent.ChainId).SetUnwrapRequestStatus(ecommon.Hash(param.TransactionHash), param.LogIndex, common.PendingRedeemStatus); err != nil {
-					return err
-				}
+			if err := rC.recordUnwrapRegistration(ctx, param, rpcZnnEvent, redeemableIn, receiveBlockHeight, sourceChecked, live); err != nil {
+				return err
 			}
 		}
 	case base64.StdEncoding.EncodeToString(definition.ABIBridge.Methods[definition.RevokeUnwrapRequestMethodName].Id()):
@@ -802,7 +1093,17 @@ func (rC *znnNetwork) interpretSendBlockData(ctx context.Context, sendBlock *api
 			}
 			rC.logger.Debug("network non existent")
 			if err := rC.startRuntimeEvmNetwork(network); err != nil {
-				rC.stopBridgeListener(rC.listenerCtx, err)
+				// A signer does not go on without a network the bridge has
+				// added. While startup is still reading the account, a
+				// signer in an emergency or a halt is not stopped for it and
+				// the receive is held: the account is not read to its tip
+				// until the network is added, and until it is no transfer
+				// is signed.
+				if rC.readingAtStartup() {
+					rC.state.WhileSigningTransfers(func() { rC.stopBridgeListener(rC.listenerCtx, err) })
+				} else {
+					rC.stopBridgeListener(rC.listenerCtx, err)
+				}
 				return err
 			}
 		}
@@ -917,30 +1218,27 @@ func (rC *znnNetwork) interpretSendBlockData(ctx context.Context, sendBlock *api
 		}
 		rC.administrator = bridgeInfo.Administrator.String()
 	case base64.StdEncoding.EncodeToString(definition.ABIBridge.Methods[definition.ChangeTssECDSAPubKeyMethodName].Id()):
-		if !live {
-			break
-		}
 		param := new(definition.ChangeECDSAPubKeyParam)
 		if err := definition.ABIBridge.UnpackMethod(param, definition.ChangeTssECDSAPubKeyMethodName, sendBlock.Data); err != nil {
 			return constants.ErrUnpackError
 		}
 		common.AdministratorLogger.Infof("ChangeTssECDSAPubKeyMethodName PubKey: %s, OldSig: %s, NewSig: %s", param.PubKey, param.OldPubKeySignature, param.NewPubKeySignature)
+		if !live {
+			if err := rC.followKeyGenSetting(ctx); err != nil {
+				return err
+			}
+			break
+		}
 		bridgeInfo, err := rC.GetBridgeInfo()
 		if err != nil {
 			return err
 		}
-		// If the key was changed to the param, we are no longer in keyGen
-		if bridgeInfo.CompressedTssECDSAPubKey == param.PubKey {
-			currentState, err := rC.state.GetState()
-			if err != nil {
-				rC.stopBridgeListener(rC.listenerCtx, err)
+		// If the key was changed to the param, we are no longer in keyGen. A
+		// key change that takes effect ends key generation on the bridge; if
+		// the bridge allows it again, a newer round has begun.
+		if bridgeInfo.CompressedTssECDSAPubKey == param.PubKey && !bridgeInfo.AllowKeyGen {
+			if err := rC.leaveKeyGen(); err != nil {
 				return err
-			}
-			if currentState == common.KeyGenState {
-				if err := rC.state.SetState(common.LiveState); err != nil {
-					rC.stopBridgeListener(rC.listenerCtx, err)
-					return err
-				}
 			}
 		}
 	case base64.StdEncoding.EncodeToString(definition.ABIBridge.Methods[definition.ChangeAdministratorMethodName].Id()):
@@ -958,7 +1256,15 @@ func (rC *znnNetwork) interpretSendBlockData(ctx context.Context, sendBlock *api
 		}
 		rC.administrator = bridgeInfo.Administrator.String()
 	case base64.StdEncoding.EncodeToString(definition.ABIBridge.Methods[definition.SetAllowKeygenMethodName].Id()):
-		if !live || sendBlock.Address.String() != rC.administrator {
+		if !live {
+			// What the bridge allows now decides, whoever sent this and
+			// whoever administers the bridge today.
+			if err := rC.followKeyGenSetting(ctx); err != nil {
+				return err
+			}
+			break
+		}
+		if sendBlock.Address.String() != rC.administrator {
 			break
 		}
 		var value bool
@@ -968,16 +1274,8 @@ func (rC *znnNetwork) interpretSendBlockData(ctx context.Context, sendBlock *api
 
 		common.AdministratorLogger.Infof("SetAllowKeygenMethodName %t", value)
 		if value == false {
-			currentState, err := rC.state.GetState()
-			if err != nil {
-				rC.stopBridgeListener(rC.listenerCtx, err)
+			if err := rC.leaveKeyGen(); err != nil {
 				return err
-			}
-			if currentState == common.KeyGenState {
-				if err := rC.state.SetState(common.LiveState); err != nil {
-					rC.stopBridgeListener(rC.listenerCtx, err)
-					return err
-				}
 			}
 		}
 	case base64.StdEncoding.EncodeToString(definition.ABIBridge.Methods[definition.SetOrchestratorInfoMethodName].Id()):
@@ -1009,7 +1307,11 @@ func (rC *znnNetwork) interpretSendBlockData(ctx context.Context, sendBlock *api
 		common.AdministratorLogger.Infof("SetBridgeMetadataMethodName %s", metadataJSON)
 		var metadata common.BridgeMetadata
 		if err := json.Unmarshal([]byte(metadataJSON), &metadata); err != nil {
-			return err
+			// The bridge accepts any JSON document. One that does not decode
+			// into the settings cannot be applied now or on a retry, so the
+			// current settings stay and the listener moves on.
+			rC.logger.Errorf("ignoring bridge metadata that does not decode, the current settings stay in force: %v", err)
+			break
 		}
 		rC.setBridgeMetadata(&metadata)
 	case base64.StdEncoding.EncodeToString(definition.ABIBridge.Methods[definition.SetNetworkMetadataMethodName].Id()):
@@ -1028,6 +1330,422 @@ func (rC *znnNetwork) interpretSendBlockData(ctx context.Context, sendBlock *api
 		return err
 	}
 	return rC.eventsStore().SetLastUpdateHeight(receiveBlockHeight)
+}
+
+type unwrapSource uint8
+
+const (
+	// The source chain served the event and it carries the registered transfer.
+	sourceMatches unwrapSource = iota
+	// The source chain served the transaction or its block and no log there
+	// carries the registered transfer.
+	sourceDiffers
+	// The endpoint has no receipt for the transaction and this node has no
+	// record of the event.
+	sourceUnknown
+)
+
+// unwrapSource looks for the EVM event a registered unwrap request claims as
+// its source.
+func (rC *znnNetwork) unwrapSource(ctx context.Context, param *definition.UnwrapTokenParam, rpcZnnEvent *definition.UnwrapTokenRequest) (unwrapSource, error) {
+	evm := rC.rpcManager.Evm(rpcZnnEvent.ChainId)
+	var blockHash ecommon.Hash
+	var logs []etypes.Log
+	tx, rpcEvmErr := evm.TransactionReceiptContext(ctx, ecommon.Hash(param.TransactionHash))
+	if rpcEvmErr != nil {
+		rC.logger.Debugf("error: %s", rpcEvmErr.Error())
+		// todo filter errors, maybe just an rpc error
+		if !errors.Is(rpcEvmErr, ethereum.NotFound) && rpcEvmErr.Error() != "server returned transaction without signature" {
+			return sourceUnknown, rpcEvmErr
+		}
+		// A node can drop a transaction from its index and still serve the
+		// block's logs. Where this node recorded the event's block when it
+		// read the source chain itself, the event is read from that block.
+		recorded, err := rC.recordedUnwrapLog(evm, param, rpcZnnEvent)
+		if err != nil {
+			return sourceUnknown, awaitsSourceRecord{err}
+		}
+		if recorded == nil {
+			return sourceUnknown, nil
+		}
+		blockHash, logs = recorded.BlockHash, []etypes.Log{*recorded}
+	} else {
+		blockHash = tx.BlockHash
+		var err error
+		if logs, err = evm.FilterBlockLogsContext(ctx, tx.BlockHash); err != nil {
+			rC.logger.Debug(err)
+			return sourceUnknown, err
+		}
+		// The receipt and the block's logs are two views of the same data. An
+		// endpoint that lists a bridge log in one and omits or alters it in
+		// the other is not serving this block, and its answer says nothing
+		// about the request.
+		if index, missing := receiptLogMissingFrom(logs, tx, evm.BridgeAddress()); missing {
+			return sourceUnknown, errors.Errorf("the endpoint's receipt of %s and its logs for block %s disagree on bridge log %d",
+				param.TransactionHash, tx.BlockHash, index)
+		}
+	}
+	found := false
+	event := &events.UnwrapRequestEvm{
+		TransactionHash: ecommon.Hash(param.TransactionHash),
+		LogIndex:        param.LogIndex,
+		BlockHash:       blockHash,
+	}
+	if log, ok := findUnwrapLog(logs, event, evm.BridgeAddress()); !ok {
+		rC.logger.Debugf("Matching unwrap log not found for tx %s and log index %d", param.TransactionHash.String(), param.LogIndex)
+	} else {
+		if strings.ToLower(log.Address.String()) != strings.ToLower(evm.BridgeAddress().String()) {
+			rC.logger.Debugf("Address that generated this log %s is different than contract address %s",
+				strings.ToLower(log.Address.String()), strings.ToLower(evm.BridgeAddress().String()))
+		} else if log.Topics[0].Hex() != common.UnwrapSigHash.Hex() {
+			rC.logger.Debugf("log Topic hash %s is different than unwrapSigHash %s", log.Topics[0].Hex(), common.UnwrapSigHash.Hex())
+		} else {
+			if unwrapRequest, parseErr := evm.Bridge().ParseUnwrapped(log); parseErr != nil {
+				rC.logger.Debugf("Could not parse unwrapped event with error: %s", parseErr.Error())
+			} else {
+				addresses := strings.Split(unwrapRequest.To, common.AffiliateProgramAddressSeparator)
+				if beneficiary, errParse := types.ParseAddress(addresses[0]); errParse != nil {
+					rC.logger.Debugf("Could not parse zenon address: %s with error: %s", addresses[0], errParse.Error())
+				} else if types.IsEmbeddedAddress(beneficiary) {
+					// Ingestion creates no request for an embedded
+					// beneficiary, so no signer registers one.
+					rC.logger.Debugf("Source beneficiary %s is an embedded address", addresses[0])
+				} else {
+					// We have to check the proper amounts for the initiator or the affiliate amount
+					parseOk := false
+					if len(addresses) > 1 {
+						if parsedAffiliate, errParseAffiliate := common.ParseAddressString(addresses[1], definition.NoMClass); errParseAffiliate != nil {
+							rC.logger.Debugf("Could not parse affiliate zenon address: %s for tx: %s and logIndex: %d, with error: %s",
+								addresses[1], param.TransactionHash.String(), param.LogIndex, errParseAffiliate.Error())
+						} else {
+							// If affiliate is embedded address, we want to check for usual amounts, without affiliate amount added and also skip the affiliate address
+							parseOk = !types.IsEmbeddedAddress(parsedAffiliate.(types.Address))
+						}
+					}
+
+					var policy common.AffiliatePolicy
+					if parseOk {
+						stored, exists, err := rC.dbManager.EvmStorage(rpcZnnEvent.ChainId).UnwrapAffiliatePolicy(affiliateEvidenceKey(log))
+						if err != nil {
+							return sourceUnknown, err
+						}
+						policy = stored
+						if !exists {
+							policy = rC.state.AffiliatePolicyAt(rpcZnnEvent.ChainId, unwrapRequest.Token.Hex(), log.BlockNumber)
+						}
+					}
+					isAffiliateProgramActive := policy&common.VerifyAffiliate != 0
+
+					// Here we check the zts because the checks on evm only might not be active
+					if len(addresses) == 1 || !parseOk || !isAffiliateProgramActive {
+						if param.LogIndex >= common.AffiliateLogIndexAddition {
+							rC.logger.Debugf("Found affiliate logIndex but this is a non affiliate unwrap - len(addresses): %d, !parseOk: %t,"+
+								"!isAffiliateProgramActive: %t", len(addresses), !parseOk, !isAffiliateProgramActive)
+						} else if !sameZenonAddress(addresses[0], rpcZnnEvent.ToAddress) {
+							rC.logger.Debugf("Normal unwrap event address %s different than znn unwrap toAddress %s", addresses[0], rpcZnnEvent.ToAddress.String())
+						} else if unwrapRequest.Amount.Cmp(rpcZnnEvent.Amount) != 0 {
+							rC.logger.Debugf("Normal unwrap event amount %s different than znn unwrap amount %s", unwrapRequest.Amount.String(), rpcZnnEvent.Amount.String())
+						} else if strings.ToLower(unwrapRequest.Token.String()) != rpcZnnEvent.TokenAddress {
+							rC.logger.Debugf("Normal unwrap event Token %s different than znn unwrap TokenAddress %s", unwrapRequest.Token.String(), rpcZnnEvent.TokenAddress)
+						} else {
+							found = true
+						}
+					} else {
+						addressToCheck := addresses[0]
+						amountToCheck := big.NewInt(0).Set(unwrapRequest.Amount)
+						fee := big.NewInt(0).Div(amountToCheck, big.NewInt(100)) // 1%
+						amountToCheck.Add(amountToCheck, fee)                    // 101%
+
+						// we check the affiliate tx
+						if param.LogIndex >= common.AffiliateLogIndexAddition {
+							affiliateAmount := big.NewInt(0).Set(unwrapRequest.Amount)
+							affiliateAmount.Mul(affiliateAmount, big.NewInt(2))
+							affiliateAmount.Div(affiliateAmount, big.NewInt(100)) // 2%
+
+							amountToCheck.Set(affiliateAmount)
+							addressToCheck = addresses[1] // we checked that we have this address
+						}
+
+						rC.logger.Infof("addressToCheck: %s", addressToCheck)
+						rC.logger.Infof("amountToCheck: %s", amountToCheck.String())
+						if !sameZenonAddress(addressToCheck, rpcZnnEvent.ToAddress) {
+							rC.logger.Debugf("Affiliate unwrap event address %s different than znn unwrap toAddress %s", addressToCheck, rpcZnnEvent.ToAddress.String())
+						} else if strings.ToLower(unwrapRequest.Token.String()) != rpcZnnEvent.TokenAddress {
+							rC.logger.Debugf("Affiliate unwrap event Token %s different than znn unwrap TokenAddress %s", unwrapRequest.Token.String(), rpcZnnEvent.TokenAddress)
+						} else if amountToCheck.Cmp(rpcZnnEvent.Amount) != 0 {
+							// If affiliate program is active and the address is correct, but somehow the amount is the same as the unwrap, we move on
+							if param.LogIndex < common.AffiliateLogIndexAddition {
+								if rpcZnnEvent.Amount.Cmp(unwrapRequest.Amount) == 0 {
+									found = true
+									rC.logger.Debugf("Affiliate unwrap event %s (amountToCheck %s) equal to znn unwrap amount %s", unwrapRequest.Amount.String(), amountToCheck.String(), rpcZnnEvent.Amount.String())
+								}
+							}
+							if !found {
+								rC.logger.Debugf("Affiliate amountToCheck %s (unwrap event %s) different than znn unwrap amount %s", amountToCheck.String(), unwrapRequest.Amount.String(), rpcZnnEvent.Amount.String())
+							}
+						} else {
+							found = true
+						}
+					}
+				}
+			}
+		}
+	}
+	rC.logger.Infof("found: %t", found)
+	if found {
+		return sourceMatches, nil
+	}
+	return sourceDiffers, nil
+}
+
+// recordedUnwrapLog returns the source log of an unwrap from the block this
+// node recorded for it when it read the source chain itself, as every
+// configured endpoint serves that block now. It returns nil when the node has
+// no such record.
+//
+// The block is the one the stored request carries. A scan that ran ahead of
+// the read of the bridge account also records the block of an event on its
+// own, which is used when the request carries none or carries one that is no
+// longer the canonical block at its height.
+func (rC *znnNetwork) recordedUnwrapLog(evm *rpc.EvmRpc, param *definition.UnwrapTokenParam, rpcZnnEvent *definition.UnwrapTokenRequest) (*etypes.Log, error) {
+	store := rC.dbManager.EvmStorage(rpcZnnEvent.ChainId)
+	tx := ecommon.Hash(param.TransactionHash)
+	row, err := store.GetUnwrapRequestByHashAndLog(tx, param.LogIndex)
+	if err != nil {
+		return nil, err
+	}
+	index := param.LogIndex
+	if index >= common.AffiliateLogIndexAddition {
+		index -= common.AffiliateLogIndexAddition
+	}
+	// The height of a recorded block that turned out to have been replaced,
+	// and that block.
+	var replacedAt uint64
+	var replaced ecommon.Hash
+	if row != nil && row.BlockHash != (ecommon.Hash{}) {
+		canonical, err := evm.CanonicalHash(row.BlockNumber)
+		if err != nil {
+			return nil, err
+		}
+		if canonical == row.BlockHash {
+			log, err := evm.AgreedUnwrapLog(row.BlockNumber, row.BlockHash, tx, index, 0)
+			if err != nil {
+				return nil, err
+			}
+			return &log, nil
+		}
+		replacedAt, replaced = row.BlockNumber, row.BlockHash
+	}
+	// Only now: a request whose own block answers is read from that alone.
+	number, hash, located, err := store.UnwrapSourceLocation(tx, param.LogIndex)
+	if err != nil {
+		return nil, err
+	}
+	if located && hash != replaced {
+		canonical, err := evm.CanonicalHash(number)
+		if err != nil {
+			return nil, err
+		}
+		if canonical == hash {
+			log, err := evm.AgreedUnwrapLog(number, hash, tx, index, 0)
+			if err != nil {
+				return nil, err
+			}
+			return &log, nil
+		}
+		replacedAt, replaced = number, hash
+	}
+	if replaced != (ecommon.Hash{}) {
+		return nil, errors.Errorf("the block recorded for unwrap %s/%d is not the canonical block at height %d",
+			param.TransactionHash.String(), param.LogIndex, replacedAt)
+	}
+	return nil, nil
+}
+
+// receiptLogMissingFrom returns the index of a bridge log of the receipt's
+// transaction that the receipt and the block's logs do not both contain with
+// the same content. Other transactions in the block and other contracts in the
+// receipt are not compared.
+func receiptLogMissingFrom(blockLogs []etypes.Log, receipt *etypes.Receipt, bridge ecommon.Address) (uint, bool) {
+	for _, listed := range receipt.Logs {
+		if listed == nil || listed.Address != bridge {
+			continue
+		}
+		served := false
+		for i := range blockLogs {
+			log := &blockLogs[i]
+			if log.TxHash == listed.TxHash && log.Index == listed.Index {
+				served = log.Removed == listed.Removed && log.Address == listed.Address && log.BlockHash == receipt.BlockHash &&
+					receipt.BlockNumber != nil && receipt.BlockNumber.IsUint64() && log.BlockNumber == receipt.BlockNumber.Uint64() &&
+					slices.Equal(log.Topics, listed.Topics) && bytes.Equal(log.Data, listed.Data)
+				break
+			}
+		}
+		if !served {
+			return listed.Index, true
+		}
+	}
+	for i := range blockLogs {
+		log := &blockLogs[i]
+		if log.Address != bridge || log.TxHash != receipt.TxHash {
+			continue
+		}
+		listed := false
+		for _, entry := range receipt.Logs {
+			if entry != nil && entry.Address == bridge && entry.TxHash == log.TxHash && entry.Index == log.Index {
+				listed = true
+				break
+			}
+		}
+		if !listed {
+			return log.Index, true
+		}
+	}
+	return 0, false
+}
+
+// recordUnwrapRegistration checks a request the bridge registered against its
+// source event and stores it.
+//
+// checked says the request is one this node must vouch for: the receive is
+// live, the running listener read it, or this database had already followed
+// the bridge account to its tip before the receive existed. However late such
+// a receive is read, a request without its source event is an emergency and a
+// source that cannot be read holds the checkpoint.
+//
+// A receive read after finality gives the endpoint's history time to move on.
+// An endpoint with no receipt for the transaction then does not show that the
+// transaction never existed. Unless the node recorded the event's block
+// itself, or the source chain serves a transaction without the event, such a
+// request is held and reported instead of judged.
+//
+// Anything else is history a database reads on its way to the tip for the
+// first time. The bridge withholds a request for its redeem delay so that it
+// can be checked, and a request still inside that delay is checked here like
+// any other. One that is past it, redeemed or revoked was registered long
+// enough ago that an endpoint may no longer serve its transaction, which the
+// node could not tell from a transaction that never existed. Those are
+// recorded without asking.
+func (rC *znnNetwork) recordUnwrapRegistration(ctx context.Context, param *definition.UnwrapTokenParam, rpcZnnEvent *definition.UnwrapTokenRequest, redeemableIn *uint64, receiveHeight uint64, checked, live bool) error {
+	if !checked {
+		inside, err := insideRedeemDelay(rpcZnnEvent, redeemableIn)
+		if err != nil {
+			return err
+		}
+		if inside {
+			// Record the obligation before the lookup. If the lookup fails
+			// and the delay has run out by the next start, the request is
+			// still checked.
+			if err := rC.markBridgeWatch(receiveHeight); err != nil {
+				return err
+			}
+			checked = true
+		}
+	}
+	// The bridge returned the request, so its network and token pair exist
+	// there. Without a client or store for the chain this node can neither
+	// check the request nor record it; looking either up would stop the node.
+	if !rC.rpcManager.HasEvmNetwork(rpcZnnEvent.ChainId) || !rC.dbManager.HasEvmStorage(rpcZnnEvent.ChainId) {
+		if checked {
+			return errors.Errorf("unwrap request %s/%d is on EVM chainId %d, which this node has no client or store for",
+				param.TransactionHash.String(), param.LogIndex, rpcZnnEvent.ChainId)
+		}
+		rC.logger.Infof("skipping unwrap request %s/%d: chainId %d is not an EVM network configured on this node",
+			param.TransactionHash.String(), param.LogIndex, rpcZnnEvent.ChainId)
+		return nil
+	}
+	if checked {
+		source, err := rC.unwrapSource(ctx, param, rpcZnnEvent)
+		if err != nil {
+			return err
+		}
+		// A lookup that outlived the listener must not be acted on.
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if source == sourceUnknown && !live {
+			return awaitsSourceRecord{errors.Errorf("unwrap request %s/%d on chainId %d cannot be judged: the endpoint has no receipt for its transaction and this node has no record of the event, "+
+				"and this long after the receive that does not show whether the transaction never existed or lies outside the endpoint's history",
+				param.TransactionHash.String(), param.LogIndex, rpcZnnEvent.ChainId)}
+		}
+		if source != sourceMatches {
+			rC.logger.Errorf("unwrap request %s/%d has no matching source event on chainId %d",
+				param.TransactionHash.String(), param.LogIndex, rpcZnnEvent.ChainId)
+			if stateErr := rC.state.SetState(common.EmergencyState); stateErr != nil {
+				rC.logger.Info("error setting emergency state")
+				rC.stopBridgeListener(rC.listenerCtx, stateErr)
+				return stateErr
+			}
+			return nil
+		}
+	}
+	rC.logger.Debug("Trying to add unwrap request")
+	// The stored event becomes the registered request, pending redeem. The
+	// block and sender this node's own scan recorded for it stay: if this
+	// receive is read again before its checkpoint is written, they are what a
+	// missing receipt is answered from.
+	registered := common.ZnnUnwrapToOrchestatorUnwrap(rpcZnnEvent)
+	registered.RedeemStatus = common.PendingRedeemStatus
+	if storageErr := rC.dbManager.EvmStorage(rpcZnnEvent.ChainId).AddRegisteredUnwrapRequest(registered); storageErr != nil {
+		return storageErr
+	}
+	rC.logger.Debug("Successfully added unwrap request")
+	return nil
+}
+
+// insideRedeemDelay reports whether the bridge still withholds a request that
+// has been neither redeemed nor revoked. redeemableIn comes from the reply
+// that carried the request.
+func insideRedeemDelay(request *definition.UnwrapTokenRequest, redeemableIn *uint64) (bool, error) {
+	if request.Redeemed == 1 || request.Revoked == 1 {
+		return false, nil
+	}
+	if redeemableIn == nil {
+		return false, errors.Errorf("the node returned no redeem delay for unwrap request %s/%d", request.TransactionHash, request.LogIndex)
+	}
+	return *redeemableIn > 0, nil
+}
+
+// followKeyGenSetting takes a signer out of key generation when the bridge no
+// longer allows it. It runs for a receive about key generation that is read
+// late, where other sends may have followed, and when startup reaches the tip,
+// where the receive that ended key generation may already be behind the
+// checkpoint. Nothing else ends the state.
+func (rC *znnNetwork) followKeyGenSetting(ctx context.Context) error {
+	currentState, err := rC.state.GetState()
+	if err != nil {
+		rC.stopBridgeListener(rC.listenerCtx, err)
+		return err
+	}
+	if currentState != common.KeyGenState {
+		return nil
+	}
+	if err := rC.requireSyncedNode(ctx); err != nil {
+		return err
+	}
+	read, cancel := context.WithTimeout(ctx, rpc.ZnnSettingsTimeout)
+	defer cancel()
+	info, err := rC.ZnnRpc().GetBridgeInfoContext(read)
+	if err != nil {
+		return err
+	}
+	if info == nil {
+		return errors.New("missing bridge info")
+	}
+	if info.AllowKeyGen {
+		return nil
+	}
+	return rC.leaveKeyGen()
+}
+
+// leaveKeyGen returns a signer in key generation to live. A state set in the
+// meantime, such as a halt, stays.
+func (rC *znnNetwork) leaveKeyGen() error {
+	if _, err := rC.state.SetStateIf(common.KeyGenState, common.LiveState); err != nil {
+		rC.stopBridgeListener(rC.listenerCtx, err)
+		return err
+	}
+	return nil
 }
 
 // Subscriptions
@@ -1146,6 +1864,7 @@ func (rC *znnNetwork) startRuntimeEvmNetwork(network *definition.NetworkInfo) er
 	}
 	net.client = client
 	net.startupDone = ctx.Done()
+	net.bridgeRead = rC.startupRead
 	net.health.AddNetwork(network.NetworkClass, network.Id)
 	if err := net.Start(); err != nil {
 		client.Stop()
@@ -1171,10 +1890,27 @@ func (rC *znnNetwork) stopBridgeListener(ctx context.Context, err error) {
 	common.RequestStop(rC.stopChan)
 }
 
+// stopOnCorruptCursor reports whether err is a corrupt local sync cursor.
+// Retrying cannot repair it, so the listener stops and keeps it for
+// recovery. The store has already requested a stop, which may have cancelled
+// the listener's context; the line is logged anyway because it explains why
+// the node stopped.
+func (rC *znnNetwork) stopOnCorruptCursor(err error) bool {
+	if !errors.Is(err, db.ErrCorruptCursor) {
+		return false
+	}
+	rC.logger.Errorf("Stopping Zenon bridge listener: %v", err)
+	common.RequestStop(rC.stopChan)
+	return true
+}
+
 func (rC *znnNetwork) followBridgeAccount(ctx context.Context, hints <-chan []subscribe.AccountBlock, subscriptionErrors <-chan error, refresh func() error) {
 	// Notifications can arrive before confirmation, out of order, or alongside
 	// a reconnect. Always take work from the next ledger height.
 	height, err := rC.eventsStore().GetLastUpdateHeight()
+	if rC.stopOnCorruptCursor(err) {
+		return
+	}
 	if err != nil {
 		rC.stopBridgeListener(ctx, errors.Wrap(err, "read bridge account checkpoint"))
 		return
@@ -1183,27 +1919,51 @@ func (rC *znnNetwork) followBridgeAccount(ctx context.Context, hints <-chan []su
 	for ctx.Err() == nil {
 		next, fullPage, err := rC.processBridgeAccountPage(ctx, height, refresh)
 		height = next
+		// Checked before ctx: the store's stop request can cancel ctx first.
+		if rC.stopOnCorruptCursor(err) {
+			return
+		}
 		if ctx.Err() != nil {
 			return
+		}
+		// A pass that fails at a confirmed block the endpoint listed is held
+		// at that block. An endpoint that then answers without the block has
+		// not let the listener past it.
+		listed := rC.pageListed > height
+		if err == nil && rC.hold.listed && height < rC.hold.height {
+			err = errors.Errorf("the endpoint no longer lists bridge account block %d", rC.hold.height)
+			listed = true
 		}
 		// Even without a notification, check for a missed tail after subscribing.
 		delay := 30 * time.Second
 		notifications := hints
-		if errors.Is(err, db.ErrCorruptCursor) {
-			// Retrying cannot repair the stored cursor; keep it for recovery.
-			// The store has already requested a stop, so log even if that
-			// shutdown has cancelled ctx: this line explains why it stopped.
-			rC.logger.Errorf("Stopping Zenon bridge listener: %v", err)
-			common.RequestStop(rC.stopChan)
-			return
-		} else if err != nil {
-			rC.logger.Warnf("bridge account paused at height %d: %v", height+1, err)
+		if err != nil {
+			if rC.holdBridgeAccount(height+1, err, listed, time.Time{}) {
+				// In an emergency the signer is signing the halt, and halted
+				// it signs nothing, so stopping it would only take it away
+				// from the halt. The state is checked and the stop requested
+				// under one lock.
+				stopping := rC.state.WhileSigningTransfers(func() {
+					rC.stopBridgeListener(ctx, errors.Wrapf(err, "the bridge account listener could not pass height %d for %s; stopping instead of signing without it",
+						height+1, maxBridgeAccountHold))
+				})
+				if stopping {
+					return
+				}
+			}
 			delay = 4 * time.Second
+			if rC.retryPause != 0 {
+				delay = rC.retryPause
+			}
 			notifications = nil // preserve the retry delay during bursts
-		} else if fullPage {
-			continue
-		} else if height < notifiedHeight {
-			delay = 4 * time.Second
+		} else {
+			rC.releaseBridgeAccount()
+			if fullPage {
+				continue
+			}
+			if height < notifiedHeight {
+				delay = 4 * time.Second
+			}
 		}
 		timer := time.NewTimer(delay)
 		select {
@@ -1227,10 +1987,74 @@ func (rC *znnNetwork) followBridgeAccount(ctx context.Context, hints <-chan []su
 	}
 }
 
+// A listener that cannot pass a bridge account height reads nothing after it:
+// no halt, no network change, no later registration. Past this long the node
+// stops instead of signing without its listener. A supervisor that restarts it
+// retries at startup, which ends the process again unless startupHolds keeps
+// it; a start that is kept applies the same limit in finishStartup.
+const (
+	maxBridgeAccountHold    = 10 * time.Minute
+	bridgeAccountHoldReport = time.Minute
+)
+
+type bridgeAccountHold struct {
+	height   uint64
+	since    time.Time
+	reported time.Time
+	attempts uint64
+	// The endpoint listed a block at this height, so the hold ends only when
+	// the listener has processed it.
+	listed bool
+}
+
+func (rC *znnNetwork) clock() time.Time {
+	if rC.now != nil {
+		return rC.now()
+	}
+	return time.Now()
+}
+
+// holdBridgeAccount records a failed pass at height and reports whether the
+// listener has been held there for too long. listed says the endpoint showed a
+// block at that height in this pass. Time before notBefore does not count
+// towards the limit.
+func (rC *znnNetwork) holdBridgeAccount(height uint64, err error, listed bool, notBefore time.Time) bool {
+	now := rC.clock()
+	if rC.hold.attempts == 0 || rC.hold.height != height {
+		rC.hold = bridgeAccountHold{height: height, since: now, reported: now}
+	}
+	rC.hold.attempts++
+	rC.hold.listed = rC.hold.listed || listed
+	held := snapshot.ReceiveHold{Height: height, Since: rC.hold.since.UTC(), Attempts: rC.hold.attempts}
+	rC.state.HealthStore().UpdateZenon(func(z *snapshot.Zenon) { z.ReceiveHold = &held })
+	if now.Sub(rC.hold.reported) >= bridgeAccountHoldReport {
+		rC.hold.reported = now
+		rC.logger.Errorf("bridge account listener has not passed height %d for %s (%d attempts) and reads nothing after it: %v",
+			height, now.Sub(rC.hold.since).Round(time.Second), rC.hold.attempts, err)
+	} else {
+		rC.logger.Warnf("bridge account paused at height %d: %v", height, err)
+	}
+	counted := rC.hold.since
+	if notBefore.After(counted) {
+		counted = notBefore
+	}
+	return now.Sub(counted) >= maxBridgeAccountHold
+}
+
+func (rC *znnNetwork) releaseBridgeAccount() {
+	if rC.hold.attempts == 0 {
+		return
+	}
+	rC.logger.Infof("bridge account listener passed height %d after %d attempts", rC.hold.height, rC.hold.attempts)
+	rC.hold = bridgeAccountHold{}
+	rC.state.HealthStore().UpdateZenon(func(z *snapshot.Zenon) { z.ReceiveHold = nil })
+}
+
 // Return the last consecutively processed height, including successful work
 // before an error in the same page. Only receives write a durable checkpoint.
 func (rC *znnNetwork) processBridgeAccountPage(ctx context.Context, height uint64, refresh func() error) (uint64, bool, error) {
 	const pageSize = 30
+	rC.pageListed = 0
 	read, cancel := context.WithTimeout(ctx, rpc.ZnnLedgerTimeout)
 	page, err := rC.ZnnRpc().GetAccountBlocksByHeightContext(read, types.BridgeContract, height+1, pageSize)
 	cancel()
@@ -1249,6 +2073,10 @@ func (rC *znnNetwork) processBridgeAccountPage(ctx context.Context, height uint6
 		}
 		if block.ConfirmationDetail == nil || block.ConfirmationDetail.MomentumHeight == 0 {
 			return height, false, errors.Errorf("bridge account block %d awaits confirmation", block.Height)
+		}
+		rC.pageListed = block.Height
+		if block.Hash == types.ZeroHash {
+			return height, false, errors.Errorf("bridge account block %d has no hash", block.Height)
 		}
 		receive, err := bridgeAccountReceive(block.BlockType, block.Height)
 		if err != nil {
@@ -1279,14 +2107,6 @@ func (rC *znnNetwork) processBridgeAccountPage(ctx context.Context, height uint6
 }
 
 // Transactions
-
-func (rC *znnNetwork) UpdateWrapRequest(id types.Hash, signature string, keyPair *wallet.KeyPair) error {
-	return rC.ZnnRpc().UpdateWrapRequest(id, signature, keyPair)
-}
-
-func (rC *znnNetwork) SendUnwrapRequest(event *events.UnwrapRequestEvm, keyPair *wallet.KeyPair) error {
-	return rC.ZnnRpc().SendUnwrapRequest(event, keyPair)
-}
 
 func (rC *znnNetwork) Halt(signature string, keyPair *wallet.KeyPair) error {
 	return rC.ZnnRpc().Halt(signature, keyPair)
@@ -1385,6 +2205,21 @@ func (rC *znnNetwork) GetBridgeInfo() (*definition.BridgeInfoVariable, error) {
 	return rC.ZnnRpc().GetBridgeInfo()
 }
 
+// HaltFlagSet reports whether the bridge on Zenon has its halt flag set.
+// Unlike IsHalted it does not count the wait that follows an unhalt, during
+// which a new halt is still needed, and a failed read is an error, not a
+// halt.
+func (rC *znnNetwork) HaltFlagSet() (bool, error) {
+	info, err := rC.GetBridgeInfo()
+	if err != nil {
+		return false, err
+	}
+	if info == nil {
+		return false, errors.New("missing Zenon bridge info")
+	}
+	return info.Halted, nil
+}
+
 func (rC *znnNetwork) GetOrchestratorInfo() (*definition.OrchestratorInfo, error) {
 	return rC.ZnnRpc().GetOrchestratorInfo()
 }
@@ -1403,44 +2238,39 @@ func (rC *znnNetwork) recordSync(syncInfo *protocol.SyncInfo, err error) bool {
 	return synced
 }
 
-// IsHalted treats a failed read as halted and stops the bridge listener. Code
-// that records a confirmed halt must use HaltStatus instead.
 func (rC *znnNetwork) IsHalted() bool {
-	halted, err := rC.HaltStatus()
+	bridgeInfo, err := rC.GetBridgeInfo()
 	if err != nil {
 		rC.stopBridgeListener(rC.listenerCtx, err)
 		return true
 	}
-	return halted
+	frMom, frMomErr := rC.state.GetFrontierMomentum()
+	if frMomErr != nil {
+		rC.stopBridgeListener(rC.listenerCtx, frMomErr)
+		return true
+	}
+
+	return bridgeInfo.Halted || bridgeInfo.UnhaltedAt+bridgeInfo.UnhaltDurationInMomentums >= frMom
 }
 
-// HaltStatus reports whether the Zenon bridge is halted, or still inside its
-// unhalt delay. A failed read returns an error, never a halt.
-func (rC *znnNetwork) HaltStatus() (bool, error) {
-	bridgeInfo, err := rC.GetBridgeInfo()
+// halted reports whether the bridge on Zenon is halted or still inside the
+// wait that follows an unhalt, as IsHalted does, from a read that ends with
+// the listener or after ZnnSettingsTimeout.
+func (rC *znnNetwork) halted() (bool, error) {
+	read, cancel := context.WithTimeout(rC.listenerCtx, rpc.ZnnSettingsTimeout)
+	defer cancel()
+	bridgeInfo, err := rC.ZnnRpc().GetBridgeInfoContext(read)
 	if err != nil {
 		return false, err
+	}
+	if bridgeInfo == nil {
+		return false, errors.New("missing bridge info")
 	}
 	frMom, err := rC.state.GetFrontierMomentum()
 	if err != nil {
 		return false, err
 	}
-	return haltedAt(bridgeInfo, frMom), nil
-}
-
-// HaltConfirmed reports whether the Zenon bridge has its halted flag set. It
-// does not count the unhalt delay, which ends by itself, so a halt ceremony
-// confirms against it rather than HaltStatus.
-func (rC *znnNetwork) HaltConfirmed() (bool, error) {
-	bridgeInfo, err := rC.GetBridgeInfo()
-	if err != nil {
-		return false, err
-	}
-	return bridgeInfo.Halted, nil
-}
-
-func haltedAt(bridgeInfo *definition.BridgeInfoVariable, frontierMomentum uint64) bool {
-	return bridgeInfo.Halted || bridgeInfo.UnhaltedAt+bridgeInfo.UnhaltDurationInMomentums >= frontierMomentum
+	return bridgeInfo.Halted || bridgeInfo.UnhaltedAt+bridgeInfo.UnhaltDurationInMomentums >= frMom, nil
 }
 
 /// Local storage
@@ -1478,7 +2308,13 @@ func (rC *znnNetwork) GetWrapEventById(id types.Hash) (*events.WrapRequestZnn, e
 }
 
 func (rC *znnNetwork) AddWrapEvent(rpcEvent *definition.WrapTokenRequest) error {
-	event := events.WrapRequestZnn{
+	return rC.eventsStore().AddWrapRequest(wrapEvent(rpcEvent))
+}
+
+// wrapEvent is the record of a wrap request as the bridge holds it, not yet
+// redeemed.
+func wrapEvent(rpcEvent *definition.WrapTokenRequest) events.WrapRequestZnn {
+	return events.WrapRequestZnn{
 		NetworkClass:  rpcEvent.NetworkClass,
 		ChainId:       rpcEvent.ChainId,
 		Id:            rpcEvent.Id,
@@ -1490,8 +2326,6 @@ func (rC *znnNetwork) AddWrapEvent(rpcEvent *definition.WrapTokenRequest) error 
 		RedeemStatus:  common.UnredeemedStatus,
 		SentSignature: false,
 	}
-
-	return rC.eventsStore().AddWrapRequest(event)
 }
 
 func (rC *znnNetwork) SetWrapEventStatus(id types.Hash, status uint32) error {

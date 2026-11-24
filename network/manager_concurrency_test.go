@@ -7,7 +7,6 @@ import (
 	"testing"
 
 	"github.com/zenon-network/go-zenon/vm/embedded/definition"
-	"go.uber.org/zap"
 
 	"orchestrator/common/config"
 	"orchestrator/health/snapshot"
@@ -60,7 +59,6 @@ func TestNetworkListConcurrentAddRemoveIterate(t *testing.T) {
 		func() { _ = m.NetworksLength() },
 		func() { _ = m.GetSigners() },
 		func() { _ = m.Evm(1) },
-		func() { _ = m.findEvm(150) },
 		func() { m.SetEvmBackfillBlocks(0) },
 	}
 	for _, read := range readers {
@@ -110,7 +108,7 @@ func TestNetworksReturnsSnapshot(t *testing.T) {
 	default:
 		t.Fatal("removed network was not stopped")
 	}
-	if m.isRegistered(a) || !m.isRegistered(b) {
+	if m.hasNetwork(a) || !m.hasNetwork(b) {
 		t.Fatal("registration does not follow the removal")
 	}
 	m.RemoveEvmNetwork(1) // already gone
@@ -166,17 +164,5 @@ func TestRemovalStopsRecordedHealthPoller(t *testing.T) {
 	m.RemoveEvmNetwork(1)
 	if stops.Load() != 1 {
 		t.Fatalf("poller stopped %d times by removal, want 1", stops.Load())
-	}
-}
-
-func TestIndexedCallsSurviveAListChange(t *testing.T) {
-	store := snapshot.New("v1", "")
-	m := &NetworksManager{health: store, logger: zap.NewNop().Sugar(), evmNetworks: []*evmNetwork{listNetwork(t, store, 1), listNetwork(t, store, 2)}}
-	if _, err := m.GetHaltEvmTxs([][]byte{{1}}, [20]byte{}); err == nil {
-		t.Fatal("halt txs built with fewer signatures than networks")
-	}
-	// A worker whose network was removed finishes instead of panicking.
-	if halted, err := m.SendHaltEvmAdministrator(3, nil, [20]byte{}); err != nil || !halted {
-		t.Fatalf("halted=%v err=%v for a removed network", halted, err)
 	}
 }

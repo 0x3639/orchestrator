@@ -37,7 +37,7 @@ Sync for chainId 1: eth_getLogs for blocks [18004000, 18005999] failed at block 
 
 The same range is retried with backoff from 2 seconds to 2 minutes. After 12 consecutive failures the pass stops. What happens next depends on when it failed:
 
-- **During the initial sync at startup**, the orchestrator exits. The supervisor restarts it (the systemd unit in [Install](../install.md) waits 10 seconds) and the sync resumes from the persisted cursor.
+- **During the initial sync at startup**, the orchestrator exits. The supervisor restarts it (the systemd unit in [Install](../install.md) waits 10 seconds) and the sync resumes from the persisted cursor. A signer in `EmergencyState` or `HaltedState` is kept running instead and starts the network again after 30 seconds; see [A held startup](states.md#a-held-startup).
 - **On a running node**, the next 3-minute refresh resumes from the same cursor.
 
 The cursor **never** advances past a range that did not complete, so nothing is skipped by a failure.

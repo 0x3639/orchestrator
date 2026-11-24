@@ -46,7 +46,7 @@ func TestEvmSyncStopsOnCorruptCursor(t *testing.T) {
 	stop := make(chan os.Signal, 1)
 	net := evmNetwork{dbManager: unwrapTestStores{evm: unwrap.NewEvmStorage(mem, stop, 100)}, done: make(chan struct{}), logger: zap.NewNop().Sugar()}
 	err := net.Sync()
-	checkCorruptCursorStop(t, err, stop, mem, raw, "EVM sync cursor lastUpdateHeight")
+	checkCorruptCursorStop(t, err, stop, mem, raw, "EVM scan checkpoint")
 	if !strings.Contains(err.Error(), "chainId 0") {
 		t.Fatalf("error %q does not name the chain", err)
 	}

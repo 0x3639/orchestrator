@@ -56,29 +56,33 @@ func (ec *EvmParams) ContractAddress() *ecommon.Address {
 	return &ec.contractAddress
 }
 
+// The three values a network reads from its contract when it starts are read
+// and written atomically: a network can start while the health API and the
+// signing loops already read them.
+
 func (ec *EvmParams) ContractDeploymentHeight() uint64 {
-	return ec.contractDeploymentHeight
+	return atomic.LoadUint64(&ec.contractDeploymentHeight)
 }
 
 func (ec *EvmParams) SetContractDeploymentHeight(height uint64) {
-	ec.contractDeploymentHeight = height
+	atomic.StoreUint64(&ec.contractDeploymentHeight, height)
 }
 
 func (ec *EvmParams) EstimatedBlockTime() time.Duration {
-	return ec.estimatedBlockTime
+	return time.Duration(atomic.LoadInt64((*int64)(&ec.estimatedBlockTime)))
 }
 
 func (ec *EvmParams) SetEstimatedBlockTime(blockTime uint64) {
-	ec.estimatedBlockTime = time.Second * time.Duration(int64(blockTime))
+	atomic.StoreInt64((*int64)(&ec.estimatedBlockTime), int64(time.Second*time.Duration(int64(blockTime))))
 }
 
 func (ec *EvmParams) ConfirmationsToFinality() uint64 {
-	return ec.confirmationsToFinality
+	return atomic.LoadUint64(&ec.confirmationsToFinality)
 }
 
 func (ec *EvmParams) SetConfirmationsToFinality(confirmations uint64) {
-	ec.confirmationsToFinality = confirmations
-	common.GlobalLogger.Infof("set ec.confirmationsToFinality %d", ec.confirmationsToFinality)
+	atomic.StoreUint64(&ec.confirmationsToFinality, confirmations)
+	common.GlobalLogger.Infof("set ec.confirmationsToFinality %d", confirmations)
 }
 
 type ZnnParams struct {

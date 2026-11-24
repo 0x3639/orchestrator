@@ -72,6 +72,16 @@ type Zenon struct {
 	NodeSync               Observation[string] `json:"nodeSync"`
 	FrontierMomentum       Observation[uint64] `json:"frontierMomentum"`
 	ProcessedReceiveHeight Observation[uint64] `json:"processedReceiveHeight"`
+	// Null while the bridge account listener is advancing or idle.
+	ReceiveHold *ReceiveHold `json:"receiveHold"`
+}
+
+// ReceiveHold is a bridge account height the listener keeps failing to pass.
+// It reads no later receive, including a halt, until this one succeeds.
+type ReceiveHold struct {
+	Height   uint64    `json:"height"`
+	Since    time.Time `json:"since"`
+	Attempts uint64    `json:"attempts"`
 }
 
 type Build struct {
@@ -134,6 +144,19 @@ func (s *Store) SetPhase(phase string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.status.Phase = phase
+}
+
+// AdvancePhase moves from one phase to the next and leaves any other phase,
+// such as one set by a stop in the meantime, as it is.
+func (s *Store) AdvancePhase(from, to string) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.status.Phase == from {
+		s.status.Phase = to
+	}
 }
 
 func (s *Store) SetBridgeState(state string) {

@@ -120,15 +120,6 @@ func rotationManager(nets ...*evmNetwork) (*NetworksManager, *observer.ObservedL
 	return &NetworksManager{evmNetworks: nets, logger: zap.New(core).Sugar()}, logs
 }
 
-func pendingLogged(logs *observer.ObservedLogs, chainIds string) bool {
-	for _, entry := range logs.All() {
-		if strings.Contains(entry.Message, "not yet confirmed on evm chain ids "+chainIds) {
-			return true
-		}
-	}
-	return false
-}
-
 type rotationCall func(m *NetworksManager, pubKey string) (bool, error)
 
 func rotationCalls(t *testing.T) map[string]rotationCall {
@@ -141,8 +132,12 @@ func rotationCalls(t *testing.T) map[string]rotationCall {
 			return m.CheckNewTssEcdsaPubKeyEvm(pubKey)
 		},
 		"Set": func(m *NetworksManager, pubKey string) (bool, error) {
-			sigs := [][]byte{make([]byte, 65), make([]byte, 65)}
-			return m.SetTssEcdsaPubKeyEvm(sigs, sigs, pubKey, sender, crypto.PubkeyToAddress(sender.PublicKey))
+			batch := m.EvmBatch()
+			sigs := make([][]byte, batch.Len())
+			for i := range sigs {
+				sigs[i] = make([]byte, 65)
+			}
+			return m.SetTssEcdsaPubKeyEvm(batch, sigs, sigs, pubKey, sender, crypto.PubkeyToAddress(sender.PublicKey))
 		},
 	}
 }
@@ -155,7 +150,7 @@ func TestTssRotationReadErrorIsNotComplete(t *testing.T) {
 			pubKey, newTss := rotationKey(t)
 			confirmed, confirmedTrace := newRotationNetwork(t, 1, &tssProvider{tss: newTss})
 			unreadable, unreadableTrace := newRotationNetwork(t, 2, &tssProvider{err: errors.New("rpc unavailable")})
-			m, logs := rotationManager(confirmed, unreadable)
+			m, _ := rotationManager(confirmed, unreadable)
 
 			done, err := call(m, pubKey)
 			if err != nil {
@@ -163,9 +158,6 @@ func TestTssRotationReadErrorIsNotComplete(t *testing.T) {
 			}
 			if done {
 				t.Fatal("rotation reported complete while chain 2's tss could not be read")
-			}
-			if !pendingLogged(logs, "[2]") {
-				t.Fatalf("pending chain ids not logged as [2]; logs: %v", logs.All())
 			}
 			// The sending path is unchanged: nothing is sent to a network that
 			// already has the new key or whose key could not be read.
@@ -186,22 +178,16 @@ func TestTssRotationStates(t *testing.T) {
 
 			first, firstTrace := newRotationNetwork(t, 1, &tssProvider{tss: newTss})
 			second, _ := newRotationNetwork(t, 2, &tssProvider{tss: newTss})
-			m, logs := rotationManager(first, second)
+			m, _ := rotationManager(first, second)
 			if done, err := call(m, pubKey); err != nil || !done {
 				t.Fatalf("all networks confirmed: got %v, %v; want true, nil", done, err)
-			}
-			if pendingLogged(logs, "") {
-				t.Fatal("logged pending chains when every chain confirmed")
 			}
 
 			stale, staleTrace := newRotationNetwork(t, 3, &tssProvider{tss: oldTss})
 			failing, failingTrace := newRotationNetwork(t, 4, &tssProvider{err: errors.New("timeout")})
-			m, logs = rotationManager(first, stale, failing)
+			m, _ = rotationManager(first, stale, failing)
 			if done, err := call(m, pubKey); err != nil || done {
 				t.Fatalf("one stale and one unreadable network: got %v, %v; want false, nil", done, err)
-			}
-			if !pendingLogged(logs, "[3 4]") {
-				t.Fatalf("pending chain ids not logged as [3 4]; logs: %v", logs.All())
 			}
 			// Set builds a tx only for the network that read a different key.
 			if got := staleTrace.received("eth_blockNumber"); got != (name == "Set") {
@@ -220,7 +206,7 @@ func TestTssRotationRejectsInvalidKey(t *testing.T) {
 	offCurve := base64.StdEncoding.EncodeToString(append([]byte{0x02}, bytes.Repeat([]byte{0xff}, 32)...))
 	calls := rotationCalls(t)
 	calls["Messages"] = func(m *NetworksManager, pubKey string) (bool, error) {
-		msgs, err := m.GetSetTssEcdsaPubKeysEvmMessages(pubKey)
+		_, msgs, err := m.GetSetTssEcdsaPubKeysEvmMessages(pubKey)
 		return msgs != nil, err
 	}
 	for name, call := range calls {
