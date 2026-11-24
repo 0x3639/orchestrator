@@ -492,15 +492,18 @@ func (m *NetworksManager) batchTargets(batch EvmBatch, signatures ...[][]byte) (
 			return nil, nil, fmt.Errorf("%d signatures for a round of %d EVM networks", len(set), len(batch.networks))
 		}
 	}
+	// Both lists come from one read of the networks the bridge lists, so a
+	// network replaced in between is in one of them.
+	listed := m.networks()
 	var added []*evmNetwork
-	for _, network := range m.networks() {
+	for _, network := range listed {
 		if !slices.Contains(batch.networks, network) {
 			added = append(added, network)
 		}
 	}
 	targets := make([]batchTarget, 0, len(batch.networks))
 	for idx, network := range batch.networks {
-		if m.hasNetwork(network) {
+		if slices.Contains(listed, network) {
 			targets = append(targets, batchTarget{network: network, index: idx})
 		}
 	}
@@ -687,9 +690,6 @@ func (m *NetworksManager) Evm(chainId uint32) *evmNetwork {
 }
 
 // SetTssEcdsaPubKeyEvm sends the key change, signed for the networks in
-// batch, to each of them that the bridge still lists and that does not have
-// the new key yet.
-// SetTssEcdsaPubKeyEvm sends the key change, signed for the networks in
 // batch, to each of them that the bridge still lists and that does not hold
 // the new key yet. It reports whether all of them hold it. A network the
 // bridge added after the round's messages were made has no signature in the
@@ -755,6 +755,10 @@ func (m *NetworksManager) SetTssEcdsaPubKeyEvm(batch EvmBatch, oldKeySignatures,
 	}
 	var unchanged []string
 	for _, network := range added {
+		if !m.hasNetwork(network) {
+			// Removed again since; it needs no key.
+			continue
+		}
 		if tss, err := network.GetCurrentTss(); err == nil && tss == newTss {
 			continue
 		}

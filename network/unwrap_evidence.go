@@ -196,8 +196,8 @@ func (eN *evmNetwork) unwrapRequestsFromLog(log etypes.Log, expected *events.Unw
 // policyStillCurrent returns errSettingsStale when the bridge's affiliate
 // settings, as it holds them now, give another policy for the event than the
 // node's, or do not establish one: an update that does not list the event's
-// chain leaves it as earlier updates set it, and the node has not read those
-// updates yet.
+// chain leaves it as earlier updates set it, which the node has not read
+// unless the bridge holds the settings the node applied last.
 func (eN *evmNetwork) policyStillCurrent(token string, height uint64, policy common.AffiliatePolicy) error {
 	ctx, cancel := context.WithTimeout(context.Background(), rpc.ZnnSettingsTimeout)
 	defer cancel()

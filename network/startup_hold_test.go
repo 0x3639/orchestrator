@@ -231,14 +231,16 @@ type heldEvm struct {
 	// Runs, once, when the signer first asks for the halt flag.
 	onHaltedRead atomic.Pointer[func()]
 	// The TSS address the contract holds, when one is set.
-	tss      atomic.Pointer[ecommon.Address]
-	sent     atomic.Int32 // transactions sent to this chain
-	gate     chan struct{}
-	opening  sync.Once
-	calls    atomic.Int32
-	receipts atomic.Int32
-	scans    atomic.Int32
-	starts   atomic.Int32 // times a network asked whether the node is synced
+	tss atomic.Pointer[ecommon.Address]
+	// Runs, once, when the TSS address is read.
+	onTssRead atomic.Pointer[func()]
+	sent      atomic.Int32 // transactions sent to this chain
+	gate      chan struct{}
+	opening   sync.Once
+	calls     atomic.Int32
+	receipts  atomic.Int32
+	scans     atomic.Int32
+	starts    atomic.Int32 // times a network asked whether the node is synced
 }
 
 func newHeldEvm(t *testing.T, b *replayBridge) *heldEvm {
@@ -305,6 +307,9 @@ func (e *heldEvm) answer(method string, params []json.RawMessage) (interface{}, 
 			return "0x" + strings.Repeat("0", 64), nil
 		}
 		if selector := append(call.Data, call.Input...); len(selector) >= 4 && string(selector[:4]) == string(contractSelector(e.t, "tss")) {
+			if hook := e.onTssRead.Swap(nil); hook != nil {
+				(*hook)()
+			}
 			if tss := e.tss.Load(); tss != nil {
 				return ecommon.BytesToHash(tss.Bytes()).Hex(), nil
 			}

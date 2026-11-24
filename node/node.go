@@ -590,6 +590,9 @@ func (node *Node) processSignatures() {
 			// if len is 0, it means that we have not generated a key before and the administrator needs to set it manually
 			// otherwise, orchestrator will generate a signature using the new key and validate it
 			// it will then create a signature with the old key to send an account block that changes the key
+			// keyNotSet names the networks the bridge added during the round
+			// that do not hold the new key; the round does not change them.
+			var keyNotSet error
 			if len(oldKey) != 0 {
 				decompressedOldKey, errDecompress := common.DecompressPubKey(oldKey)
 				if errDecompress != nil {
@@ -721,7 +724,10 @@ func (node *Node) processSignatures() {
 						if producerPubKey == node.getParticipant(index) {
 							node.logger.Debug("[send set tss ecdsa pub key evm tx] this is me")
 							changed, err := node.networksManager.SetTssEcdsaPubKeyEvm(evmBatch, oldKeyFullSignatures, newKeyFullSignatures, keyGenResponse.PubKey, node.ecdsaPrivateKey, node.evmAddress)
+							// Read after senders.Wait.
+							keyNotSet = nil
 							if errors.Is(err, network.ErrNetworksChanged) {
+								keyNotSet = err
 								// The networks the round was signed for still
 								// get the new key; the one added since is
 								// not changed by this round.
@@ -778,7 +784,11 @@ func (node *Node) processSignatures() {
 				waiters.Wait()
 			}
 
-			node.logger.Info("Successfully set pubKey on all networks")
+			if keyNotSet != nil {
+				node.logger.Errorf("Set pubKey on the networks of the key change round; not on every EVM network: %v", keyNotSet)
+			} else {
+				node.logger.Info("Successfully set pubKey on all networks")
+			}
 			node.resetSignatures()
 
 			node.logger.Infof("ECDSA KeyGen Response here: %v", keyGenResponse)

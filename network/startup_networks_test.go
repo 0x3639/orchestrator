@@ -270,6 +270,43 @@ func TestKeyChangeReachesItsNetworksWhenTheBridgeAddsOne(t *testing.T) {
 	}
 }
 
+// A key change reports only networks the bridge lists. A network of the round
+// the bridge removed gets nothing, the others still get theirs, and a network
+// the bridge added and removed again during the call is not named.
+func TestKeyChangeReportsOnlyNetworksTheBridgeLists(t *testing.T) {
+	h := newHeldStart(t)
+	h.evm.open()
+	second := newHeldEvm(t, h.bridge)
+	second.open()
+	h.addEvmNetwork(2, second.url)
+	batch := h.m.EvmBatch()
+	h.m.RemoveEvmNetwork(1)
+	third := newHeldEvm(t, h.bridge)
+	third.open()
+	h.addEvmNetwork(3, third.url)
+	removeThird := func() { h.m.RemoveEvmNetwork(3) }
+	second.onTssRead.Store(&removeThird)
+	tssKey, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	newKey := base64.StdEncoding.EncodeToString(crypto.CompressPubkey(&tssKey.PublicKey))
+	key, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	noPanic(t, "sending the key change", func() {
+		changed, err := h.m.SetTssEcdsaPubKeyEvm(batch, [][]byte{{1}, {2}}, [][]byte{{3}, {4}}, newKey, key, crypto.PubkeyToAddress(key.PublicKey))
+		if err != nil || changed {
+			t.Fatalf("changed %v, err %v; want not changed yet and no network named", changed, err)
+		}
+	})
+	if sent := [3]int32{h.evm.sent.Load(), second.sent.Load(), third.sent.Load()}; sent != [3]int32{0, 1, 0} {
+		t.Fatalf("transactions sent to chains 1, 2, 3: %v; want only chain 2's", sent)
+	}
+}
+
 // The administrator halts each network of a batch on its own. One the bridge
 // removes in the meantime needs no halt, and no other takes its place.
 func TestAdministratorHaltKeepsEachWorkerOnItsNetwork(t *testing.T) {
@@ -417,29 +454,37 @@ func TestUnlistedChainDoesNotConfirmAPolicyOfNoSplit(t *testing.T) {
 	}
 }
 
-// A program that does not list the event's chain does not confirm the node's
-// policy for it while the scan is ahead of the bridge read, also when it is
-// the program the node applied last: the bridge may have received an update
-// that changed the chain and then that program again.
-func TestUnlistedChainUnderTheProgramAppliedLastIsDeferred(t *testing.T) {
-	const omitsChain1 = `{"affiliateProgram":{"networks":{"2":{"startingHeight":1}}}}`
-	h := newHeldStart(t)
-	h.n.state.SetTokensMap(1, types.ZnnTokenStandard.String(), h.bridge.token.Hex())
-	h.n.state.SetIsAffiliateProgram(common.AffiliateProgram{Networks: map[uint32]common.AffiliateNetwork{1: {StartingHeight: 1}}})
-	h.n.state.SetIsAffiliateProgram(common.AffiliateProgram{Networks: map[uint32]common.AffiliateNetwork{2: {StartingHeight: 1}}})
-	h.zenon.change(func(z *heldZenon) {
-		z.registered = map[uint32]*definition.UnwrapTokenRequest{}
-		z.metadata = omitsChain1
-	})
-	h.net.bridgeRead = make(chan struct{}) // the bridge account is not read yet
-	log := h.bridge.sourceLog(t, testRecipient+common.AffiliateProgramAddressSeparator+testRecipient)
+// While the scan is ahead of the bridge read, a program that does not list the
+// event's chain confirms the node's policy for it when it is the program the
+// node applied last, an empty program included. Such an event is not deferred:
+// a deferred event holds its range, and the scan has to pass it to record the
+// source of an event a held start waits for.
+func TestUnlistedChainUnderTheProgramAppliedLastIsNotDeferred(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		metadata string
+		applied  map[uint32]common.AffiliateNetwork
+	}{
+		{"no program", `{}`, nil},
+		{"a program for another chain", `{"affiliateProgram":{"networks":{"2":{"startingHeight":1}}}}`,
+			map[uint32]common.AffiliateNetwork{2: {StartingHeight: 1}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHeldStart(t)
+			h.n.state.SetTokensMap(1, types.ZnnTokenStandard.String(), h.bridge.token.Hex())
+			h.n.state.SetIsAffiliateProgram(common.AffiliateProgram{Networks: tc.applied})
+			h.zenon.change(func(z *heldZenon) {
+				z.registered = map[uint32]*definition.UnwrapTokenRequest{}
+				z.metadata = tc.metadata
+			})
+			h.net.bridgeRead = make(chan struct{}) // the bridge account is not read yet
+			log := h.bridge.sourceLog(t, testRecipient+common.AffiliateProgramAddressSeparator+testRecipient)
 
-	transfers, err := h.net.unwrapRequestsFromLog(log, nil)
-	_, pinned, storeErr := h.stores.evm[1].UnwrapAffiliatePolicy(affiliateEvidenceKey(log))
-	if storeErr != nil {
-		t.Fatal(storeErr)
-	}
-	if !errors.Is(err, errSettingsStale) || pinned {
-		t.Fatalf("%d transfers, err %v, settings fixed %v; want the event deferred", len(transfers), err, pinned)
+			transfers, err := h.net.unwrapRequestsFromLog(log, nil)
+			policy, pinned, storeErr := h.stores.evm[1].UnwrapAffiliatePolicy(affiliateEvidenceKey(log))
+			if err != nil || storeErr != nil || len(transfers) != 1 || !pinned || policy != 0 {
+				t.Fatalf("%d transfers, err %v, policy %d fixed %v (%v); want the transfer whole with no split fixed", len(transfers), err, policy, pinned, storeErr)
+			}
+		})
 	}
 }
