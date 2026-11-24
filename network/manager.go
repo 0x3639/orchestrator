@@ -442,7 +442,7 @@ func (m *NetworksManager) SetTssEcdsaPubKeyEvm(oldKeySignatures, newKeySignature
 	// A network counts as done only after a successful read that returns the
 	// new tss. A failed read leaves it pending and sends nothing for it.
 	var pending []uint32
-	for idx, network := range m.evmNetworks {
+	for idx, network := range m.evmSnapshot() {
 		tss, err := network.GetCurrentTss()
 		if err != nil {
 			m.logger.Infof("could not read current tss on chain %d: %s", network.ChainId(), err.Error())
@@ -454,6 +454,12 @@ func (m *NetworksManager) SetTssEcdsaPubKeyEvm(oldKeySignatures, newKeySignature
 			continue
 		}
 		pending = append(pending, network.ChainId())
+		// A network added after signing has no signature here. It stays
+		// pending instead of indexing past the list.
+		if idx >= len(oldKeySignatures) || idx >= len(newKeySignatures) {
+			m.logger.Warnf("no tss change signature for network with chainId %d; it was added after signing", network.ChainId())
+			continue
+		}
 		m.logger.Debug("before getting change ecdsa pub key tx")
 		tx, err := network.GetSetTssEcdsaPubKeyEvmTx(newTss, evmAddress, oldKeySignatures[idx], newKeySignatures[idx])
 		if err != nil {
@@ -496,7 +502,7 @@ func (m *NetworksManager) CheckNewTssEcdsaPubKeyEvm(newCompressedPubKey string) 
 	// A network counts as done only after a successful read that returns the
 	// new tss. A failed read leaves it pending.
 	var pending []uint32
-	for _, network := range m.evmNetworks {
+	for _, network := range m.evmSnapshot() {
 		tss, err := network.GetCurrentTss()
 		if err != nil {
 			m.logger.Infof("could not read current tss on chain %d: %s", network.ChainId(), err.Error())
