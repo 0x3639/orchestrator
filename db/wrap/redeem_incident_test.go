@@ -251,7 +251,7 @@ func TestOtherKeysInTheDatabaseAreNotIncidents(t *testing.T) {
 // current keys once, with their resolutions, and nothing else is touched.
 func TestMoveRedeemIncidentKeysFromAnEarlierBuild(t *testing.T) {
 	syncs := new(atomic.Int64)
-	db, err := leveldb.Open(journalSyncs{storage.NewMemStorage(), syncs}, nil)
+	db, err := leveldb.Open(journalSyncs{storage.NewMemStorage(), syncs, nil}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

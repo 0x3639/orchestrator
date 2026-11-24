@@ -1,6 +1,7 @@
 package wrap
 
 import (
+	"errors"
 	"math/big"
 	"os"
 	"sync"
@@ -75,10 +76,12 @@ func TestRedeemStatusPreservesLegacyRowsAndConcurrentWrites(t *testing.T) {
 	}
 }
 
-// journalSyncs counts the syncs LevelDB issues on its journal files.
+// journalSyncs counts the journal syncs LevelDB completes, and fails them
+// while fail is set.
 type journalSyncs struct {
 	storage.Storage
 	count *atomic.Int64
+	fail  *atomic.Bool
 }
 
 func (s journalSyncs) Create(fd storage.FileDesc) (storage.Writer, error) {
@@ -86,15 +89,19 @@ func (s journalSyncs) Create(fd storage.FileDesc) (storage.Writer, error) {
 	if err != nil || fd.Type != storage.TypeJournal {
 		return w, err
 	}
-	return syncCounter{w, s.count}, nil
+	return syncCounter{w, s.count, s.fail}, nil
 }
 
 type syncCounter struct {
 	storage.Writer
 	count *atomic.Int64
+	fail  *atomic.Bool
 }
 
 func (w syncCounter) Sync() error {
+	if w.fail != nil && w.fail.Load() {
+		return errors.New("journal sync failed")
+	}
 	w.count.Add(1)
 	return w.Writer.Sync()
 }
@@ -104,7 +111,7 @@ func (w syncCounter) Sync() error {
 // not survive a power loss that these writes do not.
 func TestWrapRowsAndRedeemStatusesAreSynced(t *testing.T) {
 	syncs := new(atomic.Int64)
-	raw, err := leveldb.Open(journalSyncs{storage.NewMemStorage(), syncs}, nil)
+	raw, err := leveldb.Open(journalSyncs{storage.NewMemStorage(), syncs, nil}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -147,5 +154,61 @@ func TestWrapRowsAndRedeemStatusesAreSynced(t *testing.T) {
 	}
 	if has, _ := raw.Has(redeemStatusKey(1, types.Hash{3}), nil); has {
 		t.Fatal("a snapshot write reached the file")
+	}
+}
+
+// A write whose sync failed is not visible, so a retry writes it again and
+// syncs it instead of taking it for done. Without that, the scan retries the
+// range, finds the status already applied, and checkpoints past a status that
+// may not be on disk.
+func TestFailedSyncLeavesNothingForARetryToSkip(t *testing.T) {
+	syncs, fail := new(atomic.Int64), new(atomic.Bool)
+	raw, err := leveldb.Open(journalSyncs{storage.NewMemStorage(), syncs, fail}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer raw.Close()
+	store := NewDurableZnnStorage(raw, make(chan os.Signal, 4))
+	wrap := events.WrapRequestZnn{Id: types.Hash{2}, NetworkClass: 2, ChainId: 1, Amount: big.NewInt(2), Fee: big.NewInt(1)}
+	for _, tc := range []struct {
+		name    string
+		write   func() error
+		visible func() bool
+	}{
+		{"redeem status", func() error { return store.ApplyRedeemLog(1, wrap.Id, 10, 0, common.PendingRedeemStatus) },
+			func() bool { has, _ := raw.Has(redeemStatusKey(1, wrap.Id), nil); return has }},
+		{"wrap row", func() error { return store.AddWrapRequest(wrap) },
+			func() bool { row, err := store.GetWrapRequestById(wrap.Id); return err == nil && row != nil }},
+	} {
+		fail.Store(true)
+		if err := tc.write(); err == nil {
+			t.Fatalf("%s: the write succeeded although its sync failed", tc.name)
+		}
+		if tc.visible() {
+			t.Fatalf("%s: a write whose sync failed is visible", tc.name)
+		}
+		fail.Store(false)
+		before := syncs.Load()
+		if err := tc.write(); err != nil {
+			t.Fatalf("%s: retry: %v", tc.name, err)
+		}
+		if syncs.Load() == before {
+			t.Fatalf("%s: the retry returned without a synced write", tc.name)
+		}
+		if !tc.visible() {
+			t.Fatalf("%s: not visible after the retry", tc.name)
+		}
+	}
+	// The stored form matches what the Zenon wrapper writes and reads.
+	if got, err := store.GetWrapRequestById(wrap.Id); err != nil || got == nil || got.Amount.Cmp(wrap.Amount) != 0 {
+		t.Fatalf("read back through the wrapper: %+v %v", got, err)
+	}
+	plain := zdb.NewLevelDBWrapper(raw)
+	if err := plain.Put([]byte{0xee}, []byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	wrapped, _ := raw.Get([]byte{0xee}, nil)
+	if want := storedValue([]byte("x")); string(wrapped) != string(want) {
+		t.Fatalf("the wrapper stores %x, putDurable would store %x", wrapped, want)
 	}
 }

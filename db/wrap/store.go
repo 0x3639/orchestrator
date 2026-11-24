@@ -55,22 +55,24 @@ func NewDurableZnnStorage(raw *leveldb.DB, stopChan chan os.Signal) db.ZnnStorag
 	return store
 }
 
+// storedValue is how the Zenon wrapper around the LevelDB file stores a value:
+// a marker byte that tells a present value from a deleted one, then the value.
+func storedValue(value []byte) []byte {
+	return append([]byte{0}, value...)
+}
+
 // putDurable writes a wrap row or a redeem status. The EVM scan stores its
 // checkpoint in another database once it is past the log such a write came
 // from, so the write itself has to be on disk first. Syncing some later write
 // would not do: an earlier one can sit in a journal file that LevelDB has
 // already closed without a sync.
 //
-// The value goes through DB first, which owns the stored encoding, and the
-// stored bytes are then written again with a sync. Callers hold mu, so no
-// other write to the key comes between the two.
+// The synced write is the only write. LevelDB adds a write to what it serves
+// only after the journal sync succeeded, so a failed sync leaves no trace a
+// retry could take for a finished write.
 func (es *eventStore) putDurable(key, value []byte) error {
-	if err := es.DB.Put(key, value); err != nil || es.raw == nil {
-		return err
+	if es.raw == nil {
+		return es.DB.Put(key, value)
 	}
-	stored, err := es.raw.Get(key, nil)
-	if err != nil {
-		return err
-	}
-	return es.raw.Put(key, stored, &opt.WriteOptions{Sync: true})
+	return es.raw.Put(key, storedValue(value), &opt.WriteOptions{Sync: true})
 }
