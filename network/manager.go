@@ -370,20 +370,22 @@ func (m *NetworksManager) SetTssEcdsaPubKeyEvm(oldKeySignatures, newKeySignature
 	}
 	newTss := crypto.PubkeyToAddress(*newPubKey)
 	m.logger.Debugf("New tss address: %s", newTss.String())
-	// true means that all evm networks have the new tss
-	ok := true
+	// A network counts as done only after a successful read that returns the
+	// new tss. A failed read leaves it pending and sends nothing for it.
+	var pending []uint32
 	for idx, network := range m.evmNetworks {
 		tss, err := network.GetCurrentTss()
 		if err != nil {
-			m.logger.Debug(err)
+			m.logger.Infof("could not read current tss on chain %d: %s", network.ChainId(), err.Error())
+			pending = append(pending, network.ChainId())
 			continue
 		}
 		m.logger.Debugf("current tss address: %s for network: %d", tss.String(), network.ChainId())
-		if tss.String() == newTss.String() {
+		if tss == newTss {
 			continue
 		}
+		pending = append(pending, network.ChainId())
 		m.logger.Debug("before getting change ecdsa pub key tx")
-		ok = false
 		tx, err := network.GetSetTssEcdsaPubKeyEvmTx(newTss, evmAddress, oldKeySignatures[idx], newKeySignatures[idx])
 		if err != nil {
 			m.logger.Debug(err)
@@ -406,7 +408,7 @@ func (m *NetworksManager) SetTssEcdsaPubKeyEvm(oldKeySignatures, newKeySignature
 		}
 		m.logger.Debug("sent evm tx")
 	}
-	return ok, nil
+	return m.evmTssRotationDone(newTss, pending), nil
 }
 
 func (m *NetworksManager) CheckNewTssEcdsaPubKeyEvm(newCompressedPubKey string) (bool, error) {
@@ -422,20 +424,32 @@ func (m *NetworksManager) CheckNewTssEcdsaPubKeyEvm(newCompressedPubKey string) 
 	}
 	newTss := crypto.PubkeyToAddress(*newPubKey)
 	m.logger.Debugf("New tss address: %s", newTss.String())
-	// true means that all evm networks have the new tss
-	ok := true
+	// A network counts as done only after a successful read that returns the
+	// new tss. A failed read leaves it pending.
+	var pending []uint32
 	for _, network := range m.evmNetworks {
 		tss, err := network.GetCurrentTss()
 		if err != nil {
-			m.logger.Debug(err)
+			m.logger.Infof("could not read current tss on chain %d: %s", network.ChainId(), err.Error())
+			pending = append(pending, network.ChainId())
 			continue
 		}
-		if tss.String() == newTss.String() {
+		if tss == newTss {
 			continue
 		}
-		ok = false
+		pending = append(pending, network.ChainId())
 	}
-	return ok, nil
+	return m.evmTssRotationDone(newTss, pending), nil
+}
+
+// evmTssRotationDone logs the chains that have not confirmed newTss and
+// reports whether there are none.
+func (m *NetworksManager) evmTssRotationDone(newTss ecommon.Address, pending []uint32) bool {
+	if len(pending) == 0 {
+		return true
+	}
+	m.logger.Infof("tss %s not yet confirmed on evm chain ids %v", newTss.String(), pending)
+	return false
 }
 
 func (m *NetworksManager) SendHaltEvm(signatures [][]byte, ecdsaPrivateKey *ecdsa.PrivateKey, evmAddress ecommon.Address) (bool, error) {
