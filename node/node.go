@@ -540,6 +540,16 @@ func (node *Node) processSignatures() {
 				node.logger.Debug(errDecompress)
 				continue
 			}
+			// The Zenon contract drops leading zero bytes of X and Y, so such a
+			// key could rotate the EVM networks but never Zenon. Every node sees
+			// the same key and generates a new one.
+			if accepted, errZenon := common.ZenonAcceptsDecompressedPubKey(decompressedKeyGenPubKey); errZenon != nil || !accepted {
+				node.logger.Infof("Generated pubKey %s cannot be set on the Zenon bridge contract (leading zero coordinate byte), generating a new key", keyGenResponse.PubKey)
+				if err := common.DeletePubKeyFile(node.config.TssConfig.BaseDir, keyGenResponse.PubKey); err != nil {
+					node.logger.Error(err)
+				}
+				continue
+			}
 
 			time.Sleep(5 * time.Second)
 			// we save the old pubKey because we will need it
@@ -553,6 +563,15 @@ func (node *Node) processSignatures() {
 				decompressedOldKey, errDecompress := common.DecompressPubKey(oldKey)
 				if errDecompress != nil {
 					node.logger.Debug(errDecompress)
+					continue
+				}
+				// Zenon checks the old-key signature against its own short form of
+				// such a key and rejects it, while the EVM networks would accept it.
+				if accepted, errZenon := common.ZenonAcceptsDecompressedPubKey(decompressedOldKey); errZenon != nil || !accepted {
+					node.logger.Errorf("Active pubKey %s has a leading zero coordinate byte that the Zenon bridge contract cannot verify; the administrator must set the key", oldKey)
+					if err := common.DeletePubKeyFile(node.config.TssConfig.BaseDir, keyGenResponse.PubKey); err != nil {
+						node.logger.Error(err)
+					}
 					continue
 				}
 
