@@ -59,10 +59,7 @@ type GlobalState struct {
 	affiliateStartingHeight map[uint32]uint64
 	// Counts the changes to the affiliate settings and the token map, which
 	// decide an event's affiliate policy.
-	affiliateGeneration uint64
-	// The networks of the affiliate program SetIsAffiliateProgram applied
-	// last.
-	appliedAffiliate     map[uint32]AffiliateNetwork
+	affiliateGeneration  uint64
 	resignNetworkClass   uint32
 	resignNetworkChainId uint32
 }
@@ -340,7 +337,6 @@ func (gs *GlobalState) SetIsAffiliateProgram(program AffiliateProgram) {
 		gs.affiliateStartingHeight[id] = values.StartingHeight
 		GlobalLogger.Infof("Updated affiliate program for network %d at starting height %d", id, values.StartingHeight)
 	}
-	gs.appliedAffiliate = maps.Clone(program.Networks)
 }
 
 func (gs *GlobalState) GetIsAffiliateProgramActive(id uint32, token string) bool {
@@ -367,18 +363,13 @@ func (gs *GlobalState) GetAffiliateStartingHeight(id uint32) *big.Int {
 // AffiliatePolicyUnder returns the policy AffiliatePolicyAt would return once
 // SetIsAffiliateProgram had applied program, and whether program establishes
 // it. A program that does not list the chain leaves the chain's settings as
-// the updates before it set them. Those are the node's own only when program
-// is the one the node applied last; otherwise the policy is not known.
+// the updates before it set them, so it does not establish them: the same
+// program can follow updates that changed the chain, also when it is the
+// program the node applied last.
 func (gs *GlobalState) AffiliatePolicyUnder(program AffiliateProgram, id uint32, token string, height uint64) (AffiliatePolicy, bool) {
 	values, listed := program.Networks[id]
 	if !listed {
-		gs.affiliateMu.RLock()
-		applied := maps.Equal(gs.appliedAffiliate, program.Networks)
-		gs.affiliateMu.RUnlock()
-		if !applied {
-			return 0, false
-		}
-		return gs.AffiliatePolicyAt(id, token, height), true
+		return 0, false
 	}
 	gs.affiliateMu.RLock()
 	defer gs.affiliateMu.RUnlock()

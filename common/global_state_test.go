@@ -151,7 +151,7 @@ func TestAffiliatePolicyUnderAProgram(t *testing.T) {
 		known   bool
 	}{
 		{"chain not listed, another program", 1, AffiliateProgram{Networks: map[uint32]AffiliateNetwork{2: {StartingHeight: 1}}}, 20, 0, false},
-		{"chain not listed, the program applied last", 2, appliedLast, 20, 0, true},
+		{"chain not listed, the program applied last", 2, appliedLast, 20, 0, false},
 		{"no split", 1, AffiliateProgram{Networks: map[uint32]AffiliateNetwork{1: {StartingHeight: 10}}}, 20, 0, true},
 		{"same settings", 1, AffiliateProgram{Networks: map[uint32]AffiliateNetwork{1: {StartingHeight: 10, WZNN: true}}}, 20, held, true},
 		{"before the starting height", 1, AffiliateProgram{Networks: map[uint32]AffiliateNetwork{1: {StartingHeight: 30, WZNN: true}}}, 20, 0, true},

@@ -720,14 +720,17 @@ func (node *Node) processSignatures() {
 						producerPubKey := base64.StdEncoding.EncodeToString(node.producerKeyPair.Public)
 						if producerPubKey == node.getParticipant(index) {
 							node.logger.Debug("[send set tss ecdsa pub key evm tx] this is me")
-							if changed, err := node.networksManager.SetTssEcdsaPubKeyEvm(evmBatch, oldKeyFullSignatures, newKeyFullSignatures, keyGenResponse.PubKey, node.ecdsaPrivateKey, node.evmAddress); err != nil {
-								if errors.Is(err, network.ErrNetworksChanged) {
-									node.logger.Errorf("the key change cannot be sent to every EVM network: %v", err)
-								} else {
-									node.logger.Debug(err)
-								}
+							changed, err := node.networksManager.SetTssEcdsaPubKeyEvm(evmBatch, oldKeyFullSignatures, newKeyFullSignatures, keyGenResponse.PubKey, node.ecdsaPrivateKey, node.evmAddress)
+							if errors.Is(err, network.ErrNetworksChanged) {
+								// The networks the round was signed for still
+								// get the new key; the one added since is
+								// not changed by this round.
+								node.logger.Errorf("the key change round has no signature for a network the bridge added: %v", err)
+							} else if err != nil {
+								node.logger.Debug(err)
 								continue
-							} else if changed {
+							}
+							if changed {
 								break
 							}
 						}
