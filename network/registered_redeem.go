@@ -153,6 +153,13 @@ func (eN *evmNetwork) verifyRedeemLog(log etypes.Log, depth uint64) (etypes.Log,
 	if canonical != log.BlockHash {
 		return etypes.Log{}, errors.New("redeem block is not canonical")
 	}
+	// The depth was checked before the endpoints were read. Every endpoint
+	// must still serve it now.
+	if depth > 0 {
+		if _, err := eN.EvmRpc().CanonicalHash(log.BlockNumber + depth); err != nil {
+			return etypes.Log{}, err
+		}
+	}
 	return source, nil
 }
 

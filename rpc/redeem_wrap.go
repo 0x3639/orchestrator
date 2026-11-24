@@ -17,19 +17,28 @@ import (
 )
 
 // decodeRedeemWrap reads a wrap request reply for the redeem check. The Zenon
-// type turns a missing or malformed amount or fee into zero, which would read
-// as a real request with other numbers. Here both must be present as decimal
-// integers; a fee of "0" is valid. A null reply decodes to nil.
+// type turns a missing or malformed amount, fee, chain id or network class
+// into zero, which would read as a real request with other values. Here the
+// amount and fee must be present as decimal integers (a fee of "0" is valid),
+// and the chain id and network class must be present. A null reply decodes to
+// nil.
 func decodeRedeemWrap(raw json.RawMessage) (*definition.WrapTokenRequest, error) {
 	if len(raw) == 0 || string(raw) == "null" {
 		return nil, nil
 	}
 	var wire struct {
-		Amount *string `json:"amount"`
-		Fee    *string `json:"fee"`
+		Amount       *string `json:"amount"`
+		Fee          *string `json:"fee"`
+		ChainId      *uint32 `json:"chainId"`
+		NetworkClass *uint32 `json:"networkClass"`
 	}
 	if err := json.Unmarshal(raw, &wire); err != nil {
 		return nil, err
+	}
+	// A missing destination decodes as zero, which would read as a request
+	// for another network.
+	if wire.ChainId == nil || wire.NetworkClass == nil {
+		return nil, errors.New("wrap request reply without a chain id or a network class")
 	}
 	for _, field := range []*string{wire.Amount, wire.Fee} {
 		if field == nil {

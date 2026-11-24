@@ -22,7 +22,8 @@ type eventStore struct {
 	mu       *sync.Mutex
 	// raw is the file behind DB, when there is one. Wrap rows and redeem
 	// statuses are then written through it with a sync. A snapshot has none.
-	raw *leveldb.DB
+	raw   *leveldb.DB
+	guard *writeGuard
 }
 
 func (es *eventStore) Storage() zdb.DB {
@@ -50,9 +51,21 @@ func NewZnnStorage(db zdb.DB, stopChan chan os.Signal) db.ZnnStorage {
 // NewDurableZnnStorage is NewZnnStorage over a LevelDB file. Its wrap rows and
 // redeem statuses are synced as they are written.
 func NewDurableZnnStorage(raw *leveldb.DB, stopChan chan os.Signal) db.ZnnStorage {
+	return newDurableZnnStorage(raw, stopChan, newWriteGuard(func() { common.RequestStop(stopChan) }))
+}
+
+func newDurableZnnStorage(raw *leveldb.DB, stopChan chan os.Signal, guard *writeGuard) *eventStore {
 	store := NewZnnStorage(zdb.NewLevelDBWrapper(raw), stopChan).(*eventStore)
-	store.raw = raw
+	store.raw, store.guard = raw, guard
 	return store
+}
+
+// NewZenonStores opens the wrap store and the redeem incident store over the
+// Zenon database. Their synced writes share one guard: after one of them
+// fails, neither acknowledges another write.
+func NewZenonStores(raw *leveldb.DB, stopChan chan os.Signal) (db.ZnnStorage, *RedeemIncidentStore) {
+	guard := newWriteGuard(func() { common.RequestStop(stopChan) })
+	return newDurableZnnStorage(raw, stopChan, guard), &RedeemIncidentStore{db: raw, guard: guard}
 }
 
 // storedValue is how the Zenon wrapper around the LevelDB file stores a value:
@@ -74,5 +87,7 @@ func (es *eventStore) putDurable(key, value []byte) error {
 	if es.raw == nil {
 		return es.DB.Put(key, value)
 	}
-	return es.raw.Put(key, storedValue(value), &opt.WriteOptions{Sync: true})
+	return es.guard.write(func() error {
+		return es.raw.Put(key, storedValue(value), &opt.WriteOptions{Sync: true})
+	})
 }

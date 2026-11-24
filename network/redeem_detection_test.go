@@ -186,6 +186,9 @@ func TestSourceReplyWithoutAmountOrFeeDecidesNothing(t *testing.T) {
 		{name: "fee negative", amount: 20, fee: 1, mangle: func(r map[string]any) { r["fee"] = "-1" }},
 		{name: "amount missing", amount: 20, fee: 1, mangle: func(r map[string]any) { delete(r, "amount") }},
 		{name: "amount not a string", amount: 20, fee: 1, mangle: func(r map[string]any) { r["amount"] = 20 }},
+		{name: "chain id missing", amount: 19, fee: 0, mangle: func(r map[string]any) { delete(r, "chainId") }},
+		{name: "network class missing", amount: 19, fee: 0, mangle: func(r map[string]any) { delete(r, "networkClass") }},
+		{name: "chain id not a number", amount: 19, fee: 0, mangle: func(r map[string]any) { r["chainId"] = "1" }},
 		{name: "explicit zero fee", amount: 19, fee: 0, mangle: func(map[string]any) {}, wantOK: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -245,6 +248,28 @@ func TestHaltSignaturesNeedTheNetworksTheyWereSignedFor(t *testing.T) {
 	}
 	if halted, err := m.SendHaltEvm(signatures, nil, ecommon.Address{}); err != nil || !halted {
 		t.Fatalf("after signing again: halted=%t err=%v", halted, err)
+	}
+}
+
+// Finalized evidence is checked against the confirmation depth before the
+// endpoints are read. An endpoint that no longer serves that depth by the time
+// the reads are done decides nothing.
+func TestFinalizedRedeemNeedsTheDepthAfterTheReads(t *testing.T) {
+	src := &redeemSource{synced: true}
+	n, reg, chain := redeemFixture(t, src)
+	src.wrap = sourceRequestFor(reg)
+	chain.afterReceipt = sync.OnceFunc(func() {
+		chain.set(evidenceReceipt(reg), []etypes.Log{reg}, reg.BlockNumber+n.ConfirmationsToFinality()-1)
+	})
+	if err := n.InterpretLog(reg, false); err == nil {
+		t.Fatal("decided on evidence that was no longer final on every endpoint")
+	}
+	if row, err := n.dbManager.ZnnStorage().GetWrapRequestById(src.wrap.Id); err != nil || row != nil {
+		t.Fatalf("a wrap row was written: %+v %v", row, err)
+	}
+	chain.set(evidenceReceipt(reg), []etypes.Log{reg}, 140)
+	if err := n.InterpretLog(reg, false); err != nil {
+		t.Fatalf("with the depth back: %v", err)
 	}
 }
 

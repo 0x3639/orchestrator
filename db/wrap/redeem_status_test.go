@@ -15,6 +15,7 @@ import (
 	"github.com/zenon-network/go-zenon/vm/embedded/definition"
 	"orchestrator/common"
 	"orchestrator/common/events"
+	"orchestrator/db"
 )
 
 func TestRedeemStatusPreservesLegacyRowsAndConcurrentWrites(t *testing.T) {
@@ -157,58 +158,107 @@ func TestWrapRowsAndRedeemStatusesAreSynced(t *testing.T) {
 	}
 }
 
-// A write whose sync failed is not visible, so a retry writes it again and
-// syncs it instead of taking it for done. Without that, the scan retries the
-// range, finds the status already applied, and checkpoints past a status that
-// may not be on disk.
-func TestFailedSyncLeavesNothingForARetryToSkip(t *testing.T) {
-	syncs, fail := new(atomic.Int64), new(atomic.Bool)
-	raw, err := leveldb.Open(journalSyncs{storage.NewMemStorage(), syncs, fail}, nil)
+// A write whose sync failed is not visible, and after it the stores
+// acknowledge no further write until the node restarts. LevelDB may have put
+// the failed record in its journal without advancing its sequence number, so
+// a later write could be dropped when the journal is replayed. After a
+// restart the write goes through, synced.
+func TestFailedSyncStopsWritesUntilRestart(t *testing.T) {
+	wrap := events.WrapRequestZnn{Id: types.Hash{2}, NetworkClass: 2, ChainId: 1, Amount: big.NewInt(2), Fee: big.NewInt(1)}
+	for _, tc := range []struct {
+		name    string
+		write   func(db.ZnnStorage) error
+		visible func(*leveldb.DB, db.ZnnStorage) bool
+	}{
+		{"redeem status", func(s db.ZnnStorage) error { return s.ApplyRedeemLog(1, wrap.Id, 10, 0, common.PendingRedeemStatus) },
+			func(raw *leveldb.DB, _ db.ZnnStorage) bool {
+				has, _ := raw.Has(redeemStatusKey(1, wrap.Id), nil)
+				return has
+			}},
+		{"wrap row", func(s db.ZnnStorage) error { return s.AddWrapRequest(wrap) },
+			func(_ *leveldb.DB, s db.ZnnStorage) bool {
+				row, err := s.GetWrapRequestById(wrap.Id)
+				return err == nil && row != nil
+			}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			syncs, fail := new(atomic.Int64), new(atomic.Bool)
+			files := journalSyncs{storage.NewMemStorage(), syncs, fail}
+			raw, err := leveldb.Open(files, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			stop := make(chan os.Signal, 4)
+			store, incidents := NewZenonStores(raw, stop)
+			fail.Store(true)
+			if err := tc.write(store); err == nil {
+				t.Fatal("the write succeeded although its sync failed")
+			}
+			if tc.visible(raw, store) {
+				t.Fatal("a write whose sync failed is visible")
+			}
+			if len(stop) == 0 {
+				t.Fatal("a failed synced write did not ask the node to stop")
+			}
+			// The disk works again, but this process acknowledges nothing more.
+			fail.Store(false)
+			if err := store.ApplyRedeemLog(56, types.Hash{3}, 10, 0, common.PendingRedeemStatus); err == nil {
+				t.Fatal("a later status write on another key was acknowledged")
+			}
+			if _, err := incidents.RecordRedeemIncident(incidentFixture(1, 2)); err == nil {
+				t.Fatal("a later incident write was acknowledged")
+			}
+			if err := tc.write(store); err == nil {
+				t.Fatal("the retry was acknowledged before a restart")
+			}
+			// Restart: the same files, opened again.
+			if err := raw.Close(); err != nil {
+				t.Fatal(err)
+			}
+			raw, err = leveldb.Open(files, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer raw.Close()
+			// The failed record may come back from the journal; either way the
+			// write is accepted now and is there.
+			store, _ = NewZenonStores(raw, make(chan os.Signal, 4))
+			if err := tc.write(store); err != nil {
+				t.Fatalf("after the restart: %v", err)
+			}
+			if !tc.visible(raw, store) {
+				t.Fatal("not visible after the restart")
+			}
+			if has, _ := raw.Has(redeemStatusKey(56, types.Hash{3}), nil); has {
+				t.Fatal("a write that was refused is in the database")
+			}
+		})
+	}
+}
+
+// The stored form matches what the Zenon wrapper writes and reads.
+func TestDurableWritesUseTheWrapperEncoding(t *testing.T) {
+	raw, err := leveldb.Open(storage.NewMemStorage(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer raw.Close()
-	store := NewDurableZnnStorage(raw, make(chan os.Signal, 4))
+	store := NewDurableZnnStorage(raw, make(chan os.Signal, 1))
 	wrap := events.WrapRequestZnn{Id: types.Hash{2}, NetworkClass: 2, ChainId: 1, Amount: big.NewInt(2), Fee: big.NewInt(1)}
-	for _, tc := range []struct {
-		name    string
-		write   func() error
-		visible func() bool
-	}{
-		{"redeem status", func() error { return store.ApplyRedeemLog(1, wrap.Id, 10, 0, common.PendingRedeemStatus) },
-			func() bool { has, _ := raw.Has(redeemStatusKey(1, wrap.Id), nil); return has }},
-		{"wrap row", func() error { return store.AddWrapRequest(wrap) },
-			func() bool { row, err := store.GetWrapRequestById(wrap.Id); return err == nil && row != nil }},
-	} {
-		fail.Store(true)
-		if err := tc.write(); err == nil {
-			t.Fatalf("%s: the write succeeded although its sync failed", tc.name)
-		}
-		if tc.visible() {
-			t.Fatalf("%s: a write whose sync failed is visible", tc.name)
-		}
-		fail.Store(false)
-		before := syncs.Load()
-		if err := tc.write(); err != nil {
-			t.Fatalf("%s: retry: %v", tc.name, err)
-		}
-		if syncs.Load() == before {
-			t.Fatalf("%s: the retry returned without a synced write", tc.name)
-		}
-		if !tc.visible() {
-			t.Fatalf("%s: not visible after the retry", tc.name)
-		}
+	if err := store.AddWrapRequest(wrap); err != nil {
+		t.Fatal(err)
 	}
-	// The stored form matches what the Zenon wrapper writes and reads.
 	if got, err := store.GetWrapRequestById(wrap.Id); err != nil || got == nil || got.Amount.Cmp(wrap.Amount) != 0 {
 		t.Fatalf("read back through the wrapper: %+v %v", got, err)
 	}
 	plain := zdb.NewLevelDBWrapper(raw)
-	if err := plain.Put([]byte{0xee}, []byte("x")); err != nil {
-		t.Fatal(err)
-	}
-	wrapped, _ := raw.Get([]byte{0xee}, nil)
-	if want := storedValue([]byte("x")); string(wrapped) != string(want) {
-		t.Fatalf("the wrapper stores %x, putDurable would store %x", wrapped, want)
+	for _, value := range [][]byte{[]byte("x"), {}} {
+		if err := plain.Put([]byte{0xee}, value); err != nil {
+			t.Fatal(err)
+		}
+		wrapped, _ := raw.Get([]byte{0xee}, nil)
+		if want := storedValue(value); string(wrapped) != string(want) {
+			t.Fatalf("the wrapper stores %x, putDurable would store %x", wrapped, want)
+		}
 	}
 }

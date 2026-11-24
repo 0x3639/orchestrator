@@ -40,9 +40,10 @@ func NewDbManager(stop chan os.Signal) (*Manager, error) {
 		newLogger.Infof("Moved %d redeem incident records written by an earlier build to their current keys", moved)
 	}
 
+	znnStorage, redeemIncidents := wrap.NewZenonStores(newZnnLdb, stop)
 	newDbManager := &Manager{
-		redeemIncidents: wrap.NewRedeemIncidentStore(newZnnLdb),
-		znnStorage:      wrap.NewDurableZnnStorage(newZnnLdb, stop),
+		redeemIncidents: redeemIncidents,
+		znnStorage:      znnStorage,
 		evmStorage:      make(map[uint32]db.EvmStorage),
 		stopChan:        stop,
 		logger:          newLogger,

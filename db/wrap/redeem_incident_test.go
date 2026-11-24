@@ -349,7 +349,9 @@ func TestMoveRedeemIncidentKeysRejectsUnaccountedEvidence(t *testing.T) {
 			}
 			defer db.Close()
 			good := earlier(redeemEvidenceKey(ev), oldRedeemEvidencePrefix)
-			bad := earlier(redeemEvidenceKey(incidentFixture(1, 1)), oldRedeemEvidencePrefix)
+			// After the good one in key order, so a move that wrote record by
+			// record would already have moved the good one.
+			bad := earlier(redeemEvidenceKey(incidentFixture(1, 3)), oldRedeemEvidencePrefix)
 			if err := db.Put(good, data, nil); err != nil {
 				t.Fatal(err)
 			}
@@ -385,10 +387,55 @@ func TestZenonKeyBytesAreDistinct(t *testing.T) {
 		"wrap events": wrapEventPrefix[0], "receive cursor": lastUpdatePrefix[0], "resign status": resignedStatusPrefix[0],
 		"receive coverage": receiveCoverageKey[0], "legacy redeem status": legacyRedeemStatusPrefix, "redeem status": redeemStatusPrefix,
 		"incident evidence": redeemEvidencePrefix, "incident resolution": redeemHaltConfirmedPrefix,
+		"bridge watch": bridgeWatchKey[0],
 	} {
 		if other, ok := seen[b]; ok {
 			t.Fatalf("%s and %s both use key byte %d", name, other, b)
 		}
 		seen[b] = name
+	}
+}
+
+// One earlier build wrote a one-byte sync marker under byte 8, which is now
+// the evidence prefix. The move removes exactly that marker, so it does not
+// read as an incident nobody can acknowledge, and leaves real incidents alone.
+func TestMoveRemovesTheSyncMarkerOfAnEarlierBuild(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		value       []byte
+		withPending bool
+		wantPending bool
+		wantRemoved bool
+	}{
+		{name: "marker alone", value: []byte{1}, wantRemoved: true},
+		{name: "marker beside a pending incident", value: []byte{1}, withPending: true, wantPending: true, wantRemoved: true},
+		{name: "another value under that key", value: []byte{2}, wantPending: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db, err := leveldb.Open(storage.NewMemStorage(), nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+			if err := db.Put([]byte{8}, tc.value, nil); err != nil {
+				t.Fatal(err)
+			}
+			store := NewRedeemIncidentStore(db)
+			if tc.withPending {
+				if _, err := store.RecordRedeemIncident(incidentFixture(1, 2)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if _, err := MoveRedeemIncidentKeys(db); err != nil {
+				t.Fatal(err)
+			}
+			if has, _ := db.Has([]byte{8}, nil); has == tc.wantRemoved {
+				t.Fatalf("one-byte key 8 present=%t", has)
+			}
+			pending, err := store.HasPendingRedeemIncident()
+			if err != nil || pending != tc.wantPending {
+				t.Fatalf("pending=%t err=%v, want %t", pending, err, tc.wantPending)
+			}
+		})
 	}
 }

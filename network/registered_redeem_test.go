@@ -86,13 +86,14 @@ func contractWith(registered uint64) *redeemContract {
 type redeemProvider struct {
 	primary *redeemProvider // companion endpoint for advancing the fixture chain
 	*unwrapProvider
-	halted     *bool
-	contract   *redeemContract
-	afterRange func()
-	headFails  atomic.Bool   // eth_blockNumber fails on this endpoint
-	headReads  atomic.Uint64 // eth_blockNumber requests received
-	blockReads atomic.Uint64 // eth_getBlockByNumber requests received
-	replaced   sync.Map      // height to the hash of a block that replaced the fixture block there
+	halted       *bool
+	contract     *redeemContract
+	afterRange   func()
+	headFails    atomic.Bool   // eth_blockNumber fails on this endpoint
+	afterReceipt func()        // runs after a receipt is served
+	headReads    atomic.Uint64 // eth_blockNumber requests received
+	blockReads   atomic.Uint64 // eth_getBlockByNumber requests received
+	replaced     sync.Map      // height to the hash of a block that replaced the fixture block there
 }
 
 func (p *redeemProvider) BlockNumber() (hexutil.Uint64, error) {
@@ -101,6 +102,14 @@ func (p *redeemProvider) BlockNumber() (hexutil.Uint64, error) {
 		return 0, errors.New("head unavailable")
 	}
 	return p.unwrapProvider.BlockNumber(), nil
+}
+
+func (p *redeemProvider) GetTransactionReceipt(hash ecommon.Hash) *etypes.Receipt {
+	receipt := p.unwrapProvider.GetTransactionReceipt(hash)
+	if p.afterReceipt != nil {
+		p.afterReceipt()
+	}
+	return receipt
 }
 
 func (p *redeemProvider) GetBlockByNumber(n hexutil.Uint64, full bool) map[string]interface{} {

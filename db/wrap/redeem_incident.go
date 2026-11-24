@@ -22,13 +22,25 @@ const (
 	oldRedeemHaltConfirmedPrefix byte = 5
 )
 
+// One earlier build wrote this exact key and value to force a journal sync.
+// The key byte is now the evidence prefix, where it would read as an incident.
+var (
+	oldRedeemSyncKey   = []byte{redeemEvidencePrefix}
+	oldRedeemSyncValue = []byte{1}
+)
+
 // prefix, chain id, block hash, transaction hash, log index
 const redeemEvidenceKeyLength = 1 + 4 + 32 + 32 + 8
 
-type RedeemIncidentStore struct{ db *leveldb.DB }
+type RedeemIncidentStore struct {
+	db    *leveldb.DB
+	guard *writeGuard // shared with the wrap store; see NewZenonStores
+}
 
+// NewRedeemIncidentStore opens the incident store on its own. NewZenonStores
+// opens it together with the wrap store.
 func NewRedeemIncidentStore(db *leveldb.DB) *RedeemIncidentStore {
-	return &RedeemIncidentStore{db: db}
+	return &RedeemIncidentStore{db: db, guard: newWriteGuard(nil)}
 }
 
 func redeemEvidenceKey(ev common.RedeemIncident) []byte {
@@ -80,7 +92,7 @@ func (s *RedeemIncidentStore) RecordRedeemIncident(ev common.RedeemIncident) (bo
 	if err != nil {
 		return false, err
 	}
-	return true, s.db.Put(key, data, &opt.WriteOptions{Sync: true})
+	return true, s.guard.write(func() error { return s.db.Put(key, data, &opt.WriteOptions{Sync: true}) })
 }
 
 func (s *RedeemIncidentStore) HasPendingRedeemIncident() (bool, error) {
@@ -121,7 +133,7 @@ func (s *RedeemIncidentStore) ConfirmRedeemHalt(checkedChains map[uint32]bool) e
 	if err := it.Error(); err != nil {
 		return err
 	}
-	return s.db.Write(batch, &opt.WriteOptions{Sync: true})
+	return s.guard.write(func() error { return s.db.Write(batch, &opt.WriteOptions{Sync: true}) })
 }
 
 // PendingRedeemIncidents returns the evidence that still holds the bridge.
@@ -171,12 +183,13 @@ func (s *RedeemIncidentStore) ResolveRedeemIncident(ev common.RedeemIncident, re
 		return err
 	}
 	batch.Put(marker, []byte{byte(reason)})
-	return s.db.Write(batch, &opt.WriteOptions{Sync: true})
+	return s.guard.write(func() error { return s.db.Write(batch, &opt.WriteOptions{Sync: true}) })
 }
 
 // MoveRedeemIncidentKeys moves incident evidence and resolutions that earlier
-// builds wrote under bytes 4 and 5 to the current prefixes. Call it before
-// the incident store is used.
+// builds wrote under bytes 4 and 5 to the current prefixes, and removes the
+// sync marker one earlier build wrote under byte 8. Call it before the
+// incident store is used.
 //
 // Only a key that is exactly such evidence is moved: it has the evidence
 // layout and its value is the incident the key names. Other keys under 4 and
@@ -227,7 +240,14 @@ func MoveRedeemIncidentKeys(db *leveldb.DB) (int, error) {
 	if err := it.Error(); err != nil {
 		return 0, err
 	}
-	if moved == 0 {
+	switch value, err := db.Get(oldRedeemSyncKey, nil); {
+	case errors.Is(err, leveldb.ErrNotFound):
+	case err != nil:
+		return 0, err
+	case bytes.Equal(value, oldRedeemSyncValue):
+		batch.Delete(oldRedeemSyncKey)
+	}
+	if batch.Len() == 0 {
 		return 0, nil
 	}
 	return moved, db.Write(batch, &opt.WriteOptions{Sync: true})

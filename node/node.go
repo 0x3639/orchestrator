@@ -906,9 +906,19 @@ func (node *Node) processSignatures() {
 			}
 
 			node.logger.Debug("Halt signatures are valid!")
+			// The redeem worker can release the last incident while the group
+			// signs. A halt is sent only while the emergency still stands.
+			emergency := func() bool {
+				state, err := node.state.GetState()
+				return err == nil && state == common.EmergencyState
+			}
+			if !emergency() {
+				continue
+			}
 			// Set when the EVM networks are no longer the ones these messages
-			// were signed for. Both senders then stop, and the round ends
-			// without recording a halt, so the next one signs again.
+			// were signed for, or when the emergency ended. Both senders then
+			// stop, and the round ends without recording a halt. If the
+			// emergency still stands, the next round signs again.
 			var aborted atomic.Bool
 			var senders sync.WaitGroup
 			senders.Add(2)
@@ -919,6 +929,10 @@ func (node *Node) processSignatures() {
 					for {
 						index = (index + 1) % node.getParticipantsLength()
 						if node.networksManager.Znn().IsHalted() || aborted.Load() {
+							break
+						}
+						if !emergency() {
+							aborted.Store(true)
 							break
 						}
 						producerPubKey := base64.StdEncoding.EncodeToString(node.producerKeyPair.Public)
@@ -943,6 +957,13 @@ func (node *Node) processSignatures() {
 				defer senders.Done()
 				index := uint32(int(znnSignature[0])) % node.getParticipantsLength()
 				for {
+					if aborted.Load() {
+						break
+					}
+					if !emergency() {
+						aborted.Store(true)
+						break
+					}
 					index = (index + 1) % node.getParticipantsLength()
 					producerPubKey := base64.StdEncoding.EncodeToString(node.producerKeyPair.Public)
 					if producerPubKey == node.getParticipant(index) {
@@ -968,7 +989,7 @@ func (node *Node) processSignatures() {
 			}()
 			senders.Wait()
 			if aborted.Load() {
-				continue // Still an emergency: sign for the current networks.
+				continue // The next iteration decides from the state as it is now.
 			}
 
 			if err := node.state.SetState(common.HaltedState); err != nil {
