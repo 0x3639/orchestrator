@@ -461,8 +461,13 @@ func TestHistoricalRedeemRequiresAgreement(t *testing.T) {
 
 func TestRedeemHaltNeedsExplicitNetworkFlags(t *testing.T) {
 	src := &redeemSource{synced: true}
-	n, _, evm := redeemFixture(t, src)
+	n, reg, evm := redeemFixture(t, src)
 	m := &NetworksManager{znnNetwork: &znnNetwork{rpcManager: n.rpcManager}, evmNetworks: []*evmNetwork{n}}
+	// A real incident on the fixture's chain, so that the confirmation below
+	// goes through the incident store.
+	if err := n.state.ReportRedeemIncident(common.RedeemIncident{ChainID: n.ChainId(), Log: reg}); err != nil || n.state.RedeemHaltGeneration() == 0 {
+		t.Fatalf("reported incident: pending=%d err=%v", n.state.RedeemHaltGeneration(), err)
+	}
 	if halted, err := m.ConfirmRedeemHalt(n.state, n.state.RedeemHaltGeneration()); err != nil || halted {
 		t.Fatalf("Zenon unhalted: %t %v", halted, err)
 	}
@@ -481,6 +486,12 @@ func TestRedeemHaltNeedsExplicitNetworkFlags(t *testing.T) {
 	*evm.halted = true
 	if halted, err := m.ConfirmRedeemHalt(n.state, n.state.RedeemHaltGeneration()); err != nil || !halted {
 		t.Fatalf("confirmed halt: %t %v", halted, err)
+	}
+	if n.state.RedeemHaltGeneration() != 0 {
+		t.Fatal("a confirmed halt left the incident pending")
+	}
+	if handled, err := n.state.HandledRedeemLog(n.ChainId(), reg); err != nil || !handled {
+		t.Fatalf("the confirmed incident is not recorded as handled: %v %v", handled, err)
 	}
 }
 

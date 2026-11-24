@@ -9,7 +9,10 @@ import (
 	"time"
 
 	ecommon "github.com/ethereum/go-ethereum/common"
+	etypes "github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
+	"github.com/syndtr/goleveldb/leveldb"
+	lstorage "github.com/syndtr/goleveldb/leveldb/storage"
 	"github.com/zenon-network/go-zenon/chain/nom"
 	"github.com/zenon-network/go-zenon/common/types"
 	"github.com/zenon-network/go-zenon/rpc/api"
@@ -19,6 +22,7 @@ import (
 	"orchestrator/common/events"
 	"orchestrator/common/storage"
 	"orchestrator/db"
+	"orchestrator/db/wrap"
 )
 
 // A start that waited for the EVM scans does not complete startup by itself.
@@ -215,6 +219,12 @@ func TestHaltIsNotSentAfterItsEmergencyEnded(t *testing.T) {
 			t.Fatalf("halted %v, err %v; want ErrEmergencyEnded", halted, err)
 		}
 	})
+	noPanic(t, "the administrator's halt after the emergency ended", func() {
+		halted, err := h.m.SendHaltEvmAdministrator(batch, 0, key, sender, ended)
+		if !errors.Is(err, ErrEmergencyEnded) || halted {
+			t.Fatalf("halted %v, err %v; want ErrEmergencyEnded", halted, err)
+		}
+	})
 	if sends := h.evm.sends.Load(); sends != 0 {
 		t.Fatalf("%d halt transactions were sent after the emergency ended", sends)
 	}
@@ -252,13 +262,119 @@ func TestHaltIsSentDuringTheUnhaltDelay(t *testing.T) {
 		}
 	})
 	noPanic(t, "the administrator's halt", func() {
-		halted, err := h.m.SendHaltEvmAdministrator(batch, 0, key, sender)
+		halted, err := h.m.SendHaltEvmAdministrator(batch, 0, key, sender, nil)
 		if err != nil || halted {
 			t.Fatalf("halted %v, err %v; want a halt sent", halted, err)
 		}
 	})
 	if sends := h.evm.sends.Load(); sends != 2 {
 		t.Fatalf("%d halt transactions sent, want 2", sends)
+	}
+}
+
+// The Zenon halt senders read the halt flag itself. During the wait after an
+// unhalt Zenon still reports IsHalted, but a new halt is needed; and a read
+// that fails is an error, not a halt.
+func TestZenonHaltFlagIgnoresTheUnhaltWait(t *testing.T) {
+	h := newHeldStart(t)
+	znn := h.m.Znn()
+	h.zenon.change(func(z *heldZenon) { z.unhaltWait = true })
+	if !znn.IsHalted() {
+		t.Fatal("fixture: IsHalted should count the wait after an unhalt")
+	}
+	if halted, err := znn.HaltFlagSet(); err != nil || halted {
+		t.Fatalf("during the wait after an unhalt: halted %v, err %v; want the flag clear", halted, err)
+	}
+	h.zenon.change(func(z *heldZenon) { z.halted = true })
+	if halted, err := znn.HaltFlagSet(); err != nil || !halted {
+		t.Fatalf("halted bridge: halted %v, err %v", halted, err)
+	}
+	h.zenon.change(func(z *heldZenon) { z.bridgeInfoFails = true })
+	if halted, err := znn.HaltFlagSet(); err == nil || halted {
+		t.Fatalf("failed read of the bridge info: halted %v, err %v; want an error", halted, err)
+	}
+}
+
+// restoreIncident gives the signer a pending redeem incident on chain, as if
+// it had been stored before a restart.
+func restoreIncident(t *testing.T, h *heldStart, chain uint32) common.RedeemIncident {
+	t.Helper()
+	ldb, err := leveldb.Open(lstorage.NewMemStorage(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ldb.Close() })
+	store := wrap.NewRedeemIncidentStore(ldb)
+	ev := common.RedeemIncident{ChainID: chain, Log: etypes.Log{BlockNumber: 9, BlockHash: ecommon.HexToHash("0xa4"),
+		TxHash: ecommon.HexToHash("0xd3"), Index: 1, Topics: []ecommon.Hash{common.RegisteredRedeemSigHash}, Data: []byte{1}}}
+	if _, err := store.RecordRedeemIncident(ev); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.n.state.RestoreRedeemIncidents(store); err != nil {
+		t.Fatal(err)
+	}
+	if !h.n.state.RestoredRedeemHalt(h.n.state.RedeemHaltGeneration()) {
+		t.Fatal("fixture: the incident should be restored")
+	}
+	return ev
+}
+
+// A signer that restarts with a pending incident does not act on it until
+// each EVM network's first scan has looked at it. That scan stops for the
+// pending halt, so startup completes only once the halt is released and the
+// scan has reached the head.
+func TestRestoredIncidentIsLookedAtBeforeStartupActsOnIt(t *testing.T) {
+	h := newHeldStart(t)
+	h.plainReceive()
+	h.evm.open()
+	h.net.heldRetryEvery = 10 * time.Millisecond
+	h.m.restoreWait = time.Hour
+	ev := restoreIncident(t, h, 99)
+	if err := h.start(); err != nil {
+		t.Fatal(err)
+	}
+	if !h.m.CompletesStartupLater() {
+		t.Fatal("a signer with a restored incident completed startup before the scans")
+	}
+	waitFor(t, "the first scan to look at the restored incidents", h.m.RestoredIncidentsChecked)
+	waitFor(t, "the scan to stop for the pending halt", h.net.scanPaused.Load)
+	time.Sleep(100 * time.Millisecond)
+	if h.complete() || h.net.scanned.Load() {
+		t.Fatal("startup completed while its scan was stopped for a pending halt")
+	}
+	if err := h.n.state.ArchiveSettledRedeem(ev); err != nil || h.n.state.RedeemHaltGeneration() != 0 {
+		t.Fatalf("release: pending %d, err %v", h.n.state.RedeemHaltGeneration(), err)
+	}
+	waitFor(t, "startup to complete once the scan reached the head", h.complete)
+	if !h.net.scanned.Load() {
+		t.Fatal("startup completed before the scan reached the head")
+	}
+}
+
+// When the first scan cannot look at the restored incidents, here because
+// the network's node is still syncing, the signer acts on them after a
+// bounded wait.
+func TestRestoredIncidentIsActedOnWhenTheScanCannotLook(t *testing.T) {
+	h := newHeldStart(t)
+	h.plainReceive()
+	h.evm.syncing.Store(true)
+	h.evm.open()
+	const wait = 300 * time.Millisecond
+	h.m.restoreWait = wait
+	restoreIncident(t, h, 99)
+	started := time.Now()
+	if err := h.start(); err != nil {
+		t.Fatal(err)
+	}
+	if h.m.RestoredIncidentsChecked() {
+		t.Fatal("the restored incidents count as looked at before any scan")
+	}
+	waitFor(t, "the wait for the scan to end", h.m.RestoredIncidentsChecked)
+	if elapsed := time.Since(started); elapsed < wait {
+		t.Fatalf("acted after %s, before the %s wait", elapsed, wait)
+	}
+	if h.net.settleChecked.Load() {
+		t.Fatal("fixture: the scan should not have run while the node syncs")
 	}
 }
 
@@ -300,7 +416,7 @@ func TestAdministratorHaltKeepsEachWorkerOnItsNetwork(t *testing.T) {
 	}
 	for idx := 0; idx < batch.Len(); idx++ {
 		noPanic(t, fmt.Sprintf("the worker for index %d", idx), func() {
-			halted, err := h.m.SendHaltEvmAdministrator(batch, idx, key, crypto.PubkeyToAddress(key.PublicKey))
+			halted, err := h.m.SendHaltEvmAdministrator(batch, idx, key, crypto.PubkeyToAddress(key.PublicKey), nil)
 			if err != nil || !halted {
 				t.Fatalf("index %d: halted %v, err %v; want halted", idx, halted, err)
 			}

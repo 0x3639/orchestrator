@@ -201,3 +201,30 @@ func TestPendingRedeemHaltCountsAsAnEmergency(t *testing.T) {
 		t.Fatalf("state %d, want EmergencyState", current)
 	}
 }
+
+// pendingIncidentStore holds one pending incident and accepts new ones.
+type pendingIncidentStore struct{ lossyIncidentStore }
+
+func (s *pendingIncidentStore) HasPendingRedeemIncident() (bool, error) { return true, nil }
+
+// The redeem halt restored at startup is told apart from one an incident
+// reported since has renewed.
+func TestRestoredRedeemHaltIsToldApartFromALaterOne(t *testing.T) {
+	state := NewGlobalState(new(uint8))
+	if err := state.RestoreRedeemIncidents(new(pendingIncidentStore)); err != nil {
+		t.Fatal(err)
+	}
+	restored := state.RedeemHaltGeneration()
+	if restored == 0 || !state.RestoredRedeemHalt(restored) {
+		t.Fatalf("restored generation %d not recognised", restored)
+	}
+	if state.RestoredRedeemHalt(0) {
+		t.Fatal("no halt counts as restored")
+	}
+	if err := state.ReportRedeemIncident(RedeemIncident{ChainID: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if later := state.RedeemHaltGeneration(); later == restored || state.RestoredRedeemHalt(later) {
+		t.Fatalf("generation %d after a new incident still counts as restored", later)
+	}
+}

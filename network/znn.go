@@ -2192,6 +2192,21 @@ func (rC *znnNetwork) GetBridgeInfo() (*definition.BridgeInfoVariable, error) {
 	return rC.ZnnRpc().GetBridgeInfo()
 }
 
+// HaltFlagSet reports whether the bridge on Zenon has its halt flag set.
+// Unlike IsHalted it does not count the wait that follows an unhalt, during
+// which a new halt is still needed, and a failed read is an error, not a
+// halt.
+func (rC *znnNetwork) HaltFlagSet() (bool, error) {
+	info, err := rC.GetBridgeInfo()
+	if err != nil {
+		return false, err
+	}
+	if info == nil {
+		return false, errors.New("missing Zenon bridge info")
+	}
+	return info.Halted, nil
+}
+
 func (rC *znnNetwork) GetOrchestratorInfo() (*definition.OrchestratorInfo, error) {
 	return rC.ZnnRpc().GetOrchestratorInfo()
 }

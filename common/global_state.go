@@ -41,6 +41,7 @@ type GlobalState struct {
 	redeemHaltPending     atomic.Uint64
 	redeemWriteFailed     bool
 	redeemGeneration      uint64 // guarded by stateMu
+	restoredGeneration    uint64 // the generation restored at startup; guarded by stateMu
 	// Held for reading while a halt transaction is submitted, and for
 	// writing, before stateMu, by whatever can release a redeem halt.
 	haltSendMu sync.RWMutex

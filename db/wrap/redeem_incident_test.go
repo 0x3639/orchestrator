@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"strings"
 	"sync/atomic"
 	"testing"
 
@@ -437,5 +439,33 @@ func TestMoveRemovesTheSyncMarkerOfAnEarlierBuild(t *testing.T) {
 				t.Fatalf("pending=%t err=%v, want %t", pending, err, tc.wantPending)
 			}
 		})
+	}
+}
+
+// An incident whose chain has no confirmed halt flag keeps the halt pending.
+// The error names it in the form --redeem.acknowledge takes, so an operator
+// can release one on a chain this signer no longer runs.
+func TestUnconfirmedIncidentNamesItsAcknowledgement(t *testing.T) {
+	db, err := leveldb.Open(storage.NewMemStorage(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	s := NewRedeemIncidentStore(db)
+	ev := incidentFixture(56, 3)
+	if _, err := s.RecordRedeemIncident(ev); err != nil {
+		t.Fatal(err)
+	}
+	err = s.ConfirmRedeemHalt(map[uint32]bool{1: true})
+	id := fmt.Sprintf("%d:%s:%d", ev.ChainID, ev.Log.TxHash.Hex(), ev.Log.Index)
+	if err == nil || !strings.Contains(err.Error(), "--redeem.acknowledge "+id) {
+		t.Fatalf("error %v, want one that names --redeem.acknowledge %s", err, id)
+	}
+	parsed, err := common.ParseRedeemLogID(id)
+	if err != nil || parsed != (common.RedeemLogID{ChainID: ev.ChainID, TxHash: ev.Log.TxHash, Index: ev.Log.Index}) {
+		t.Fatalf("the named incident parses as %+v, err %v", parsed, err)
+	}
+	if pending, err := s.HasPendingRedeemIncident(); err != nil || !pending {
+		t.Fatalf("pending %v, err %v; the incident must stay pending", pending, err)
 	}
 }

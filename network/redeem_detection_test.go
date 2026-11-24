@@ -469,8 +469,9 @@ func TestOnlySettledHistoryIsArchived(t *testing.T) {
 }
 
 // A signer that restarts with a stored incident the chain settled while it
-// was down releases it in its first scan, before anything acts on the
-// restored emergency, and then scans on.
+// was down releases it in its first scan, and then scans on. That nothing
+// acts on the restored emergency before this scan, when the networks start
+// through NetworksManager.Start, is TestRestoredIncidentIsLookedAtBeforeStartupActsOnIt.
 func TestRestoredIncidentIsReleasedByTheFirstScan(t *testing.T) {
 	src := &redeemSource{synced: true, err: constants.ErrDataNonExistent.Error()}
 	n, reg, chain := redeemFixture(t, src)
@@ -509,6 +510,9 @@ func TestRestoredIncidentIsReleasedByTheFirstScan(t *testing.T) {
 	}
 	if err := n.Sync(); err != nil {
 		t.Fatal(err)
+	}
+	if !n.settleChecked.Load() || !n.scanned.Load() {
+		t.Fatalf("after the first scan: looked at the incidents %v, reached the head %v", n.settleChecked.Load(), n.scanned.Load())
 	}
 	state, _ := n.state.GetState()
 	cursor, _ := n.eventsStore().GetLastUpdateHeight()

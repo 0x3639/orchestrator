@@ -81,6 +81,13 @@ type evmNetwork struct {
 	// The subscription loop then tries the scan again soon, so a released
 	// halt does not leave the range unscanned until the next refresh.
 	scanPaused atomic.Bool
+	// settleChecked is set once a scan has looked at the restored redeem
+	// incidents of this chain, or found none pending. See
+	// NetworksManager.RestoredIncidentsChecked.
+	settleChecked atomic.Bool
+	// scanned is set once a scan has reached the head without stopping for a
+	// pending redeem halt. Startup completes only after that.
+	scanned atomic.Bool
 }
 
 // agreedHashForLog returns the endpoint-agreed canonical hash at number,
@@ -347,7 +354,17 @@ const (
 	syncProgressEvery = 25
 )
 
+// Sync scans from the stored checkpoints to the head. It returns nil also
+// when it stopped early for a pending redeem halt; scanPaused then says so.
 func (eN *evmNetwork) Sync() error {
+	err := eN.sync()
+	if err == nil && !eN.scanPaused.Load() {
+		eN.scanned.Store(true)
+	}
+	return err
+}
+
+func (eN *evmNetwork) sync() error {
 	eN.logger.Info("In sync evm")
 	eN.resetCanonicalCache()
 	eN.scanPaused.Store(false)
@@ -357,6 +374,7 @@ func (eN *evmNetwork) Sync() error {
 		// record whether what remains can be paid.
 		eN.settlePendingIncidents(nil, true)
 	}
+	eN.settleChecked.Store(true)
 	startHeight, redeemFrom, legacy, err := eN.eventsStore().GetScanHeights(eN.ConfirmationsToFinality())
 	if err != nil {
 		return err

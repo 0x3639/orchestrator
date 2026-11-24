@@ -63,6 +63,10 @@ type heldZenon struct {
 	allowKeyGen bool
 	// The node returns no bridge info.
 	noBridgeInfo bool
+	// The bridge's halt flag, and an unhalt whose wait has not passed.
+	halted, unhaltWait bool
+	// A read of the bridge info fails.
+	bridgeInfoFails bool
 	// A read of the account waits here once it has said so on stalled.
 	stall, stalled chan struct{}
 	// The requests the bridge holds by log index, when a test sets them
@@ -164,13 +168,20 @@ func (z *heldZenon) GetNetworkInfo(_, id uint32) (*definition.NetworkInfo, error
 	return nil, constants.ErrUnknownNetwork
 }
 
-func (z *heldZenon) GetBridgeInfo() *definition.BridgeInfoVariable {
+func (z *heldZenon) GetBridgeInfo() (*definition.BridgeInfoVariable, error) {
 	z.mu.Lock()
 	defer z.mu.Unlock()
-	if z.noBridgeInfo {
-		return nil
+	if z.bridgeInfoFails {
+		return nil, errors.New("upstream timeout")
 	}
-	return &definition.BridgeInfoVariable{Metadata: z.metadata, AllowKeyGen: z.allowKeyGen}
+	if z.noBridgeInfo {
+		return nil, nil
+	}
+	info := &definition.BridgeInfoVariable{Metadata: z.metadata, AllowKeyGen: z.allowKeyGen, Halted: z.halted}
+	if z.unhaltWait {
+		info.UnhaltedAt, info.UnhaltDurationInMomentums = z.frontier, 1000
+	}
+	return info, nil
 }
 
 func (z *heldZenon) Momentums(ctx context.Context) (*zserver.Subscription, error) {

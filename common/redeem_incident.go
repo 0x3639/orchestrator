@@ -110,8 +110,17 @@ func (gs *GlobalState) RestoreRedeemIncidents(store RedeemIncidentStore) error {
 	gs.redeemIncidents = store
 	if pending {
 		gs.beginRedeemHaltLocked()
+		gs.restoredGeneration = gs.redeemGeneration
 	}
 	return nil
+}
+
+// RestoredRedeemHalt reports whether generation is the redeem halt this
+// signer restored at startup, with no incident reported since.
+func (gs *GlobalState) RestoredRedeemHalt(generation uint64) bool {
+	gs.stateMu.Lock()
+	defer gs.stateMu.Unlock()
+	return generation != 0 && generation == gs.restoredGeneration
 }
 
 // Startup calls this before workers start. At runtime the state lock is held.

@@ -126,7 +126,15 @@ func (s *RedeemIncidentStore) ConfirmRedeemHalt(checkedChains map[uint32]bool) e
 		}
 		chainID := binary.BigEndian.Uint32(key[1:5])
 		if !checkedChains[chainID] {
-			return fmt.Errorf("pending redeem incident on chain %d has no confirmed halt flag", chainID)
+			// Name the incident as --redeem.acknowledge takes it. A chain
+			// this signer no longer runs can never confirm the flag, and an
+			// operator who has reviewed the incident can release it so.
+			var ev common.RedeemIncident
+			if err := json.Unmarshal(it.Value(), &ev); err != nil {
+				return err
+			}
+			return fmt.Errorf("pending redeem incident %d:%s:%d has no confirmed halt flag on chain %d; if this signer no longer runs that chain, review it and restart with --redeem.acknowledge %d:%s:%d",
+				ev.ChainID, ev.Log.TxHash.Hex(), ev.Log.Index, chainID, ev.ChainID, ev.Log.TxHash.Hex(), ev.Log.Index)
 		}
 		batch.Put(marker, []byte{byte(common.RedeemHaltObserved)})
 	}

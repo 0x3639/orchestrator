@@ -221,7 +221,8 @@ func TestSendSigIntNeverBlocks(t *testing.T) {
 }
 
 // An explicit rewind keeps a redeem checkpoint that is already below the
-// target, and otherwise resets it as before.
+// target, and otherwise moves it to the target. A database that holds the
+// pair keeps the pair; only one without it gets the single-height record.
 func TestExplicitRewindKeepsALowerRedeemCheckpoint(t *testing.T) {
 	const depth = 20
 	for _, tc := range []struct {
@@ -233,8 +234,10 @@ func TestExplicitRewindKeepsALowerRedeemCheckpoint(t *testing.T) {
 	}{
 		{name: "redeem checkpoint far below the target", through: 1000, redeem: 800, target: 990, wantRedeem: 800},
 		{name: "redeem checkpoint just below the target", through: 1000, redeem: 989, target: 990, wantRedeem: 989},
-		{name: "redeem checkpoint at the target", through: 1000, redeem: 990, target: 990, wantRedeem: 970, wantLegacy: true},
-		{name: "redeem checkpoint above the target", through: 1000, redeem: 995, target: 990, wantRedeem: 970, wantLegacy: true},
+		// The pair stays a pair, so the rewind is not read as a database of
+		// an earlier build, which would replay from contract deployment.
+		{name: "redeem checkpoint at the target", through: 1000, redeem: 990, target: 990, wantRedeem: 990},
+		{name: "redeem checkpoint above the target", through: 1000, redeem: 995, target: 990, wantRedeem: 990},
 		{name: "nothing stored", target: 500, wantRedeem: 480, wantLegacy: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
