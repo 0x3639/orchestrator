@@ -265,8 +265,10 @@ func (r *EvmRpc) syncState(ctx context.Context) (bool, error) {
 
 /// Subscribe
 
-func (r *EvmRpc) SubscribeToLogs() (ethereum.Subscription, chan etypes.Log, error) {
-	sub, err := r.rpcClient.SubscribeFilterLogs(context.Background(), r.filterQuery, r.logChan)
+// SubscribeToLogs subscribes to the bridge's logs. ctx bounds the setup only;
+// a subscription that was set up lasts until it ends or is unsubscribed.
+func (r *EvmRpc) SubscribeToLogs(ctx context.Context) (ethereum.Subscription, chan etypes.Log, error) {
+	sub, err := r.rpcClient.SubscribeFilterLogs(ctx, r.filterQuery, r.logChan)
 	if err != nil {
 		r.logger.Errorf("Error after subscribe: %s", err.Error())
 		return nil, nil, err

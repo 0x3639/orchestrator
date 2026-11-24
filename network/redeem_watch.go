@@ -70,12 +70,15 @@ func (eN *evmNetwork) checkLiveRedeem(log etypes.Log) error {
 }
 
 // examineRegistration checks a registration the range scan met above the
-// redeem checkpoint limit, and holds it when the check gives no answer.
-func (eN *evmNetwork) examineRegistration(log etypes.Log, young bool) {
+// redeem checkpoint limit, and holds it when the check gives no answer. It
+// reports whether the check answered.
+func (eN *evmNetwork) examineRegistration(log etypes.Log, young bool) bool {
 	if log.Removed || log.Address != *eN.ContractAddress() {
-		return // InterpretLog rejects these once the finalized scan reaches them.
+		return true // InterpretLog rejects these once the finalized scan reaches them.
 	}
-	eN.noteRedeemCheck(log, eN.registerRedeem(log, young), true)
+	err := eN.registerRedeem(log, young)
+	eN.noteRedeemCheck(log, err, true)
+	return err == nil
 }
 
 // noteRedeemCheck records the outcome of a check. A first observation that

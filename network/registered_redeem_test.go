@@ -392,11 +392,11 @@ func TestHistoricalRedeemHaltSurvivesRestartAndResumes(t *testing.T) {
 	if err := net.state.ReportRedeemIncident(common.RedeemIncident{ChainID: 1, Log: newLog}); err != nil {
 		t.Fatal(err)
 	}
-	if err := net.state.CompleteEmergencyHalt(generation, map[uint32]bool{1: true}); err != nil || net.state.RedeemHaltGeneration() == 0 {
-		t.Fatalf("stale halt observation released newer incident: %v", err)
+	if recorded, err := net.state.CompleteEmergencyHalt(generation, map[uint32]bool{1: true}); err != nil || recorded || net.state.RedeemHaltGeneration() == 0 {
+		t.Fatalf("stale halt observation: recorded=%v err=%v pending=%d", recorded, err, net.state.RedeemHaltGeneration())
 	}
-	if err := net.state.CompleteEmergencyHalt(net.state.RedeemHaltGeneration(), map[uint32]bool{1: true}); err != nil {
-		t.Fatal(err)
+	if recorded, err := net.state.CompleteEmergencyHalt(net.state.RedeemHaltGeneration(), map[uint32]bool{1: true}); err != nil || !recorded {
+		t.Fatalf("current halt observation: recorded=%v err=%v", recorded, err)
 	}
 	if err := net.state.SetState(common.LiveState); err != nil {
 		t.Fatal(err)

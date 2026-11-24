@@ -154,6 +154,10 @@ func (gs *GlobalState) HandledRedeemLog(chainID uint32, log etypes.Log) (bool, e
 }
 
 func (gs *GlobalState) ReportRedeemIncident(ev RedeemIncident) error {
+	// A new incident starts an emergency, which waits for a transfer being
+	// published.
+	gs.transferSendMu.Lock()
+	defer gs.transferSendMu.Unlock()
 	// An acknowledged registration is archived, which can release the halt.
 	// The acknowledgements are fixed before the workers start.
 	if gs.acknowledgedRedeems[redeemLogID(ev)] {
@@ -185,22 +189,24 @@ func (gs *GlobalState) ReportRedeemIncident(ev RedeemIncident) error {
 }
 
 // CompleteEmergencyHalt records that Zenon and all EVM halt flags were set
-// for this generation. Other state transitions cannot clear a pending halt.
-func (gs *GlobalState) CompleteEmergencyHalt(generation uint64, checkedChains map[uint32]bool) error {
+// for this generation, and reports whether it did. It records nothing for a
+// generation that is no longer the pending one. Other state transitions
+// cannot clear a pending halt.
+func (gs *GlobalState) CompleteEmergencyHalt(generation uint64, checkedChains map[uint32]bool) (bool, error) {
 	gs.stateMu.Lock()
 	defer gs.stateMu.Unlock()
 	if generation == 0 || generation != gs.RedeemHaltGeneration() {
-		return nil
+		return false, nil
 	}
 	if gs.redeemWriteFailed {
-		return errors.New("redeem evidence write failed; restart from the saved scan cursor")
+		return false, errors.New("redeem evidence write failed; restart from the saved scan cursor")
 	}
 	if err := gs.redeemIncidents.ConfirmRedeemHalt(checkedChains); err != nil {
-		return err
+		return false, err
 	}
 	gs.redeemHaltPending.Store(0)
 	gs.publishStateLocked(EmergencyState)
-	return nil
+	return true, nil
 }
 
 // WhileEmergency runs send, which submits a halt transaction, if the signer

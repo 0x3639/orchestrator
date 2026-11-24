@@ -11,6 +11,7 @@ import (
 	etypes "github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/pkg/errors"
+	"github.com/zenon-network/go-zenon/chain/nom"
 	"github.com/zenon-network/go-zenon/common/types"
 	"github.com/zenon-network/go-zenon/rpc/api/embedded"
 	"github.com/zenon-network/go-zenon/vm/embedded/definition"
@@ -637,10 +638,7 @@ func (m *NetworksManager) ConfirmRedeemHalt(state *common.GlobalState, generatio
 	if !slices.Equal(m.evmNetworks, networks) {
 		return false, nil
 	}
-	if err := state.CompleteEmergencyHalt(generation, checked); err != nil {
-		return false, err
-	}
-	return true, nil
+	return state.CompleteEmergencyHalt(generation, checked)
 }
 
 func (m *NetworksManager) CountNetworksHaltState() (int, int, error) {
@@ -670,16 +668,49 @@ func (m *NetworksManager) Znn() *znnNetwork {
 
 // Account blocks
 
-func (m *NetworksManager) UpdateWrapRequest(id types.Hash, signature string, keyPair *wallet.KeyPair) error {
-	return m.Znn().UpdateWrapRequest(id, signature, keyPair)
+// WhileLive runs send, which publishes a transfer, only while the signer is
+// live for transfers, and reports whether it ran. GlobalState.WhileLive is one.
+type WhileLive func(send func() error) (bool, error)
+
+// ErrNotLive is returned when the signer left LiveState before a transfer
+// was published.
+var ErrNotLive = errors.New("the bridge is no longer live for transfers")
+
+// UpdateWrapRequest adds signature to wrap request id on Zenon. The block is
+// prepared first, proof of work included, and published through while.
+func (m *NetworksManager) UpdateWrapRequest(id types.Hash, signature string, keyPair *wallet.KeyPair, while WhileLive) error {
+	tx, err := m.Znn().ZnnRpc().PrepareWrapUpdate(id, signature, keyPair)
+	if err != nil {
+		return err
+	}
+	return m.publishTransfer(tx, while)
+}
+
+// publishTransfer publishes tx through while, and returns ErrNotLive when it
+// was not published.
+func (m *NetworksManager) publishTransfer(tx *nom.AccountBlock, while WhileLive) error {
+	sent, err := submit(while, func() error { return m.Znn().ZnnRpc().PublishTransaction(tx) })
+	if err != nil {
+		return err
+	}
+	if !sent {
+		return ErrNotLive
+	}
+	return nil
 }
 
 func (m *NetworksManager) ChangeTssEcdsaPubKeyZnn(pubKey, signature, newSignature string, keyPair *wallet.KeyPair) error {
 	return m.Znn().ChangeTssEcdsaPubKey(pubKey, signature, newSignature, keyPair)
 }
 
-func (m *NetworksManager) SendUnwrapRequest(event *events.UnwrapRequestEvm, keyPair *wallet.KeyPair) error {
-	return m.Znn().SendUnwrapRequest(event, keyPair)
+// SendUnwrapRequest registers event on Zenon, prepared and published as
+// UpdateWrapRequest does.
+func (m *NetworksManager) SendUnwrapRequest(event *events.UnwrapRequestEvm, keyPair *wallet.KeyPair, while WhileLive) error {
+	tx, err := m.Znn().ZnnRpc().PrepareUnwrap(event, keyPair)
+	if err != nil {
+		return err
+	}
+	return m.publishTransfer(tx, while)
 }
 
 // WhileEmergency runs send, which submits a halt, only while the signer is in
@@ -691,21 +722,22 @@ type WhileEmergency func(send func() error) (bool, error)
 // before the halt was sent.
 var ErrEmergencyEnded = errors.New("the emergency ended before the halt was sent")
 
-// haltSendTimeout bounds how long one halt submission can hold off the release
-// of its emergency. A submission still running then may yet land.
-const haltSendTimeout = 30 * time.Second
+// submitTimeout bounds how long one submission can hold off the change of
+// state it waits on: the release of a halt's emergency, or the end of
+// LiveState for a transfer. A submission still running then may yet land.
+const submitTimeout = 30 * time.Second
 
-// submitHalt runs send through while, and waits for it at most
-// haltSendTimeout.
-func submitHalt(while WhileEmergency, send func() error) (bool, error) {
+// submit runs send through while, and waits for it at most submitTimeout. A
+// nil while always runs send.
+func submit(while func(send func() error) (bool, error), send func() error) (bool, error) {
 	bounded := func() error {
 		done := make(chan error, 1)
 		go func() { done <- send() }()
 		select {
 		case err := <-done:
 			return err
-		case <-time.After(haltSendTimeout):
-			return errors.New("the halt submission did not answer in time")
+		case <-time.After(submitTimeout):
+			return errors.New("the submission did not answer in time")
 		}
 	}
 	if while == nil {
@@ -721,7 +753,7 @@ func (m *NetworksManager) HaltZnn(signature string, keyPair *wallet.KeyPair, whi
 	if err != nil {
 		return false, err
 	}
-	return submitHalt(while, func() error { return m.Znn().ZnnRpc().PublishTransaction(tx) })
+	return submit(while, func() error { return m.Znn().ZnnRpc().PublishTransaction(tx) })
 }
 
 //// RPC Calls
@@ -1004,7 +1036,7 @@ func (m *NetworksManager) SendHaltEvm(batch EvmBatch, signatures [][]byte, ecdsa
 			m.logger.Error(err)
 			continue
 		}
-		sent, err := submitHalt(while, func() error { return network.SendTransaction(tx) })
+		sent, err := submit(while, func() error { return network.SendTransaction(tx) })
 		if err != nil {
 			m.logger.Error(err)
 		} else if !sent {
@@ -1077,7 +1109,7 @@ func (m *NetworksManager) SendHaltEvmAdministrator(batch EvmBatch, idx int, ecds
 	if err != nil {
 		return false, err
 	}
-	sent, err := submitHalt(while, func() error { return network.SendTransaction(tx) })
+	sent, err := submit(while, func() error { return network.SendTransaction(tx) })
 	if err != nil {
 		return false, err
 	}

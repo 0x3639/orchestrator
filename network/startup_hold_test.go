@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"strings"
@@ -17,6 +18,7 @@ import (
 	ecommon "github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/hexutil"
 	etypes "github.com/ethereum/go-ethereum/core/types"
+	"github.com/gorilla/websocket"
 	"github.com/zenon-network/go-zenon/chain/nom"
 	zdb "github.com/zenon-network/go-zenon/common/db"
 	"github.com/zenon-network/go-zenon/common/types"
@@ -76,6 +78,39 @@ type heldZenon struct {
 	// Heights the node lists without their confirmation, which a lookup by
 	// hash returns.
 	listedUnconfirmed map[uint64]bool
+	// Blocks published to the node.
+	published int
+	// Runs, once, when the node is asked how much proof of work a block
+	// needs, which a transaction's preparation asks last.
+	onPrepare func()
+}
+
+func (z *heldZenon) GetFrontierAccountBlock(types.Address) (*nom.AccountBlock, error) {
+	return nil, nil
+}
+
+func (z *heldZenon) GetRequiredPoWForAccountBlock(embedded.GetRequiredParam) (*embedded.GetRequiredResult, error) {
+	z.mu.Lock()
+	hook := z.onPrepare
+	z.onPrepare = nil
+	z.mu.Unlock()
+	if hook != nil {
+		hook()
+	}
+	return &embedded.GetRequiredResult{AvailablePlasma: 21000, BasePlasma: 21000}, nil
+}
+
+func (z *heldZenon) PublishRawTransaction(*nom.AccountBlock) error {
+	z.mu.Lock()
+	defer z.mu.Unlock()
+	z.published++
+	return nil
+}
+
+func (z *heldZenon) publishedBlocks() int {
+	z.mu.Lock()
+	defer z.mu.Unlock()
+	return z.published
 }
 
 func (z *heldZenon) GetAccountBlocksByHeight(_ types.Address, height, _ uint64) (*api.AccountBlockListMarshal, error) {
@@ -402,6 +437,47 @@ func (e *heldEvm) answer(method string, params []json.RawMessage) (interface{}, 
 	return nil, nil
 }
 
+// pendingSubscriptionServer serves answer over a WebSocket, as an EVM node
+// does, but never answers a subscription, whose setup stays pending. It
+// returns the URL and counts the subscriptions asked for.
+func pendingSubscriptionServer(t *testing.T, answer func(string, []json.RawMessage) (interface{}, *replayRPCError)) (string, *atomic.Int32) {
+	t.Helper()
+	subscribes := new(atomic.Int32)
+	var upgrader websocket.Upgrader
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		for {
+			var call struct {
+				ID     json.RawMessage   `json:"id"`
+				Method string            `json:"method"`
+				Params []json.RawMessage `json:"params"`
+			}
+			if err := conn.ReadJSON(&call); err != nil {
+				return
+			}
+			if call.Method == "eth_subscribe" {
+				subscribes.Add(1)
+				continue
+			}
+			reply := map[string]interface{}{"jsonrpc": "2.0", "id": call.ID}
+			if result, rpcErr := answer(call.Method, call.Params); rpcErr != nil {
+				reply["error"] = rpcErr
+			} else {
+				reply["result"] = result
+			}
+			if err := conn.WriteJSON(reply); err != nil {
+				return
+			}
+		}
+	}))
+	t.Cleanup(func() { server.CloseClientConnections(); server.Close() })
+	return "ws" + strings.TrimPrefix(server.URL, "http"), subscribes
+}
+
 var heldAdministrator = types.Address{7}
 
 // heldStart is a signer with one EVM network (chain 1) whose networks are
@@ -433,7 +509,7 @@ func newHeldStart(t *testing.T) *heldStart {
 	h.zenon = &heldZenon{frontier: 5000, sends: map[types.Hash]*api.AccountBlockMarshal{}, unreadable: map[uint64]bool{},
 		listed: -1, request: h.bridge.request, metadata: "{}"}
 	srv := zserver.NewServer()
-	for _, name := range []string{"ledger", "stats", "embedded.bridge"} {
+	for _, name := range []string{"ledger", "stats", "embedded.bridge", "embedded.plasma"} {
 		if err := srv.RegisterName(name, h.zenon); err != nil {
 			t.Fatal(err)
 		}

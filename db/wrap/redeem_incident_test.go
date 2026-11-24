@@ -58,7 +58,7 @@ func TestRedeemIncidentEvidenceAfterHaltAndStorageFailure(t *testing.T) {
 	if state.RedeemHaltGeneration() == 0 {
 		t.Fatal("storage failure allowed normal signing")
 	}
-	if err := state.CompleteEmergencyHalt(state.RedeemHaltGeneration(), map[uint32]bool{1: true}); err == nil || state.RedeemHaltGeneration() == 0 {
+	if _, err := state.CompleteEmergencyHalt(state.RedeemHaltGeneration(), map[uint32]bool{1: true}); err == nil || state.RedeemHaltGeneration() == 0 {
 		t.Fatalf("storage error released halt: %v", err)
 	}
 }
@@ -198,7 +198,7 @@ func TestRedeemIncidentResolutionIsPerIncident(t *testing.T) {
 	if reason, err := db.Get(confirmedKey(redeemEvidenceKey(first)), nil); err != nil || len(reason) != 1 || common.RedeemResolution(reason[0]) != common.RedeemSettledOnChain {
 		t.Fatalf("first resolution was replaced: %v %v", reason, err)
 	}
-	if err := state.CompleteEmergencyHalt(state.RedeemHaltGeneration(), map[uint32]bool{56: true}); err != nil || state.RedeemHaltGeneration() != 0 {
+	if _, err := state.CompleteEmergencyHalt(state.RedeemHaltGeneration(), map[uint32]bool{56: true}); err != nil || state.RedeemHaltGeneration() != 0 {
 		t.Fatalf("observed halt did not release the remaining incident: pending=%d err=%v", state.RedeemHaltGeneration(), err)
 	}
 	if reason, err := db.Get(confirmedKey(redeemEvidenceKey(second)), nil); err != nil || len(reason) != 1 || common.RedeemResolution(reason[0]) != common.RedeemHaltObserved {

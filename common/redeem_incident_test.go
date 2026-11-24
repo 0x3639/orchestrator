@@ -178,6 +178,76 @@ func TestReleaseWaitsForAHaltSubmission(t *testing.T) {
 	}
 }
 
+// Every change that takes the signer out of LiveState waits for a transfer
+// being published, and no transfer is published after it.
+func TestLeavingLiveStateWaitsForATransferPublication(t *testing.T) {
+	for name, leave := range map[string]func(*GlobalState) error{
+		"emergency":   func(s *GlobalState) error { return s.SetState(EmergencyState) },
+		"conditional": func(s *GlobalState) error { _, err := s.SetStateIf(LiveState, HaltedState); return err },
+		"halt":        func(s *GlobalState) error { _, err := s.HaltSigning(); return err },
+		"incident":    func(s *GlobalState) error { return s.ReportRedeemIncident(RedeemIncident{ChainID: 1}) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			state := NewGlobalState(new(uint8))
+			if err := state.RestoreRedeemIncidents(new(lossyIncidentStore)); err != nil {
+				t.Fatal(err)
+			}
+			publishing, finish := make(chan struct{}), make(chan struct{})
+			published := make(chan bool, 1)
+			go func() {
+				ran, err := state.WhileLive(func() error {
+					close(publishing)
+					<-finish
+					return nil
+				})
+				published <- ran && err == nil
+			}()
+			<-publishing
+			left := make(chan error, 1)
+			go func() { left <- leave(state) }()
+			select {
+			case <-left:
+				t.Fatal("the signer left LiveState while a transfer was being published")
+			case <-time.After(100 * time.Millisecond):
+			}
+			close(finish)
+			if !<-published {
+				t.Fatal("the publication of a live signer did not run")
+			}
+			if err := <-left; err != nil {
+				t.Fatal(err)
+			}
+			if current, _ := state.GetState(); current == LiveState {
+				t.Fatal("the signer is still live")
+			}
+			ran, err := state.WhileLive(func() error {
+				t.Error("a transfer was published after the signer left LiveState")
+				return nil
+			})
+			if ran || err != nil {
+				t.Fatalf("after leaving LiveState: ran %v, err %v", ran, err)
+			}
+		})
+	}
+	// A move to LiveState cannot end it, and does not wait.
+	state := NewGlobalState(new(uint8))
+	finish := make(chan struct{})
+	defer close(finish)
+	publishing := make(chan struct{})
+	go state.WhileLive(func() error { close(publishing); <-finish; return nil })
+	<-publishing
+	set := make(chan error, 1)
+	go func() { set <- state.SetState(LiveState) }()
+	select {
+	case err := <-set:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("a move to LiveState waited for a transfer publication")
+	}
+}
+
 // A pending redeem halt is an emergency for dev's state checks too, although
 // the stored state under it is HaltedState.
 func TestPendingRedeemHaltCountsAsAnEmergency(t *testing.T) {

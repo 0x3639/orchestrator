@@ -77,6 +77,57 @@ func TestRedeemStatusPreservesLegacyRowsAndConcurrentWrites(t *testing.T) {
 	}
 }
 
+// countedGets counts the point reads on a database and on its subsets.
+type countedGets struct {
+	zdb.DB
+	gets *atomic.Int32
+}
+
+func (c countedGets) Get(key []byte) ([]byte, error) {
+	c.gets.Add(1)
+	return c.DB.Get(key)
+}
+
+func (c countedGets) Subset(prefix []byte) zdb.DB { return countedGets{c.DB.Subset(prefix), c.gets} }
+
+// The wraps waiting for their signature to be sent are chosen on their rows,
+// and only those are given their recorded redeem status.
+func TestUnsentWrapsAreChosenBeforeTheirRedeemStatusIsRead(t *testing.T) {
+	gets := new(atomic.Int32)
+	store := NewZnnStorage(countedGets{zdb.NewMemDB(), gets}, nil)
+	wrap := func(id byte) events.WrapRequestZnn {
+		return events.WrapRequestZnn{NetworkClass: definition.EvmClass, ChainId: 1, Id: types.Hash{id}, Amount: big.NewInt(19), Fee: big.NewInt(1)}
+	}
+	unsent, sent, unsigned := wrap(1), wrap(2), wrap(3)
+	for _, w := range []events.WrapRequestZnn{unsent, sent, unsigned} {
+		if err := store.AddWrapRequest(w); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.ApplyRedeemLog(1, w.Id, 10, 1, common.RevokedStatus); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, id := range []types.Hash{unsent.Id, sent.Id} {
+		if err := store.SetWrapRequestSignature(id, "signature"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := store.SetWrapRequestSentSignature(sent.Id, true); err != nil {
+		t.Fatal(err)
+	}
+	gets.Store(0)
+	got, err := store.GetUnsentSignedWrapRequests()
+	if err != nil || len(got) != 1 || got[0].Id != unsent.Id {
+		t.Fatalf("unsent signed wraps: %+v %v", got, err)
+	}
+	if got[0].RedeemStatus != common.RevokedStatus {
+		t.Fatalf("redeem status %d, want the recorded %d", got[0].RedeemStatus, common.RevokedStatus)
+	}
+	if n := gets.Load(); n != 1 {
+		t.Fatalf("%d redeem statuses read, want only the one for the wrap returned", n)
+	}
+}
+
 // journalSyncs counts the journal syncs LevelDB completes, and fails them
 // while fail is set.
 type journalSyncs struct {

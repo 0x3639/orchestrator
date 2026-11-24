@@ -63,7 +63,7 @@ func TestRestartAfterRedeemAcknowledgment(t *testing.T) {
 			if err := n.SaveConfig(); err != nil {
 				t.Fatal(err)
 			}
-			if err := n.state.CompleteEmergencyHalt(n.state.RedeemHaltGeneration(), map[uint32]bool{1: true}); err != nil {
+			if _, err := n.state.CompleteEmergencyHalt(n.state.RedeemHaltGeneration(), map[uint32]bool{1: true}); err != nil {
 				t.Fatal(err)
 			}
 			if err := db.Close(); err != nil {

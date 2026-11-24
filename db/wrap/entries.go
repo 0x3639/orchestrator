@@ -153,13 +153,18 @@ func (es *eventStore) GetUnsentSignedWrapRequests() ([]*events.WrapRequestZnn, e
 			continue
 		}
 
-		event, err := es.decodeWrap(iterator.Value())
+		// Filtered on the row alone, before its redeem status is looked up.
+		event, err := events.DeserializeWrapEventZnn(iterator.Value())
 		if err != nil {
 			es.SendSigInt()
 			return nil, err
 		}
 		if event.SentSignature || len(event.Signature) == 0 {
 			continue
+		}
+		if event, err = es.withRedeemStatus(event); err != nil {
+			es.SendSigInt()
+			return nil, err
 		}
 
 		result = append(result, event)

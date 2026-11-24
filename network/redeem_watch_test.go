@@ -298,7 +298,7 @@ func TestStoredIncidentIsReleasedOnceSettled(t *testing.T) {
 	if err != nil || len(pending) != 1 || pending[0].ChainID != 56 || n.state.RedeemHaltGeneration() == 0 {
 		t.Fatalf("incident on another chain: pending=%+v generation=%d err=%v", pending, n.state.RedeemHaltGeneration(), err)
 	}
-	if err := n.state.CompleteEmergencyHalt(n.state.RedeemHaltGeneration(), map[uint32]bool{56: true}); err != nil {
+	if _, err := n.state.CompleteEmergencyHalt(n.state.RedeemHaltGeneration(), map[uint32]bool{56: true}); err != nil {
 		t.Fatal(err)
 	}
 	if state, _ := n.state.GetState(); n.state.RedeemHaltGeneration() != 0 || state != common.HaltedState {

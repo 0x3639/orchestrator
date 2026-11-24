@@ -2087,14 +2087,6 @@ func (rC *znnNetwork) processBridgeAccountPage(ctx context.Context, height uint6
 
 // Transactions
 
-func (rC *znnNetwork) UpdateWrapRequest(id types.Hash, signature string, keyPair *wallet.KeyPair) error {
-	return rC.ZnnRpc().UpdateWrapRequest(id, signature, keyPair)
-}
-
-func (rC *znnNetwork) SendUnwrapRequest(event *events.UnwrapRequestEvm, keyPair *wallet.KeyPair) error {
-	return rC.ZnnRpc().SendUnwrapRequest(event, keyPair)
-}
-
 func (rC *znnNetwork) Halt(signature string, keyPair *wallet.KeyPair) error {
 	return rC.ZnnRpc().Halt(signature, keyPair)
 }

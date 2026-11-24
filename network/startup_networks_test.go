@@ -19,6 +19,7 @@ import (
 	"github.com/zenon-network/go-zenon/common/types"
 	"github.com/zenon-network/go-zenon/rpc/api"
 	"github.com/zenon-network/go-zenon/vm/embedded/definition"
+	"github.com/zenon-network/go-zenon/wallet"
 
 	"orchestrator/common"
 	"orchestrator/common/events"
@@ -240,6 +241,78 @@ func TestHaltIsNotSentAfterItsEmergencyEnded(t *testing.T) {
 	if sends := h.evm.sent.Load(); sends != 1 {
 		t.Fatalf("%d halt transactions sent during the emergency, want 1", sends)
 	}
+}
+
+// A wrap update or an unwrap registration is published only while the signer
+// is live for transfers. Preparing the block takes Zenon calls, and the
+// signer can leave LiveState during them, after the callers' own checks.
+func TestTransferIsNotPublishedOnceTheSignerLeftLiveState(t *testing.T) {
+	keyPair, err := wallet.DeriveWithIndex(0, make([]byte, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	unwrap := &events.UnwrapRequestEvm{NetworkClass: definition.EvmClass, ChainId: 1, TransactionHash: ecommon.Hash{7},
+		To: keyPair.Address.String(), Amount: big.NewInt(1), Signature: "c2lnbmF0dXJl"}
+	sends := map[string]func(h *heldStart) error{
+		"wrap update": func(h *heldStart) error {
+			return h.m.UpdateWrapRequest(types.Hash{9}, "c2lnbmF0dXJl", keyPair, h.n.state.WhileLive)
+		},
+		"unwrap registration": func(h *heldStart) error {
+			return h.m.SendUnwrapRequest(unwrap, keyPair, h.n.state.WhileLive)
+		},
+	}
+	leaves := map[string]func(*common.GlobalState) error{
+		"emergency": func(state *common.GlobalState) error { return state.SetState(common.EmergencyState) },
+		"halt": func(state *common.GlobalState) error {
+			_, err := state.HaltSigning()
+			return err
+		},
+	}
+	for name, send := range sends {
+		for leave, to := range leaves {
+			t.Run(name+" after "+leave, func(t *testing.T) {
+				h := newHeldStart(t)
+				if err := send(h); err != nil {
+					t.Fatalf("a live signer could not publish: %v", err)
+				}
+				if published := h.zenon.publishedBlocks(); published != 1 {
+					t.Fatalf("%d blocks published by a live signer, want 1", published)
+				}
+				h.zenon.change(func(z *heldZenon) {
+					z.onPrepare = func() {
+						if err := to(h.n.state); err != nil {
+							t.Error(err)
+						}
+					}
+				})
+				if err := send(h); !errors.Is(err, ErrNotLive) {
+					t.Fatalf("err %v, want ErrNotLive", err)
+				}
+				if published := h.zenon.publishedBlocks(); published != 1 {
+					t.Fatalf("%d blocks published, want none after the signer left LiveState", published-1)
+				}
+			})
+		}
+	}
+}
+
+// An endpoint can leave the setup of a log subscription unanswered. The
+// catch-up scan still runs when it is due, so a scan paused for a halt can
+// resume.
+func TestUnansweredSubscriptionDoesNotHoldBackTheCatchUp(t *testing.T) {
+	h := newHeldStart(t)
+	h.evm.open()
+	url, subscribes := pendingSubscriptionServer(t, h.evm.answer)
+	n := h.addEvmNetwork(2, url)
+	// The last scan stopped for a halt, so the next one is due soon.
+	n.heldRetryEvery = 2 * time.Millisecond
+	n.scanPaused.Store(true)
+	stopped := make(chan struct{})
+	go func() { defer close(stopped); n.SubscribeToEvents() }()
+	defer func() { n.stopOnce.Do(func() { close(n.done) }); <-stopped }()
+	waitUntil(t, "no catch-up scan ran while the subscription setup was pending", func() bool {
+		return subscribes.Load() > 0 && h.evm.scans.Load() > 0
+	})
 }
 
 // The halt senders read the halt flag itself. During the delay after an

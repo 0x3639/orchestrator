@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/ecdsa"
 	"fmt"
+	"github.com/ethereum/go-ethereum"
 	ecommon "github.com/ethereum/go-ethereum/common"
 	etypes "github.com/ethereum/go-ethereum/core/types"
 	"github.com/joncrlsn/dque"
@@ -86,8 +87,12 @@ type evmNetwork struct {
 	// NetworksManager.RestoredIncidentsChecked.
 	settleChecked atomic.Bool
 	// scanned is set once a scan has reached the head without stopping for a
-	// pending redeem halt. Startup completes only after that.
+	// pending redeem halt and without a final registration left unchecked.
+	// Startup completes only after that.
 	scanned atomic.Bool
+	// finalUnchecked is set when the last Sync held a final registration,
+	// above its redeem checkpoint limit, that it could not check.
+	finalUnchecked atomic.Bool
 }
 
 // agreedHashForLog returns the endpoint-agreed canonical hash at number,
@@ -356,9 +361,12 @@ const (
 
 // Sync scans from the stored checkpoints to the head. It returns nil also
 // when it stopped early for a pending redeem halt; scanPaused then says so.
+// A pass that held a final registration it could not check does not count
+// as having scanned the chain: a later pass, which the redeem checkpoint
+// makes revisit it, has to.
 func (eN *evmNetwork) Sync() error {
 	err := eN.sync()
-	if err == nil && !eN.scanPaused.Load() {
+	if err == nil && !eN.scanPaused.Load() && !eN.finalUnchecked.Load() {
 		eN.scanned.Store(true)
 	}
 	return err
@@ -368,6 +376,7 @@ func (eN *evmNetwork) sync() error {
 	eN.logger.Info("In sync evm")
 	eN.resetCanonicalCache()
 	eN.scanPaused.Store(false)
+	eN.finalUnchecked.Store(false)
 	if eN.state.RedeemHaltGeneration() != 0 {
 		// The first scan after a restart runs before anything acts on a
 		// restored incident. Release what the chain has settled since, and
@@ -516,7 +525,9 @@ func (eN *evmNetwork) sync() error {
 					// a long pass, keeps it here. A check without an answer
 					// is held for retry and does not stall the range.
 					if log.Topics[0] == common.RegisteredRedeemSigHash {
-						eN.examineRegistration(log, recent)
+						if !eN.examineRegistration(log, recent) && !recent {
+							eN.finalUnchecked.Store(true)
+						}
 						if eN.state.RedeemHaltGeneration() != 0 {
 							eN.scanPaused.Store(true)
 							return nil
@@ -870,6 +881,26 @@ func (eN *evmNetwork) refreshInterval() time.Duration {
 	return subscriptionRefreshInterval
 }
 
+// subscribeToLogs sets up the log subscription. An endpoint can leave the
+// setup unanswered, so it gives up when the next catch-up Sync is due
+// (catchUpDue, or one refresh from now before the first), or when the
+// network stops. The catch-up then runs on the error path.
+func (eN *evmNetwork) subscribeToLogs(catchUpDue time.Time) (ethereum.Subscription, chan etypes.Log, error) {
+	if catchUpDue.IsZero() {
+		catchUpDue = time.Now().Add(eN.refreshInterval())
+	}
+	ctx, cancel := context.WithDeadline(context.Background(), catchUpDue)
+	defer cancel()
+	go func() {
+		select {
+		case <-eN.done:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+	return eN.EvmRpc().SubscribeToLogs(ctx)
+}
+
 func (eN *evmNetwork) subscribeToEvents() {
 	eN.logger.Infof("SubscribeToEvents for network with chainId: %d", eN.ChainId())
 	resubscribeBackoff := processEventsBaseBackoff
@@ -882,7 +913,7 @@ func (eN *evmNetwork) subscribeToEvents() {
 	}
 
 	for {
-		logSub, logChan, err := eN.EvmRpc().SubscribeToLogs()
+		logSub, logChan, err := eN.subscribeToLogs(nextCatchUp)
 		if err != nil {
 			// HTTP range queries may still work while subscriptions are down.
 			if !time.Now().Before(nextCatchUp) {

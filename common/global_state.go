@@ -45,6 +45,10 @@ type GlobalState struct {
 	// Held for reading while a halt transaction is submitted, and for
 	// writing, before stateMu, by whatever can release a redeem halt.
 	haltSendMu sync.RWMutex
+	// Held for reading while a transfer is published, and for writing, before
+	// haltSendMu and stateMu, by every change that can take the signer out of
+	// LiveState. No transfer is published once the signer has left it.
+	transferSendMu sync.RWMutex
 	// Closed once startup has read the bridge account to its tip and every
 	// EVM network has finished its startup scan.
 	startupDone chan struct{}
@@ -98,6 +102,8 @@ func NewPersistentGlobalState(state *uint8, persistEmergency func(uint8) error) 
 }
 
 func (gs *GlobalState) SetState(newState uint8) error {
+	unlock := gs.lockTransfersFor(newState)
+	defer unlock()
 	gs.stateMu.Lock()
 	defer gs.stateMu.Unlock()
 	if gs.RedeemHaltGeneration() != 0 && newState != EmergencyState {
@@ -110,6 +116,8 @@ func (gs *GlobalState) SetState(newState uint8) error {
 // whether it did. The comparison and the change happen under one lock, so a
 // state another goroutine set in between is never overwritten.
 func (gs *GlobalState) SetStateIf(expected, newState uint8) (bool, error) {
+	unlock := gs.lockTransfersFor(newState)
+	defer unlock()
 	gs.stateMu.Lock()
 	defer gs.stateMu.Unlock()
 	if gs.RedeemHaltGeneration() != 0 && newState != EmergencyState {
@@ -161,6 +169,8 @@ func (gs *GlobalState) publishStateLocked(oldState uint8) {
 // HaltedState, as a halt the bridge listener reads does, and reports whether
 // it did. A signer in EmergencyState or HaltedState stays where it is.
 func (gs *GlobalState) HaltSigning() (bool, error) {
+	gs.transferSendMu.Lock()
+	defer gs.transferSendMu.Unlock()
 	gs.stateMu.Lock()
 	defer gs.stateMu.Unlock()
 	switch gs.effectiveStateLocked() {
@@ -279,6 +289,30 @@ func (gs *GlobalState) WhileSettingsCurrent(do func() error) (bool, error) {
 		return false, nil
 	}
 	return true, do()
+}
+
+// lockTransfersFor takes transferSendMu when a move to newState can take the
+// signer out of LiveState, and returns what releases it.
+func (gs *GlobalState) lockTransfersFor(newState uint8) func() {
+	if newState == LiveState {
+		return func() {}
+	}
+	gs.transferSendMu.Lock()
+	return gs.transferSendMu.Unlock
+}
+
+// WhileLive runs send, which publishes a transfer, if the signer is in
+// LiveState, and reports whether it ran. No change of state takes the signer
+// out of LiveState while send runs, so no transfer is published after the
+// signer left it. send must not touch the state, and has to be bounded in
+// time: such a change waits for it.
+func (gs *GlobalState) WhileLive(send func() error) (bool, error) {
+	gs.transferSendMu.RLock()
+	defer gs.transferSendMu.RUnlock()
+	if state, err := gs.GetState(); err != nil || state != LiveState {
+		return false, err
+	}
+	return true, send()
 }
 
 func (gs *GlobalState) GetState() (uint8, error) {

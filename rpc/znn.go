@@ -150,16 +150,26 @@ func (r *ZnnRpc) PublishTransaction(tx *nom.AccountBlock) error {
 	return r.rpcClient.LedgerApi.PublishRawTransaction(tx)
 }
 
-func (r *ZnnRpc) UpdateWrapRequest(id types.Hash, signature string, keyPair *wallet.KeyPair) error {
+// PrepareWrapUpdate makes the signed block that adds signature to wrap
+// request id, proof of work included, without publishing it.
+func (r *ZnnRpc) PrepareWrapUpdate(id types.Hash, signature string, keyPair *wallet.KeyPair) (*nom.AccountBlock, error) {
 	tx := r.rpcClient.BridgeApi.UpdateWrapRequest(id, signature)
-	return r.BroadcastTransaction(tx, keyPair)
+	if err := r.prepareTransaction(tx, keyPair); err != nil {
+		return nil, err
+	}
+	return tx, nil
 }
 
-func (r *ZnnRpc) SendUnwrapRequest(event *events.UnwrapRequestEvm, keyPair *wallet.KeyPair) error {
+// PrepareUnwrap makes the signed block that registers event, proof of work
+// included, without publishing it.
+func (r *ZnnRpc) PrepareUnwrap(event *events.UnwrapRequestEvm, keyPair *wallet.KeyPair) (*nom.AccountBlock, error) {
 	hash := types.BytesToHashPanic(event.TransactionHash.Bytes())
 	toAddress := types.ParseAddressPanic(event.To)
 	tx := r.rpcClient.BridgeApi.UnwrapToken(event.NetworkClass, event.ChainId, event.Token.String(), hash, event.LogIndex, event.Amount, toAddress, event.Signature)
-	return r.BroadcastTransaction(tx, keyPair)
+	if err := r.prepareTransaction(tx, keyPair); err != nil {
+		return nil, err
+	}
+	return tx, nil
 }
 
 func (r *ZnnRpc) ChangeTssEcdsaPubKey(pubKey, signature, newSignature string, keyPair *wallet.KeyPair) error {

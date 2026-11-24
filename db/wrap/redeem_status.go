@@ -65,8 +65,17 @@ func (es *eventStore) ApplyRedeemLog(chainID uint32, id types.Hash, block uint64
 
 func (es *eventStore) decodeWrap(data []byte) (*events.WrapRequestZnn, error) {
 	wrap, err := events.DeserializeWrapEventZnn(data)
-	if err != nil || wrap.NetworkClass != definition.EvmClass {
+	if err != nil {
 		return wrap, err
+	}
+	return es.withRedeemStatus(wrap)
+}
+
+// withRedeemStatus merges into wrap, an EVM wrap as stored in its row, the
+// redeem status recorded for it apart.
+func (es *eventStore) withRedeemStatus(wrap *events.WrapRequestZnn) (*events.WrapRequestZnn, error) {
+	if wrap.NetworkClass != definition.EvmClass {
+		return wrap, nil
 	}
 	last, err := es.readRedeemStatus(redeemStatusKey(wrap.ChainId, wrap.Id))
 	if err != nil {

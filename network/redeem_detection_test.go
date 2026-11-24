@@ -336,7 +336,7 @@ func TestSettledHistoryDoesNotHaltAFreshSigner(t *testing.T) {
 	if generation == 0 {
 		t.Fatal("a payable unmatched registration did not open a halt")
 	}
-	if err := n.state.CompleteEmergencyHalt(generation, map[uint32]bool{1: true}); err != nil {
+	if _, err := n.state.CompleteEmergencyHalt(generation, map[uint32]bool{1: true}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -482,6 +482,9 @@ func TestRestoredIncidentIsReleasedByTheFirstScan(t *testing.T) {
 	defer db.Close()
 	restart := func() {
 		t.Helper()
+		// A new process: the scan has looked at nothing yet.
+		n.settleChecked.Store(false)
+		n.scanned.Store(false)
 		n.state = common.NewGlobalState(new(uint8))
 		if err := n.state.RestoreRedeemIncidents(wrap.NewRedeemIncidentStore(db)); err != nil {
 			t.Fatal(err)
@@ -600,6 +603,39 @@ func TestSettledRegistrationAboveTheCheckpointLimit(t *testing.T) {
 	}
 }
 
+// A final registration above the checkpoint limit whose check gives no answer
+// is held without stalling the range, but the pass does not count as a scan
+// of the chain, which startup waits for. A later pass that checks it does.
+func TestUncheckedFinalRegistrationLeavesTheScanIncomplete(t *testing.T) {
+	src := &redeemSource{synced: false, err: constants.ErrDataNonExistent.Error()}
+	n, reg, chain := redeemFixture(t, src)
+	reg.BlockNumber = 110
+	reg.BlockHash = canonicalHeader(110).Hash()
+	chain.contract.registered.Store(110)
+	chain.setChain(112, reg) // the pass starts here: checkpoint limit 100
+	n.queryRange = newQueryRangeAdapter(5)
+	chain.primary.afterRange = sync.OnceFunc(func() { chain.setChain(150, reg) })
+	if err := n.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	if len(n.heldRedeemLogs()) != 1 || n.state.RedeemHaltGeneration() != 0 {
+		t.Fatalf("unanswered final check: held=%d pending=%d", len(n.heldRedeemLogs()), n.state.RedeemHaltGeneration())
+	}
+	if n.scanned.Load() {
+		t.Fatal("a pass that left a final registration unchecked counted as a scan of the chain")
+	}
+	// Settled by the next pass, which the redeem checkpoint makes meet it.
+	src.update(func(s *redeemSource) { s.synced = true })
+	chain.contract.closedAt.Store(115)
+	chain.contract.unhaltedAt.Store(120)
+	if err := n.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	if !n.scanned.Load() || len(n.heldRedeemLogs()) != 0 {
+		t.Fatalf("after the check answered: scanned=%v held=%d", n.scanned.Load(), len(n.heldRedeemLogs()))
+	}
+}
+
 // The live rules are for a registration that can still be paid. A registration
 // that an endpoint already shows closed after a completed halt is history,
 // even when a stale head or a late delivery puts it on the live path. It is
@@ -653,7 +689,7 @@ func TestPausedScanResumesWhenTheHaltIsReleased(t *testing.T) {
 	if cursor, _ := n.eventsStore().GetLastUpdateHeight(); cursor != 100 {
 		t.Fatalf("the scan ran while the halt was pending: cursor=%d", cursor)
 	}
-	if err := n.state.CompleteEmergencyHalt(n.state.RedeemHaltGeneration(), map[uint32]bool{56: true}); err != nil {
+	if _, err := n.state.CompleteEmergencyHalt(n.state.RedeemHaltGeneration(), map[uint32]bool{56: true}); err != nil {
 		t.Fatal(err)
 	}
 	// The ordinary first retry of a failed subscription is five seconds away.

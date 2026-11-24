@@ -436,6 +436,10 @@ func (node *Node) processSignatures() {
 				}
 			} else if halted {
 				continue
+			} else if node.state.RedeemHaltGeneration() != generation {
+				// The halt changed while the flags were read, and nothing was
+				// confirmed for it. Look again from the halt as it is now.
+				continue
 			}
 			// Incidents restored at startup are first looked at by each EVM
 			// network's first scan, which releases the ones the chain shows
@@ -1618,7 +1622,10 @@ func (node *Node) sendSignaturesWrap(seenEventsCount map[string]uint32) {
 			if err := node.requireLiveTransfers(); err != nil {
 				return
 			}
-			err = node.networksManager.UpdateWrapRequest(req.Id, req.Signature, node.producerKeyPair)
+			err = node.networksManager.UpdateWrapRequest(req.Id, req.Signature, node.producerKeyPair, node.state.WhileLive)
+			if errors.Is(err, network.ErrNotLive) {
+				return
+			}
 			if err != nil {
 				node.logger.Debug(err)
 				continue
@@ -1663,7 +1670,10 @@ func (node *Node) sendUnwrapRequests(seenEventsCount map[string]uint32) {
 			if err := node.requireLiveTransfers(); err != nil {
 				return
 			}
-			err = node.networksManager.SendUnwrapRequest(req, node.producerKeyPair)
+			err = node.networksManager.SendUnwrapRequest(req, node.producerKeyPair, node.state.WhileLive)
+			if errors.Is(err, network.ErrNotLive) {
+				return
+			}
 			if err != nil {
 				node.logger.Debug(err)
 			}
