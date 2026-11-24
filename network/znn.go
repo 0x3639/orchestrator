@@ -399,9 +399,9 @@ func (rC *znnNetwork) readBridgeAccount(ctx context.Context) (uint64, error) {
 
 // A start reads a receive that is already final as history: what the receive
 // changed is taken from what the node read from the bridge when it started.
-// The change may have been made after that. A start that reaches the tip is
-// none the worse for it than before. A start that fails on the way ends, and
-// the next one reads the bridge again. A held start goes on instead, with the
+// The change may have been made after that. A start that reaches the tip
+// goes on with the settings it loaded when it started. A start that fails on
+// the way ends, and the next one reads the bridge again. A held start goes on instead, with the
 // values from before the change, so once it has read such a change it reads no
 // further receive, which those values would be used to judge, and does not
 // complete. The signer stops and its next start reads the bridge as it is

@@ -12,6 +12,7 @@ import (
 	"github.com/zenon-network/go-zenon/vm/constants"
 	"github.com/zenon-network/go-zenon/vm/embedded/definition"
 	"go.uber.org/zap"
+	"math"
 	"orchestrator/common/config"
 	"orchestrator/common/storage"
 	"orchestrator/db"
@@ -1059,14 +1060,14 @@ func (eN *evmNetwork) ProcessEvents() {
 				// plus periodic Sync). The existing record may already carry a
 				// signature or a sent status and must not be reset.
 				eN.logger.Infof("Event %s already in persistent storage, keeping the existing record", key)
-				// A record made from the bridge's registration has no source
-				// block. The confirmed block is recorded on it; its status
-				// and signature stay.
-				if err := eN.recordConfirmedBlock(frontEvent); err != nil {
-					eN.logger.Error(err)
-					eN.requestStop()
-					return
-				}
+			}
+			// A record made from the bridge's registration has no source
+			// block. The confirmed block is recorded on it, keeping its status
+			// and signature, and as the event's location.
+			if err := eN.recordConfirmedBlock(frontEvent); err != nil {
+				eN.logger.Error(err)
+				eN.requestStop()
+				return
 			}
 			if !eN.dropQueuedEvent() {
 				return
@@ -1084,7 +1085,18 @@ func (eN *evmNetwork) recordConfirmedBlock(confirmed *events.UnwrapRequestEvm) e
 	if err := eN.eventsStore().FillUnwrapRequestBlock(*confirmed); err != nil {
 		return err
 	}
-	return eN.eventsStore().SaveUnwrapSourceLocation(confirmed.TransactionHash, confirmed.LogIndex, confirmed.BlockNumber, confirmed.BlockHash)
+	// The affiliate's request names the same source log under its own index,
+	// whether or not the event was split when it was queued.
+	indexes := []uint32{confirmed.LogIndex}
+	if confirmed.LogIndex < common.AffiliateLogIndexAddition && uint64(confirmed.LogIndex) <= math.MaxUint32-uint64(common.AffiliateLogIndexAddition) {
+		indexes = append(indexes, confirmed.LogIndex+common.AffiliateLogIndexAddition)
+	}
+	for _, index := range indexes {
+		if err := eN.eventsStore().SaveUnwrapSourceLocation(confirmed.TransactionHash, index, confirmed.BlockNumber, confirmed.BlockHash); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // dropQueuedEvent removes the head of the unconfirmed queue. It returns

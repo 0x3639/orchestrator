@@ -123,6 +123,11 @@ func TestQueuedUnwrapSurvivesTwoReceiptErrorsAndRestart(t *testing.T) {
 	if err != nil || queue.Size() != 0 || len(requests) != 1 || requests[0].TransactionHash != event.TransactionHash || requests[0].LogIndex != event.LogIndex {
 		t.Fatalf("after RPC recovery: queue=%d, requests=%v, err=%v", queue.Size(), requests, err)
 	}
+	// A new record carries the block. The affiliate's index names the same
+	// source log and has only the location.
+	if number, hash, found, err := store.UnwrapSourceLocation(event.TransactionHash, event.LogIndex+common.AffiliateLogIndexAddition); err != nil || !found || number != 105 || hash != event.BlockHash {
+		t.Fatalf("recorded location for the affiliate index: block %d %s, found %v, err %v", number, hash, found, err)
+	}
 }
 
 // A record made from the bridge's registration has no source block. When the
@@ -189,8 +194,12 @@ func TestConfirmedEventRecordsItsBlockOnARegisteredRecord(t *testing.T) {
 	}
 	// The confirmed block is also the event's location, which is what
 	// answers when a record names a block that has been replaced.
-	number, hash, found, err := store.UnwrapSourceLocation(event.TransactionHash, event.LogIndex)
-	if err != nil || !found || number != 105 || hash != event.BlockHash {
-		t.Fatalf("recorded location: block %d %s, found %v, err %v", number, hash, found, err)
+	// So is it for the affiliate's request, which names the same source log
+	// under its own index.
+	for _, index := range []uint32{event.LogIndex, event.LogIndex + common.AffiliateLogIndexAddition} {
+		number, hash, found, err := store.UnwrapSourceLocation(event.TransactionHash, index)
+		if err != nil || !found || number != 105 || hash != event.BlockHash {
+			t.Fatalf("recorded location for index %d: block %d %s, found %v, err %v", index, number, hash, found, err)
+		}
 	}
 }

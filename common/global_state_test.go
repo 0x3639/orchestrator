@@ -126,3 +126,34 @@ func TestNodeReadyIsSignalledOnce(t *testing.T) {
 		t.Fatal("marking the node ready did not signal it")
 	}
 }
+
+// The policy under a program the node has not applied is the one it would
+// have once it had applied it, and a program that does not list the chain
+// changes nothing.
+func TestAffiliatePolicyUnderAProgram(t *testing.T) {
+	gs := NewGlobalState(new(uint8))
+	gs.SetTokensMap(1, "zts1znnxxxxxxxxxxxxx9z4ulx", "0xAA")
+	gs.SetIsAffiliateProgram(AffiliateProgram{Networks: map[uint32]AffiliateNetwork{1: {StartingHeight: 10, WZNN: true}}})
+	held := gs.AffiliatePolicyAt(1, "0xaa", 20)
+	if held != SplitAffiliate {
+		t.Fatalf("policy in force %d, want split", held)
+	}
+	for _, tc := range []struct {
+		name    string
+		program AffiliateProgram
+		height  uint64
+		want    AffiliatePolicy
+	}{
+		{"chain not listed", AffiliateProgram{Networks: map[uint32]AffiliateNetwork{2: {StartingHeight: 1}}}, 20, held},
+		{"no split", AffiliateProgram{Networks: map[uint32]AffiliateNetwork{1: {StartingHeight: 10}}}, 20, 0},
+		{"same settings", AffiliateProgram{Networks: map[uint32]AffiliateNetwork{1: {StartingHeight: 10, WZNN: true}}}, 20, held},
+		{"before the starting height", AffiliateProgram{Networks: map[uint32]AffiliateNetwork{1: {StartingHeight: 30, WZNN: true}}}, 20, 0},
+	} {
+		if got := gs.AffiliatePolicyUnder(tc.program, 1, "0xAA", tc.height); got != tc.want {
+			t.Errorf("%s: policy %d, want %d", tc.name, got, tc.want)
+		}
+	}
+	if gs.AffiliatePolicyAt(1, "0xaa", 20) != held {
+		t.Fatal("asking about a program applied it")
+	}
+}

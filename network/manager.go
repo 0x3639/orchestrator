@@ -561,7 +561,10 @@ func (m *NetworksManager) SetTssEcdsaPubKeyEvm(oldKeySignatures, newKeySignature
 	for idx, network := range m.networks() {
 		tss, err := network.GetCurrentTss()
 		if err != nil {
+			// A network whose key cannot be read has not been seen to
+			// have the new one.
 			m.logger.Debug(err)
+			ok = false
 			continue
 		}
 		m.logger.Debugf("current tss address: %s for network: %d", tss.String(), network.ChainId())
@@ -613,7 +616,10 @@ func (m *NetworksManager) CheckNewTssEcdsaPubKeyEvm(newCompressedPubKey string) 
 	for _, network := range m.networks() {
 		tss, err := network.GetCurrentTss()
 		if err != nil {
+			// A network whose key cannot be read has not been seen to
+			// have the new one.
 			m.logger.Debug(err)
+			ok = false
 			continue
 		}
 		if tss.String() == newTss.String() {

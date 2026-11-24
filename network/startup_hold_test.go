@@ -1583,13 +1583,23 @@ func TestScanAheadOfTheBridgeAccountAsksTheBridgeForTheRegisteredRequest(t *test
 		registered bool
 		local      bool // the store holds this node's own split reading of the event
 		conflict   bool
+		// The bridge's metadata as it holds it now, if not the node's.
+		metadata string
 	}{
-		{"ahead, request registered whole", true, true, false, true},
-		{"ahead, the bridge answers with another request", true, false, false, true},
-		{"ahead, request registered whole, own reading stored", true, true, true, true},
-		{"ahead, no request registered", true, false, false, false},
-		{"ahead, no request registered, own reading stored", true, false, true, false},
-		{"account read, request registered whole", false, true, false, false},
+		{"ahead, request registered whole", true, true, false, true, ""},
+		{"ahead, the bridge answers with another request", true, false, false, true, ""},
+		{"ahead, request registered whole, own reading stored", true, true, true, true, ""},
+		{"ahead, no request registered", true, false, false, false, ""},
+		{"ahead, no request registered, own reading stored", true, false, true, false, ""},
+		{"account read, request registered whole", false, true, false, false, ""},
+		// The bridge no longer splits the transfer, in a receive the read of
+		// the account has not reached. Nothing says so but the bridge.
+		{"ahead, no request registered, the bridge's settings changed", true, false, false, true,
+			`{"affiliateProgram":{"networks":{"1":{"startingHeight":1,"wZNN":false}}}}`},
+		{"ahead, no request registered, the bridge's settings agree", true, false, false, false,
+			`{"affiliateProgram":{"networks":{"1":{"startingHeight":1,"wZNN":true}}}}`},
+		{"account read, the bridge's settings changed", false, false, false, false,
+			`{"affiliateProgram":{"networks":{"1":{"startingHeight":1,"wZNN":false}}}}`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			h := newHeldStart(t)
@@ -1601,12 +1611,17 @@ func TestScanAheadOfTheBridgeAccountAsksTheBridgeForTheRegisteredRequest(t *test
 			registered := map[uint32]*definition.UnwrapTokenRequest{}
 			if tc.registered {
 				registered[0] = h.bridge.request
-			} else if tc.conflict {
+			} else if tc.conflict && tc.metadata == "" {
 				// Asked for the affiliate's request, the node returns the
 				// one under another log index. That establishes nothing.
 				registered[common.AffiliateLogIndexAddition] = h.bridge.request
 			}
-			h.zenon.change(func(z *heldZenon) { z.registered = registered })
+			h.zenon.change(func(z *heldZenon) {
+				z.registered = registered
+				if tc.metadata != "" {
+					z.metadata = tc.metadata
+				}
+			})
 			if tc.local {
 				if err := h.stores.evm[1].AddUnwrapRequest(events.UnwrapRequestEvm{
 					NetworkClass: definition.EvmClass, ChainId: 1, BlockNumber: 100, BlockHash: h.bridge.blockHash,

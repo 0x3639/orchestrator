@@ -3,6 +3,7 @@ package network
 import (
 	"context"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
@@ -159,6 +160,15 @@ func (eN *evmNetwork) unwrapRequestsFromLog(log etypes.Log, expected *events.Unw
 				return nil, errors.New("affiliate settings do not match the existing unwrap record")
 			}
 		}
+		if ahead {
+			// The bridge may have changed its affiliate settings since the
+			// node read them, in a receive the read of the account has not
+			// reached. What they say now decides whether the node's own
+			// settings may be fixed for this event.
+			if err := eN.policyStillCurrent(decoded.Token.Hex(), log.BlockNumber, policy); err != nil {
+				return nil, err
+			}
+		}
 		// The settings may have been marked stale while the rows and the
 		// bridge were read. Nothing is fixed with settings marked so.
 		current, err := eN.state.WhileSettingsCurrent(func() error {
@@ -172,6 +182,29 @@ func (eN *evmNetwork) unwrapRequestsFromLog(log etypes.Log, expected *events.Unw
 		}
 	}
 	return transfers, nil
+}
+
+// policyStillCurrent returns errSettingsStale when the bridge's affiliate
+// settings, as it holds them now, give another policy for the event than the
+// node's.
+func (eN *evmNetwork) policyStillCurrent(token string, height uint64, policy common.AffiliatePolicy) error {
+	ctx, cancel := context.WithTimeout(context.Background(), rpc.ZnnSettingsTimeout)
+	defer cancel()
+	info, err := eN.rpcManager.Znn().GetBridgeInfoContext(ctx)
+	if err != nil {
+		return err
+	}
+	if info == nil {
+		return errors.New("missing bridge info")
+	}
+	var metadata common.BridgeMetadata
+	if err := json.Unmarshal([]byte(info.Metadata), &metadata); err != nil {
+		return fmt.Errorf("bridge metadata does not decode: %w", err)
+	}
+	if eN.state.AffiliatePolicyUnder(metadata.AffiliateProgram, eN.ChainId(), token, height) != policy {
+		return errSettingsStale
+	}
+	return nil
 }
 
 var errSettingsStale = errors.New("the affiliate settings for this event are fixed once the node has read the bridge's current settings")

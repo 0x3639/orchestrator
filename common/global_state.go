@@ -334,6 +334,38 @@ func (gs *GlobalState) GetAffiliateStartingHeight(id uint32) *big.Int {
 	return new(big.Int).SetUint64(gs.affiliateStartingHeight[id])
 }
 
+// AffiliatePolicyUnder returns the policy AffiliatePolicyAt would return once
+// SetIsAffiliateProgram had applied program. A program that does not list the
+// chain leaves its settings as they are.
+func (gs *GlobalState) AffiliatePolicyUnder(program AffiliateProgram, id uint32, token string, height uint64) AffiliatePolicy {
+	values, listed := program.Networks[id]
+	if !listed {
+		return gs.AffiliatePolicyAt(id, token, height)
+	}
+	gs.affiliateMu.RLock()
+	defer gs.affiliateMu.RUnlock()
+	if values.StartingHeight == 0 || height < values.StartingHeight {
+		return 0
+	}
+	znn, qsr := types.ZnnTokenStandard.String(), types.QsrTokenStandard.String()
+	flags := map[string]bool{znn: values.ZNN, qsr: values.QSR}
+	if addr := gs.tokensMap[id][znn]; addr != "" {
+		flags[addr] = values.WZNN
+	}
+	if addr := gs.tokensMap[id][qsr]; addr != "" {
+		flags[addr] = values.WQSR
+	}
+	token = strings.ToLower(token)
+	var policy AffiliatePolicy
+	if flags[token] {
+		policy |= SplitAffiliate
+	}
+	if flags[gs.tokensMap[id][token]] {
+		policy |= VerifyAffiliate
+	}
+	return policy
+}
+
 // Wrapped and native token flags govern distinct sides of the bridge.
 type AffiliatePolicy byte
 
