@@ -384,15 +384,17 @@ func (node *Node) processSignatures() {
 				continue
 			}
 
-			partyTimeout := uint64(node.tssManager.Config().PartyTimeout.Minutes())
-			keyGenWindow := partyTimeout * 30 * 6 // 1.5 minutes * 30 = 45 minutes * 6 momentums / minute
+			keyGenWindow := keyGenWindowMomentums(node.tssManager.Config().PartyTimeout)
 			for mom.Height%keyGenWindow > 3 {
 				time.Sleep(10 * time.Second)
-				mom, err = node.networksManager.Znn().GetFrontierMomentum()
+				// Keep the last good momentum on error: the loop condition
+				// dereferences mom, and a failed read returns nil.
+				next, err := node.networksManager.Znn().GetFrontierMomentum()
 				if err != nil {
 					node.logger.Debug(err)
 					continue
 				}
+				mom = next
 
 				if mom.Height%24 == 0 {
 					node.logger.Infof("%d momentums left before starting keygen", keyGenWindow-mom.Height%keyGenWindow)
@@ -1585,29 +1587,25 @@ func (node *Node) SetBridgeMetadata(metadata *common.BridgeMetadata) {
 	node.logger.Info("In SetBridgeMetadata:")
 	if metadata != nil {
 		if node.tssManager != nil {
-			if metadata.PartyTimeout != 0 {
-				duration := time.Duration(metadata.PartyTimeout) * time.Second
+			if duration, ok := node.metadataTssTimeout("PartyTimeout", metadata.PartyTimeout, minPartyTimeout); ok {
 				node.logger.Infof("PartyTimeout in seconds - old: %f, new: %d", node.config.TssConfig.BaseConfig.PartyTimeout.Seconds(), metadata.PartyTimeout)
 				node.tssManager.SetPartyTimeout(duration)
 				node.config.TssConfig.BaseConfig.PartyTimeout = duration
 			}
 
-			if metadata.KeyGenTimeout != 0 {
-				duration := time.Duration(metadata.KeyGenTimeout) * time.Second
+			if duration, ok := node.metadataTssTimeout("KeyGenTimeout", metadata.KeyGenTimeout, time.Second); ok {
 				node.logger.Infof("KeyGenTimeout in seconds - old: %f, new: %d", node.config.TssConfig.BaseConfig.KeyGenTimeout.Seconds(), metadata.KeyGenTimeout)
 				node.tssManager.SetKeyGenTimeout(duration)
 				node.config.TssConfig.BaseConfig.KeyGenTimeout = duration
 			}
 
-			if metadata.KeySignTimeout != 0 {
-				duration := time.Duration(metadata.KeySignTimeout) * time.Second
+			if duration, ok := node.metadataTssTimeout("KeySignTimeout", metadata.KeySignTimeout, time.Second); ok {
 				node.logger.Infof("KeySignTimeout in seconds - old: %f, new: %d", node.config.TssConfig.BaseConfig.KeySignTimeout.Seconds(), metadata.KeySignTimeout)
 				node.tssManager.SetKeySignTimeout(duration)
 				node.config.TssConfig.BaseConfig.KeySignTimeout = duration
 			}
 
-			if metadata.PreParamTimeout != 0 {
-				duration := time.Duration(metadata.PreParamTimeout) * time.Second
+			if duration, ok := node.metadataTssTimeout("PreParamTimeout", metadata.PreParamTimeout, time.Second); ok {
 				node.logger.Infof("PreParamsTimeout in seconds - old: %f, new: %d", node.config.TssConfig.BaseConfig.PreParamTimeout.Seconds(), metadata.PreParamTimeout)
 				node.tssManager.SetPreParamsTimeout(duration)
 				node.config.TssConfig.BaseConfig.PreParamTimeout = duration
