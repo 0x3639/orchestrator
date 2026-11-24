@@ -31,6 +31,13 @@ Log lines you will meet, what they mean, and what to do.
 | `unwrap reconciliation incomplete for this ceremony` | Lookup budget spent | The signer sits out this window; continues next window. |
 | `reconcile: cannot query Zenon` | Local Zenon RPC failed | Signer sits out the ceremony. Check the Zenon node. |
 | `log subscription … lasted only …; resubscribing in …` | Provider accepts then drops subscriptions | Backoff is automatic; check the WebSocket endpoint. |
+| `bridge account paused at height N: …` | The bridge-account listener could not process that account block and will retry in four seconds | Normal for a few attempts. The cause follows the colon. |
+| `bridge account listener has not passed height N for …` | The same block has failed for over a minute; nothing after it is being read | Fix the cause named in the line: usually the Zenon node or the EVM endpoint of the request's network. See [Signer states](states.md). |
+| `the bridge account listener could not pass height N for 10m0s; stopping …` | The signer stopped instead of signing without its listener | Fix the cause; the supervisor restart retries the block at startup. |
+| `the Zenon node is not synced; …` | The node reported a sync state other than done while a recent block was being classified, or when startup reached the tip | Wait for the node, or point the signer at a synced one. |
+| `unwrap request … cannot be judged: the endpoint has no receipt for its transaction and this node has no record of the event …` | A request read after finality whose transaction the EVM endpoint does not return. The listener holds it | Look the transaction up through an endpoint with full history. If it exists, point the signer at such an endpoint; if it does not, treat it as an unwrap request without a source and coordinate with the other signers. |
+| `unwrap request … has no matching source event on chainId N` | The signer entered `EmergencyState` | Look the transaction up on that network through an independent endpoint and coordinate with the other signers. See [Signer states](states.md). |
+| `ignoring bridge metadata that does not decode, the current settings stay in force` | The administrator set metadata the orchestrator cannot decode | The administrator corrects the metadata. A running signer keeps the previous settings until then; a signer that restarts in the meantime does not start, because startup needs metadata it can decode. |
 | `Too many requests, retry later` (health API `429`) | Monitoring probe exceeded the health rate cap | Raise `HealthConfig` limits or probe less often. |
 
 ## Comparing signers

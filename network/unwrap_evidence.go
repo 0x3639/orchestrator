@@ -64,6 +64,8 @@ func (eN *evmNetwork) unwrapRequestsFromLog(log etypes.Log, expected *events.Unw
 		}
 		return nil, nil
 	}
+	// Keep the recipient as the log spelled it. Earlier builds compare the
+	// stored string with the log literally, and every reader parses it.
 	transfer := &events.UnwrapRequestEvm{
 		NetworkClass: eN.NetworkClass(), ChainId: eN.ChainId(),
 		BlockNumber: log.BlockNumber, BlockHash: log.BlockHash, TransactionHash: log.TxHash, LogIndex: uint32(log.Index),

@@ -16,6 +16,9 @@ type EvmStorage interface {
 	SendSigInt()
 
 	AddUnwrapRequest(events.UnwrapRequestEvm) error
+	// AddRegisteredUnwrapRequest stores a request read from the bridge and
+	// keeps the source block and sender an existing record already holds.
+	AddRegisteredUnwrapRequest(events.UnwrapRequestEvm) error
 	UpdateUnwrapRequestBlockNumber(events.UnwrapRequestEvm) error
 	HydrateUnsignedUnwrap(before, verified events.UnwrapRequestEvm) error
 	UnwrapAffiliatePolicy(ecommon.Hash) (common.AffiliatePolicy, bool, error)
@@ -64,6 +67,8 @@ type ZnnStorage interface {
 	HasReceiveCoverageCheckpoint(uint64) bool
 	SaveReceiveCoverageCheckpoint(uint64) error
 	SetLastUpdateHeight(uint64) error
+	BridgeWatchFrom() (uint64, error)
+	SaveBridgeWatchFrom(uint64) error
 
 	GetResignStatus(types.Hash) (bool, error)
 	SetResignStatus(types.Hash, bool) error

@@ -81,6 +81,22 @@ func (gs *GlobalState) SetState(newState uint8) error {
 	return gs.setStateLocked(newState)
 }
 
+// SetStateIf moves to newState only from the expected state and reports
+// whether it did. The comparison and the change happen under one lock, so a
+// state another goroutine set in between is never overwritten.
+func (gs *GlobalState) SetStateIf(expected, newState uint8) (bool, error) {
+	gs.stateMu.Lock()
+	defer gs.stateMu.Unlock()
+	if gs.RedeemHaltGeneration() != 0 && newState != EmergencyState {
+		return false, nil // The incident owns the halt until all explicit flags are set.
+	}
+	if *gs.state != expected {
+		return false, nil
+	}
+	err := gs.setStateLocked(newState)
+	return expected != newState && *gs.state == newState, err
+}
+
 func (gs *GlobalState) setStateLocked(newState uint8) error {
 	oldEffective := gs.effectiveStateLocked()
 	previous := *gs.state
@@ -136,6 +152,20 @@ func (gs *GlobalState) SaveConfig(save func() error) error {
 	gs.stateMu.Lock()
 	defer gs.stateMu.Unlock()
 	return save()
+}
+
+// WhileSigningTransfers runs do unless the signer is in EmergencyState or
+// HaltedState, and reports whether it ran. The state lock is held throughout,
+// so no transition can fall between the check and do. do must not touch the
+// state.
+func (gs *GlobalState) WhileSigningTransfers(do func()) bool {
+	gs.stateMu.Lock()
+	defer gs.stateMu.Unlock()
+	if *gs.state == EmergencyState || *gs.state == HaltedState {
+		return false
+	}
+	do()
+	return true
 }
 
 func (gs *GlobalState) GetState() (uint8, error) {

@@ -95,3 +95,28 @@ func TestParseRedeemLogID(t *testing.T) {
 		}
 	}
 }
+
+// A conditional state change cannot move the stored state underneath a
+// pending redeem halt either, so the node does not come back to a state the
+// incident did not allow once the halt is released.
+func TestSetStateIfLeavesAPendingRedeemHaltAlone(t *testing.T) {
+	stored := KeyGenState
+	state := NewGlobalState(&stored)
+	if err := state.RestoreRedeemIncidents(&lossyIncidentStore{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := state.ReportRedeemIncident(RedeemIncident{ChainID: 1}); err != nil {
+		t.Fatal(err)
+	}
+	before := stored
+	if changed, err := state.SetStateIf(before, LiveState); err != nil || changed || stored != before {
+		t.Fatalf("changed=%t err=%v stored=%d, want %d", changed, err, stored, before)
+	}
+	if effective, _ := state.GetState(); effective != EmergencyState {
+		t.Fatalf("effective state %d", effective)
+	}
+	// An emergency is still allowed through, as with SetState.
+	if changed, err := state.SetStateIf(before, EmergencyState); err != nil || !changed || stored != EmergencyState {
+		t.Fatalf("emergency: changed=%t err=%v stored=%d", changed, err, stored)
+	}
+}

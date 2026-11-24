@@ -14,6 +14,13 @@ import (
 // network that has since been removed answers "unknown network" rather than
 // "data non existent". None of these can be signed, redeemed or revoked, so
 // the sync records nothing and moves on instead of aborting.
+// unwrapRequestMissing reports whether the bridge answered that it holds no
+// request under the looked-up key, as opposed to its network or token pair
+// having been removed since.
+func unwrapRequestMissing(err error) bool {
+	return err != nil && (errors.Is(err, constants.ErrDataNonExistent) || err.Error() == constants.ErrDataNonExistent.Error())
+}
+
 func bridgeObjectGone(err error) bool {
 	if err == nil {
 		return false

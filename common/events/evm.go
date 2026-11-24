@@ -63,7 +63,21 @@ func (e *UnwrapRequestEvm) Hash() (string, error) {
 func (e *UnwrapRequestEvm) SameTransfer(other *UnwrapRequestEvm) bool {
 	return e.NetworkClass == other.NetworkClass && e.ChainId == other.ChainId &&
 		e.TransactionHash == other.TransactionHash && e.LogIndex == other.LogIndex &&
-		e.To == other.To && e.Token == other.Token && e.Amount != nil && other.Amount != nil && e.Amount.Cmp(other.Amount) == 0
+		sameRecipient(e.To, other.To) && e.Token == other.Token && e.Amount != nil && other.Amount != nil && e.Amount.Cmp(other.Amount) == 0
+}
+
+// A row from an EVM log keeps the recipient as the log spelled it, which may
+// be the all-uppercase form of the address a Zenon registration holds.
+func sameRecipient(a, b string) bool {
+	if a == b {
+		return true
+	}
+	first, err := types.ParseAddress(a)
+	if err != nil {
+		return false
+	}
+	second, err := types.ParseAddress(b)
+	return err == nil && first == second
 }
 
 func (e *UnwrapRequestEvm) GetMessage() ([]byte, error) {

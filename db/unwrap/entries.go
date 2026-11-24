@@ -40,6 +40,23 @@ func (es *evmStorage) putUnwrapRequest(event events.UnwrapRequestEvm) error {
 	return nil
 }
 
+// AddRegisteredUnwrapRequest stores a request as the bridge registered it. A
+// registration carries no source block or sender, so the block and sender an
+// existing record holds from this node's own scan of the source chain are
+// kept. The read and the write are one operation under the record lock.
+func (es *evmStorage) AddRegisteredUnwrapRequest(event events.UnwrapRequestEvm) error {
+	es.mu.Lock()
+	defer es.mu.Unlock()
+	existing, err := es.GetUnwrapRequestByHashAndLog(event.TransactionHash, event.LogIndex)
+	if err != nil {
+		return err
+	}
+	if existing != nil && existing.BlockHash != (ecommon.Hash{}) {
+		event.BlockNumber, event.BlockHash, event.From = existing.BlockNumber, existing.BlockHash, existing.From
+	}
+	return es.putUnwrapRequest(event)
+}
+
 func (es *evmStorage) AddUnwrapRequestIfMissing(event events.UnwrapRequestEvm) (bool, error) {
 	es.mu.Lock()
 	defer es.mu.Unlock()
