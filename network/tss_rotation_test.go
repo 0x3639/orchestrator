@@ -225,3 +225,26 @@ func TestTssRotationRejectsInvalidKey(t *testing.T) {
 		})
 	}
 }
+
+// After a key change round, every network the bridge lists is looked at
+// again: a network added after the EVM sender ended, or one whose key cannot
+// be read, is named as not holding the new key.
+func TestNetworksWithoutKeyNamesEveryListedNetwork(t *testing.T) {
+	pubKey, newTss := rotationKey(t)
+	_, oldTss := rotationKey(t)
+	rotated, _ := newRotationNetwork(t, 1, &tssProvider{tss: newTss})
+	stale, _ := newRotationNetwork(t, 2, &tssProvider{tss: oldTss})
+	unreadable, _ := newRotationNetwork(t, 3, &tssProvider{err: errors.New("timeout")})
+	m, _ := rotationManager(rotated)
+	if missing, err := m.NetworksWithoutKey(pubKey); err != nil || len(missing) != 0 {
+		t.Fatalf("missing %v, err %v; want none", missing, err)
+	}
+	m.AddEvmNetwork(stale)
+	m.AddEvmNetwork(unreadable)
+	if missing, err := m.NetworksWithoutKey(pubKey); err != nil || len(missing) != 2 || missing[0] != 2 || missing[1] != 3 {
+		t.Fatalf("missing %v, err %v; want [2 3]", missing, err)
+	}
+	if _, err := m.NetworksWithoutKey("not-base64!!"); err == nil {
+		t.Fatal("an undecodable key was accepted")
+	}
+}
