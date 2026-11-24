@@ -873,9 +873,10 @@ func (eN *evmNetwork) SubscribeToEvents() {
 }
 
 // refreshInterval is the time to the next catch-up Sync: the ordinary refresh,
-// or a short retry while the last scan stopped for a pending redeem halt.
+// or a short retry while the last scan stopped for a pending redeem halt, or
+// while startup waits for a scan that left a final registration unchecked.
 func (eN *evmNetwork) refreshInterval() time.Duration {
-	if eN.scanPaused.Load() {
+	if eN.scanPaused.Load() || eN.finalUnchecked.Load() && !eN.scanned.Load() {
 		return pausedScanRetryRounds * eN.redeemRetryInterval()
 	}
 	return subscriptionRefreshInterval
@@ -913,6 +914,11 @@ func (eN *evmNetwork) subscribeToEvents() {
 	}
 
 	for {
+		// A catch-up that fell due during a pause runs first, so the setup
+		// below always has until the next one.
+		if !nextCatchUp.IsZero() && !time.Now().Before(nextCatchUp) {
+			catchUp()
+		}
 		logSub, logChan, err := eN.subscribeToLogs(nextCatchUp)
 		if err != nil {
 			// HTTP range queries may still work while subscriptions are down.

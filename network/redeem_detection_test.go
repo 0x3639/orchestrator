@@ -636,6 +636,25 @@ func TestUncheckedFinalRegistrationLeavesTheScanIncomplete(t *testing.T) {
 	}
 }
 
+// Startup waits for a scan that checks such a registration, so the next one
+// comes on the short retry, not the ordinary refresh.
+func TestUncheckedFinalRegistrationIsScannedAgainSoon(t *testing.T) {
+	src := &redeemSource{synced: false, err: constants.ErrDataNonExistent.Error()}
+	n, reg, chain := redeemFixture(t, src)
+	reg.BlockNumber = 110
+	reg.BlockHash = canonicalHeader(110).Hash()
+	chain.contract.registered.Store(110)
+	chain.setChain(112, reg)
+	n.queryRange = newQueryRangeAdapter(5)
+	chain.primary.afterRange = sync.OnceFunc(func() { chain.setChain(150, reg) })
+	startRedeemWatch(t, n)
+	waitUntil(t, "the first scan did not leave the registration unchecked", func() bool { return n.finalUnchecked.Load() })
+	src.update(func(s *redeemSource) { s.synced = true })
+	chain.contract.closedAt.Store(115)
+	chain.contract.unhaltedAt.Store(120)
+	waitUntil(t, "no scan checked the registration soon after it could be checked", func() bool { return n.scanned.Load() })
+}
+
 // The live rules are for a registration that can still be paid. A registration
 // that an endpoint already shows closed after a completed halt is history,
 // even when a stale head or a late delivery puts it on the live path. It is

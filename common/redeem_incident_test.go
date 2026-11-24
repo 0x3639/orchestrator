@@ -229,22 +229,38 @@ func TestLeavingLiveStateWaitsForATransferPublication(t *testing.T) {
 			}
 		})
 	}
-	// A move to LiveState cannot end it, and does not wait.
-	state := NewGlobalState(new(uint8))
-	finish := make(chan struct{})
-	defer close(finish)
-	publishing := make(chan struct{})
-	go state.WhileLive(func() error { close(publishing); <-finish; return nil })
-	<-publishing
-	set := make(chan error, 1)
-	go func() { set <- state.SetState(LiveState) }()
-	select {
-	case err := <-set:
-		if err != nil {
-			t.Fatal(err)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("a move to LiveState waited for a transfer publication")
+	// A move to LiveState, and an acknowledged registration, which is only
+	// archived, cannot end it, and do not wait.
+	acknowledged := RedeemIncident{ChainID: 1, Log: etypes.Log{TxHash: ecommon.Hash{9}, Index: 2}}
+	for name, stay := range map[string]func(*GlobalState) error{
+		"live":         func(s *GlobalState) error { return s.SetState(LiveState) },
+		"acknowledged": func(s *GlobalState) error { return s.ReportRedeemIncident(acknowledged) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			state := NewGlobalState(new(uint8))
+			state.AcknowledgeRedeemLogs([]RedeemLogID{redeemLogID(acknowledged)})
+			if err := state.RestoreRedeemIncidents(new(lossyIncidentStore)); err != nil {
+				t.Fatal(err)
+			}
+			finish := make(chan struct{})
+			defer close(finish)
+			publishing := make(chan struct{})
+			go state.WhileLive(func() error { close(publishing); <-finish; return nil })
+			<-publishing
+			done := make(chan error, 1)
+			go func() { done <- stay(state) }()
+			select {
+			case err := <-done:
+				if err != nil {
+					t.Fatal(err)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("it waited for a transfer publication")
+			}
+			if current, _ := state.GetState(); current != LiveState {
+				t.Fatalf("state %d, want LiveState", current)
+			}
+		})
 	}
 }
 

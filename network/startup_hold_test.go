@@ -441,6 +441,14 @@ func (e *heldEvm) answer(method string, params []json.RawMessage) (interface{}, 
 // does, but never answers a subscription, whose setup stays pending. It
 // returns the URL and counts the subscriptions asked for.
 func pendingSubscriptionServer(t *testing.T, answer func(string, []json.RawMessage) (interface{}, *replayRPCError)) (string, *atomic.Int32) {
+	return subscriptionServer(t, answer, func(int32) (interface{}, *replayRPCError, bool) { return nil, nil, false })
+}
+
+// subscriptionServer is pendingSubscriptionServer with the n-th subscription
+// (from 1) answered as subscribe says: with a result or an error, or not at
+// all when ok is false.
+func subscriptionServer(t *testing.T, answer func(string, []json.RawMessage) (interface{}, *replayRPCError),
+	subscribe func(n int32) (result interface{}, rpcErr *replayRPCError, ok bool)) (string, *atomic.Int32) {
 	t.Helper()
 	subscribes := new(atomic.Int32)
 	var upgrader websocket.Upgrader
@@ -459,12 +467,20 @@ func pendingSubscriptionServer(t *testing.T, answer func(string, []json.RawMessa
 			if err := conn.ReadJSON(&call); err != nil {
 				return
 			}
-			if call.Method == "eth_subscribe" {
-				subscribes.Add(1)
-				continue
-			}
 			reply := map[string]interface{}{"jsonrpc": "2.0", "id": call.ID}
-			if result, rpcErr := answer(call.Method, call.Params); rpcErr != nil {
+			result, rpcErr := interface{}(nil), (*replayRPCError)(nil)
+			switch call.Method {
+			case "eth_subscribe":
+				var ok bool
+				if result, rpcErr, ok = subscribe(subscribes.Add(1)); !ok {
+					continue
+				}
+			case "eth_unsubscribe":
+				result = true
+			default:
+				result, rpcErr = answer(call.Method, call.Params)
+			}
+			if rpcErr != nil {
 				reply["error"] = rpcErr
 			} else {
 				reply["result"] = result

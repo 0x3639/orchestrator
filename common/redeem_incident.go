@@ -154,15 +154,16 @@ func (gs *GlobalState) HandledRedeemLog(chainID uint32, log etypes.Log) (bool, e
 }
 
 func (gs *GlobalState) ReportRedeemIncident(ev RedeemIncident) error {
-	// A new incident starts an emergency, which waits for a transfer being
-	// published.
-	gs.transferSendMu.Lock()
-	defer gs.transferSendMu.Unlock()
-	// An acknowledged registration is archived, which can release the halt.
-	// The acknowledgements are fixed before the workers start.
+	// An acknowledged registration is archived, which can release the halt
+	// but never ends LiveState. Any other starts an emergency, which waits
+	// for a transfer being published. The acknowledgements are fixed before
+	// the workers start.
 	if gs.acknowledgedRedeems[redeemLogID(ev)] {
 		gs.haltSendMu.Lock()
 		defer gs.haltSendMu.Unlock()
+	} else {
+		gs.transferSendMu.Lock()
+		defer gs.transferSendMu.Unlock()
 	}
 	gs.stateMu.Lock()
 	defer gs.stateMu.Unlock()

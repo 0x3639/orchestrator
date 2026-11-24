@@ -7,6 +7,7 @@ import (
 	"math/big"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -313,6 +314,38 @@ func TestUnansweredSubscriptionDoesNotHoldBackTheCatchUp(t *testing.T) {
 	waitUntil(t, "no catch-up scan ran while the subscription setup was pending", func() bool {
 		return subscribes.Load() > 0 && h.evm.scans.Load() > 0
 	})
+}
+
+// While a scan is paused for a halt, the pause between subscription attempts
+// can pass the time the next catch-up is due. That catch-up runs first, so
+// the next attempt still has time to be answered, and the subscription is
+// set up once the endpoint accepts it.
+func TestPausedScanStillSubscribesAfterAFailedAttempt(t *testing.T) {
+	h := newHeldStart(t)
+	h.evm.open()
+	restoreIncident(t, h, 1) // the scan of chain 2 stops for the pending halt
+	answered := new(atomic.Int32)
+	url, subscribes := subscriptionServer(t, h.evm.answer, func(n int32) (interface{}, *replayRPCError, bool) {
+		if n == 1 {
+			return nil, &replayRPCError{-32000, "subscriptions are full"}, true
+		}
+		answered.Add(1)
+		return "0x9cef478923ff08bf67fde6c64013158d", nil, true
+	})
+	n := h.addEvmNetwork(2, url)
+	// The next catch-up is due a little after each failed attempt, and the
+	// pause after a failure is longer.
+	n.heldRetryEvery = 20 * time.Millisecond
+	stopped := make(chan struct{})
+	go func() { defer close(stopped); n.SubscribeToEvents() }()
+	defer func() { n.stopOnce.Do(func() { close(n.done) }); <-stopped }()
+	waitUntil(t, "no subscription was answered after the failed attempt", func() bool { return answered.Load() > 0 })
+	// Set up, the subscription is kept while the scan is paused.
+	before := subscribes.Load()
+	time.Sleep(10 * n.refreshInterval())
+	if after := subscribes.Load(); after != before {
+		t.Fatalf("%d more subscriptions while one was set up: the setups did not get time to be answered", after-before)
+	}
 }
 
 // The halt senders read the halt flag itself. During the delay after an
