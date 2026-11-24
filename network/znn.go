@@ -1428,6 +1428,17 @@ func (rC *znnNetwork) HaltStatus() (bool, error) {
 	return haltedAt(bridgeInfo, frMom), nil
 }
 
+// HaltConfirmed reports whether the Zenon bridge has its halted flag set. It
+// does not count the unhalt delay, which ends by itself, so a halt ceremony
+// confirms against it rather than HaltStatus.
+func (rC *znnNetwork) HaltConfirmed() (bool, error) {
+	bridgeInfo, err := rC.GetBridgeInfo()
+	if err != nil {
+		return false, err
+	}
+	return bridgeInfo.Halted, nil
+}
+
 func haltedAt(bridgeInfo *definition.BridgeInfoVariable, frontierMomentum uint64) bool {
 	return bridgeInfo.Halted || bridgeInfo.UnhaltedAt+bridgeInfo.UnhaltDurationInMomentums >= frontierMomentum
 }

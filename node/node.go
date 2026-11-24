@@ -24,6 +24,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"slices"
 	"sort"
 	"sync"
 	"syscall"
@@ -1034,6 +1035,12 @@ func (node *Node) processSignatures() {
 			if !znnHalted || !evmHalted {
 				continue
 			}
+			// A network registered after the EVM sender finished, while it
+			// waited for Zenon, has no halt signature and is live.
+			if added := node.networksOutside(evmChainIds); len(added) > 0 {
+				node.logger.Infof("evm networks %v were added during the halt; signing again", added)
+				continue
+			}
 
 			if err := node.state.SetState(common.HaltedState); err != nil {
 				node.logger.Error(err)
@@ -1630,17 +1637,31 @@ func (node *Node) sendUnwrapRequests(seenEventsCount map[string]uint32) {
 	}
 }
 
-// znnHaltConfirmed reports whether a successful read shows the Zenon bridge
-// halted. A failed read is logged and is not a confirmation, so a halt is never
-// recorded on an RPC error.
+// znnHaltConfirmed reports whether a successful read shows the Zenon bridge's
+// halted flag set. A failed read is logged and is not a confirmation, and
+// neither is the unhalt delay, so a halt is never recorded on an RPC error or
+// on a bridge that resumes by itself.
 func (node *Node) znnHaltConfirmed() bool {
-	halted, err := node.networksManager.Znn().HaltStatus()
+	halted, err := node.networksManager.Znn().HaltConfirmed()
 	if err != nil {
 		node.logger.Infof("could not read the Zenon halt status: %s", err.Error())
 		node.workerSleep(time.Second)
 		return false
 	}
 	return halted
+}
+
+// networksOutside returns the chain ids of registered EVM networks that are not
+// in chainIds: networks added after a halt round started, which it has not
+// halted.
+func (node *Node) networksOutside(chainIds []uint32) []uint32 {
+	var outside []uint32
+	for _, evmNetwork := range node.networksManager.Networks() {
+		if !slices.Contains(chainIds, evmNetwork.ChainId()) {
+			outside = append(outside, evmNetwork.ChainId())
+		}
+	}
+	return outside
 }
 
 // Administrator methods
@@ -1676,13 +1697,9 @@ func (node *Node) haltNetworksAdministrator() {
 
 	// One sender per network, by chain id: list positions shift when a
 	// network is added or removed while the senders run.
-	targets := make(map[uint32]bool)
+	var chainIds []uint32
 	for _, evmNetwork := range node.networksManager.Networks() {
-		targets[evmNetwork.ChainId()] = true
-	}
-	chainIds := make([]uint32, 0, len(targets))
-	for chainId := range targets {
-		chainIds = append(chainIds, chainId)
+		chainIds = append(chainIds, evmNetwork.ChainId())
 	}
 	evmHalted := make([]bool, len(chainIds))
 	senders.Add(len(chainIds))
@@ -1721,11 +1738,9 @@ func (node *Node) haltNetworksAdministrator() {
 	}
 	// A network added while the senders ran has not been halted. Stay in
 	// EmergencyState so the next pass halts it.
-	for _, evmNetwork := range node.networksManager.Networks() {
-		if !targets[evmNetwork.ChainId()] {
-			node.logger.Infof("network with chainId %d was added during the halt; halting again", evmNetwork.ChainId())
-			return
-		}
+	if added := node.networksOutside(chainIds); len(added) > 0 {
+		node.logger.Infof("evm networks %v were added during the halt; halting again", added)
+		return
 	}
 	if err := node.state.SetState(common.HaltedState); err != nil {
 		node.logger.Debug(err)

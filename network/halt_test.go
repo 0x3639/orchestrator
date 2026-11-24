@@ -100,18 +100,19 @@ func TestSendHaltEvmReadErrorIsNotHalted(t *testing.T) {
 }
 
 func TestSendHaltEvmAdministratorByChainId(t *testing.T) {
-	m, _ := rotationManager(haltNetwork(t, 1, false), haltNetwork(t, 2, true))
-	if halted, err := m.SendHaltEvmAdministrator(2, nil, ecommon.Address{}); err != nil || !halted {
+	m, _ := rotationManager(haltNetwork(t, 1, true), haltNetwork(t, 2, false))
+	if halted, err := m.SendHaltEvmAdministrator(1, nil, ecommon.Address{}); err != nil || !halted {
 		t.Fatalf("halted=%v err=%v for a halted network", halted, err)
 	}
-	// Removing network 1 shifts network 2 to position 0; the sender for
-	// chain 2 still checks chain 2, and the sender for chain 1 finishes.
+	// Removing network 1 shifts live network 2 to position 0. Its sender
+	// still reads chain 2 and does not report it halted; an index-based
+	// sender for position 1 would have found nothing and reported success.
 	m.RemoveEvmNetwork(1)
+	if halted, _ := m.SendHaltEvmAdministrator(2, nil, ecommon.Address{}); halted {
+		t.Fatal("live network reported halted after the list shifted")
+	}
 	if halted, err := m.SendHaltEvmAdministrator(1, nil, ecommon.Address{}); err != nil || !halted {
 		t.Fatalf("halted=%v err=%v for a removed network", halted, err)
-	}
-	if halted, err := m.SendHaltEvmAdministrator(2, nil, ecommon.Address{}); err != nil || !halted {
-		t.Fatalf("halted=%v err=%v after the list shifted", halted, err)
 	}
 }
 
