@@ -25,6 +25,7 @@ import (
 	"orchestrator/rpc"
 	"os"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -473,21 +474,40 @@ type batchTarget struct {
 // batch does not, and an error when a set of signatures is not one per
 // network of the batch.
 func (m *NetworksManager) targets(batch EvmBatch, signatures ...[][]byte) ([]batchTarget, error) {
+	targets, added, err := m.batchTargets(batch, signatures...)
+	if err != nil {
+		return nil, err
+	}
+	if len(added) != 0 {
+		return nil, ErrNetworksChanged
+	}
+	return targets, nil
+}
+
+// batchTargets returns what targets returns, without the error for networks
+// the bridge lists that batch does not: it returns those networks instead.
+func (m *NetworksManager) batchTargets(batch EvmBatch, signatures ...[][]byte) ([]batchTarget, []*evmNetwork, error) {
 	for _, set := range signatures {
 		if len(set) != len(batch.networks) {
-			return nil, fmt.Errorf("%d signatures for a round of %d EVM networks", len(set), len(batch.networks))
+			return nil, nil, fmt.Errorf("%d signatures for a round of %d EVM networks", len(set), len(batch.networks))
 		}
 	}
-	if !m.Covers(batch) {
-		return nil, ErrNetworksChanged
+	// Both lists come from one read of the networks the bridge lists, so a
+	// network replaced in between is in one of them.
+	listed := m.networks()
+	var added []*evmNetwork
+	for _, network := range listed {
+		if !slices.Contains(batch.networks, network) {
+			added = append(added, network)
+		}
 	}
 	targets := make([]batchTarget, 0, len(batch.networks))
 	for idx, network := range batch.networks {
-		if m.hasNetwork(network) {
+		if slices.Contains(listed, network) {
 			targets = append(targets, batchTarget{network: network, index: idx})
 		}
 	}
-	return targets, nil
+	return targets, added, nil
 }
 
 ///////// state
@@ -670,10 +690,14 @@ func (m *NetworksManager) Evm(chainId uint32) *evmNetwork {
 }
 
 // SetTssEcdsaPubKeyEvm sends the key change, signed for the networks in
-// batch, to each of them that the bridge still lists and that does not have
-// the new key yet.
+// batch, to each of them that the bridge still lists and that does not hold
+// the new key yet. It reports whether all of them hold it. A network the
+// bridge added after the round's messages were made has no signature in the
+// round and does not hold back the others: when it does not hold the new key
+// either, the error wraps ErrNetworksChanged and names it, beside the report
+// for the networks of batch.
 func (m *NetworksManager) SetTssEcdsaPubKeyEvm(batch EvmBatch, oldKeySignatures, newKeySignatures [][]byte, newCompressedPubKey string, ecdsaPrivateKey *ecdsa.PrivateKey, evmAddress ecommon.Address) (bool, error) {
-	targets, err := m.targets(batch, oldKeySignatures, newKeySignatures)
+	targets, added, err := m.batchTargets(batch, oldKeySignatures, newKeySignatures)
 	if err != nil {
 		return false, err
 	}
@@ -728,6 +752,20 @@ func (m *NetworksManager) SetTssEcdsaPubKeyEvm(batch EvmBatch, oldKeySignatures,
 			continue
 		}
 		m.logger.Debug("sent evm tx")
+	}
+	var unchanged []string
+	for _, network := range added {
+		if !m.hasNetwork(network) {
+			// Removed again since; it needs no key.
+			continue
+		}
+		if tss, err := network.GetCurrentTss(); err == nil && tss == newTss {
+			continue
+		}
+		unchanged = append(unchanged, fmt.Sprintf("EVM network %d", network.ChainId()))
+	}
+	if len(unchanged) != 0 {
+		return ok, fmt.Errorf("%w: %s", ErrNetworksChanged, strings.Join(unchanged, ", "))
 	}
 	return ok, nil
 }

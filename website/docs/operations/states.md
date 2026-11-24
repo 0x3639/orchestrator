@@ -20,7 +20,7 @@ The flags and parameters behind these transitions are described in [Bridge param
 
 The administrator can halt a network unilaterally. Ordinary signers halt only through the threshold-signed emergency ceremony, and reach `HaltedState` when the bridge's halt flags are set, however they were set.
 
-A halt or key change is signed for the EVM networks the bridge lists when the messages are built, and each signature is sent only to the network it was signed for. A network the bridge removes in the meantime needs nothing more. If the bridge adds a network during the halt, the signer signs the halt again for every network it lists; a key change cannot include the added network, and the signer logs that and keeps retrying the others until it is restarted.
+A halt or key change is signed for the EVM networks the bridge lists when the messages are built, and each signature is sent only to the network it was signed for. A network the bridge removes in the meantime needs nothing more. If the bridge adds a network during the halt, the signer signs the halt again for every network it lists; a key change has no signature for the added network, so the signer still sends it to the networks it was signed for and completes once they hold the new key. If the added network does not already hold the new key, the signer logs an error naming it, and that network keeps the key it holds.
 
 The signer also asks to be restarted, rather than continuing, when a subscription or storage operation fails in a way it cannot recover from. Run it under a supervisor with automatic restart.
 

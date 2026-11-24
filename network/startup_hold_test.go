@@ -230,12 +230,17 @@ type heldEvm struct {
 	haltedFails atomic.Bool
 	// Runs, once, when the signer first asks for the halt flag.
 	onHaltedRead atomic.Pointer[func()]
-	gate         chan struct{}
-	opening      sync.Once
-	calls        atomic.Int32
-	receipts     atomic.Int32
-	scans        atomic.Int32
-	starts       atomic.Int32 // times a network asked whether the node is synced
+	// The TSS address the contract holds, when one is set.
+	tss atomic.Pointer[ecommon.Address]
+	// Runs, once, when the TSS address is read.
+	onTssRead atomic.Pointer[func()]
+	sent      atomic.Int32 // transactions sent to this chain
+	gate      chan struct{}
+	opening   sync.Once
+	calls     atomic.Int32
+	receipts  atomic.Int32
+	scans     atomic.Int32
+	starts    atomic.Int32 // times a network asked whether the node is synced
 }
 
 func newHeldEvm(t *testing.T, b *replayBridge) *heldEvm {
@@ -261,12 +266,15 @@ func (e *heldEvm) event() etypes.Log {
 
 // haltedSelector is the call the signer makes to ask a bridge contract
 // whether it is halted.
-func haltedSelector(t *testing.T) []byte {
+func haltedSelector(t *testing.T) []byte { return contractSelector(t, "isHalted") }
+
+// contractSelector is the selector of a bridge contract method.
+func contractSelector(t *testing.T, method string) []byte {
 	contract, err := bridge.BridgeMetaData.GetAbi()
 	if err != nil {
 		t.Fatal(err)
 	}
-	return contract.Methods["isHalted"].ID
+	return contract.Methods[method].ID
 }
 
 func (e *heldEvm) answer(method string, params []json.RawMessage) (interface{}, *replayRPCError) {
@@ -298,8 +306,27 @@ func (e *heldEvm) answer(method string, params []json.RawMessage) (interface{}, 
 			}
 			return "0x" + strings.Repeat("0", 64), nil
 		}
+		if selector := append(call.Data, call.Input...); len(selector) >= 4 && string(selector[:4]) == string(contractSelector(e.t, "tss")) {
+			if hook := e.onTssRead.Swap(nil); hook != nil {
+				(*hook)()
+			}
+			if tss := e.tss.Load(); tss != nil {
+				return ecommon.BytesToHash(tss.Bytes()).Hex(), nil
+			}
+		}
 		// Finality, deployment height and block time: 5 each.
 		return "0x" + strings.Repeat("0", 63) + "5", nil
+	case "eth_getBalance":
+		return "0xde0b6b3a7640000", nil
+	case "eth_getTransactionCount":
+		return "0x0", nil
+	case "eth_gasPrice":
+		return "0x1", nil
+	case "eth_estimateGas":
+		return "0x5208", nil
+	case "eth_sendRawTransaction":
+		e.sent.Add(1)
+		return ecommon.Hash{1}.Hex(), nil
 	case "eth_blockNumber":
 		return "0xc8", nil
 	case "eth_getBlockByNumber":
