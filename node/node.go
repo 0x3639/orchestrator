@@ -64,9 +64,17 @@ type Node struct {
 
 	logger *zap.SugaredLogger
 
-	// Channel to wait for termination notifications
+	// Channel to wait for termination notifications. It is never closed:
+	// some senders (e.g. evmNetwork.requestStop) do not recover from a send
+	// on a closed channel.
 	stopChan chan os.Signal
 	lock     sync.RWMutex
+	// Signing workers launched by Start; Stop cancels and joins them.
+	workers  signingWorkers
+	stopOnce sync.Once
+	stopErr  error
+	// Closed when Stop has finished; Wait also returns on it.
+	stopped chan struct{}
 	// Prevents concurrent use of instance directory
 	dataDirLock fileutil.Releaser
 }
@@ -78,6 +86,7 @@ func NewNode(config *oconfig.Config, logger *zap.Logger) (_ *Node, initErr error
 		config:   config,
 		logger:   logger.Sugar(),
 		stopChan: make(chan os.Signal, 1),
+		stopped:  make(chan struct{}),
 		state: common.NewPersistentGlobalState(&config.GlobalState, func(state uint8) error {
 			return oconfig.WriteGlobalState(config.DataPath, state)
 		}),
@@ -311,8 +320,8 @@ func (node *Node) Start() (startErr error) {
 	}()
 
 	node.state.HealthStore().SetPhase("running")
-	go node.processSignatures()
-	go node.sendSignatures()
+	node.workers.start(node.processSignatures)
+	node.workers.start(node.sendSignatures)
 	return nil
 }
 
@@ -323,35 +332,74 @@ func (node *Node) closeSnapshot() {
 	}
 }
 
+// Stop shuts the node down once; concurrent and later calls wait for the
+// first one and return its result.
 func (node *Node) Stop() error {
+	node.stopOnce.Do(func() { node.stopErr = node.stop() })
+	return node.stopErr
+}
+
+func (node *Node) stop() error {
+	defer close(node.stopped)
 	// Start holds the lock during bridge sync. Interrupt pending ledger
 	// reads and backoff before waiting for the startup path to unwind.
-	node.networksManager.Znn().CancelAccountBlockReads()
+	if node.networksManager != nil {
+		node.networksManager.Znn().CancelAccountBlockReads()
+	}
+	// Refuse new workers and cancel the running ones. Workers never take
+	// node.lock, so they are joined here, and again below while it is held.
+	workersDone := node.workers.shutdown()
+	joined := node.joinWorkers(workersDone, workerStopGrace)
+
 	node.lock.Lock()
 	defer node.lock.Unlock()
-	defer close(node.stopChan)
 	node.logger.Info("stopping node ...")
 
 	node.state.HealthStore().SetPhase("stopping")
-	defer node.closeSnapshot()
+	if !joined {
+		// A worker is still inside a TSS or network call. Stopping those
+		// dependencies is what makes such a call return.
+		node.logger.Warnf("signing workers still running after %s, stopping their dependencies", workerStopGrace)
+	}
 	if node.tssManager != nil {
 		node.tssManager.Stop()
 	}
-	node.networksManager.Stop()
-
-	if err := node.healthRpcServer.Shutdown(context.Background()); err != nil {
-		node.logger.Fatalf("Health rpc server shutdown failed: %v", err)
+	if node.networksManager != nil {
+		node.networksManager.Stop()
+	}
+	if !joined {
+		joined = node.joinWorkers(workersDone, workerStopTimeout)
 	}
 
+	if node.healthRpcServer != nil {
+		if err := node.healthRpcServer.Shutdown(context.Background()); err != nil {
+			node.logger.Fatalf("Health rpc server shutdown failed: %v", err)
+		}
+	}
+	defer node.closeSnapshot()
+
+	if !joined {
+		// A stuck worker may still write to the data dir, so keep the
+		// instance lock until it exits, and keep draining its stop signals.
+		node.logger.Errorf("signing workers did not exit within %s of stopping their dependencies; keeping the data dir locked until they do", workerStopTimeout)
+		go func() {
+			node.joinWorkers(workersDone, 0)
+			node.closeDataDir()
+		}()
+		return errSigningWorkersRunning
+	}
 	// Release instance directory lock.
 	node.closeDataDir()
-	node.logger.Info("closed stopChan")
 	return nil
 }
 
 func (node *Node) Wait() {
-	signalReceived := <-node.stopChan
-	node.logger.Info("signal from wait: ", signalReceived)
+	select {
+	case signalReceived := <-node.stopChan:
+		node.logger.Info("signal from wait: ", signalReceived)
+	case <-node.stopped:
+		node.logger.Info("node stopped")
+	}
 }
 
 // Sign messages methods
@@ -359,12 +407,14 @@ func (node *Node) Wait() {
 func (node *Node) processSignatures() {
 	node.logger.Info("in node processSignatures")
 	for {
-		time.Sleep(time.Second)
+		if !node.workerSleep(time.Second) {
+			return
+		}
 		currentState, err := node.state.GetState()
 		if err != nil {
 			node.logger.Debug("currentState error in processSig")
 			node.logger.Debug(err.Error())
-			time.Sleep(5 * time.Second)
+			node.workerSleep(5 * time.Second)
 			continue
 		}
 
@@ -373,7 +423,7 @@ func (node *Node) processSignatures() {
 				continue
 			}
 			node.haltNetworksAdministrator()
-			time.Sleep(5 * time.Second)
+			node.workerSleep(5 * time.Second)
 			continue
 		}
 		switch currentState {
@@ -387,7 +437,9 @@ func (node *Node) processSignatures() {
 			partyTimeout := uint64(node.tssManager.Config().PartyTimeout.Minutes())
 			keyGenWindow := partyTimeout * 30 * 6 // 1.5 minutes * 30 = 45 minutes * 6 momentums / minute
 			for mom.Height%keyGenWindow > 3 {
-				time.Sleep(10 * time.Second)
+				if !node.workerSleep(10 * time.Second) {
+					return
+				}
 				mom, err = node.networksManager.Znn().GetFrontierMomentum()
 				if err != nil {
 					node.logger.Debug(err)
@@ -433,6 +485,10 @@ func (node *Node) processSignatures() {
 			node.logger.Debug("node.getParticipantsLength(): ", initialParticipantsLength)
 
 			for node.networksManager.Znn().KeyGenThreshold() <= node.getParticipantsLength() {
+				// Do not start another ceremony once Stop has begun.
+				if node.workerStopping() {
+					return
+				}
 				state, err := node.state.GetState()
 				if err != nil {
 					node.logger.Debug("currentState error in processSig")
@@ -519,7 +575,9 @@ func (node *Node) processSignatures() {
 					break
 				} else {
 					// Sleep so we can close current connections
-					time.Sleep(15 * time.Second)
+					if !node.workerSleep(15 * time.Second) {
+						return
+					}
 				}
 			}
 			// there was en error while trying to keyGen, we retry
@@ -541,7 +599,9 @@ func (node *Node) processSignatures() {
 				continue
 			}
 
-			time.Sleep(5 * time.Second)
+			if !node.workerSleep(5 * time.Second) {
+				return
+			}
 			// we save the old pubKey because we will need it
 			oldKey := node.tssManager.GetPubKey()
 			node.logger.Debugf("Old pubKey: %s", oldKey)
@@ -755,11 +815,13 @@ func (node *Node) processSignatures() {
 				node.logger.Info(err.Error())
 			}
 		case common.LiveState:
-			time.Sleep(10 * time.Second)
+			if !node.workerSleep(10 * time.Second) {
+				return
+			}
 			bridgeInfo, err := node.networksManager.GetBridgeInfo()
 			if err != nil {
 				node.logger.Debug(err)
-				time.Sleep(5 * time.Second)
+				node.workerSleep(5 * time.Second)
 				continue
 			} else if bridgeInfo == nil {
 				node.logger.Debug("processSignatures bridgeInfo == nil")
@@ -768,7 +830,7 @@ func (node *Node) processSignatures() {
 			if bridgeInfo.AllowKeyGen == true {
 				// this means we generated a key and we wait for the administrator to change it
 				if len(bridgeInfo.CompressedTssECDSAPubKey) == 0 && len(node.tssManager.GetPubKey()) != 0 {
-					time.Sleep(10 * time.Second)
+					node.workerSleep(10 * time.Second)
 					continue
 				}
 				if err := node.state.SetState(common.KeyGenState); err != nil {
@@ -816,7 +878,9 @@ func (node *Node) processSignatures() {
 
 			// todo when to exit this state in case we don't halt the network after some time
 			node.logger.Debug("Process in emergency state")
-			time.Sleep(5 * time.Second)
+			if !node.workerSleep(5 * time.Second) {
+				return
+			}
 			znnTssNonce, err := node.networksManager.GetTssNonceZnn()
 			if err != nil {
 				node.logger.Debug(err)
@@ -867,15 +931,26 @@ func (node *Node) processSignatures() {
 			}
 
 			node.logger.Debug("Halt signatures are valid!")
+			// Each sender sets its flag only once its network is halted. A
+			// sender cancelled by Stop returns without setting it.
 			var senders sync.WaitGroup
+			var znnHalted, evmHalted bool
 			senders.Add(2)
 			go func() {
 				defer senders.Done()
 				index := uint32(int(znnSignature[0])) % node.getParticipantsLength()
 				if !node.networksManager.Znn().IsHalted() {
 					for {
+						if node.workerStopping() {
+							return
+						}
 						index = (index + 1) % node.getParticipantsLength()
 						if node.networksManager.Znn().IsHalted() {
+							// IsHalted also reports true when its RPC fails,
+							// which shutdown makes likely.
+							if node.workerStopping() {
+								return
+							}
 							break
 						}
 						producerPubKey := base64.StdEncoding.EncodeToString(node.producerKeyPair.Public)
@@ -889,17 +964,23 @@ func (node *Node) processSignatures() {
 							node.logger.Debug("[send Halt Znn Tx] sent request")
 							// we wait 2 momentums so that the send and receive block are inserted and the pubKey changes
 							// todo wait use constant
-							time.Sleep(20 * time.Second)
+							if !node.workerSleep(20 * time.Second) {
+								return
+							}
 						}
 					}
-					time.Sleep(time.Second)
+					node.workerSleep(time.Second)
 				}
+				znnHalted = true
 			}()
 
 			go func() {
 				defer senders.Done()
 				index := uint32(int(znnSignature[0])) % node.getParticipantsLength()
 				for {
+					if node.workerStopping() {
+						return
+					}
 					index = (index + 1) % node.getParticipantsLength()
 					producerPubKey := base64.StdEncoding.EncodeToString(node.producerKeyPair.Public)
 					if producerPubKey == node.getParticipant(index) {
@@ -912,13 +993,21 @@ func (node *Node) processSignatures() {
 							break
 						} else {
 							// todo use estimatedBlockTime / TimeToFinality
-							time.Sleep(15 * time.Second)
+							if !node.workerSleep(15 * time.Second) {
+								return
+							}
 						}
 					}
-					time.Sleep(time.Second)
+					node.workerSleep(time.Second)
 				}
+				evmHalted = true
 			}()
 			senders.Wait()
+			// A sender cancelled by Stop has not halted its network. Halts
+			// that were confirmed are still recorded.
+			if !znnHalted || !evmHalted {
+				return
+			}
 
 			if err := node.state.SetState(common.HaltedState); err != nil {
 				node.logger.Error(err)
@@ -958,10 +1047,14 @@ func (node *Node) processSignatures() {
 			// Gather all wraps that need to be resigned
 			node.logger.Debug("Parsing all the wraps in resign state")
 			for {
+				// Returning keeps ReSignState; the next start resumes the scan.
+				if node.workerStopping() {
+					return
+				}
 				wrapRequests, err := node.networksManager.Znn().GetAllWrapTokenRequests(pageIndex, pageSize)
 				if err != nil {
 					node.logger.Debug(err)
-					time.Sleep(10 * time.Second)
+					node.workerSleep(10 * time.Second)
 					continue
 				} else if wrapRequests == nil || len(wrapRequests.List) == 0 {
 					break
@@ -1399,7 +1492,7 @@ func (node *Node) sendSignatures() {
 		if err != nil {
 			node.logger.Debug("currentState error in processSig")
 			node.logger.Debug(err.Error())
-			time.Sleep(5 * time.Second)
+			node.workerSleep(5 * time.Second)
 			continue
 		}
 		switch currentState {
@@ -1409,7 +1502,9 @@ func (node *Node) sendSignatures() {
 			}
 		}
 		// todo use constant for momentum duration
-		time.Sleep(10 * time.Second)
+		if !node.workerSleep(10 * time.Second) {
+			return
+		}
 	}
 }
 
@@ -1456,7 +1551,9 @@ func (node *Node) sendSignaturesWrap(seenEventsCount map[string]uint32) {
 			node.logger.Info("[sendSignaturesWrap] sent request")
 		}
 		// todo how much to wait between sends?
-		time.Sleep(15 * time.Second)
+		if !node.workerSleep(15 * time.Second) {
+			return
+		}
 	}
 }
 
@@ -1495,20 +1592,33 @@ func (node *Node) sendUnwrapRequests(seenEventsCount map[string]uint32) {
 			}
 		}
 		// todo how much to wait between sends?
-		time.Sleep(25 * time.Second)
+		if !node.workerSleep(25 * time.Second) {
+			return
+		}
 	}
 }
 
 // Administrator methods
 
 func (node *Node) haltNetworksAdministrator() {
+	// Each sender sets its flag only once its network is halted. A sender
+	// cancelled by Stop returns without setting it.
 	var senders sync.WaitGroup
+	var znnHalted bool
 	senders.Add(1)
 
 	go func() {
 		defer senders.Done()
 		for {
+			if node.workerStopping() {
+				return
+			}
 			if node.networksManager.Znn().IsHalted() {
+				// IsHalted also reports true when its RPC fails, which
+				// shutdown makes likely.
+				if node.workerStopping() {
+					return
+				}
 				node.logger.Info("ZNN Network is halted")
 				break
 			}
@@ -1517,17 +1627,24 @@ func (node *Node) haltNetworksAdministrator() {
 			if errZnn != nil {
 				node.logger.Info(errZnn.Error())
 			}
-			time.Sleep(20 * time.Second)
+			if !node.workerSleep(20 * time.Second) {
+				return
+			}
 		}
+		znnHalted = true
 	}()
 
 	l := node.networksManager.NetworksLength()
+	evmHalted := make([]bool, l)
 	senders.Add(l)
 
 	for idx := 0; idx < l; idx++ {
 		go func(index int) {
 			defer senders.Done()
 			for {
+				if node.workerStopping() {
+					return
+				}
 				halted, err := node.networksManager.SendHaltEvmAdministrator(index, node.ecdsaPrivateKey, node.evmAddress)
 				if err != nil {
 					node.logger.Error(err)
@@ -1535,11 +1652,24 @@ func (node *Node) haltNetworksAdministrator() {
 					break
 				}
 				// todo use network block time
-				time.Sleep(12 * time.Second)
+				if !node.workerSleep(12 * time.Second) {
+					return
+				}
 			}
+			evmHalted[index] = true
 		}(idx)
 	}
 	senders.Wait()
+	// A sender cancelled by Stop has not halted its network. Halts that were
+	// confirmed are still recorded.
+	if !znnHalted {
+		return
+	}
+	for _, halted := range evmHalted {
+		if !halted {
+			return
+		}
+	}
 	if err := node.state.SetState(common.HaltedState); err != nil {
 		node.logger.Debug(err)
 	}
