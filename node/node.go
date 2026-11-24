@@ -972,11 +972,17 @@ func (node *Node) processSignatures() {
 							continue
 						}
 						event, errGetWrap := node.networksManager.GetWrapEventById(wrap.Id)
-						if errGetWrap != nil || event == nil {
+						if errGetWrap != nil {
+							// A failed read is not a missing record.
+							node.logger.Error(errGetWrap)
+							common.RequestStop(node.stopChan)
+							continue
+						}
+						if event == nil {
 							// if the rpc returns it but we don't have it locally there was a problem
 							// if we don't have it we just add it now
 							if errStorage := node.networksManager.Znn().AddWrapEvent(wrap.WrapTokenRequest); errStorage != nil {
-								node.logger.Error(errGetWrap)
+								node.logger.Error(errStorage)
 								node.stopChan <- syscall.SIGINT
 								continue
 							}
@@ -1011,7 +1017,7 @@ func (node *Node) processSignatures() {
 							}
 
 							if errStorage := node.networksManager.Znn().SetWrapEventStatus(event.Id, status); errStorage != nil {
-								node.logger.Error(errGetWrap)
+								node.logger.Error(errStorage)
 								node.stopChan <- syscall.SIGINT
 								continue
 							}
@@ -1060,25 +1066,35 @@ func (node *Node) processSignaturesWrap(window uint64) (error, bool) {
 	msgsIndexes := make(map[string]int)
 	for idx, request := range wrapRequestsIds {
 		event, err := node.networksManager.GetWrapEventById(request.Id)
-		if err != nil || event == nil {
+		if err != nil {
+			// A failed read must not be mistaken for a missing record: adding
+			// it again would overwrite a stored signature and redeem status.
+			node.logger.Error(err)
+			common.RequestStop(node.stopChan)
+			return err, false
+		}
+		if event == nil {
 			// if the rpc returns it but we don't have it locally there was a problem
 			// if we don't have it we just add it now
 			if errStorage := node.networksManager.Znn().AddWrapEvent(request); errStorage != nil {
-				node.logger.Error(err)
-				node.stopChan <- syscall.SIGINT
-				return err, false
+				node.logger.Error(errStorage)
+				common.RequestStop(node.stopChan)
+				return errStorage, false
 			}
 			event, err = node.networksManager.GetWrapEventById(request.Id)
-			if err != nil || event == nil {
+			if err == nil && event == nil {
+				err = fmt.Errorf("wrap request %s missing after it was stored", request.Id)
+			}
+			if err != nil {
 				node.logger.Error(err)
-				node.stopChan <- syscall.SIGINT
+				common.RequestStop(node.stopChan)
 				return err, false
 			}
 		} else {
 			resignStatus, err := node.networksManager.GetResignStatus(event.Id)
 			if err != nil {
 				node.logger.Error(err)
-				node.stopChan <- syscall.SIGINT
+				common.RequestStop(node.stopChan)
 				return err, false
 			}
 			if !resignStatus && len(event.Signature) > 0 {
@@ -1090,22 +1106,12 @@ func (node *Node) processSignaturesWrap(window uint64) (error, bool) {
 		node.logger.Debugf("param.TokenAddress: %s", request.TokenAddress)
 		node.logger.Debugf("param.Amount: %s", request.Amount.String())
 
-		if localEvent, errStorage := node.dbManager.ZnnStorage().GetWrapRequestById(event.Id); err != nil {
-			node.logger.Debug(errStorage)
-		} else {
-			resignStatus, err := node.networksManager.GetResignStatus(event.Id)
-			if err != nil {
-				node.logger.Error(err)
-				node.stopChan <- syscall.SIGINT
-				return err, false
-			}
-
-			// If we should resign it, we add it to the pool
-			// if we have a signature but it was not sent yet, do not sign again
-			// on a new key sign, this will be set as unsigned if the signature set will not be succeeded
-			if !resignStatus && len(localEvent.Signature) > 0 {
-				continue
-			}
+		if needed, errStorage := wrapNeedsSignature(node.dbManager.ZnnStorage(), event.Id); errStorage != nil {
+			node.logger.Error(errStorage)
+			common.RequestStop(node.stopChan)
+			return errStorage, false
+		} else if !needed {
+			continue
 		}
 
 		msg, err := event.GetMessage(node.networksManager.Evm(event.ChainId).ContractAddress())

@@ -365,8 +365,8 @@ func (m *NetworksManager) SetTssEcdsaPubKeyEvm(oldKeySignatures, newKeySignature
 	}
 	newPubKey, errDecompress := crypto.DecompressPubkey(newCompressedPubKeyBytes)
 	if errDecompress != nil {
-		m.logger.Debug(err)
-		return false, err
+		m.logger.Debug(errDecompress)
+		return false, errDecompress
 	}
 	newTss := crypto.PubkeyToAddress(*newPubKey)
 	m.logger.Debugf("New tss address: %s", newTss.String())
@@ -417,8 +417,8 @@ func (m *NetworksManager) CheckNewTssEcdsaPubKeyEvm(newCompressedPubKey string) 
 	}
 	newPubKey, errDecompress := crypto.DecompressPubkey(newCompressedPubKeyBytes)
 	if errDecompress != nil {
-		m.logger.Debug(err)
-		return false, err
+		m.logger.Debug(errDecompress)
+		return false, errDecompress
 	}
 	newTss := crypto.PubkeyToAddress(*newPubKey)
 	m.logger.Debugf("New tss address: %s", newTss.String())
@@ -575,8 +575,8 @@ func (m *NetworksManager) GetSetTssEcdsaPubKeysEvmMessages(newCompressedPubKey s
 	}
 	newPubKey, errDecompress := crypto.DecompressPubkey(newCompressedPubKeyBytes)
 	if errDecompress != nil {
-		m.logger.Debug(err)
-		return nil, err
+		m.logger.Debug(errDecompress)
+		return nil, errDecompress
 	}
 	newTss := crypto.PubkeyToAddress(*newPubKey)
 

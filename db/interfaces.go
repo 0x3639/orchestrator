@@ -45,6 +45,8 @@ type ZnnStorage interface {
 	Snapshot() ZnnStorage
 	SendSigInt()
 
+	// AddWrapRequest stores the event only when no record exists for its id;
+	// an existing record is kept unchanged.
 	AddWrapRequest(events.WrapRequestZnn) error
 	SetWrapRequestStatus(types.Hash, uint32) error
 	SetWrapRequestSignature(types.Hash, string) error
