@@ -25,11 +25,18 @@ import (
 	"orchestrator/rpc"
 	"os"
 	"slices"
+	"sync"
 )
 
 type NetworksManager struct {
-	health      *snapshot.Store
-	znnNetwork  *znnNetwork
+	health     *snapshot.Store
+	znnNetwork *znnNetwork
+	// evmMu guards evmNetworks. The Zenon listener adds and removes networks
+	// at runtime while the node and the health server read the list, so every
+	// access goes through the lock. Writers publish a new slice instead of
+	// changing the old one, and readers iterate a copy from evmSnapshot, so a
+	// slow call on one network never holds the lock.
+	evmMu       sync.RWMutex
 	evmNetworks []*evmNetwork
 	stopChan    chan os.Signal
 	logger      *zap.SugaredLogger
@@ -117,18 +124,32 @@ func (m *NetworksManager) Init(networksInfo map[string]config.BaseNetworkConfig,
 			return errors.New("wrong network initializers 4")
 		}
 	}
+	m.evmMu.Lock()
 	m.evmNetworks = newEvmNetworks
+	m.evmMu.Unlock()
 	return nil
 }
 
 func (m *NetworksManager) Start() error {
+	// Only the networks from Init still need starting. The Zenon listener
+	// starts below and publishes runtime networks it has already started.
+	initial := m.evmSnapshot()
 	if err := m.znnNetwork.Start(); err != nil {
 		return err
 	}
 
 	// todo add control for the threads
-	for _, eNetwork := range m.evmNetworks {
+	for _, eNetwork := range initial {
+		// The listener may remove a network before or while it starts. Its
+		// Start then ends early, and that is not a startup failure.
+		if !m.isRegistered(eNetwork) {
+			continue
+		}
 		if err := eNetwork.Start(); err != nil {
+			if !m.isRegistered(eNetwork) {
+				m.logger.Infof("network with chainId %d was removed during startup: %v", eNetwork.ChainId(), err)
+				continue
+			}
 			return err
 		}
 	}
@@ -136,21 +157,64 @@ func (m *NetworksManager) Start() error {
 	return nil
 }
 
-func (m *NetworksManager) AddEvmNetwork(network *evmNetwork) {
-	m.evmNetworks = append(m.evmNetworks, network)
+// evmSnapshot returns a copy of the current EVM network list. Callers may
+// iterate it without holding the lock. A network in the copy may be removed
+// afterwards; see RemoveEvmNetwork for what still works on it.
+func (m *NetworksManager) evmSnapshot() []*evmNetwork {
+	m.evmMu.RLock()
+	defer m.evmMu.RUnlock()
+	return slices.Clone(m.evmNetworks)
 }
 
+func (m *NetworksManager) isRegistered(network *evmNetwork) bool {
+	m.evmMu.RLock()
+	defer m.evmMu.RUnlock()
+	return slices.Contains(m.evmNetworks, network)
+}
+
+// findEvm returns the registered network for chainId, or nil.
+func (m *NetworksManager) findEvm(chainId uint32) *evmNetwork {
+	m.evmMu.RLock()
+	defer m.evmMu.RUnlock()
+	for _, network := range m.evmNetworks {
+		if network.ChainId() == chainId {
+			return network
+		}
+	}
+	return nil
+}
+
+func (m *NetworksManager) AddEvmNetwork(network *evmNetwork) {
+	m.evmMu.Lock()
+	defer m.evmMu.Unlock()
+	next := make([]*evmNetwork, 0, len(m.evmNetworks)+1)
+	next = append(next, m.evmNetworks...)
+	m.evmNetworks = append(next, network)
+}
+
+// RemoveEvmNetwork unregisters the network, stops its health poller and
+// closes done so its background loops leave their sleeps. It does not close
+// the unconfirmed queue, so a ProcessEvents worker blocked on it stays
+// blocked. Work that took a snapshot earlier can still hold the removed
+// network. The caller then removes its RPC client and data directories, so
+// later RPC or storage calls through that network can fail.
 func (m *NetworksManager) RemoveEvmNetwork(chainId uint32) {
 	m.health.RemoveNetwork(chainId)
+	m.evmMu.Lock()
+	var removed *evmNetwork
 	for idx, network := range m.evmNetworks {
 		if network.ChainId() == chainId {
-			if network.stopHealth != nil {
-				network.stopHealth()
-			}
-			network.stopOnce.Do(func() { close(network.done) })
-			m.evmNetworks = append(m.evmNetworks[:idx], m.evmNetworks[idx+1:]...)
-			return
+			removed = network
+			// Build a new slice so a list read before the lock was taken
+			// is never changed underneath its reader.
+			m.evmNetworks = slices.Delete(slices.Clone(m.evmNetworks), idx, idx+1)
+			break
 		}
+	}
+	m.evmMu.Unlock()
+	// Stopping the poller waits for an in-flight sample, so do it unlocked.
+	if removed != nil {
+		removed.halt()
 	}
 }
 
@@ -160,7 +224,7 @@ func (m *NetworksManager) Stop() {
 		m.logger.Error(err)
 	}
 
-	for _, eNetwork := range m.evmNetworks {
+	for _, eNetwork := range m.evmSnapshot() {
 		eNetwork.Stop()
 	}
 }
@@ -172,18 +236,22 @@ func (m *NetworksManager) RpcManager() *rpc.Manager {
 }
 
 func (m *NetworksManager) NetworksLength() int {
+	m.evmMu.RLock()
+	defer m.evmMu.RUnlock()
 	return len(m.evmNetworks)
 }
 
+// Networks returns a snapshot of the registered EVM networks. Changing the
+// returned slice does not affect the manager.
 func (m *NetworksManager) Networks() []*evmNetwork {
-	return m.evmNetworks
+	return m.evmSnapshot()
 }
 
 ///////// state
 
 func (m *NetworksManager) CountNetworksHaltState() (int, int, error) {
 	halted, unhalted := 0, 0
-	for _, network := range m.evmNetworks {
+	for _, network := range m.evmSnapshot() {
 		if isHalted, err := network.IsHalted(); err != nil {
 			return 0, 0, err
 		} else {
@@ -346,13 +414,14 @@ func (m *NetworksManager) GetUnsignedWrapRequests() ([]*definition.WrapTokenRequ
 
 // / Evm
 func (m *NetworksManager) Evm(chainId uint32) *evmNetwork {
-	if m.evmNetworks == nil {
+	m.evmMu.RLock()
+	initialized := m.evmNetworks != nil
+	m.evmMu.RUnlock()
+	if !initialized {
 		panic(errors.New("evm networks not init"))
 	}
-	for _, network := range m.evmNetworks {
-		if network.ChainId() == chainId {
-			return network
-		}
+	if network := m.findEvm(chainId); network != nil {
+		return network
 	}
 	panic(errors.Errorf("evm network with chainId: %d not found", chainId))
 }
@@ -455,7 +524,13 @@ func (m *NetworksManager) evmTssRotationDone(newTss ecommon.Address, pending []u
 func (m *NetworksManager) SendHaltEvm(signatures [][]byte, ecdsaPrivateKey *ecdsa.PrivateKey, evmAddress ecommon.Address) (bool, error) {
 	// true means that all evm networks are halted
 	ok := true
-	for idx, network := range m.evmNetworks {
+	for idx, network := range m.evmSnapshot() {
+		// A network added after the ceremony has no signature here. Leave
+		// it to the next ceremony instead of indexing past the list.
+		if idx >= len(signatures) {
+			m.logger.Warnf("no halt signature for network with chainId %d; it was added after signing", network.ChainId())
+			continue
+		}
 		halted, err := network.IsHalted()
 		if err != nil {
 			return false, err
@@ -486,7 +561,7 @@ func (m *NetworksManager) SendHaltEvm(signatures [][]byte, ecdsaPrivateKey *ecds
 
 func (m *NetworksManager) GetHaltMessages() ([][]byte, error) {
 	ans := make([][]byte, 0)
-	for _, network := range m.evmNetworks {
+	for _, network := range m.evmSnapshot() {
 		msg, err := network.GetHaltEvmMessage()
 		if err != nil {
 			return nil, err
@@ -498,7 +573,11 @@ func (m *NetworksManager) GetHaltMessages() ([][]byte, error) {
 
 func (m *NetworksManager) GetHaltEvmTxs(signatures [][]byte, tss ecommon.Address) ([]*etypes.Transaction, error) {
 	txs := make([]*etypes.Transaction, 0)
-	for idx, network := range m.evmNetworks {
+	networks := m.evmSnapshot()
+	if len(signatures) != len(networks) {
+		return nil, errors.Errorf("have %d halt signatures for %d networks", len(signatures), len(networks))
+	}
+	for idx, network := range networks {
 		tx, err := network.GetHaltEvmTx(signatures[idx], tss)
 		if err != nil {
 			return nil, err
@@ -510,10 +589,17 @@ func (m *NetworksManager) GetHaltEvmTxs(signatures [][]byte, tss ecommon.Address
 
 // SendHaltEvmAdministrator return value represent if the network is halted or not
 func (m *NetworksManager) SendHaltEvmAdministrator(idx int, ecdsaPrivateKey *ecdsa.PrivateKey, evmAddress ecommon.Address) (bool, error) {
-	if idx > len(m.evmNetworks) {
+	if idx < 0 {
 		return false, errors.New("network index non existent")
 	}
-	network := m.evmNetworks[idx]
+	networks := m.evmSnapshot()
+	if idx >= len(networks) {
+		// The network was removed after the workers were sized; there is
+		// nothing left at this index to halt.
+		m.logger.Infof("network index %d no longer exists", idx)
+		return true, nil
+	}
+	network := networks[idx]
 	halted, err := network.IsHalted()
 	if err != nil {
 		return false, err
@@ -540,7 +626,7 @@ func (m *NetworksManager) SendHaltEvmAdministrator(idx int, ecdsaPrivateKey *ecd
 
 func (m *NetworksManager) GetSigners() []etypes.Signer {
 	ans := make([]etypes.Signer, 0)
-	for _, network := range m.evmNetworks {
+	for _, network := range m.evmSnapshot() {
 		signer := etypes.LatestSignerForChainID(big.NewInt(int64(network.ChainId())))
 		ans = append(ans, signer)
 	}
@@ -571,7 +657,11 @@ func (m *NetworksManager) GetChangeTssEcdsaPubKeysEvmTxs(oldPublicKey, newPublic
 	newTss := crypto.PubkeyToAddress(*newPublicKeyECDSA)
 
 	txs := make([]*etypes.Transaction, 0)
-	for idx, network := range m.evmNetworks {
+	networks := m.evmSnapshot()
+	if len(oldKeyFullSignatures) != len(networks) || len(newKeyFullSignatures) != len(networks) {
+		return nil, errors.Errorf("have %d old and %d new key signatures for %d networks", len(oldKeyFullSignatures), len(newKeyFullSignatures), len(networks))
+	}
+	for idx, network := range networks {
 		tx, err := network.GetSetTssEcdsaPubKeyEvmTx(oldTss, newTss, oldKeyFullSignatures[idx], newKeyFullSignatures[idx])
 		if err != nil {
 			return nil, err
@@ -595,7 +685,7 @@ func (m *NetworksManager) GetSetTssEcdsaPubKeysEvmMessages(newCompressedPubKey s
 	newTss := crypto.PubkeyToAddress(*newPubKey)
 
 	ans := make([][]byte, 0)
-	for _, network := range m.evmNetworks {
+	for _, network := range m.evmSnapshot() {
 		msg, err := network.GetSetTssEcdsaPubKeyEvmMessage(newTss)
 		if err != nil {
 			return nil, err
@@ -609,7 +699,7 @@ func (m *NetworksManager) GetSetTssEcdsaPubKeysEvmMessages(newCompressedPubKey s
 func (m *NetworksManager) GetEvmUnwrapRequestByHashAndLog(chainId uint32, txHash ecommon.Hash, logIndex uint32) (*events.UnwrapRequestEvm, error) {
 	var event *events.UnwrapRequestEvm
 	var err error
-	for _, network := range m.evmNetworks {
+	for _, network := range m.evmSnapshot() {
 		if network.ChainId() == chainId {
 			if event, err = network.GetUnwrapRequestByHashAndLog(txHash, logIndex); err != nil {
 				return nil, err
@@ -623,7 +713,7 @@ func (m *NetworksManager) GetEvmUnwrapRequestByHashAndLog(chainId uint32, txHash
 
 func (m *NetworksManager) GetUnsignedUnwrapRequests() ([]*events.UnwrapRequestEvm, error) {
 	ans := make([]*events.UnwrapRequestEvm, 0)
-	for _, network := range m.evmNetworks {
+	for _, network := range m.evmSnapshot() {
 		requests, err := network.GetUnsignedUnwrapRequests()
 		if err != nil {
 			return nil, err
@@ -650,8 +740,10 @@ func (m *NetworksManager) GetUnsignedUnwrapRequests() ([]*events.UnwrapRequestEv
 // ceremony's messages. Unavailable evidence postpones the entire batch.
 func (m *NetworksManager) VerifyUnwrapsForSigning(requests []*events.UnwrapRequestEvm) error {
 	for _, req := range requests {
+		// Look the source up per row, so a network removed while an earlier
+		// row was being verified is reported missing instead of used.
 		var source *evmNetwork
-		for _, network := range m.evmNetworks {
+		for _, network := range m.evmSnapshot() {
 			if network.ChainId() == req.ChainId && network.NetworkClass() == req.NetworkClass {
 				source = network
 				break
@@ -696,7 +788,7 @@ func (m *NetworksManager) VerifyUnwrapsForSigning(requests []*events.UnwrapReque
 
 func (m *NetworksManager) GetUnsentSignedUnwrapRequests() ([]*events.UnwrapRequestEvm, error) {
 	ans := make([]*events.UnwrapRequestEvm, 0)
-	for _, network := range m.evmNetworks {
+	for _, network := range m.evmSnapshot() {
 		requests, err := network.GetUnsentSignedUnwrapRequests()
 		if err != nil {
 			return nil, err
@@ -709,7 +801,7 @@ func (m *NetworksManager) GetUnsentSignedUnwrapRequests() ([]*events.UnwrapReque
 }
 
 func (m *NetworksManager) SetUnsentUnwrapRequestAsUnsigned(event events.UnwrapRequestEvm) error {
-	for _, network := range m.evmNetworks {
+	for _, network := range m.evmSnapshot() {
 		if network.ChainId() == event.ChainId {
 			if err := network.SetUnsentUnwrapRequestAsUnsigned(event.TransactionHash, event.LogIndex); err != nil {
 				return err
@@ -720,7 +812,7 @@ func (m *NetworksManager) SetUnsentUnwrapRequestAsUnsigned(event events.UnwrapRe
 }
 
 func (m *NetworksManager) SetEvmUnwrapRequestAsSent(event *events.UnwrapRequestEvm) error {
-	for _, network := range m.evmNetworks {
+	for _, network := range m.evmSnapshot() {
 		if network.ChainId() == event.ChainId {
 			if err := network.SetUnwrapRequestStatus(event.TransactionHash, event.LogIndex, common.PendingRedeemStatus); err != nil {
 				return err
@@ -732,7 +824,7 @@ func (m *NetworksManager) SetEvmUnwrapRequestAsSent(event *events.UnwrapRequestE
 
 // SetEvmUnwrapRequestStatus updates only the redeem status of an existing record.
 func (m *NetworksManager) SetEvmUnwrapRequestStatus(event *events.UnwrapRequestEvm, status uint32) error {
-	for _, network := range m.evmNetworks {
+	for _, network := range m.evmSnapshot() {
 		if network.ChainId() == event.ChainId {
 			if err := network.SetUnwrapRequestStatus(event.TransactionHash, event.LogIndex, status); err != nil {
 				return err
@@ -745,7 +837,7 @@ func (m *NetworksManager) SetEvmUnwrapRequestStatus(event *events.UnwrapRequestE
 // SetEvmBackfillBlocks asks every EVM network to rewind its sync cursor
 // once at start by the given number of blocks. Must be called before Start.
 func (m *NetworksManager) SetEvmBackfillBlocks(blocks uint64) {
-	for _, network := range m.evmNetworks {
+	for _, network := range m.evmSnapshot() {
 		network.SetBackfillBlocks(blocks)
 	}
 }
@@ -754,7 +846,7 @@ func (m *NetworksManager) SetEvmBackfillBlocks(blocks uint64) {
 // record, leaving its redeem status untouched. Writing the whole event back
 // after a ceremony could undo a status change made meanwhile by the sender.
 func (m *NetworksManager) SetEvmUnwrapRequestSignature(event *events.UnwrapRequestEvm) error {
-	for _, network := range m.evmNetworks {
+	for _, network := range m.evmSnapshot() {
 		if network.ChainId() == event.ChainId {
 			if err := network.SetUnwrapRequestSignature(event.TransactionHash, event.LogIndex, event.Signature); err != nil {
 				return err
@@ -765,7 +857,7 @@ func (m *NetworksManager) SetEvmUnwrapRequestSignature(event *events.UnwrapReque
 }
 
 func (m *NetworksManager) AddEvmUnwrapRequest(event events.UnwrapRequestEvm) error {
-	for _, network := range m.evmNetworks {
+	for _, network := range m.evmSnapshot() {
 		if network.ChainId() == event.ChainId {
 			if err := network.AddUnwrapRequest(event); err != nil {
 				return err
