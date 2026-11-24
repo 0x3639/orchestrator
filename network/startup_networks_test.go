@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math/big"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -375,6 +376,38 @@ func TestRestoredIncidentIsActedOnWhenTheScanCannotLook(t *testing.T) {
 	}
 	if h.net.settleChecked.Load() {
 		t.Fatal("fixture: the scan should not have run while the node syncs")
+	}
+}
+
+// The wait for the first scans starts when they can start. A long read of
+// the bridge account before them, as after a signer was down, does not use
+// it up.
+func TestRestoredIncidentWaitStartsAfterTheBridgeAccountRead(t *testing.T) {
+	h := newHeldStart(t)
+	h.plainReceive()
+	h.evm.syncing.Store(true) // no scan can look at the incidents here
+	h.evm.open()
+	const wait = 300 * time.Millisecond
+	h.m.restoreWait = wait
+	restoreIncident(t, h, 99)
+	stall, stalled := make(chan struct{}), make(chan struct{}, 1)
+	var release sync.Once
+	t.Cleanup(func() { release.Do(func() { close(stall) }) })
+	h.zenon.change(func(z *heldZenon) { z.stall, z.stalled = stall, stalled })
+	result := make(chan error, 1)
+	go func() { result <- h.start() }()
+	select {
+	case <-stalled:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the read of the bridge account did not begin")
+	}
+	time.Sleep(2 * wait)
+	release.Do(func() { close(stall) })
+	if err := <-result; err != nil {
+		t.Fatal(err)
+	}
+	if h.m.RestoredIncidentsChecked() {
+		t.Fatal("the read of the bridge account used up the wait for the scans")
 	}
 }
 

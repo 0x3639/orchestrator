@@ -202,11 +202,13 @@ func (m *NetworksManager) Start() error {
 	// The networks Init created. Once the bridge account is being read, the
 	// listener can add a network of its own, which it starts itself.
 	initial := m.networks()
-	m.restoreCheck, m.restoreDeadline = initial, time.Now().Add(m.restoredIncidentWait())
 	held, err := m.znnNetwork.Start()
 	if err != nil {
 		return err
 	}
+	// The wait for the first scans starts when they can: the read of the
+	// bridge account above can take long after a signer was down.
+	m.restoreCheck, m.restoreDeadline = initial, time.Now().Add(m.restoredIncidentWait())
 	state := m.znnNetwork.state
 	if held || !signsTransfers(state) {
 		for _, eNetwork := range initial {

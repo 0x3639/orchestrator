@@ -437,17 +437,19 @@ func (node *Node) processSignatures() {
 			} else if halted {
 				continue
 			}
-			// The recheck worker can archive the last incident while the
-			// flags above are being read. Then there is nothing to halt for:
-			// look again from the state as it is now. A newer incident keeps
-			// the generation set, and the halt goes ahead.
-			if node.state.RedeemHaltGeneration() == 0 {
-				continue
-			}
 			// Incidents restored at startup are first looked at by each EVM
 			// network's first scan, which releases the ones the chain shows
 			// settled. Nothing acts on them before that, for a bounded time.
 			if node.state.RestoredRedeemHalt(generation) && !node.networksManager.RestoredIncidentsChecked() {
+				continue
+			}
+			// The recheck worker, or that first scan, can archive the last
+			// incident while the flags above are being read. Then there is
+			// nothing to halt for: look again from the state as it is now. A
+			// newer incident keeps the generation set, and the halt goes
+			// ahead. This comes after the check above, which a scan passes
+			// only after it has released what it could.
+			if node.state.RedeemHaltGeneration() == 0 {
 				continue
 			}
 		}
@@ -1679,12 +1681,21 @@ func (node *Node) haltNetworksAdministrator() {
 	// Set when the emergency ended. The senders then stop, and no halt is
 	// recorded.
 	var aborted atomic.Bool
+	// ended reports, and records, that the emergency is over. Each sender
+	// looks before every attempt, so one whose calls keep failing still
+	// stops.
+	ended := func() bool {
+		if state, err := node.state.GetState(); err == nil && state != common.EmergencyState {
+			aborted.Store(true)
+		}
+		return aborted.Load()
+	}
 	var senders sync.WaitGroup
 	senders.Add(1)
 
 	go func() {
 		defer senders.Done()
-		for !aborted.Load() {
+		for !ended() {
 			if halted, ok := node.znnHaltFlag(); !ok {
 				continue
 			} else if halted {
@@ -1712,7 +1723,7 @@ func (node *Node) haltNetworksAdministrator() {
 	for idx := 0; idx < l; idx++ {
 		go func(index int) {
 			defer senders.Done()
-			for !aborted.Load() {
+			for !ended() {
 				halted, err := node.networksManager.SendHaltEvmAdministrator(batch, index, node.ecdsaPrivateKey, node.evmAddress, node.state.WhileEmergency)
 				if errors.Is(err, network.ErrEmergencyEnded) {
 					aborted.Store(true)
