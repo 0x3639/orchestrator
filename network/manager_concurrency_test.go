@@ -176,10 +176,7 @@ func TestIndexedCallsSurviveAListChange(t *testing.T) {
 		t.Fatal("halt txs built with fewer signatures than networks")
 	}
 	// A worker whose network was removed finishes instead of panicking.
-	if halted, err := m.SendHaltEvmAdministrator(2, nil, [20]byte{}); err != nil || !halted {
-		t.Fatalf("halted=%v err=%v for a removed index", halted, err)
-	}
-	if _, err := m.SendHaltEvmAdministrator(-1, nil, [20]byte{}); err == nil {
-		t.Fatal("negative index accepted")
+	if halted, err := m.SendHaltEvmAdministrator(3, nil, [20]byte{}); err != nil || !halted {
+		t.Fatalf("halted=%v err=%v for a removed network", halted, err)
 	}
 }

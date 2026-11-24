@@ -923,7 +923,7 @@ func (node *Node) processSignatures() {
 			messagesToSign := make([][]byte, 0)
 			messagesToSign = append(messagesToSign, znnMessage)
 
-			evmMessages, err := node.networksManager.GetHaltMessages()
+			evmMessages, evmChainIds, err := node.networksManager.GetHaltMessages()
 			if err != nil {
 				node.logger.Debug(err)
 				continue
@@ -960,18 +960,13 @@ func (node *Node) processSignatures() {
 			go func() {
 				defer senders.Done()
 				index := uint32(int(znnSignature[0])) % node.getParticipantsLength()
-				if !node.networksManager.Znn().IsHalted() {
+				if !node.znnHaltConfirmed() {
 					for {
 						if node.workerStopping() {
 							return
 						}
 						index = (index + 1) % node.getParticipantsLength()
-						if node.networksManager.Znn().IsHalted() {
-							// IsHalted also reports true when its RPC fails,
-							// which shutdown makes likely.
-							if node.workerStopping() {
-								return
-							}
+						if node.znnHaltConfirmed() {
 							break
 						}
 						producerPubKey := base64.StdEncoding.EncodeToString(node.producerKeyPair.Public)
@@ -1007,7 +1002,13 @@ func (node *Node) processSignatures() {
 					if producerPubKey == node.getParticipant(index) {
 						node.logger.Debug("[send halt evm tx] this is me")
 						// todo discuss using concurrent send for different networks with different senders
-						if changed, err := node.networksManager.SendHaltEvm(evmFullSignatures, node.ecdsaPrivateKey, node.evmAddress); err != nil {
+						if changed, err := node.networksManager.SendHaltEvm(evmFullSignatures, evmChainIds, node.ecdsaPrivateKey, node.evmAddress); err != nil {
+							if errors.Is(err, network.ErrHaltSignaturesStale) {
+								// A network joined after signing; a new
+								// ceremony has to sign its halt.
+								node.logger.Info(err.Error())
+								return
+							}
 							node.logger.Debug(err)
 							continue
 						} else if changed {
@@ -1024,10 +1025,14 @@ func (node *Node) processSignatures() {
 				evmHalted = true
 			}()
 			senders.Wait()
-			// A sender cancelled by Stop has not halted its network. Halts
-			// that were confirmed are still recorded.
-			if !znnHalted || !evmHalted {
+			if node.workerStopping() {
 				return
+			}
+			// A sender without a confirmed halt (cancelled, or holding stale
+			// signatures) leaves the node in EmergencyState, and the next
+			// pass signs again.
+			if !znnHalted || !evmHalted {
+				continue
 			}
 
 			if err := node.state.SetState(common.HaltedState); err != nil {
@@ -1625,6 +1630,19 @@ func (node *Node) sendUnwrapRequests(seenEventsCount map[string]uint32) {
 	}
 }
 
+// znnHaltConfirmed reports whether a successful read shows the Zenon bridge
+// halted. A failed read is logged and is not a confirmation, so a halt is never
+// recorded on an RPC error.
+func (node *Node) znnHaltConfirmed() bool {
+	halted, err := node.networksManager.Znn().HaltStatus()
+	if err != nil {
+		node.logger.Infof("could not read the Zenon halt status: %s", err.Error())
+		node.workerSleep(time.Second)
+		return false
+	}
+	return halted
+}
+
 // Administrator methods
 
 func (node *Node) haltNetworksAdministrator() {
@@ -1640,12 +1658,7 @@ func (node *Node) haltNetworksAdministrator() {
 			if node.workerStopping() {
 				return
 			}
-			if node.networksManager.Znn().IsHalted() {
-				// IsHalted also reports true when its RPC fails, which
-				// shutdown makes likely.
-				if node.workerStopping() {
-					return
-				}
+			if node.znnHaltConfirmed() {
 				node.logger.Info("ZNN Network is halted")
 				break
 			}
@@ -1661,18 +1674,27 @@ func (node *Node) haltNetworksAdministrator() {
 		znnHalted = true
 	}()
 
-	l := node.networksManager.NetworksLength()
-	evmHalted := make([]bool, l)
-	senders.Add(l)
+	// One sender per network, by chain id: list positions shift when a
+	// network is added or removed while the senders run.
+	targets := make(map[uint32]bool)
+	for _, evmNetwork := range node.networksManager.Networks() {
+		targets[evmNetwork.ChainId()] = true
+	}
+	chainIds := make([]uint32, 0, len(targets))
+	for chainId := range targets {
+		chainIds = append(chainIds, chainId)
+	}
+	evmHalted := make([]bool, len(chainIds))
+	senders.Add(len(chainIds))
 
-	for idx := 0; idx < l; idx++ {
-		go func(index int) {
+	for idx, chainId := range chainIds {
+		go func(index int, chainId uint32) {
 			defer senders.Done()
 			for {
 				if node.workerStopping() {
 					return
 				}
-				halted, err := node.networksManager.SendHaltEvmAdministrator(index, node.ecdsaPrivateKey, node.evmAddress)
+				halted, err := node.networksManager.SendHaltEvmAdministrator(chainId, node.ecdsaPrivateKey, node.evmAddress)
 				if err != nil {
 					node.logger.Error(err)
 				} else if halted {
@@ -1684,7 +1706,7 @@ func (node *Node) haltNetworksAdministrator() {
 				}
 			}
 			evmHalted[index] = true
-		}(idx)
+		}(idx, chainId)
 	}
 	senders.Wait()
 	// A sender cancelled by Stop has not halted its network. Halts that were
@@ -1694,6 +1716,14 @@ func (node *Node) haltNetworksAdministrator() {
 	}
 	for _, halted := range evmHalted {
 		if !halted {
+			return
+		}
+	}
+	// A network added while the senders ran has not been halted. Stay in
+	// EmergencyState so the next pass halts it.
+	for _, evmNetwork := range node.networksManager.Networks() {
+		if !targets[evmNetwork.ChainId()] {
+			node.logger.Infof("network with chainId %d was added during the halt; halting again", evmNetwork.ChainId())
 			return
 		}
 	}

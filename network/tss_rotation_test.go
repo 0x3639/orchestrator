@@ -69,7 +69,8 @@ func (r *rotationNet) received(method string) bool {
 	return false
 }
 
-func newRotationNetwork(t *testing.T, chainId uint32, provider *tssProvider) (*evmNetwork, *rotationNet) {
+// newRotationNetwork serves provider's eth methods to one fake EVM network.
+func newRotationNetwork(t *testing.T, chainId uint32, provider any) (*evmNetwork, *rotationNet) {
 	t.Helper()
 	srv := gethrpc.NewServer()
 	if err := srv.RegisterName("eth", provider); err != nil {

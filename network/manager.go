@@ -527,14 +527,33 @@ func (m *NetworksManager) evmTssRotationDone(newTss ecommon.Address, pending []u
 	return false
 }
 
-func (m *NetworksManager) SendHaltEvm(signatures [][]byte, ecdsaPrivateKey *ecdsa.PrivateKey, evmAddress ecommon.Address) (bool, error) {
-	// true means that all evm networks are halted
+// ErrHaltSignaturesStale means an EVM network registered now has no halt
+// signature from the ceremony. The signatures cannot halt it, so the caller
+// must run a new ceremony instead of recording the halt.
+var ErrHaltSignaturesStale = errors.New("halt signatures do not cover every registered evm network")
+
+// SendHaltEvm sends at most one halt tx per call, to the first registered
+// network that is not halted yet. signatures[i] is the halt signature for
+// chainIds[i], as returned by GetHaltMessages. It returns true only when every
+// registered network is halted. A network with no signature (added after the
+// ceremony) is never reported as halted: once the signed networks are halted,
+// SendHaltEvm returns ErrHaltSignaturesStale. A signed network that was removed
+// since is ignored.
+func (m *NetworksManager) SendHaltEvm(signatures [][]byte, chainIds []uint32, ecdsaPrivateKey *ecdsa.PrivateKey, evmAddress ecommon.Address) (bool, error) {
+	if len(signatures) != len(chainIds) {
+		return false, errors.Errorf("have %d halt signatures for %d chain ids", len(signatures), len(chainIds))
+	}
+	signed := make(map[uint32][]byte, len(chainIds))
+	for idx, chainId := range chainIds {
+		signed[chainId] = signatures[idx]
+	}
+	var unsigned []uint32
+	// true means that all signed evm networks are halted
 	ok := true
-	for idx, network := range m.evmSnapshot() {
-		// A network added after the ceremony has no signature here. Leave
-		// it to the next ceremony instead of indexing past the list.
-		if idx >= len(signatures) {
-			m.logger.Warnf("no halt signature for network with chainId %d; it was added after signing", network.ChainId())
+	for _, network := range m.evmSnapshot() {
+		signature, found := signed[network.ChainId()]
+		if !found {
+			unsigned = append(unsigned, network.ChainId())
 			continue
 		}
 		halted, err := network.IsHalted()
@@ -547,7 +566,7 @@ func (m *NetworksManager) SendHaltEvm(signatures [][]byte, ecdsaPrivateKey *ecds
 		} else {
 			ok = false
 		}
-		tx, err := network.GetHaltEvmTx(signatures[idx], evmAddress)
+		tx, err := network.GetHaltEvmTx(signature, evmAddress)
 		if err != nil {
 			m.logger.Error(err)
 			continue
@@ -562,19 +581,30 @@ func (m *NetworksManager) SendHaltEvm(signatures [][]byte, ecdsaPrivateKey *ecds
 		}
 		break
 	}
-	return ok, nil
+	if !ok {
+		return false, nil
+	}
+	if len(unsigned) > 0 {
+		return false, errors.Wrapf(ErrHaltSignaturesStale, "no halt signature for chain ids %v", unsigned)
+	}
+	return true, nil
 }
 
-func (m *NetworksManager) GetHaltMessages() ([][]byte, error) {
-	ans := make([][]byte, 0)
-	for _, network := range m.evmSnapshot() {
+// GetHaltMessages returns the halt message of every registered EVM network and
+// the chain id each message is for, read from one snapshot of the list.
+func (m *NetworksManager) GetHaltMessages() ([][]byte, []uint32, error) {
+	networks := m.evmSnapshot()
+	messages := make([][]byte, 0, len(networks))
+	chainIds := make([]uint32, 0, len(networks))
+	for _, network := range networks {
 		msg, err := network.GetHaltEvmMessage()
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
-		ans = append(ans, msg)
+		messages = append(messages, msg)
+		chainIds = append(chainIds, network.ChainId())
 	}
-	return ans, nil
+	return messages, chainIds, nil
 }
 
 func (m *NetworksManager) GetHaltEvmTxs(signatures [][]byte, tss ecommon.Address) ([]*etypes.Transaction, error) {
@@ -593,19 +623,16 @@ func (m *NetworksManager) GetHaltEvmTxs(signatures [][]byte, tss ecommon.Address
 	return txs, nil
 }
 
-// SendHaltEvmAdministrator return value represent if the network is halted or not
-func (m *NetworksManager) SendHaltEvmAdministrator(idx int, ecdsaPrivateKey *ecdsa.PrivateKey, evmAddress ecommon.Address) (bool, error) {
-	if idx < 0 {
-		return false, errors.New("network index non existent")
-	}
-	networks := m.evmSnapshot()
-	if idx >= len(networks) {
-		// The network was removed after the workers were sized; there is
-		// nothing left at this index to halt.
-		m.logger.Infof("network index %d no longer exists", idx)
+// SendHaltEvmAdministrator sends an administrator halt to the network with
+// chainId. It returns true once that network is halted, or when it is no longer
+// registered, since this node can no longer reach it. The caller checks that
+// no network was added in the meantime before recording the halt.
+func (m *NetworksManager) SendHaltEvmAdministrator(chainId uint32, ecdsaPrivateKey *ecdsa.PrivateKey, evmAddress ecommon.Address) (bool, error) {
+	network := m.findEvm(chainId)
+	if network == nil {
+		m.logger.Infof("network with chainId %d is no longer registered", chainId)
 		return true, nil
 	}
-	network := networks[idx]
 	halted, err := network.IsHalted()
 	if err != nil {
 		return false, err

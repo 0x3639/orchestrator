@@ -1403,19 +1403,33 @@ func (rC *znnNetwork) recordSync(syncInfo *protocol.SyncInfo, err error) bool {
 	return synced
 }
 
+// IsHalted treats a failed read as halted and stops the bridge listener. Code
+// that records a confirmed halt must use HaltStatus instead.
 func (rC *znnNetwork) IsHalted() bool {
-	bridgeInfo, err := rC.GetBridgeInfo()
+	halted, err := rC.HaltStatus()
 	if err != nil {
 		rC.stopBridgeListener(rC.listenerCtx, err)
 		return true
 	}
-	frMom, frMomErr := rC.state.GetFrontierMomentum()
-	if frMomErr != nil {
-		rC.stopBridgeListener(rC.listenerCtx, frMomErr)
-		return true
-	}
+	return halted
+}
 
-	return bridgeInfo.Halted || bridgeInfo.UnhaltedAt+bridgeInfo.UnhaltDurationInMomentums >= frMom
+// HaltStatus reports whether the Zenon bridge is halted, or still inside its
+// unhalt delay. A failed read returns an error, never a halt.
+func (rC *znnNetwork) HaltStatus() (bool, error) {
+	bridgeInfo, err := rC.GetBridgeInfo()
+	if err != nil {
+		return false, err
+	}
+	frMom, err := rC.state.GetFrontierMomentum()
+	if err != nil {
+		return false, err
+	}
+	return haltedAt(bridgeInfo, frMom), nil
+}
+
+func haltedAt(bridgeInfo *definition.BridgeInfoVariable, frontierMomentum uint64) bool {
+	return bridgeInfo.Halted || bridgeInfo.UnhaltedAt+bridgeInfo.UnhaltDurationInMomentums >= frontierMomentum
 }
 
 /// Local storage
