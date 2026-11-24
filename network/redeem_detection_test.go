@@ -210,26 +210,25 @@ func TestSourceReplyWithoutAmountOrFeeDecidesNothing(t *testing.T) {
 	}
 }
 
-// Halt signatures are matched to networks by position and cover the
-// network's contract. When the networks are not the ones the messages were
-// built for, sending must stop and say so instead of using a signature for
-// another network or none at all.
+// Halt signatures cover the network's contract. When the networks are not the
+// ones the messages were built for, sending must stop and say so instead of
+// using a signature for another network or none at all.
 func TestHaltSignaturesNeedTheNetworksTheyWereSignedFor(t *testing.T) {
 	src := &redeemSource{synced: true}
 	n, _, chain := redeemFixture(t, src)
 	m := &NetworksManager{evmNetworks: []*evmNetwork{n}, logger: zap.NewNop().Sugar()}
 	// Signed while there was no EVM network; one was published since.
-	if _, err := m.SendHaltEvm(nil, nil, ecommon.Address{}); !errors.Is(err, ErrHaltMembershipChanged) {
+	if _, err := m.SendHaltEvm(EvmBatch{}, nil, nil, ecommon.Address{}, nil); !errors.Is(err, ErrNetworksChanged) {
 		t.Fatalf("a network without a signature: %v", err)
 	}
-	messages, err := m.GetHaltMessages()
+	batch, messages, err := m.GetHaltMessages()
 	if err != nil || len(messages) != 1 {
 		t.Fatalf("halt messages: %d %v", len(messages), err)
 	}
 	signatures := [][]byte{{1}}
 	// The same networks: sending goes on, here to a chain already halted.
 	*chain.halted = true
-	if halted, err := m.SendHaltEvm(signatures, nil, ecommon.Address{}); err != nil || !halted {
+	if halted, err := m.SendHaltEvm(batch, signatures, nil, ecommon.Address{}, nil); err != nil || !halted {
 		t.Fatalf("matching networks: halted=%t err=%v", halted, err)
 	}
 	// The network was removed and published again under the same chain id.
@@ -239,14 +238,15 @@ func TestHaltSignaturesNeedTheNetworksTheyWereSignedFor(t *testing.T) {
 	}
 	m.RemoveEvmNetwork(n.ChainId())
 	m.AddEvmNetwork(replacement)
-	if _, err := m.SendHaltEvm(signatures, nil, ecommon.Address{}); !errors.Is(err, ErrHaltMembershipChanged) {
+	if _, err := m.SendHaltEvm(batch, signatures, nil, ecommon.Address{}, nil); !errors.Is(err, ErrNetworksChanged) {
 		t.Fatalf("a replaced network: %v", err)
 	}
 	// New messages are for the current networks.
-	if _, err := m.GetHaltMessages(); err != nil {
+	batch, _, err = m.GetHaltMessages()
+	if err != nil {
 		t.Fatal(err)
 	}
-	if halted, err := m.SendHaltEvm(signatures, nil, ecommon.Address{}); err != nil || !halted {
+	if halted, err := m.SendHaltEvm(batch, signatures, nil, ecommon.Address{}, nil); err != nil || !halted {
 		t.Fatalf("after signing again: halted=%t err=%v", halted, err)
 	}
 }

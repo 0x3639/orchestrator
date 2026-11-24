@@ -124,6 +124,15 @@ func (r *ZnnRpc) SubscribeToAccountBlocks(address types.Address) (*server.Client
 /// Transactions
 
 func (r *ZnnRpc) BroadcastTransaction(tx *nom.AccountBlock, keyPair *wallet.KeyPair) error {
+	if err := r.prepareTransaction(tx, keyPair); err != nil {
+		return err
+	}
+	return r.PublishTransaction(tx)
+}
+
+// prepareTransaction fills in the account fields and the proof of work, and
+// signs the block.
+func (r *ZnnRpc) prepareTransaction(tx *nom.AccountBlock, keyPair *wallet.KeyPair) error {
 	if err := zenon.CheckAndSetFields(r.rpcClient, tx, keyPair.Address, keyPair.Public); err != nil {
 		return err
 	}
@@ -133,7 +142,11 @@ func (r *ZnnRpc) BroadcastTransaction(tx *nom.AccountBlock, keyPair *wallet.KeyP
 
 	tx.Hash = tx.ComputeHash()
 	tx.Signature = keyPair.Sign(tx.Hash.Bytes())
+	return nil
+}
 
+// PublishTransaction publishes a block that prepareTransaction made.
+func (r *ZnnRpc) PublishTransaction(tx *nom.AccountBlock) error {
 	return r.rpcClient.LedgerApi.PublishRawTransaction(tx)
 }
 
@@ -157,6 +170,16 @@ func (r *ZnnRpc) ChangeTssEcdsaPubKey(pubKey, signature, newSignature string, ke
 func (r *ZnnRpc) Halt(signature string, keyPair *wallet.KeyPair) error {
 	tx := r.rpcClient.BridgeApi.Halt(signature)
 	return r.BroadcastTransaction(tx, keyPair)
+}
+
+// PrepareHalt makes the signed halt block, proof of work included, without
+// publishing it.
+func (r *ZnnRpc) PrepareHalt(signature string, keyPair *wallet.KeyPair) (*nom.AccountBlock, error) {
+	tx := r.rpcClient.BridgeApi.Halt(signature)
+	if err := r.prepareTransaction(tx, keyPair); err != nil {
+		return nil, err
+	}
+	return tx, nil
 }
 
 /// RPC Calls

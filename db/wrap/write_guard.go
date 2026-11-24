@@ -5,8 +5,9 @@ import (
 	"sync"
 )
 
-// writeGuard stops the synced writes to the Zenon database after one of them
-// fails, until the process restarts.
+// writeGuard stops the writes to the Zenon database after one of them fails,
+// until the process restarts. It covers the synced writes and, through
+// guardedDB, the wrap store's other writes on the same handle.
 //
 // When a synced write fails, LevelDB may already have put the record in its
 // journal without serving it or advancing its sequence number. The next write
@@ -24,7 +25,7 @@ func newWriteGuard(stop func()) *writeGuard {
 	return &writeGuard{stop: stop}
 }
 
-// write runs one synced write unless an earlier one failed.
+// write runs one write unless an earlier one failed.
 func (g *writeGuard) write(put func() error) error {
 	if g == nil {
 		return put()

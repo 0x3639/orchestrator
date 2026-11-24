@@ -111,6 +111,25 @@ func (es *evmStorage) UpdateUnwrapRequestBlockNumber(event events.UnwrapRequestE
 	return es.putUnwrapRequest(*localEvent)
 }
 
+func (es *evmStorage) FillUnwrapRequestBlock(event events.UnwrapRequestEvm) error {
+	es.mu.Lock()
+	defer es.mu.Unlock()
+	localEvent, err := es.GetUnwrapRequestByHashAndLog(event.TransactionHash, event.LogIndex)
+	if err != nil {
+		es.SendSigInt()
+		return err
+	}
+	if localEvent == nil || localEvent.BlockHash != (ecommon.Hash{}) {
+		return nil
+	}
+	localEvent.BlockNumber = event.BlockNumber
+	localEvent.BlockHash = event.BlockHash
+	if localEvent.From == (ecommon.Address{}) && localEvent.SameTransfer(&event) {
+		localEvent.From = event.From
+	}
+	return es.putUnwrapRequest(*localEvent)
+}
+
 // Fill a legacy row only if it is still the unsigned candidate that was checked.
 func (es *evmStorage) HydrateUnsignedUnwrap(before, verified events.UnwrapRequestEvm) error {
 	es.mu.Lock()
@@ -125,6 +144,36 @@ func (es *evmStorage) HydrateUnsignedUnwrap(before, verified events.UnwrapReques
 	}
 	current.From, current.BlockHash, current.BlockNumber = verified.From, verified.BlockHash, verified.BlockNumber
 	return es.putUnwrapRequest(*current)
+}
+
+func sourceLocationKey(txHash ecommon.Hash, logIndex uint32) []byte {
+	return zcommon.JoinBytes(sourceLocationPrefix, txHash.Bytes(), binary.BigEndian.AppendUint32(nil, logIndex))
+}
+
+func (es *evmStorage) SaveUnwrapSourceLocation(txHash ecommon.Hash, logIndex uint32, blockNumber uint64, blockHash ecommon.Hash) error {
+	if blockHash == (ecommon.Hash{}) {
+		return errors.New("a source location needs a block hash")
+	}
+	value := append(binary.BigEndian.AppendUint64(nil, blockNumber), blockHash.Bytes()...)
+	if err := es.DB.Put(sourceLocationKey(txHash, logIndex), value); err != nil {
+		es.SendSigInt()
+		return err
+	}
+	return nil
+}
+
+func (es *evmStorage) UnwrapSourceLocation(txHash ecommon.Hash, logIndex uint32) (uint64, ecommon.Hash, bool, error) {
+	value, err := es.DB.Get(sourceLocationKey(txHash, logIndex))
+	if errors.Is(err, leveldb.ErrNotFound) {
+		return 0, ecommon.Hash{}, false, nil
+	}
+	if err != nil {
+		return 0, ecommon.Hash{}, false, err
+	}
+	if len(value) != 8+ecommon.HashLength {
+		return 0, ecommon.Hash{}, false, errors.New("invalid stored unwrap source location")
+	}
+	return binary.BigEndian.Uint64(value[:8]), ecommon.BytesToHash(value[8:]), true, nil
 }
 
 func (es *evmStorage) UnwrapAffiliatePolicy(key ecommon.Hash) (common.AffiliatePolicy, bool, error) {

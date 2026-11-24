@@ -66,7 +66,9 @@ type Node struct {
 
 	// Channel to wait for termination notifications
 	stopChan chan os.Signal
-	lock     sync.RWMutex
+	// Closed by Stop.
+	stopped chan struct{}
+	lock    sync.RWMutex
 	// Prevents concurrent use of instance directory
 	dataDirLock fileutil.Releaser
 }
@@ -78,6 +80,7 @@ func NewNode(config *oconfig.Config, logger *zap.Logger) (_ *Node, initErr error
 		config:   config,
 		logger:   logger.Sugar(),
 		stopChan: make(chan os.Signal, 1),
+		stopped:  make(chan struct{}),
 		state: common.NewPersistentGlobalState(&config.GlobalState, func(state uint8) error {
 			return oconfig.WriteGlobalState(config.DataPath, state)
 		}),
@@ -276,19 +279,22 @@ func (node *Node) Start() (startErr error) {
 	}
 	node.logger.Infof("Current state is: %s", common.StateToText(currentState))
 
-	// If we are in emergency we should stay so we can halt the network
-	// Otherwise we should check
-	if currentState == common.LiveState {
-		if halted, _, err := node.networksManager.CountNetworksHaltState(); err != nil {
+	// A signer in emergency stays so, so that it can halt the bridge. Any
+	// other moves to HaltedState when the bridge is halted, which is looked at
+	// before startup completes.
+	//
+	// A start that returned early, with the bridge account or the EVM scans
+	// still outstanding, signs no transfer yet, and its EVM endpoints may not
+	// answer yet. The networks manager completes that startup itself, and
+	// looks at the halt flags again until they can be read.
+	if !node.networksManager.CompletesStartupLater() {
+		if err := node.networksManager.CompleteStartup(); err != nil {
 			return err
-		} else {
-			if node.networksManager.Znn().IsHalted() || halted > 0 {
-				if err := node.state.SetState(common.HaltedState); err != nil {
-					return err
-				}
-			}
 		}
 	}
+
+	// From here on Start changes nothing it read from the bridge.
+	node.state.MarkNodeReady()
 
 	pillars, err := node.networksManager.Znn().GetAllPillars()
 	if err != nil {
@@ -322,10 +328,39 @@ func (node *Node) Start() (startErr error) {
 		}
 	}()
 
-	node.state.HealthStore().SetPhase("running")
+	// The phase stays syncingBridge while startup is held: the networks
+	// manager returned before the bridge account was read to its tip or
+	// before the EVM networks finished their startup scan.
+	select {
+	case <-node.state.StartupDone():
+		node.state.HealthStore().SetPhase("running")
+	default:
+		node.logger.Warn("startup is not complete: until it is, this signer acts only on an emergency and signs no transfer")
+		go func() {
+			select {
+			case <-node.state.StartupDone():
+				node.state.HealthStore().AdvancePhase("syncingBridge", "running")
+			case <-node.stopped:
+			}
+		}()
+	}
 	go node.processSignatures()
 	go node.sendSignatures()
 	return nil
+}
+
+// waitsForStartup reports whether the signing loops leave a signer in state
+// alone because startup is not complete: the bridge account has not been read
+// to its tip, or an EVM network has not finished its startup scan. Until then
+// the signer signs and sends nothing for a transfer, generates no key and
+// re-signs nothing. It still acts on an emergency: in EmergencyState it signs
+// and sends the halt, and in HaltedState it watches whether the halt holds.
+//
+// started is StartupComplete as read before state was. Startup completes only
+// after the bridge's halt flags have been looked at, so a state read once the
+// gate is open already reflects them; a state read earlier may not.
+func waitsForStartup(started bool, state uint8) bool {
+	return !started && state != common.EmergencyState && state != common.HaltedState
 }
 
 func (node *Node) closeSnapshot() {
@@ -342,6 +377,7 @@ func (node *Node) Stop() error {
 	node.lock.Lock()
 	defer node.lock.Unlock()
 	defer close(node.stopChan)
+	close(node.stopped)
 	node.logger.Info("stopping node ...")
 
 	node.state.HealthStore().SetPhase("stopping")
@@ -372,6 +408,7 @@ func (node *Node) processSignatures() {
 	node.logger.Info("in node processSignatures")
 	for {
 		time.Sleep(time.Second)
+		started := node.state.StartupComplete() // before the state: see waitsForStartup
 		// Read the generation first: a halt released between the two reads
 		// then shows as a stale generation, which is checked again below,
 		// and never as an emergency without one.
@@ -409,6 +446,9 @@ func (node *Node) processSignatures() {
 			}
 			node.haltNetworksAdministrator()
 			time.Sleep(5 * time.Second)
+			continue
+		}
+		if waitsForStartup(started, currentState) {
 			continue
 		}
 		switch currentState {
@@ -610,7 +650,7 @@ func (node *Node) processSignatures() {
 				messagesToSign = append(messagesToSign, znnMessage)
 
 				// EVM messages
-				toSignMessagesEvm, err := node.networksManager.GetSetTssEcdsaPubKeysEvmMessages(keyGenResponse.PubKey)
+				evmBatch, toSignMessagesEvm, err := node.networksManager.GetSetTssEcdsaPubKeysEvmMessages(keyGenResponse.PubKey)
 				if err != nil {
 					node.logger.Debug(err)
 					continue
@@ -714,8 +754,12 @@ func (node *Node) processSignatures() {
 						producerPubKey := base64.StdEncoding.EncodeToString(node.producerKeyPair.Public)
 						if producerPubKey == node.getParticipant(index) {
 							node.logger.Debug("[send set tss ecdsa pub key evm tx] this is me")
-							if changed, err := node.networksManager.SetTssEcdsaPubKeyEvm(oldKeyFullSignatures, newKeyFullSignatures, keyGenResponse.PubKey, node.ecdsaPrivateKey, node.evmAddress); err != nil {
-								node.logger.Debug(err)
+							if changed, err := node.networksManager.SetTssEcdsaPubKeyEvm(evmBatch, oldKeyFullSignatures, newKeyFullSignatures, keyGenResponse.PubKey, node.ecdsaPrivateKey, node.evmAddress); err != nil {
+								if errors.Is(err, network.ErrNetworksChanged) {
+									node.logger.Errorf("the key change cannot be sent to every EVM network: %v", err)
+								} else {
+									node.logger.Debug(err)
+								}
 								continue
 							} else if changed {
 								break
@@ -877,7 +921,7 @@ func (node *Node) processSignatures() {
 			messagesToSign := make([][]byte, 0)
 			messagesToSign = append(messagesToSign, znnMessage)
 
-			evmMessages, err := node.networksManager.GetHaltMessages()
+			evmBatch, evmMessages, err := node.networksManager.GetHaltMessages()
 			if err != nil {
 				node.logger.Debug(err)
 				continue
@@ -915,10 +959,10 @@ func (node *Node) processSignatures() {
 			if !emergency() {
 				continue
 			}
-			// Set when the EVM networks are no longer the ones these messages
-			// were signed for, or when the emergency ended. Both senders then
-			// stop, and the round ends without recording a halt. If the
-			// emergency still stands, the next round signs again.
+			// Set when the bridge lists an EVM network the round did not sign
+			// for, or when the emergency ended. Both senders then stop, and
+			// the round ends without recording a halt. If the emergency still
+			// stands, the next round signs again, for every network.
 			var aborted atomic.Bool
 			var senders sync.WaitGroup
 			senders.Add(2)
@@ -938,10 +982,16 @@ func (node *Node) processSignatures() {
 						producerPubKey := base64.StdEncoding.EncodeToString(node.producerKeyPair.Public)
 						if producerPubKey == node.getParticipant(index) {
 							node.logger.Debug("[send Halt Znn Tx] this is me")
-							err = node.networksManager.HaltZnn(znnSignature, node.producerKeyPair)
+							// The emergency cannot be released while the
+							// halt is being published.
+							sent, err := node.networksManager.HaltZnn(znnSignature, node.producerKeyPair, node.state.WhileEmergency)
 							if err != nil {
 								node.logger.Info(err.Error())
 								continue
+							}
+							if !sent {
+								aborted.Store(true)
+								break
 							}
 							node.logger.Debug("[send Halt Znn Tx] sent request")
 							// we wait 2 momentums so that the send and receive block are inserted and the pubKey changes
@@ -969,9 +1019,13 @@ func (node *Node) processSignatures() {
 					if producerPubKey == node.getParticipant(index) {
 						node.logger.Debug("[send halt evm tx] this is me")
 						// todo discuss using concurrent send for different networks with different senders
-						if changed, err := node.networksManager.SendHaltEvm(evmFullSignatures, node.ecdsaPrivateKey, node.evmAddress); err != nil {
-							if errors.Is(err, network.ErrHaltMembershipChanged) {
-								node.logger.Warn(err)
+						if changed, err := node.networksManager.SendHaltEvm(evmBatch, evmFullSignatures, node.ecdsaPrivateKey, node.evmAddress, node.state.WhileEmergency); err != nil {
+							if errors.Is(err, network.ErrNetworksChanged) {
+								node.logger.Info("the bridge lists an EVM network the halt was not signed for; signing the halt again")
+								aborted.Store(true)
+								break
+							}
+							if errors.Is(err, network.ErrEmergencyEnded) {
 								aborted.Store(true)
 								break
 							}
@@ -992,7 +1046,9 @@ func (node *Node) processSignatures() {
 				continue // The next iteration decides from the state as it is now.
 			}
 
-			if err := node.state.SetState(common.HaltedState); err != nil {
+			// Only an emergency that still stands becomes a halt. Another
+			// goroutine may have changed the state since the senders ended.
+			if _, err := node.state.SetStateIf(common.EmergencyState, common.HaltedState); err != nil {
 				node.logger.Error(err)
 				node.stopChan <- syscall.SIGINT
 				return
@@ -1472,6 +1528,7 @@ func (node *Node) sendSignatures() {
 
 	sendPending := newSignatureSendPoll(node.sendSignaturesWrap, node.sendUnwrapRequests)
 	for {
+		started := node.state.StartupComplete() // before the state: see waitsForStartup
 		currentState, err := node.state.GetState()
 		if err != nil {
 			node.logger.Debug("currentState error in processSig")
@@ -1481,7 +1538,7 @@ func (node *Node) sendSignatures() {
 		}
 		switch currentState {
 		case common.LiveState:
-			if len(node.tssManager.GetPubKey()) != 0 {
+			if !waitsForStartup(started, currentState) && len(node.tssManager.GetPubKey()) != 0 {
 				sendPending()
 			}
 		}
@@ -1596,7 +1653,7 @@ func (node *Node) haltNetworksAdministrator() {
 				break
 			}
 
-			errZnn := node.networksManager.HaltZnn("", node.producerKeyPair)
+			_, errZnn := node.networksManager.HaltZnn("", node.producerKeyPair, nil)
 			if errZnn != nil {
 				node.logger.Info(errZnn.Error())
 			}
@@ -1604,14 +1661,17 @@ func (node *Node) haltNetworksAdministrator() {
 		}
 	}()
 
-	l := node.networksManager.NetworksLength()
+	// Each worker halts one network of this batch, or ends when the bridge
+	// removes it. A network added in the meantime is halted on the next call.
+	batch := node.networksManager.EvmBatch()
+	l := batch.Len()
 	senders.Add(l)
 
 	for idx := 0; idx < l; idx++ {
 		go func(index int) {
 			defer senders.Done()
 			for {
-				halted, err := node.networksManager.SendHaltEvmAdministrator(index, node.ecdsaPrivateKey, node.evmAddress)
+				halted, err := node.networksManager.SendHaltEvmAdministrator(batch, index, node.ecdsaPrivateKey, node.evmAddress)
 				if err != nil {
 					node.logger.Error(err)
 				} else if halted {
@@ -1623,6 +1683,10 @@ func (node *Node) haltNetworksAdministrator() {
 		}(idx)
 	}
 	senders.Wait()
+	if !node.networksManager.Covers(batch) {
+		node.logger.Info("the bridge lists an EVM network added during the halt; halting it as well")
+		return
+	}
 	if err := node.state.SetState(common.HaltedState); err != nil {
 		node.logger.Debug(err)
 	}

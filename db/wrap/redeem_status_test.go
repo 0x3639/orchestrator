@@ -211,6 +211,26 @@ func TestFailedSyncStopsWritesUntilRestart(t *testing.T) {
 			if err := tc.write(store); err == nil {
 				t.Fatal("the retry was acknowledged before a restart")
 			}
+			// The writes made without a sync share the handle, so they are
+			// refused too: the stop request is asynchronous, and one of them
+			// could otherwise be the write the next start drops.
+			for name, write := range map[string]func() error{
+				"bridge watch":     func() error { return store.SaveBridgeWatchFrom(7) },
+				"receive cursor":   func() error { return store.SetLastUpdateHeight(9) },
+				"receive coverage": func() error { return store.SaveReceiveCoverageCheckpoint(9) },
+				"resign status":    func() error { return store.SetResignStatus(types.Hash{4}, true) },
+				"subset put":       func() error { return store.Storage().Put([]byte{1}, []byte{1}) },
+				"subset delete":    func() error { return store.Storage().Delete([]byte{1}) },
+				"subset patch": func() error {
+					patch := zdb.NewPatch()
+					patch.Put([]byte{1}, []byte{1})
+					return store.Storage().Apply(patch)
+				},
+			} {
+				if err := write(); err == nil {
+					t.Fatalf("a later %s write was acknowledged", name)
+				}
+			}
 			// Restart: the same files, opened again.
 			if err := raw.Close(); err != nil {
 				t.Fatal(err)
@@ -231,6 +251,28 @@ func TestFailedSyncStopsWritesUntilRestart(t *testing.T) {
 			}
 			if has, _ := raw.Has(redeemStatusKey(56, types.Hash{3}), nil); has {
 				t.Fatal("a write that was refused is in the database")
+			}
+			if from, err := store.BridgeWatchFrom(); err != nil || from != 0 {
+				t.Fatalf("a refused bridge watch write: from %d, err %v", from, err)
+			}
+			if resigned, err := store.GetResignStatus(types.Hash{4}); err != nil || resigned {
+				t.Fatalf("a refused resign status: %v, err %v", resigned, err)
+			}
+			// Those writes go through after the restart and stay.
+			if err := store.SaveBridgeWatchFrom(7); err != nil {
+				t.Fatal(err)
+			}
+			if err := raw.Close(); err != nil {
+				t.Fatal(err)
+			}
+			raw, err = leveldb.Open(files, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer raw.Close()
+			store, _ = NewZenonStores(raw, make(chan os.Signal, 4))
+			if from, err := store.BridgeWatchFrom(); err != nil || from != 7 {
+				t.Fatalf("bridge watch after a second restart: from %d, err %v", from, err)
 			}
 		})
 	}

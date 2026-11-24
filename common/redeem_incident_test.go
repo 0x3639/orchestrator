@@ -3,6 +3,7 @@ package common
 import (
 	"errors"
 	"testing"
+	"time"
 
 	ecommon "github.com/ethereum/go-ethereum/common"
 	etypes "github.com/ethereum/go-ethereum/core/types"
@@ -118,5 +119,85 @@ func TestSetStateIfLeavesAPendingRedeemHaltAlone(t *testing.T) {
 	// An emergency is still allowed through, as with SetState.
 	if changed, err := state.SetStateIf(before, EmergencyState); err != nil || !changed || stored != EmergencyState {
 		t.Fatalf("emergency: changed=%t err=%v stored=%d", changed, err, stored)
+	}
+}
+
+// A redeem halt is not released while a halt transaction is being submitted,
+// and once it has been released no halt is submitted for it.
+func TestReleaseWaitsForAHaltSubmission(t *testing.T) {
+	acknowledged := RedeemIncident{ChainID: 1, Log: etypes.Log{TxHash: ecommon.Hash{9}, Index: 2}}
+	for name, release := range map[string]func(*GlobalState) error{
+		"recheck":    func(s *GlobalState) error { return s.ReleaseResolvedRedeemHalt() },
+		"settlement": func(s *GlobalState) error { return s.ArchiveSettledRedeem(RedeemIncident{ChainID: 1}) },
+		// Archiving a registration the operator acknowledged releases a
+		// halt that nothing else needs.
+		"acknowledged": func(s *GlobalState) error { return s.ReportRedeemIncident(acknowledged) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			state := NewGlobalState(new(uint8))
+			state.AcknowledgeRedeemLogs([]RedeemLogID{redeemLogID(acknowledged)})
+			if err := state.RestoreRedeemIncidents(new(lossyIncidentStore)); err != nil {
+				t.Fatal(err)
+			}
+			if err := state.ReportRedeemIncident(RedeemIncident{ChainID: 1}); err != nil || state.RedeemHaltGeneration() == 0 {
+				t.Fatalf("reported incident: pending=%d err=%v", state.RedeemHaltGeneration(), err)
+			}
+			sending, finish := make(chan struct{}), make(chan struct{})
+			submitted := make(chan bool, 1)
+			go func() {
+				ran, err := state.WhileEmergency(func() error {
+					close(sending)
+					<-finish
+					return nil
+				})
+				submitted <- ran && err == nil
+			}()
+			<-sending
+			released := make(chan error, 1)
+			go func() { released <- release(state) }()
+			select {
+			case <-released:
+				t.Fatal("the halt was released while a halt transaction was being submitted")
+			case <-time.After(100 * time.Millisecond):
+			}
+			close(finish)
+			if !<-submitted {
+				t.Fatal("the submission during the emergency did not run")
+			}
+			if err := <-released; err != nil || state.RedeemHaltGeneration() != 0 {
+				t.Fatalf("release after the submission: pending=%d err=%v", state.RedeemHaltGeneration(), err)
+			}
+			ran, err := state.WhileEmergency(func() error {
+				t.Error("a halt was submitted after its emergency was released")
+				return nil
+			})
+			if ran || err != nil {
+				t.Fatalf("after the release: ran %v, err %v", ran, err)
+			}
+		})
+	}
+}
+
+// A pending redeem halt is an emergency for dev's state checks too, although
+// the stored state under it is HaltedState.
+func TestPendingRedeemHaltCountsAsAnEmergency(t *testing.T) {
+	state := NewGlobalState(new(uint8))
+	if err := state.RestoreRedeemIncidents(new(lossyIncidentStore)); err != nil {
+		t.Fatal(err)
+	}
+	if err := state.ReportRedeemIncident(RedeemIncident{ChainID: 1}); err != nil || state.RedeemHaltGeneration() == 0 {
+		t.Fatalf("reported incident: pending=%d err=%v", state.RedeemHaltGeneration(), err)
+	}
+	if state.UnlessInEmergency(func() {}) {
+		t.Fatal("UnlessInEmergency ran during a pending redeem halt")
+	}
+	if state.WhileSigningTransfers(func() {}) {
+		t.Fatal("WhileSigningTransfers ran during a pending redeem halt")
+	}
+	if moved, err := state.HaltSigning(); moved || err != nil {
+		t.Fatalf("HaltSigning moved %v, err %v; the emergency stays", moved, err)
+	}
+	if current, _ := state.GetState(); current != EmergencyState {
+		t.Fatalf("state %d, want EmergencyState", current)
 	}
 }

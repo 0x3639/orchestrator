@@ -19,7 +19,9 @@ func getStorageIterator() []byte {
 type eventStore struct {
 	zdb.DB
 	stopChan chan os.Signal
-	mu       *sync.Mutex
+	// Serializes the writes of a wrap request, each of which reads the
+	// record first. The bridge listener and the EVM networks both make them.
+	mu *sync.Mutex
 	// raw is the file behind DB, when there is one. Wrap rows and redeem
 	// statuses are then written through it with a sync. A snapshot has none.
 	raw   *leveldb.DB
@@ -55,9 +57,36 @@ func NewDurableZnnStorage(raw *leveldb.DB, stopChan chan os.Signal) db.ZnnStorag
 }
 
 func newDurableZnnStorage(raw *leveldb.DB, stopChan chan os.Signal, guard *writeGuard) *eventStore {
-	store := NewZnnStorage(zdb.NewLevelDBWrapper(raw), stopChan).(*eventStore)
+	store := NewZnnStorage(guardedDB{zdb.NewLevelDBWrapper(raw), guard}, stopChan).(*eventStore)
 	store.raw, store.guard = raw, guard
 	return store
+}
+
+// guardedDB passes every write the wrap store makes without a sync through
+// the guard its synced writes use. Those writes share the LevelDB handle, so
+// after a failed write none of them may be acknowledged either: the sequence
+// number it reused would make it the write dropped on the next start.
+type guardedDB struct {
+	zdb.DB
+	guard *writeGuard
+}
+
+func (g guardedDB) Put(key, value []byte) error {
+	return g.guard.write(func() error { return g.DB.Put(key, value) })
+}
+
+func (g guardedDB) Delete(key []byte) error {
+	return g.guard.write(func() error { return g.DB.Delete(key) })
+}
+
+func (g guardedDB) Apply(patch zdb.Patch) error {
+	return g.guard.write(func() error { return g.DB.Apply(patch) })
+}
+
+// Subset writes through the same handle, so it is guarded too. A snapshot
+// stays in memory and needs no guard.
+func (g guardedDB) Subset(prefix []byte) zdb.DB {
+	return guardedDB{g.DB.Subset(prefix), g.guard}
 }
 
 // NewZenonStores opens the wrap store and the redeem incident store over the

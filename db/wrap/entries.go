@@ -18,6 +18,9 @@ func getWrapEventKey(id types.Hash) []byte {
 	return zcommon.JoinBytes(getWrapEventPrefix(), id.Bytes())
 }
 
+// AddWrapRequest stores a wrap request read from the bridge. A record that
+// exists keeps what this node wrote to it, its redeem status included. Only a
+// missing signature is filled in from the bridge's.
 func (es *eventStore) AddWrapRequest(event events.WrapRequestZnn) error {
 	es.mu.Lock()
 	defer es.mu.Unlock()
@@ -44,6 +47,29 @@ func (es *eventStore) AddWrapRequest(event events.WrapRequestZnn) error {
 		}
 	}
 	return nil
+}
+
+// AddWrapRequestKeepingStatus stores a request read from the bridge and keeps
+// the redeem status of a record that exists. AddWrapRequest already does both.
+func (es *eventStore) AddWrapRequestKeepingStatus(event events.WrapRequestZnn) error {
+	return es.AddWrapRequest(event)
+}
+
+// AddWrapRequestIfMissing stores the request unless a record of it exists,
+// and reports whether it stored it. The read and the write are one operation
+// under the record lock.
+func (es *eventStore) AddWrapRequestIfMissing(event events.WrapRequestZnn) (bool, error) {
+	es.mu.Lock()
+	defer es.mu.Unlock()
+	_, err := es.DB.Get(getWrapEventKey(event.Id))
+	if errors.Is(err, leveldb.ErrNotFound) {
+		return true, es.putWrap(&event)
+	}
+	if err != nil {
+		es.SendSigInt()
+		return false, err
+	}
+	return false, nil
 }
 
 func (es *eventStore) putWrap(event *events.WrapRequestZnn) error {

@@ -146,6 +146,19 @@ func (s *Store) SetPhase(phase string) {
 	s.status.Phase = phase
 }
 
+// AdvancePhase moves from one phase to the next and leaves any other phase,
+// such as one set by a stop in the meantime, as it is.
+func (s *Store) AdvancePhase(from, to string) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.status.Phase == from {
+		s.status.Phase = to
+	}
+}
+
 func (s *Store) SetBridgeState(state string) {
 	if s == nil {
 		return

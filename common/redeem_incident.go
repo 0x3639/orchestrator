@@ -145,6 +145,12 @@ func (gs *GlobalState) HandledRedeemLog(chainID uint32, log etypes.Log) (bool, e
 }
 
 func (gs *GlobalState) ReportRedeemIncident(ev RedeemIncident) error {
+	// An acknowledged registration is archived, which can release the halt.
+	// The acknowledgements are fixed before the workers start.
+	if gs.acknowledgedRedeems[redeemLogID(ev)] {
+		gs.haltSendMu.Lock()
+		defer gs.haltSendMu.Unlock()
+	}
 	gs.stateMu.Lock()
 	defer gs.stateMu.Unlock()
 	if gs.redeemIncidents == nil {
@@ -188,6 +194,20 @@ func (gs *GlobalState) CompleteEmergencyHalt(generation uint64, checkedChains ma
 	return nil
 }
 
+// WhileEmergency runs send, which submits a halt transaction, if the signer
+// is in EmergencyState, and reports whether it ran. A redeem halt is not
+// released while send runs, so no halt is submitted after the emergency it
+// was signed for has ended. send must not touch the state, and has to be
+// bounded in time: a release waits for it.
+func (gs *GlobalState) WhileEmergency(send func() error) (bool, error) {
+	gs.haltSendMu.RLock()
+	defer gs.haltSendMu.RUnlock()
+	if state, err := gs.GetState(); err != nil || state != EmergencyState {
+		return false, err
+	}
+	return true, send()
+}
+
 // RedeemLogAcknowledged reports whether the operator named this registration.
 func (gs *GlobalState) RedeemLogAcknowledged(ev RedeemIncident) bool {
 	gs.stateMu.Lock()
@@ -207,6 +227,8 @@ func (gs *GlobalState) PendingRedeemIncidents() ([]RedeemIncident, error) {
 // longer be paid and that the administrator unhalted the bridge after. It is
 // kept as evidence and does not start, or no longer holds, a halt.
 func (gs *GlobalState) ArchiveSettledRedeem(ev RedeemIncident) error {
+	gs.haltSendMu.Lock()
+	defer gs.haltSendMu.Unlock()
 	gs.stateMu.Lock()
 	defer gs.stateMu.Unlock()
 	if gs.redeemIncidents == nil {
@@ -226,6 +248,8 @@ func (gs *GlobalState) resolveRedeemLocked(ev RedeemIncident, reason RedeemResol
 // any more. Resolving the last incident does this itself; the recheck worker
 // repeats it so a failed read at that moment cannot leave the halt in place.
 func (gs *GlobalState) ReleaseResolvedRedeemHalt() error {
+	gs.haltSendMu.Lock()
+	defer gs.haltSendMu.Unlock()
 	gs.stateMu.Lock()
 	defer gs.stateMu.Unlock()
 	if gs.redeemIncidents == nil {
@@ -236,6 +260,8 @@ func (gs *GlobalState) ReleaseResolvedRedeemHalt() error {
 
 // A pending halt ends here only when no stored incident still needs it. A
 // halt that began with a failed evidence write is not in the store and stays.
+// Callers hold haltSendMu, taken before stateMu, so the halt is not released
+// while a halt transaction is being submitted.
 func (gs *GlobalState) releaseResolvedHaltLocked() error {
 	if gs.RedeemHaltGeneration() == 0 || gs.redeemWriteFailed {
 		return nil
