@@ -3,6 +3,7 @@ package common
 import (
 	"context"
 	"errors"
+	"maps"
 	"strings"
 	"sync"
 
@@ -29,11 +30,23 @@ type CeremonyWindow struct {
 
 type GlobalState struct {
 	// Health is assigned once before any network workers start.
-	Health                 *snapshot.Store
-	state                  *uint8
-	stateMu                sync.Mutex
-	persistEmergency       func(uint8) error
-	emergencyWritePending  bool
+	Health                *snapshot.Store
+	state                 *uint8
+	stateMu               sync.Mutex
+	persistEmergency      func(uint8) error
+	emergencyWritePending bool
+	// Closed once startup has read the bridge account to its tip and every
+	// EVM network has finished its startup scan.
+	startupDone chan struct{}
+	startupOnce sync.Once
+	// Closed once the node has applied what it reads from the bridge when
+	// it starts.
+	nodeReady     chan struct{}
+	nodeReadyOnce sync.Once
+	// Set when the node goes on running although it has read, as history, a
+	// change to what it took from the bridge when it started.
+	settingsMu             sync.RWMutex
+	settingsStale          bool
 	frontierMomentumHeight uint64
 	frontierMomSemaphore   *semaphore.Weighted
 	lastCeremony           CeremonyWindow
@@ -44,8 +57,14 @@ type GlobalState struct {
 	isAffiliateProgramActive map[uint32]map[string]bool
 	// [chainId] -> height
 	affiliateStartingHeight map[uint32]uint64
-	resignNetworkClass      uint32
-	resignNetworkChainId    uint32
+	// Counts the changes to the affiliate settings and the token map, which
+	// decide an event's affiliate policy.
+	affiliateGeneration uint64
+	// The networks of the affiliate program SetIsAffiliateProgram applied
+	// last.
+	appliedAffiliate     map[uint32]AffiliateNetwork
+	resignNetworkClass   uint32
+	resignNetworkChainId uint32
 }
 
 func NewGlobalState(state *uint8) *GlobalState {
@@ -56,6 +75,8 @@ func NewGlobalState(state *uint8) *GlobalState {
 func NewPersistentGlobalState(state *uint8, persistEmergency func(uint8) error) *GlobalState {
 	return &GlobalState{
 		persistEmergency:         persistEmergency,
+		startupDone:              make(chan struct{}),
+		nodeReady:                make(chan struct{}),
 		state:                    state,
 		frontierMomentumHeight:   0,
 		frontierMomSemaphore:     semaphore.NewWeighted(1),
@@ -107,6 +128,19 @@ func (gs *GlobalState) setStateLocked(newState uint8) error {
 	return persistErr
 }
 
+// HaltSigning moves a signer in LiveState, KeyGenState or ReSignState to
+// HaltedState, as a halt the bridge listener reads does, and reports whether
+// it did. A signer in EmergencyState or HaltedState stays where it is.
+func (gs *GlobalState) HaltSigning() (bool, error) {
+	gs.stateMu.Lock()
+	defer gs.stateMu.Unlock()
+	switch *gs.state {
+	case LiveState, KeyGenState, ReSignState:
+		return true, gs.setStateLocked(HaltedState)
+	}
+	return false, nil
+}
+
 // A receive retried after a storage error may by then be historical. Even
 // if it no longer triggers a live transition, its checkpoint must wait.
 func (gs *GlobalState) FlushPendingEmergency() error {
@@ -141,6 +175,81 @@ func (gs *GlobalState) WhileSigningTransfers(do func()) bool {
 	}
 	do()
 	return true
+}
+
+// CompleteStartup records that the bridge account has been read to its tip
+// and every EVM network has finished its startup scan. Until then the signer
+// signs no transfer; see StartupComplete.
+func (gs *GlobalState) CompleteStartup() {
+	gs.startupOnce.Do(func() { close(gs.startupDone) })
+}
+
+// StartupComplete reports whether CompleteStartup has been called. It never
+// turns false again in the same process.
+func (gs *GlobalState) StartupComplete() bool {
+	select {
+	case <-gs.startupDone:
+		return true
+	default:
+		return false
+	}
+}
+
+// StartupDone is closed by CompleteStartup.
+func (gs *GlobalState) StartupDone() <-chan struct{} {
+	return gs.startupDone
+}
+
+// UnlessInEmergency runs do unless the signer is in EmergencyState, and
+// reports whether it ran. The state lock is held throughout, as in
+// WhileSigningTransfers. do must not touch the state.
+func (gs *GlobalState) UnlessInEmergency(do func()) bool {
+	gs.stateMu.Lock()
+	defer gs.stateMu.Unlock()
+	if *gs.state == EmergencyState {
+		return false
+	}
+	do()
+	return true
+}
+
+// MarkNodeReady records that the node has applied the settings and state it
+// reads from the bridge when it starts. A startup that completes in the
+// background waits for it before it looks at the halt flags.
+func (gs *GlobalState) MarkNodeReady() {
+	gs.nodeReadyOnce.Do(func() { close(gs.nodeReady) })
+}
+
+// NodeReady is closed by MarkNodeReady.
+func (gs *GlobalState) NodeReady() <-chan struct{} {
+	return gs.nodeReady
+}
+
+// MarkSettingsStale records that the settings this process holds may be
+// older than the bridge's, for as long as the process runs.
+func (gs *GlobalState) MarkSettingsStale() {
+	gs.settingsMu.Lock()
+	defer gs.settingsMu.Unlock()
+	gs.settingsStale = true
+}
+
+// SettingsStale reports whether MarkSettingsStale has been called.
+func (gs *GlobalState) SettingsStale() bool {
+	gs.settingsMu.RLock()
+	defer gs.settingsMu.RUnlock()
+	return gs.settingsStale
+}
+
+// WhileSettingsCurrent runs do unless MarkSettingsStale has been called, and
+// reports whether it ran. A call to MarkSettingsStale waits for do, so what do
+// writes was decided with settings nothing had marked stale.
+func (gs *GlobalState) WhileSettingsCurrent(do func() error) (bool, error) {
+	gs.settingsMu.RLock()
+	defer gs.settingsMu.RUnlock()
+	if gs.settingsStale {
+		return false, nil
+	}
+	return true, do()
 }
 
 func (gs *GlobalState) GetState() (uint8, error) {
@@ -185,6 +294,9 @@ func (gs *GlobalState) SetTokensMap(chainId uint32, zts, token string) {
 	if _, found := gs.tokensMap[chainId]; !found {
 		gs.tokensMap[chainId] = make(map[string]string)
 	}
+	if gs.tokensMap[chainId][zts] != token || gs.tokensMap[chainId][token] != zts {
+		gs.affiliateGeneration++
+	}
 
 	gs.tokensMap[chainId][zts] = token
 	gs.tokensMap[chainId][token] = zts
@@ -221,10 +333,14 @@ func (gs *GlobalState) SetIsAffiliateProgram(program AffiliateProgram) {
 		if addr := gs.tokensMap[id][qsr]; addr != "" {
 			flags[addr] = values.WQSR
 		}
+		if !maps.Equal(gs.isAffiliateProgramActive[id], flags) || gs.affiliateStartingHeight[id] != values.StartingHeight {
+			gs.affiliateGeneration++
+		}
 		gs.isAffiliateProgramActive[id] = flags
 		gs.affiliateStartingHeight[id] = values.StartingHeight
 		GlobalLogger.Infof("Updated affiliate program for network %d at starting height %d", id, values.StartingHeight)
 	}
+	gs.appliedAffiliate = maps.Clone(program.Networks)
 }
 
 func (gs *GlobalState) GetIsAffiliateProgramActive(id uint32, token string) bool {
@@ -236,6 +352,9 @@ func (gs *GlobalState) GetIsAffiliateProgramActive(id uint32, token string) bool
 func (gs *GlobalState) SetAffiliateStartingHeight(id uint32, height uint64) {
 	gs.affiliateMu.Lock()
 	defer gs.affiliateMu.Unlock()
+	if gs.affiliateStartingHeight[id] != height {
+		gs.affiliateGeneration++
+	}
 	gs.affiliateStartingHeight[id] = height
 }
 
@@ -243,6 +362,46 @@ func (gs *GlobalState) GetAffiliateStartingHeight(id uint32) *big.Int {
 	gs.affiliateMu.RLock()
 	defer gs.affiliateMu.RUnlock()
 	return new(big.Int).SetUint64(gs.affiliateStartingHeight[id])
+}
+
+// AffiliatePolicyUnder returns the policy AffiliatePolicyAt would return once
+// SetIsAffiliateProgram had applied program, and whether program establishes
+// it. A program that does not list the chain leaves the chain's settings as
+// the updates before it set them. Those are the node's own only when program
+// is the one the node applied last; otherwise the policy is not known.
+func (gs *GlobalState) AffiliatePolicyUnder(program AffiliateProgram, id uint32, token string, height uint64) (AffiliatePolicy, bool) {
+	values, listed := program.Networks[id]
+	if !listed {
+		gs.affiliateMu.RLock()
+		applied := maps.Equal(gs.appliedAffiliate, program.Networks)
+		gs.affiliateMu.RUnlock()
+		if !applied {
+			return 0, false
+		}
+		return gs.AffiliatePolicyAt(id, token, height), true
+	}
+	gs.affiliateMu.RLock()
+	defer gs.affiliateMu.RUnlock()
+	if values.StartingHeight == 0 || height < values.StartingHeight {
+		return 0, true
+	}
+	znn, qsr := types.ZnnTokenStandard.String(), types.QsrTokenStandard.String()
+	flags := map[string]bool{znn: values.ZNN, qsr: values.QSR}
+	if addr := gs.tokensMap[id][znn]; addr != "" {
+		flags[addr] = values.WZNN
+	}
+	if addr := gs.tokensMap[id][qsr]; addr != "" {
+		flags[addr] = values.WQSR
+	}
+	token = strings.ToLower(token)
+	var policy AffiliatePolicy
+	if flags[token] {
+		policy |= SplitAffiliate
+	}
+	if flags[gs.tokensMap[id][token]] {
+		policy |= VerifyAffiliate
+	}
+	return policy, true
 }
 
 // Wrapped and native token flags govern distinct sides of the bridge.
@@ -254,10 +413,18 @@ const (
 )
 
 func (gs *GlobalState) AffiliatePolicyAt(id uint32, token string, height uint64) AffiliatePolicy {
+	policy, _ := gs.AffiliatePolicyWithGeneration(id, token, height)
+	return policy
+}
+
+// AffiliatePolicyWithGeneration returns the policy AffiliatePolicyAt returns,
+// with the generation of the settings it was read from. See
+// WhileAffiliateSettingsAre.
+func (gs *GlobalState) AffiliatePolicyWithGeneration(id uint32, token string, height uint64) (AffiliatePolicy, uint64) {
 	gs.affiliateMu.RLock()
 	defer gs.affiliateMu.RUnlock()
 	if start := gs.affiliateStartingHeight[id]; start == 0 || height < start {
-		return 0
+		return 0, gs.affiliateGeneration
 	}
 	token = strings.ToLower(token)
 	flags := gs.isAffiliateProgramActive[id]
@@ -268,7 +435,19 @@ func (gs *GlobalState) AffiliatePolicyAt(id uint32, token string, height uint64)
 	if flags[gs.tokensMap[id][token]] {
 		policy |= VerifyAffiliate
 	}
-	return policy
+	return policy, gs.affiliateGeneration
+}
+
+// WhileAffiliateSettingsAre runs do unless the affiliate settings or the
+// token map changed since generation, and reports whether it ran. A change
+// waits for do, so what do writes was decided with the settings in force.
+func (gs *GlobalState) WhileAffiliateSettingsAre(generation uint64, do func() error) (bool, error) {
+	gs.affiliateMu.RLock()
+	defer gs.affiliateMu.RUnlock()
+	if gs.affiliateGeneration != generation {
+		return false, nil
+	}
+	return true, do()
 }
 
 func (gs *GlobalState) GetResignNetwork() (uint32, uint32) {

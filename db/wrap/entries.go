@@ -19,6 +19,45 @@ func getWrapEventKey(id types.Hash) []byte {
 }
 
 func (es *eventStore) AddWrapRequest(event events.WrapRequestZnn) error {
+	es.mu.Lock()
+	defer es.mu.Unlock()
+	return es.putWrapRequest(event)
+}
+
+// AddWrapRequestKeepingStatus stores the request and keeps the redeem status
+// of a record that already exists. The read and the write are one operation
+// under the record lock.
+func (es *eventStore) AddWrapRequestKeepingStatus(event events.WrapRequestZnn) error {
+	es.mu.Lock()
+	defer es.mu.Unlock()
+	existing, err := es.GetWrapRequestById(event.Id)
+	if err != nil {
+		return err
+	}
+	if existing != nil {
+		event.RedeemStatus = existing.RedeemStatus
+	}
+	return es.putWrapRequest(event)
+}
+
+// AddWrapRequestIfMissing stores the request unless a record of it exists,
+// and reports whether it stored it. The read and the write are one operation
+// under the record lock.
+func (es *eventStore) AddWrapRequestIfMissing(event events.WrapRequestZnn) (bool, error) {
+	es.mu.Lock()
+	defer es.mu.Unlock()
+	existing, err := es.GetWrapRequestById(event.Id)
+	if err != nil {
+		return false, err
+	}
+	if existing != nil {
+		return false, nil
+	}
+	return true, es.putWrapRequest(event)
+}
+
+// putWrapRequest writes the record. Callers must hold es.mu.
+func (es *eventStore) putWrapRequest(event events.WrapRequestZnn) error {
 	if eventBytes, err := event.Serialize(); err != nil {
 		es.SendSigInt()
 		return err
@@ -50,6 +89,8 @@ func (es *eventStore) GetWrapRequestById(id types.Hash) (*events.WrapRequestZnn,
 }
 
 func (es *eventStore) SetWrapRequestStatus(id types.Hash, status uint32) error {
+	es.mu.Lock()
+	defer es.mu.Unlock()
 	if event, err := es.GetWrapRequestById(id); err != nil {
 		es.SendSigInt()
 		return err
@@ -72,6 +113,8 @@ func (es *eventStore) SetWrapRequestStatus(id types.Hash, status uint32) error {
 }
 
 func (es *eventStore) SetWrapRequestSignature(id types.Hash, signature string) error {
+	es.mu.Lock()
+	defer es.mu.Unlock()
 	if event, err := es.GetWrapRequestById(id); err != nil {
 		es.SendSigInt()
 		return err
@@ -94,6 +137,8 @@ func (es *eventStore) SetWrapRequestSignature(id types.Hash, signature string) e
 }
 
 func (es *eventStore) SetWrapRequestSentSignature(id types.Hash, value bool) error {
+	es.mu.Lock()
+	defer es.mu.Unlock()
 	if event, err := es.GetWrapRequestById(id); err != nil {
 		es.SendSigInt()
 		return err

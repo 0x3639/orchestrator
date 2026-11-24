@@ -5,6 +5,7 @@ import (
 	"orchestrator/common"
 	"orchestrator/db"
 	"os"
+	"sync"
 )
 
 func getStorageIterator() []byte {
@@ -15,6 +16,9 @@ func getStorageIterator() []byte {
 type eventStore struct {
 	zdb.DB
 	stopChan chan os.Signal
+	// Serializes the writes of a wrap request, each of which reads the
+	// record first. The bridge listener and the EVM networks both make them.
+	mu *sync.Mutex
 }
 
 func (es *eventStore) Storage() zdb.DB {
@@ -35,5 +39,6 @@ func NewZnnStorage(db zdb.DB, stopChan chan os.Signal) db.ZnnStorage {
 	return &eventStore{
 		DB:       db,
 		stopChan: stopChan,
+		mu:       &sync.Mutex{},
 	}
 }
