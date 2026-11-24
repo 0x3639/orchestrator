@@ -8,6 +8,7 @@ import (
 	zcommon "github.com/zenon-network/go-zenon/common"
 	"orchestrator/common"
 	"orchestrator/common/events"
+	"orchestrator/db"
 )
 
 func getUnwrapRequestPrefix() []byte {
@@ -339,6 +340,10 @@ func (es *evmStorage) GetLastUpdateHeight() (uint64, error) {
 	}
 
 	if err != nil {
+		es.SendSigInt()
+		return 0, err
+	}
+	if err := db.CheckFixedWidth("EVM sync cursor lastUpdateHeight (key 0x01)", data, 8); err != nil {
 		es.SendSigInt()
 		return 0, err
 	}

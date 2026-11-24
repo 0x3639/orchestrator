@@ -1189,7 +1189,14 @@ func (rC *znnNetwork) followBridgeAccount(ctx context.Context, hints <-chan []su
 		// Even without a notification, check for a missed tail after subscribing.
 		delay := 30 * time.Second
 		notifications := hints
-		if err != nil {
+		if errors.Is(err, db.ErrCorruptCursor) {
+			// Retrying cannot repair the stored cursor; keep it for recovery.
+			// The store has already requested a stop, so log even if that
+			// shutdown has cancelled ctx: this line explains why it stopped.
+			rC.logger.Errorf("Stopping Zenon bridge listener: %v", err)
+			common.RequestStop(rC.stopChan)
+			return
+		} else if err != nil {
 			rC.logger.Warnf("bridge account paused at height %d: %v", height+1, err)
 			delay = 4 * time.Second
 			notifications = nil // preserve the retry delay during bursts
