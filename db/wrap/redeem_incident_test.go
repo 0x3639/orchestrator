@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"sync/atomic"
 	"testing"
 
 	ecommon "github.com/ethereum/go-ethereum/common"
@@ -249,7 +250,8 @@ func TestOtherKeysInTheDatabaseAreNotIncidents(t *testing.T) {
 // Incidents written by an earlier build under bytes 4 and 5 are moved to the
 // current keys once, with their resolutions, and nothing else is touched.
 func TestMoveRedeemIncidentKeysFromAnEarlierBuild(t *testing.T) {
-	db, err := leveldb.Open(storage.NewMemStorage(), nil)
+	syncs := new(atomic.Int64)
+	db, err := leveldb.Open(journalSyncs{storage.NewMemStorage(), syncs}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -281,9 +283,13 @@ func TestMoveRedeemIncidentKeysFromAnEarlierBuild(t *testing.T) {
 		put(key, []byte{7})
 	}
 
+	before := syncs.Load()
 	moved, err := MoveRedeemIncidentKeys(db)
 	if err != nil || moved != 3 {
 		t.Fatalf("moved %d err=%v", moved, err)
+	}
+	if syncs.Load() == before {
+		t.Fatal("the move was not synced to disk")
 	}
 	for _, ev := range []common.RedeemIncident{pending, acknowledged, migrated} {
 		for _, key := range [][]byte{earlier(redeemEvidenceKey(ev), oldRedeemEvidencePrefix), earlier(confirmedKey(redeemEvidenceKey(ev)), oldRedeemHaltConfirmedPrefix)} {

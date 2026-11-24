@@ -32,7 +32,7 @@ func (p *unwrapProvider) setReplacement(hash ecommon.Hash) {
 	p.replacement = hash
 }
 
-func waitFor(t *testing.T, what string, done func() bool) {
+func waitUntil(t *testing.T, what string, done func() bool) {
 	t.Helper()
 	deadline := time.Now().Add(20 * time.Second)
 	for !done() {
@@ -48,7 +48,7 @@ func waitFor(t *testing.T, what string, done func() bool) {
 func waitForMore(t *testing.T, counter func() uint64, more uint64) {
 	t.Helper()
 	start := counter()
-	waitFor(t, "the recheck worker made no further requests", func() bool { return counter() >= start+more })
+	waitUntil(t, "the recheck worker made no further requests", func() bool { return counter() >= start+more })
 }
 
 // A held registration is kept past finality for as long as its check cannot
@@ -72,8 +72,8 @@ func TestHeldRegistrationIsKeptUntilAnswered(t *testing.T) {
 		t.Fatalf("unanswered registration: held=%d pending=%d", held, n.state.RedeemHaltGeneration())
 	}
 	src.update(func(s *redeemSource) { s.synced = true })
-	waitFor(t, "the held registration was never decided", func() bool { return n.state.RedeemHaltGeneration() != 0 })
-	waitFor(t, "a decided registration stayed held", func() bool { return len(n.heldRedeemLogs()) == 0 })
+	waitUntil(t, "the held registration was never decided", func() bool { return n.state.RedeemHaltGeneration() != 0 })
+	waitUntil(t, "a decided registration stayed held", func() bool { return len(n.heldRedeemLogs()) == 0 })
 }
 
 // A held registration whose block was replaced before finality is released
@@ -103,7 +103,7 @@ func TestHeldRegistrationIsReleasedWhenItsBlockIsReplaced(t *testing.T) {
 		t.Fatal("a registration was released before every endpoint had reached finality")
 	}
 	chain.setChain(final)
-	waitFor(t, "a replaced registration stayed held", func() bool { return len(n.heldRedeemLogs()) == 0 })
+	waitUntil(t, "a replaced registration stayed held", func() bool { return len(n.heldRedeemLogs()) == 0 })
 	// Nothing rechecks a released entry, so there is no later round to wait for.
 	src.update(func(s *redeemSource) { s.synced = true })
 	if n.state.RedeemHaltGeneration() != 0 {
@@ -128,7 +128,7 @@ func TestHeldRegistrationSettledByTheTimeItIsFinal(t *testing.T) {
 	chain.set(evidenceReceipt(reg), nil, 142)
 	src.synced = true
 	startRedeemWatch(t, n)
-	waitFor(t, "a settled registration stayed held", func() bool { return len(n.heldRedeemLogs()) == 0 })
+	waitUntil(t, "a settled registration stayed held", func() bool { return len(n.heldRedeemLogs()) == 0 })
 	if state, _ := n.state.GetState(); n.state.RedeemHaltGeneration() != 0 || state != common.LiveState {
 		t.Fatalf("settled registration: pending=%d state=%d", n.state.RedeemHaltGeneration(), state)
 	}
@@ -166,7 +166,7 @@ func TestHeldRegistrationWaitsWhileTheHeadIsUnknown(t *testing.T) {
 		t.Fatalf("the registration was checked %d times while its age was unknown", src.lookups()-lookups)
 	}
 	chain.primary.headFails.Store(false)
-	waitFor(t, "the registration stayed held after the head returned", func() bool { return len(n.heldRedeemLogs()) == 0 })
+	waitUntil(t, "the registration stayed held after the head returned", func() bool { return len(n.heldRedeemLogs()) == 0 })
 	if state, _ := n.state.GetState(); n.state.RedeemHaltGeneration() != 0 || state != common.LiveState {
 		t.Fatalf("settled registration: pending=%d state=%d", n.state.RedeemHaltGeneration(), state)
 	}
@@ -241,8 +241,8 @@ func TestHeldRegistrationsWithOneIdentityAreRecheckedSeparately(t *testing.T) {
 	}
 	src.synced = true
 	startRedeemWatch(t, n)
-	waitFor(t, "the genuine registration was never decided", func() bool { return n.state.RedeemHaltGeneration() != 0 })
-	waitFor(t, "the decided registration stayed held", func() bool {
+	waitUntil(t, "the genuine registration was never decided", func() bool { return n.state.RedeemHaltGeneration() != 0 })
+	waitUntil(t, "the decided registration stayed held", func() bool {
 		held := n.heldRedeemLogs()
 		for _, log := range held {
 			if log.BlockNumber == reg.BlockNumber && log.Data[31] == reg.Data[31] {
@@ -290,7 +290,7 @@ func TestStoredIncidentIsReleasedOnceSettled(t *testing.T) {
 	chain.contract.unhaltedAt.Store(120)
 	stillHeld("a closure that is not final")
 	chain.contract.closedAt.Store(110)
-	waitFor(t, "a settled incident was not archived", func() bool {
+	waitUntil(t, "a settled incident was not archived", func() bool {
 		archived, err := n.state.HandledRedeemLog(1, reg)
 		return err == nil && archived
 	})

@@ -534,7 +534,7 @@ func TestStartupSweepStopsAtTheFirstIncidentThatStaysPending(t *testing.T) {
 	}
 	// The worker checks the rest.
 	startRedeemWatch(t, n)
-	waitFor(t, "the worker did not settle the incident behind it", func() bool {
+	waitUntil(t, "the worker did not settle the incident behind it", func() bool {
 		return slices.Equal(pendingIndexes(), []uint{gone.Index})
 	})
 	if n.state.RedeemHaltGeneration() == 0 {
@@ -620,7 +620,7 @@ func TestPausedScanResumesWhenTheHaltIsReleased(t *testing.T) {
 		t.Fatal(err)
 	}
 	startRedeemWatch(t, n)
-	waitFor(t, "the scan was never attempted", n.scanPaused.Load)
+	waitUntil(t, "the scan was never attempted", n.scanPaused.Load)
 	if cursor, _ := n.eventsStore().GetLastUpdateHeight(); cursor != 100 {
 		t.Fatalf("the scan ran while the halt was pending: cursor=%d", cursor)
 	}
