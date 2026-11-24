@@ -1,6 +1,7 @@
 package wrap
 
 import (
+	"bytes"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -15,12 +16,14 @@ import (
 	"orchestrator/common"
 )
 
-// Reserved outside the wrap, cursor, resign and health keys in the Zenon DB.
-// Keep the original evidence immutable after the bridge is halted.
-const redeemEvidencePrefix byte = 4
+// Where earlier builds kept the incident keys; see keys.go.
+const (
+	oldRedeemEvidencePrefix      byte = 4
+	oldRedeemHaltConfirmedPrefix byte = 5
+)
 
-// The marker's value is the common.RedeemResolution that released the incident.
-const redeemHaltConfirmedPrefix byte = 5
+// prefix, chain id, block hash, transaction hash, log index
+const redeemEvidenceKeyLength = 1 + 4 + 32 + 32 + 8
 
 type RedeemIncidentStore struct{ db *leveldb.DB }
 
@@ -113,7 +116,7 @@ func (s *RedeemIncidentStore) ConfirmRedeemHalt(checkedChains map[uint32]bool) e
 		if !checkedChains[chainID] {
 			return fmt.Errorf("pending redeem incident on chain %d has no confirmed halt flag", chainID)
 		}
-		batch.Put(marker, []byte{1})
+		batch.Put(marker, []byte{byte(common.RedeemHaltObserved)})
 	}
 	if err := it.Error(); err != nil {
 		return err
@@ -169,4 +172,63 @@ func (s *RedeemIncidentStore) ResolveRedeemIncident(ev common.RedeemIncident, re
 	}
 	batch.Put(marker, []byte{byte(reason)})
 	return s.db.Write(batch, &opt.WriteOptions{Sync: true})
+}
+
+// MoveRedeemIncidentKeys moves incident evidence and resolutions that earlier
+// builds wrote under bytes 4 and 5 to the current prefixes. Call it before
+// the incident store is used.
+//
+// Only a key that is exactly such evidence is moved: it has the evidence
+// layout and its value is the incident the key names. Other keys under 4 and
+// 5 are left alone. A key with the evidence layout whose value is not that
+// incident is an error, so the signer does not start without evidence it
+// cannot account for. The move is one synced batch: a crash leaves the old
+// layout or the new one, and running it again moves nothing.
+func MoveRedeemIncidentKeys(db *leveldb.DB) (int, error) {
+	it := db.NewIterator(util.BytesPrefix([]byte{oldRedeemEvidencePrefix}), nil)
+	defer it.Release()
+	batch := new(leveldb.Batch)
+	moved := 0
+	for it.Next() {
+		old := slices.Clone(it.Key())
+		if len(old) != redeemEvidenceKeyLength {
+			continue
+		}
+		var ev common.RedeemIncident
+		if err := json.Unmarshal(it.Value(), &ev); err != nil {
+			return 0, fmt.Errorf("unreadable redeem incident evidence from an earlier build under key %x: %w", old, err)
+		}
+		key := redeemEvidenceKey(ev)
+		if !bytes.Equal(key[1:], old[1:]) {
+			return 0, fmt.Errorf("redeem incident evidence from an earlier build under key %x names another incident", old)
+		}
+		if has, err := db.Has(key, nil); err != nil {
+			return 0, err
+		} else if !has {
+			batch.Put(key, slices.Clone(it.Value()))
+		}
+		oldMarker := append([]byte{oldRedeemHaltConfirmedPrefix}, old[1:]...)
+		resolution, err := db.Get(oldMarker, nil)
+		switch {
+		case errors.Is(err, leveldb.ErrNotFound):
+		case err != nil:
+			return 0, err
+		default:
+			if has, err := db.Has(confirmedKey(key), nil); err != nil {
+				return 0, err
+			} else if !has {
+				batch.Put(confirmedKey(key), resolution)
+			}
+			batch.Delete(oldMarker)
+		}
+		batch.Delete(old)
+		moved++
+	}
+	if err := it.Error(); err != nil {
+		return 0, err
+	}
+	if moved == 0 {
+		return 0, nil
+	}
+	return moved, db.Write(batch, &opt.WriteOptions{Sync: true})
 }

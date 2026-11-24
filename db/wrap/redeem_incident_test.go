@@ -202,3 +202,187 @@ func TestRedeemIncidentResolutionIsPerIncident(t *testing.T) {
 		t.Fatalf("halt observation recorded as %v: %v", reason, err)
 	}
 }
+
+func incidentFixture(chain uint32, index uint) common.RedeemIncident {
+	return common.RedeemIncident{ChainID: chain, Log: etypes.Log{BlockNumber: 9, BlockHash: ecommon.HexToHash("0xa4"),
+		TxHash: ecommon.HexToHash("0xd3"), Index: index, Topics: []ecommon.Hash{common.RegisteredRedeemSigHash}, Data: []byte{0xb0}}}
+}
+
+// earlier returns key with the first byte replaced by the one an earlier build used.
+func earlier(key []byte, prefix byte) []byte {
+	return append([]byte{prefix}, key[1:]...)
+}
+
+// Keys that other features keep in the same database are not incidents. One
+// of them, a one-byte key 4, shares its first byte with where earlier builds
+// kept incident evidence.
+func TestOtherKeysInTheDatabaseAreNotIncidents(t *testing.T) {
+	db, err := leveldb.Open(storage.NewMemStorage(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	for b := byte(0); b < redeemEvidencePrefix; b++ {
+		if err := db.Put([]byte{b}, []byte{0, 1, 2, 3, 4, 5, 6, 7}, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	store := NewRedeemIncidentStore(db)
+	if pending, err := store.HasPendingRedeemIncident(); err != nil || pending {
+		t.Fatalf("pending=%t err=%v", pending, err)
+	}
+	if listed, err := store.PendingRedeemIncidents(); err != nil || len(listed) != 0 {
+		t.Fatalf("listed %d err=%v", len(listed), err)
+	}
+	if err := store.ConfirmRedeemHalt(nil); err != nil {
+		t.Fatalf("confirm with no incidents: %v", err)
+	}
+	state := common.NewGlobalState(new(uint8))
+	if err := state.RestoreRedeemIncidents(store); err != nil || state.RedeemHaltGeneration() != 0 {
+		t.Fatalf("restore: generation=%d err=%v", state.RedeemHaltGeneration(), err)
+	}
+	if moved, err := MoveRedeemIncidentKeys(db); err != nil || moved != 0 {
+		t.Fatalf("moved %d err=%v", moved, err)
+	}
+}
+
+// Incidents written by an earlier build under bytes 4 and 5 are moved to the
+// current keys once, with their resolutions, and nothing else is touched.
+func TestMoveRedeemIncidentKeysFromAnEarlierBuild(t *testing.T) {
+	db, err := leveldb.Open(storage.NewMemStorage(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	put := func(key, value []byte) {
+		t.Helper()
+		if err := db.Put(key, value, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	pending, acknowledged, migrated := incidentFixture(1, 2), incidentFixture(1, 3), incidentFixture(56, 4)
+	for _, ev := range []common.RedeemIncident{pending, acknowledged, migrated} {
+		data, err := json.Marshal(ev)
+		if err != nil {
+			t.Fatal(err)
+		}
+		put(earlier(redeemEvidenceKey(ev), oldRedeemEvidencePrefix), data)
+	}
+	put(earlier(confirmedKey(redeemEvidenceKey(acknowledged)), oldRedeemHaltConfirmedPrefix), []byte{byte(common.RedeemOperatorAcknowledged)})
+	// One incident is already in the current layout with its own resolution;
+	// the earlier copy of its resolution does not replace it.
+	if err := NewRedeemIncidentStore(db).ResolveRedeemIncident(migrated, common.RedeemSettledOnChain); err != nil {
+		t.Fatal(err)
+	}
+	put(earlier(confirmedKey(redeemEvidenceKey(migrated)), oldRedeemHaltConfirmedPrefix), []byte{byte(common.RedeemHaltObserved)})
+	// Keys of other features under the same bytes.
+	others := [][]byte{{oldRedeemEvidencePrefix}, {oldRedeemHaltConfirmedPrefix}, {oldRedeemEvidencePrefix, 1, 2}}
+	for _, key := range others {
+		put(key, []byte{7})
+	}
+
+	moved, err := MoveRedeemIncidentKeys(db)
+	if err != nil || moved != 3 {
+		t.Fatalf("moved %d err=%v", moved, err)
+	}
+	for _, ev := range []common.RedeemIncident{pending, acknowledged, migrated} {
+		for _, key := range [][]byte{earlier(redeemEvidenceKey(ev), oldRedeemEvidencePrefix), earlier(confirmedKey(redeemEvidenceKey(ev)), oldRedeemHaltConfirmedPrefix)} {
+			if has, _ := db.Has(key, nil); has {
+				t.Fatalf("earlier key %x is still there", key)
+			}
+		}
+	}
+	for _, key := range others {
+		if value, err := db.Get(key, nil); err != nil || !bytes.Equal(value, []byte{7}) {
+			t.Fatalf("key %x of another feature changed: %x %v", key, value, err)
+		}
+	}
+	store := NewRedeemIncidentStore(db)
+	listed, err := store.PendingRedeemIncidents()
+	if err != nil || len(listed) != 1 || listed[0].Log.Index != pending.Log.Index {
+		t.Fatalf("pending after the move: %+v err=%v", listed, err)
+	}
+	for _, tc := range []struct {
+		ev   common.RedeemIncident
+		want common.RedeemResolution
+	}{{acknowledged, common.RedeemOperatorAcknowledged}, {migrated, common.RedeemSettledOnChain}} {
+		if handled, err := store.HandledRedeemLog(tc.ev.ChainID, tc.ev.Log); err != nil || !handled {
+			t.Fatalf("resolved incident %d after the move: %t %v", tc.ev.Log.Index, handled, err)
+		}
+		if reason, err := db.Get(confirmedKey(redeemEvidenceKey(tc.ev)), nil); err != nil || common.RedeemResolution(reason[0]) != tc.want {
+			t.Fatalf("resolution of incident %d: %v %v", tc.ev.Log.Index, reason, err)
+		}
+	}
+	state := common.NewGlobalState(new(uint8))
+	if err := state.RestoreRedeemIncidents(store); err != nil || state.RedeemHaltGeneration() == 0 {
+		t.Fatalf("the moved pending incident does not hold the bridge: generation=%d err=%v", state.RedeemHaltGeneration(), err)
+	}
+	if moved, err := MoveRedeemIncidentKeys(db); err != nil || moved != 0 {
+		t.Fatalf("second run moved %d err=%v", moved, err)
+	}
+}
+
+// Evidence with the earlier layout that cannot be accounted for stops the
+// move, and the database is left as it was.
+func TestMoveRedeemIncidentKeysRejectsUnaccountedEvidence(t *testing.T) {
+	ev := incidentFixture(1, 2)
+	data, err := json.Marshal(ev)
+	if err != nil {
+		t.Fatal(err)
+	}
+	other := incidentFixture(1, 9)
+	for name, value := range map[string][]byte{
+		"not an incident":          []byte("not json"),
+		"names another incident":   mustJSON(t, other),
+		"another chain in the key": mustJSON(t, incidentFixture(2, 2)),
+	} {
+		t.Run(name, func(t *testing.T) {
+			db, err := leveldb.Open(storage.NewMemStorage(), nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+			good := earlier(redeemEvidenceKey(ev), oldRedeemEvidencePrefix)
+			bad := earlier(redeemEvidenceKey(incidentFixture(1, 1)), oldRedeemEvidencePrefix)
+			if err := db.Put(good, data, nil); err != nil {
+				t.Fatal(err)
+			}
+			if err := db.Put(bad, value, nil); err != nil {
+				t.Fatal(err)
+			}
+			if moved, err := MoveRedeemIncidentKeys(db); err == nil || moved != 0 {
+				t.Fatalf("moved %d err=%v", moved, err)
+			}
+			if has, _ := db.Has(good, nil); !has {
+				t.Fatal("a failed move changed the database")
+			}
+			if has, _ := db.Has(redeemEvidenceKey(ev), nil); has {
+				t.Fatal("a failed move wrote part of the new layout")
+			}
+		})
+	}
+}
+
+func mustJSON(t *testing.T, v any) []byte {
+	t.Helper()
+	data, err := json.Marshal(v)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return data
+}
+
+// Every key byte of the Zenon database is used for one thing only.
+func TestZenonKeyBytesAreDistinct(t *testing.T) {
+	seen := map[byte]string{}
+	for name, b := range map[string]byte{
+		"wrap events": wrapEventPrefix[0], "receive cursor": lastUpdatePrefix[0], "resign status": resignedStatusPrefix[0],
+		"receive coverage": receiveCoverageKey[0], "legacy redeem status": legacyRedeemStatusPrefix, "redeem status": redeemStatusPrefix,
+		"incident evidence": redeemEvidencePrefix, "incident resolution": redeemHaltConfirmedPrefix,
+	} {
+		if other, ok := seen[b]; ok {
+			t.Fatalf("%s and %s both use key byte %d", name, other, b)
+		}
+		seen[b] = name
+	}
+}

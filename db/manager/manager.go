@@ -31,6 +31,14 @@ func NewDbManager(stop chan os.Signal) (*Manager, error) {
 	if errLog != nil {
 		return nil, errLog
 	}
+	moved, err := wrap.MoveRedeemIncidentKeys(newZnnLdb)
+	if err != nil {
+		_ = newZnnLdb.Close()
+		return nil, err
+	}
+	if moved > 0 {
+		newLogger.Infof("Moved %d redeem incident records written by an earlier build to their current keys", moved)
+	}
 
 	newDbManager := &Manager{
 		redeemIncidents: wrap.NewRedeemIncidentStore(newZnnLdb),
