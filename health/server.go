@@ -169,7 +169,7 @@ func (s *Handler) GetStatus(params []interface{}) (interface{}, error) {
 	for _, evmNetwork := range s.networksManager.Networks() {
 		lastUpdateHeight, err := s.dbManager.EvmStorage(evmNetwork.ChainId()).GetLastUpdateHeight()
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("read sync cursor for chainId %d: %w", evmNetwork.ChainId(), err)
 		}
 
 		hasher := sha3.NewLegacyKeccak256()

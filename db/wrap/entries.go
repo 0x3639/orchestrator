@@ -3,11 +3,13 @@ package wrap
 import (
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"github.com/syndtr/goleveldb/leveldb"
 	zcommon "github.com/zenon-network/go-zenon/common"
 	"github.com/zenon-network/go-zenon/common/types"
 	"orchestrator/common"
 	"orchestrator/common/events"
+	"orchestrator/db"
 )
 
 func getWrapEventPrefix() []byte {
@@ -271,6 +273,10 @@ func (es *eventStore) GetLastUpdateHeight() (uint64, error) {
 		es.SendSigInt()
 		return 0, err
 	}
+	if err := db.CheckFixedWidth("Zenon sync cursor lastUpdateHeight (key 0x01)", data, 8); err != nil {
+		es.SendSigInt()
+		return 0, err
+	}
 
 	return binary.LittleEndian.Uint64(data), nil
 }
@@ -300,6 +306,10 @@ func (es *eventStore) GetResignStatus(id types.Hash) (bool, error) {
 	}
 
 	if err != nil {
+		es.SendSigInt()
+		return false, err
+	}
+	if err := db.CheckFixedWidth(fmt.Sprintf("Zenon wrap resign status for %s (key 0x02)", id), data, 4); err != nil {
 		es.SendSigInt()
 		return false, err
 	}

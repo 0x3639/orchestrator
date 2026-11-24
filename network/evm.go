@@ -200,7 +200,7 @@ func (eN *evmNetwork) Start() (startErr error) {
 	lastUpdateHeight, err := eN.dbManager.EvmStorage(eN.ChainId()).GetLastUpdateHeight()
 	if err != nil {
 		eN.logger.Debug(err)
-		return err
+		return errors.Wrapf(err, "read sync cursor for chainId %d", eN.ChainId())
 	}
 	if lastUpdateHeight == 0 {
 		if err := eN.dbManager.EvmStorage(eN.ChainId()).SetLastUpdateHeight(eN.ContractDeploymentHeight()); err != nil {
@@ -323,7 +323,7 @@ func (eN *evmNetwork) Sync() error {
 	eN.resetCanonicalCache()
 	startHeight, err := eN.eventsStore().GetLastUpdateHeight()
 	if err != nil {
-		return err
+		return errors.Wrapf(err, "read sync cursor for chainId %d", eN.ChainId())
 	}
 	eN.logger.Info("updateHeight: ", startHeight)
 
@@ -845,7 +845,9 @@ const (
 // refreshes it every subscriptionRefreshInterval after a catch-up Sync, and
 // re-establishes it with backoff when the provider drops it. A failed Sync
 // is logged and retried at the next refresh; it never leaves the node
-// without a subscription.
+// without a subscription. The exception is a corrupt local sync cursor,
+// which retrying cannot repair: the store has already requested a stop,
+// and the loop logs the cursor and returns.
 func (eN *evmNetwork) SubscribeToEvents() {
 	eN.logger.Infof("SubscribeToEvents for network with chainId: %d", eN.ChainId())
 	resubscribeBackoff := processEventsBaseBackoff
@@ -887,7 +889,11 @@ func (eN *evmNetwork) SubscribeToEvents() {
 		refresh.Stop()
 		logSub.Unsubscribe()
 
-		if errSync := eN.Sync(); errSync != nil {
+		if errSync := eN.Sync(); errors.Is(errSync, db.ErrCorruptCursor) {
+			// The store has already requested a stop and kept the bad value.
+			eN.logger.Errorf("Stopping EVM sync for chainId %d: %v", eN.ChainId(), errSync)
+			return
+		} else if errSync != nil {
 			eN.logger.Errorf("Sync for chainId %d failed and will be retried at the next refresh; the sync cursor did not advance: %v", eN.ChainId(), errSync)
 		}
 
