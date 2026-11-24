@@ -13,7 +13,10 @@ import (
 	"github.com/zenon-network/go-zenon/common/types"
 	"github.com/zenon-network/go-zenon/rpc/api"
 	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+	"go.uber.org/zap/zaptest/observer"
 
+	"orchestrator/common"
 	"orchestrator/db"
 	"orchestrator/db/unwrap"
 	"orchestrator/db/wrap"
@@ -123,4 +126,62 @@ func TestZenonListenerStopsWhenCursorWriteFindsCorruption(t *testing.T) {
 	}
 	_, err := store.GetLastUpdateHeight()
 	checkCorruptCursorStop(t, err, stop, mem, raw, "Zenon sync cursor lastUpdateHeight")
+}
+
+// A damaged checkpoint does not mend itself, so it never holds a start, not
+// even for a signer in EmergencyState, whose other first-read failures do.
+func TestCorruptCursorDoesNotHoldStartup(t *testing.T) {
+	h := newHeldStart(t)
+	h.setState(common.EmergencyState)
+	if h.n.startupHolds(&db.CorruptCursorError{Key: "Zenon sync cursor lastUpdateHeight", Got: 1, Want: 8}) {
+		t.Fatal("a corrupt cursor held the start")
+	}
+	if !h.n.startupHolds(errors.New("unreadable receive")) {
+		t.Fatal("a signer in EmergencyState did not hold on an unreadable receive")
+	}
+}
+
+// A held start whose retry finds the Zenon checkpoint damaged stops retrying
+// and logs why, even when the stop it requested has already cancelled the
+// listener's context, as the node does on a stop request.
+func TestHeldStartupStopsOnCorruptCursor(t *testing.T) {
+	h := newHeldStart(t)
+	h.setState(common.EmergencyState)
+	core, logs := observer.New(zapcore.ErrorLevel)
+	h.n.logger = zap.New(core).Sugar()
+	raw := []byte{9}
+	mem := zdb.NewMemDB()
+	if err := mem.Put(rawCursorKey, raw); err != nil {
+		t.Fatal(err)
+	}
+	h.stores.znn = wrap.NewZnnStorage(mem, h.stop)
+	h.n.dbManager = h.stores
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		select {
+		case <-h.stop:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+	result := make(chan bool, 1)
+	go func() { result <- h.n.finishStartup(ctx, 0, errors.New("first pass failed")) }()
+	select {
+	case finished := <-result:
+		if finished {
+			t.Fatal("startup finished on a corrupt cursor")
+		}
+	case <-time.After(3 * time.Second):
+		cancel()
+		<-result
+		t.Fatal("the held start kept retrying a corrupt cursor")
+	}
+	if logs.FilterMessageSnippet("Zenon sync cursor lastUpdateHeight").Len() == 0 {
+		t.Fatalf("the corrupt cursor was not logged; logged: %v", logs.All())
+	}
+	if got, err := mem.Get(rawCursorKey); err != nil || !bytes.Equal(got, raw) {
+		t.Fatalf("stored cursor changed to %x (%v)", got, err)
+	}
 }

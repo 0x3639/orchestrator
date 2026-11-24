@@ -59,8 +59,9 @@ type ZnnStorage interface {
 	Snapshot() ZnnStorage
 	SendSigInt()
 
-	// AddWrapRequest stores the event only when no record exists for its id;
-	// an existing record is kept unchanged.
+	// AddWrapRequest stores a wrap request read from the bridge. A record
+	// that exists keeps what this node wrote to it, its redeem status
+	// included; only a missing signature is filled in from the bridge's.
 	AddWrapRequest(events.WrapRequestZnn) error
 	HasLegacyRedeemStatuses(chainID uint32) (bool, error)
 	ApplyRedeemLog(chainID uint32, id types.Hash, block uint64, index uint, status uint32) error

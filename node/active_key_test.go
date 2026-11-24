@@ -5,7 +5,6 @@ import (
 	"testing"
 
 	"github.com/ethereum/go-ethereum/crypto"
-	"go.uber.org/zap"
 )
 
 // compressedKey returns a fresh compressed public key, in base64, whose X
@@ -30,14 +29,13 @@ func compressedKey(t *testing.T, leadingZero bool) string {
 // A key change is signed with the active key. One the Zenon contract cannot
 // verify is refused before any keygen runs, instead of after each one.
 func TestActiveKeyThatZenonCannotVerifyIsRefused(t *testing.T) {
-	node := &Node{logger: zap.NewNop().Sugar()}
-	if !node.activeKeyCanSign(compressedKey(t, false)) {
-		t.Fatal("an ordinary active key was refused")
+	if err := activeKeyCanSign(compressedKey(t, false)); err != nil {
+		t.Fatalf("an ordinary active key was refused: %v", err)
 	}
-	if node.activeKeyCanSign(compressedKey(t, true)) {
+	if err := activeKeyCanSign(compressedKey(t, true)); err == nil {
 		t.Fatal("an active key with a leading zero coordinate byte was accepted")
 	}
-	if node.activeKeyCanSign("not-base64!!") {
+	if err := activeKeyCanSign("not-base64!!"); err == nil {
 		t.Fatal("an undecodable active key was accepted")
 	}
 }

@@ -96,3 +96,73 @@ func TestHaltIsRecordedOnlyWhenEveryBridgeShowsItsFlag(t *testing.T) {
 	h.evm.halted.Store(true)
 	record(true, nil)
 }
+
+// A halt that one network rejects does not end the round there: the next
+// network still gets its halt, and the round is not reported as complete.
+func TestHaltGoesPastANetworkThatRejectsIt(t *testing.T) {
+	h := newHeldStart(t)
+	h.evm.open()
+	h.evm.sendFails.Store(true)
+	second := newHeldEvm(t, h.bridge)
+	second.open()
+	h.addEvmNetwork(2, second.url)
+	batch, messages, err := h.m.GetHaltMessages()
+	if err != nil || len(messages) != 2 {
+		t.Fatalf("%d messages, err %v", len(messages), err)
+	}
+	key, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	halted, err := h.m.SendHaltEvm(batch, [][]byte{{1}, {2}}, key, crypto.PubkeyToAddress(key.PublicKey), nil)
+	if err != nil || halted {
+		t.Fatalf("halted %v, err %v; want a halt sent past the network that rejected it", halted, err)
+	}
+	if rejected := h.evm.rejected.Load(); rejected != 1 {
+		t.Fatalf("%d halts rejected by the first network, want 1", rejected)
+	}
+	if sent := second.sent.Load(); sent != 1 {
+		t.Fatalf("%d halt transactions sent to the second network, want 1", sent)
+	}
+}
+
+// The bridge adds a network while the halt flags are read. The flags read
+// all show a halt, but the new network is live, so nothing is recorded.
+func TestHaltIsNotRecordedWhenTheNetworksChangeDuringTheRead(t *testing.T) {
+	h := newHeldStart(t)
+	h.evm.open()
+	h.setState(common.EmergencyState)
+	h.zenon.change(func(z *heldZenon) { z.halted = true })
+	h.evm.halted.Store(true)
+	added := newHeldEvm(t, h.bridge)
+	added.open()
+	addNetwork := func() { h.addEvmNetwork(2, added.url) }
+	h.evm.onFlagRead.Store(&addNetwork)
+
+	recorded, err := h.m.RecordConfirmedHalt(h.n.state)
+	if err != nil || recorded {
+		t.Fatalf("recorded %v, err %v; want nothing recorded", recorded, err)
+	}
+	if h.evm.onFlagRead.Load() != nil {
+		t.Fatal("the network was not added during the read")
+	}
+	if state, err := h.n.state.GetState(); err != nil || state != common.EmergencyState {
+		t.Fatalf("state %d, err %v; want EmergencyState", state, err)
+	}
+}
+
+// Only an emergency becomes a halt. A signer whose emergency ended before
+// the flags were read records nothing, even with every flag set.
+func TestHaltIsRecordedOnlyInAnEmergency(t *testing.T) {
+	h := newHeldStart(t)
+	h.evm.open()
+	h.zenon.change(func(z *heldZenon) { z.halted = true })
+	h.evm.halted.Store(true)
+	recorded, err := h.m.RecordConfirmedHalt(h.n.state)
+	if err != nil || recorded {
+		t.Fatalf("recorded %v, err %v; want nothing recorded", recorded, err)
+	}
+	if state, err := h.n.state.GetState(); err != nil || state != common.LiveState {
+		t.Fatalf("state %d, err %v; want LiveState", state, err)
+	}
+}

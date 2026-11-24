@@ -453,6 +453,8 @@ func (node *Node) processSignatures() {
 	// The same reason the halt cannot be confirmed is logged once a minute.
 	var confirmWarned string
 	var confirmWarnedAt time.Time
+	// When a keygen was last refused because of the active key.
+	var keyRefusedAt time.Time
 	for {
 		if !node.workerSleep(time.Second) {
 			return
@@ -520,12 +522,21 @@ func (node *Node) processSignatures() {
 			// A key change is signed with the active key, so one that the
 			// Zenon contract cannot verify makes every keygen useless. Check
 			// it before waiting for the window and running a keygen, and wait
-			// here for the administrator to set a key instead.
-			if activeKey := node.tssManager.GetPubKey(); len(activeKey) != 0 && !node.activeKeyCanSign(activeKey) {
-				if !node.workerSleep(time.Minute) {
-					return
+			// here for the administrator to set a key instead. The pause is
+			// short so that an emergency is still taken up promptly; the
+			// reason is logged once a minute.
+			if activeKey := node.tssManager.GetPubKey(); len(activeKey) != 0 {
+				if err := activeKeyCanSign(activeKey); err != nil {
+					if time.Since(keyRefusedAt) >= time.Minute {
+						node.logger.Errorf("No keygen is run: %v. The administrator must set a new key, and this node must then be "+
+							"restarted: it keeps the key it holds in memory until it restarts", err)
+						keyRefusedAt = time.Now()
+					}
+					if !node.workerSleep(5 * time.Second) {
+						return
+					}
+					continue
 				}
-				continue
 			}
 			mom, err := node.networksManager.Znn().GetFrontierMomentum()
 			if err != nil {
@@ -880,8 +891,10 @@ func (node *Node) processSignatures() {
 								// not changed by this round.
 								node.logger.Errorf("the key change round has no signature for a network the bridge added: %v", err)
 							} else if err != nil {
+								// Retry after the pause below; an immediate
+								// retry would spin, and with a single
+								// participant it would never see a stop.
 								node.logger.Debug(err)
-								continue
 							}
 							if changed {
 								break
@@ -1869,19 +1882,17 @@ func (node *Node) znnHaltFlag() (halted, ok bool) {
 
 // activeKeyCanSign reports whether a key change signed with the active key
 // can be verified by the Zenon bridge contract, which drops leading zero
-// bytes of the key's coordinates. When it cannot, it logs why: only the
-// administrator can set a new key then.
-func (node *Node) activeKeyCanSign(activeKey string) bool {
+// bytes of the key's coordinates. When it cannot, the error says why: only
+// the administrator can set a new key then.
+func activeKeyCanSign(activeKey string) error {
 	decompressed, err := common.DecompressPubKey(activeKey)
 	if err != nil {
-		node.logger.Errorf("Active pubKey %s cannot be decompressed: %v; the administrator must set the key", activeKey, err)
-		return false
+		return fmt.Errorf("active pubKey %s cannot be decompressed: %v", activeKey, err)
 	}
 	if accepted, err := common.ZenonAcceptsDecompressedPubKey(decompressed); err != nil || !accepted {
-		node.logger.Errorf("Active pubKey %s has a leading zero coordinate byte that the Zenon bridge contract cannot verify; the administrator must set the key", activeKey)
-		return false
+		return fmt.Errorf("active pubKey %s has a leading zero coordinate byte that the Zenon bridge contract cannot verify", activeKey)
 	}
-	return true
+	return nil
 }
 
 // haltNetworksAdministrator halts Zenon and every EVM network with the

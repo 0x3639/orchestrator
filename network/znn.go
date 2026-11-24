@@ -216,6 +216,11 @@ func (e awaitsSourceRecord) Unwrap() error { return e.error }
 // once startup lets it, and for a signer in EmergencyState or HaltedState,
 // which has the halt to sign or to keep and signs no transfer either way.
 func (rC *znnNetwork) startupHolds(err error) bool {
+	// A damaged checkpoint does not mend itself: retrying would only read it
+	// again. The start ends and the operator restores it.
+	if errors.Is(err, db.ErrCorruptCursor) {
+		return false
+	}
 	if rC.listenerCtx.Err() != nil {
 		return false
 	}
@@ -468,6 +473,11 @@ func (rC *znnNetwork) finishStartup(ctx context.Context, reached uint64, err err
 			continue
 		}
 		reached, err = rC.readBridgeAccount(ctx)
+		// Before the context: the stop a damaged checkpoint requests may
+		// already have cancelled it, and the reason must still be logged.
+		if rC.stopOnCorruptCursor(err) {
+			return false
+		}
 		if ctx.Err() != nil {
 			return false
 		}
