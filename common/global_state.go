@@ -3,6 +3,7 @@ package common
 import (
 	"context"
 	"errors"
+	"maps"
 	"strings"
 	"sync"
 
@@ -56,8 +57,14 @@ type GlobalState struct {
 	isAffiliateProgramActive map[uint32]map[string]bool
 	// [chainId] -> height
 	affiliateStartingHeight map[uint32]uint64
-	resignNetworkClass      uint32
-	resignNetworkChainId    uint32
+	// Counts the changes to the affiliate settings and the token map, which
+	// decide an event's affiliate policy.
+	affiliateGeneration uint64
+	// The networks of the affiliate program SetIsAffiliateProgram applied
+	// last.
+	appliedAffiliate     map[uint32]AffiliateNetwork
+	resignNetworkClass   uint32
+	resignNetworkChainId uint32
 }
 
 func NewGlobalState(state *uint8) *GlobalState {
@@ -119,6 +126,19 @@ func (gs *GlobalState) setStateLocked(newState uint8) error {
 	*gs.state = newState
 	gs.Health.SetBridgeState(StateToText(newState))
 	return persistErr
+}
+
+// HaltSigning moves a signer in LiveState, KeyGenState or ReSignState to
+// HaltedState, as a halt the bridge listener reads does, and reports whether
+// it did. A signer in EmergencyState or HaltedState stays where it is.
+func (gs *GlobalState) HaltSigning() (bool, error) {
+	gs.stateMu.Lock()
+	defer gs.stateMu.Unlock()
+	switch *gs.state {
+	case LiveState, KeyGenState, ReSignState:
+		return true, gs.setStateLocked(HaltedState)
+	}
+	return false, nil
 }
 
 // A receive retried after a storage error may by then be historical. Even
@@ -274,6 +294,9 @@ func (gs *GlobalState) SetTokensMap(chainId uint32, zts, token string) {
 	if _, found := gs.tokensMap[chainId]; !found {
 		gs.tokensMap[chainId] = make(map[string]string)
 	}
+	if gs.tokensMap[chainId][zts] != token || gs.tokensMap[chainId][token] != zts {
+		gs.affiliateGeneration++
+	}
 
 	gs.tokensMap[chainId][zts] = token
 	gs.tokensMap[chainId][token] = zts
@@ -310,10 +333,14 @@ func (gs *GlobalState) SetIsAffiliateProgram(program AffiliateProgram) {
 		if addr := gs.tokensMap[id][qsr]; addr != "" {
 			flags[addr] = values.WQSR
 		}
+		if !maps.Equal(gs.isAffiliateProgramActive[id], flags) || gs.affiliateStartingHeight[id] != values.StartingHeight {
+			gs.affiliateGeneration++
+		}
 		gs.isAffiliateProgramActive[id] = flags
 		gs.affiliateStartingHeight[id] = values.StartingHeight
 		GlobalLogger.Infof("Updated affiliate program for network %d at starting height %d", id, values.StartingHeight)
 	}
+	gs.appliedAffiliate = maps.Clone(program.Networks)
 }
 
 func (gs *GlobalState) GetIsAffiliateProgramActive(id uint32, token string) bool {
@@ -325,6 +352,9 @@ func (gs *GlobalState) GetIsAffiliateProgramActive(id uint32, token string) bool
 func (gs *GlobalState) SetAffiliateStartingHeight(id uint32, height uint64) {
 	gs.affiliateMu.Lock()
 	defer gs.affiliateMu.Unlock()
+	if gs.affiliateStartingHeight[id] != height {
+		gs.affiliateGeneration++
+	}
 	gs.affiliateStartingHeight[id] = height
 }
 
@@ -335,17 +365,25 @@ func (gs *GlobalState) GetAffiliateStartingHeight(id uint32) *big.Int {
 }
 
 // AffiliatePolicyUnder returns the policy AffiliatePolicyAt would return once
-// SetIsAffiliateProgram had applied program. A program that does not list the
-// chain leaves its settings as they are.
-func (gs *GlobalState) AffiliatePolicyUnder(program AffiliateProgram, id uint32, token string, height uint64) AffiliatePolicy {
+// SetIsAffiliateProgram had applied program, and whether program establishes
+// it. A program that does not list the chain leaves the chain's settings as
+// the updates before it set them. Those are the node's own only when program
+// is the one the node applied last; otherwise the policy is not known.
+func (gs *GlobalState) AffiliatePolicyUnder(program AffiliateProgram, id uint32, token string, height uint64) (AffiliatePolicy, bool) {
 	values, listed := program.Networks[id]
 	if !listed {
-		return gs.AffiliatePolicyAt(id, token, height)
+		gs.affiliateMu.RLock()
+		applied := maps.Equal(gs.appliedAffiliate, program.Networks)
+		gs.affiliateMu.RUnlock()
+		if !applied {
+			return 0, false
+		}
+		return gs.AffiliatePolicyAt(id, token, height), true
 	}
 	gs.affiliateMu.RLock()
 	defer gs.affiliateMu.RUnlock()
 	if values.StartingHeight == 0 || height < values.StartingHeight {
-		return 0
+		return 0, true
 	}
 	znn, qsr := types.ZnnTokenStandard.String(), types.QsrTokenStandard.String()
 	flags := map[string]bool{znn: values.ZNN, qsr: values.QSR}
@@ -363,7 +401,7 @@ func (gs *GlobalState) AffiliatePolicyUnder(program AffiliateProgram, id uint32,
 	if flags[gs.tokensMap[id][token]] {
 		policy |= VerifyAffiliate
 	}
-	return policy
+	return policy, true
 }
 
 // Wrapped and native token flags govern distinct sides of the bridge.
@@ -375,10 +413,18 @@ const (
 )
 
 func (gs *GlobalState) AffiliatePolicyAt(id uint32, token string, height uint64) AffiliatePolicy {
+	policy, _ := gs.AffiliatePolicyWithGeneration(id, token, height)
+	return policy
+}
+
+// AffiliatePolicyWithGeneration returns the policy AffiliatePolicyAt returns,
+// with the generation of the settings it was read from. See
+// WhileAffiliateSettingsAre.
+func (gs *GlobalState) AffiliatePolicyWithGeneration(id uint32, token string, height uint64) (AffiliatePolicy, uint64) {
 	gs.affiliateMu.RLock()
 	defer gs.affiliateMu.RUnlock()
 	if start := gs.affiliateStartingHeight[id]; start == 0 || height < start {
-		return 0
+		return 0, gs.affiliateGeneration
 	}
 	token = strings.ToLower(token)
 	flags := gs.isAffiliateProgramActive[id]
@@ -389,7 +435,19 @@ func (gs *GlobalState) AffiliatePolicyAt(id uint32, token string, height uint64)
 	if flags[gs.tokensMap[id][token]] {
 		policy |= VerifyAffiliate
 	}
-	return policy
+	return policy, gs.affiliateGeneration
+}
+
+// WhileAffiliateSettingsAre runs do unless the affiliate settings or the
+// token map changed since generation, and reports whether it ran. A change
+// waits for do, so what do writes was decided with the settings in force.
+func (gs *GlobalState) WhileAffiliateSettingsAre(generation uint64, do func() error) (bool, error) {
+	gs.affiliateMu.RLock()
+	defer gs.affiliateMu.RUnlock()
+	if gs.affiliateGeneration != generation {
+		return false, nil
+	}
+	return true, do()
 }
 
 func (gs *GlobalState) GetResignNetwork() (uint32, uint32) {

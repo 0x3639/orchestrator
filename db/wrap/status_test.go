@@ -46,3 +46,27 @@ func TestAddWrapRequestKeepingStatusKeepsARecordedRedeem(t *testing.T) {
 		}
 	}
 }
+
+// A request is added only when no record of it exists. A record that exists
+// is left as it is, its redeem status included.
+func TestAddWrapRequestIfMissingLeavesAnExistingRecord(t *testing.T) {
+	store := NewZnnStorage(zdb.NewMemDB(), make(chan os.Signal, 1))
+	id := types.Hash{1}
+	fromBridge := events.WrapRequestZnn{Id: id, Amount: big.NewInt(5), Fee: big.NewInt(1), Signature: "from the bridge", RedeemStatus: common.UnredeemedStatus}
+	if added, err := store.AddWrapRequestIfMissing(fromBridge); err != nil || !added {
+		t.Fatalf("a missing record: added %v, err %v", added, err)
+	}
+	if err := store.SetWrapRequestStatus(id, common.RedeemedStatus); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetWrapRequestSignature(id, "local"); err != nil {
+		t.Fatal(err)
+	}
+	if added, err := store.AddWrapRequestIfMissing(fromBridge); err != nil || added {
+		t.Fatalf("an existing record: added %v, err %v", added, err)
+	}
+	row, err := store.GetWrapRequestById(id)
+	if err != nil || row == nil || row.RedeemStatus != common.RedeemedStatus || row.Signature != "local" {
+		t.Fatalf("stored record %+v, err %v; want it unchanged", row, err)
+	}
+}

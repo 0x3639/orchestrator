@@ -77,6 +77,7 @@ func (eN *evmNetwork) unwrapRequestsFromLog(log etypes.Log, expected *events.Unw
 	transfers := []*events.UnwrapRequestEvm{transfer}
 	var key ecommon.Hash
 	var policy common.AffiliatePolicy
+	var generation uint64
 	var pin bool
 	if len(addresses) > 1 {
 		affiliate, parseErr := types.ParseAddress(addresses[1])
@@ -88,7 +89,7 @@ func (eN *evmNetwork) unwrapRequestsFromLog(log etypes.Log, expected *events.Unw
 			}
 			policy = stored
 			if !exists {
-				policy = eN.state.AffiliatePolicyAt(eN.ChainId(), decoded.Token.Hex(), log.BlockNumber)
+				policy, generation = eN.state.AffiliatePolicyWithGeneration(eN.ChainId(), decoded.Token.Hex(), log.BlockNumber)
 				pin = true
 			}
 			if policy&common.SplitAffiliate != 0 {
@@ -170,9 +171,17 @@ func (eN *evmNetwork) unwrapRequestsFromLog(log etypes.Log, expected *events.Unw
 			}
 		}
 		// The settings may have been marked stale while the rows and the
-		// bridge were read. Nothing is fixed with settings marked so.
+		// bridge were read. Nothing is fixed with settings marked so. Nor is
+		// a policy the node's settings no longer give: they may have changed
+		// since it was read, and the event is then read again under them.
 		current, err := eN.state.WhileSettingsCurrent(func() error {
-			return eN.eventsStore().PinUnwrapAffiliatePolicy(key, policy)
+			same, err := eN.state.WhileAffiliateSettingsAre(generation, func() error {
+				return eN.eventsStore().PinUnwrapAffiliatePolicy(key, policy)
+			})
+			if err == nil && !same {
+				return errSettingsChanged
+			}
+			return err
 		})
 		if err != nil {
 			return nil, err
@@ -186,7 +195,9 @@ func (eN *evmNetwork) unwrapRequestsFromLog(log etypes.Log, expected *events.Unw
 
 // policyStillCurrent returns errSettingsStale when the bridge's affiliate
 // settings, as it holds them now, give another policy for the event than the
-// node's.
+// node's, or do not establish one: an update that does not list the event's
+// chain leaves it as earlier updates set it, which the node has not read
+// unless the bridge holds the settings the node applied last.
 func (eN *evmNetwork) policyStillCurrent(token string, height uint64, policy common.AffiliatePolicy) error {
 	ctx, cancel := context.WithTimeout(context.Background(), rpc.ZnnSettingsTimeout)
 	defer cancel()
@@ -201,13 +212,15 @@ func (eN *evmNetwork) policyStillCurrent(token string, height uint64, policy com
 	if err := json.Unmarshal([]byte(info.Metadata), &metadata); err != nil {
 		return fmt.Errorf("bridge metadata does not decode: %w", err)
 	}
-	if eN.state.AffiliatePolicyUnder(metadata.AffiliateProgram, eN.ChainId(), token, height) != policy {
+	if under, known := eN.state.AffiliatePolicyUnder(metadata.AffiliateProgram, eN.ChainId(), token, height); !known || under != policy {
 		return errSettingsStale
 	}
 	return nil
 }
 
 var errSettingsStale = errors.New("the affiliate settings for this event are fixed once the node has read the bridge's current settings")
+
+var errSettingsChanged = errors.New("the affiliate settings changed while this event was read; it is read again under the new settings")
 
 // recordSourceLocation stores the block in which the scan found an unwrap
 // event, for the event's own request and for the affiliate's, while the scan

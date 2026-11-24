@@ -26,6 +26,7 @@ import (
 	"os"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -139,12 +140,13 @@ func (m *NetworksManager) Init(networksInfo map[string]config.BaseNetworkConfig,
 	return nil
 }
 
-// Start reads the bridge account to its tip, then brings every EVM network
-// through its startup scan, and marks startup complete, which is what lets the
-// signer sign transfers.
+// Start reads the bridge account to its tip and then brings every EVM network
+// through its startup scan. The node then calls CompleteStartup, which looks
+// at the halt flags and marks startup complete, which is what lets the signer
+// sign transfers.
 //
-// It returns before that in two cases, with the rest going on in the
-// background and startup complete only once both parts are:
+// It returns before the scans in two cases, with the rest going on in the
+// background and startup completed there once both parts are done:
 //
 //   - The bridge account read is held (znnNetwork.startupHolds). The EVM scans
 //     are what can record the source event a held request waits for, so they
@@ -184,15 +186,46 @@ func (m *NetworksManager) Start() error {
 			return err
 		}
 	}
-	state.CompleteStartup()
 	return nil
 }
 
-// CompletesStartupLater reports whether Start returned before startup was
-// complete. The manager then completes it in the background, and looks at
-// the bridge's halt flags itself before it does.
+// CompletesStartupLater reports whether Start returned before the EVM scans
+// were done. The manager then completes startup in the background, and the
+// node does not call CompleteStartup.
 func (m *NetworksManager) CompletesStartupLater() bool {
 	return m.completesLater
+}
+
+// CompleteStartup looks at the halt flags of Zenon and of every EVM network
+// the bridge lists, moves a signer that is not in EmergencyState to
+// HaltedState when one is halted, and then marks startup complete. A network
+// the bridge listener adds in the meantime is looked at before startup
+// completes.
+func (m *NetworksManager) CompleteStartup() error {
+	for {
+		checked := m.networks()
+		if err := m.haltIfHalted(checked); err != nil {
+			return err
+		}
+		if m.completeIfListedIn(checked) {
+			return nil
+		}
+	}
+}
+
+// completeIfListedIn marks startup complete, and reports true, when every EVM
+// network the bridge lists now is one of checked. A network is added under
+// the same lock, so none can be added between the two.
+func (m *NetworksManager) completeIfListedIn(checked []*evmNetwork) bool {
+	m.evmMu.RLock()
+	defer m.evmMu.RUnlock()
+	for _, network := range m.evmNetworks {
+		if !slices.Contains(checked, network) {
+			return false
+		}
+	}
+	m.znnNetwork.state.CompleteStartup()
+	return true
 }
 
 // A network that failed to start beside a signer that signs no transfer is
@@ -200,9 +233,10 @@ func (m *NetworksManager) CompletesStartupLater() bool {
 // failed.
 const evmStartRetryPause = 30 * time.Second
 
-// startEvmNetworksInBackground starts the given EVM networks, one at a time
-// as Start does, and completes startup once the bridge account has been read
-// to its tip as well.
+// startEvmNetworksInBackground starts the given EVM networks, each on its
+// own, so that one whose node is still syncing or that keeps failing does not
+// keep the others from scanning. It completes startup once every one of them
+// has started and the bridge account has been read to its tip.
 //
 // A network that fails to start ends the process when the signer is signing
 // transfers, as it does when Start waits for the networks. A signer in
@@ -212,35 +246,20 @@ func (m *NetworksManager) startEvmNetworksInBackground(initial []*evmNetwork) {
 	defer m.evmStartup.Done()
 	znn := m.znnNetwork
 	stopping := znn.listenerCtx.Done()
+	var starts sync.WaitGroup
+	var ended atomic.Bool
 	for _, eNetwork := range initial {
-		for m.hasNetwork(eNetwork) {
-			err := eNetwork.Start()
-			if err == nil {
-				break
+		starts.Add(1)
+		go func() {
+			defer starts.Done()
+			if !m.startInBackground(eNetwork) {
+				ended.Store(true)
 			}
-			if znn.listenerCtx.Err() != nil {
-				return
-			}
-			// The bridge may have removed the network while it was starting.
-			if !m.hasNetwork(eNetwork) {
-				break
-			}
-			if znn.state.WhileSigningTransfers(func() {
-				m.logger.Errorf("EVM network %d did not start: %v", eNetwork.ChainId(), err)
-				common.RequestStop(m.stopChan)
-			}) {
-				return
-			}
-			pause := m.startRetryPause()
-			m.logger.Errorf("EVM network %d did not start and is started again in %s: %v", eNetwork.ChainId(), pause, err)
-			timer := time.NewTimer(pause)
-			select {
-			case <-stopping:
-				timer.Stop()
-				return
-			case <-timer.C:
-			}
-		}
+		}()
+	}
+	starts.Wait()
+	if ended.Load() {
+		return
 	}
 	znn.scans.end(znn.clock())
 	select {
@@ -258,7 +277,7 @@ func (m *NetworksManager) startEvmNetworksInBackground(initial []*evmNetwork) {
 	case <-znn.state.NodeReady():
 	}
 	for {
-		err := m.haltIfHalted()
+		err := m.CompleteStartup()
 		if znn.listenerCtx.Err() != nil {
 			return
 		}
@@ -274,8 +293,44 @@ func (m *NetworksManager) startEvmNetworksInBackground(initial []*evmNetwork) {
 		case <-timer.C:
 		}
 	}
-	znn.state.CompleteStartup()
 	m.logger.Info("startup is complete: the bridge account is read to its tip and every EVM network has finished its startup scan")
+}
+
+// startInBackground starts one network, again after a pause when the signer
+// is not signing transfers, and reports false when startup is not to go on:
+// the node is stopping or has been told to stop.
+func (m *NetworksManager) startInBackground(eNetwork *evmNetwork) bool {
+	znn := m.znnNetwork
+	stopping := znn.listenerCtx.Done()
+	for m.hasNetwork(eNetwork) {
+		err := eNetwork.Start()
+		if err == nil {
+			return true
+		}
+		if znn.listenerCtx.Err() != nil {
+			return false
+		}
+		// The bridge may have removed the network while it was starting.
+		if !m.hasNetwork(eNetwork) {
+			return true
+		}
+		if znn.state.WhileSigningTransfers(func() {
+			m.logger.Errorf("EVM network %d did not start: %v", eNetwork.ChainId(), err)
+			common.RequestStop(m.stopChan)
+		}) {
+			return false
+		}
+		pause := m.startRetryPause()
+		m.logger.Errorf("EVM network %d did not start and is started again in %s: %v", eNetwork.ChainId(), pause, err)
+		timer := time.NewTimer(pause)
+		select {
+		case <-stopping:
+			timer.Stop()
+			return false
+		case <-timer.C:
+		}
+	}
+	return true
 }
 
 func (m *NetworksManager) startRetryPause() time.Duration {
@@ -285,19 +340,25 @@ func (m *NetworksManager) startRetryPause() time.Duration {
 	return evmStartRetryPause
 }
 
-// haltIfHalted moves a signer in LiveState to HaltedState when the bridge is
-// halted on Zenon or on an EVM network, as the node does when it starts.
-func (m *NetworksManager) haltIfHalted() error {
-	halted, _, err := m.CountNetworksHaltState()
-	if err != nil {
-		return err
+// haltIfHalted moves a signer that is not in EmergencyState to HaltedState
+// when the bridge is halted on Zenon or on one of the given EVM networks, as
+// the bridge listener does when it reads a halt. An error names the network
+// whose flag could not be read.
+func (m *NetworksManager) haltIfHalted(networks []*evmNetwork) error {
+	halted := false
+	for _, network := range networks {
+		isHalted, err := network.IsHalted()
+		if err != nil {
+			return fmt.Errorf("EVM network %d: %w", network.ChainId(), err)
+		}
+		halted = halted || isHalted
 	}
 	onZenon, err := m.znnNetwork.halted()
 	if err != nil {
-		return err
+		return fmt.Errorf("Zenon: %w", err)
 	}
-	if onZenon || halted > 0 {
-		_, err = m.znnNetwork.state.SetStateIf(common.LiveState, common.HaltedState)
+	if onZenon || halted {
+		_, err = m.znnNetwork.state.HaltSigning()
 	}
 	return err
 }
@@ -330,6 +391,14 @@ func (m *NetworksManager) RemoveEvmNetwork(chainId uint32) {
 		if network.ChainId() == chainId {
 			network.endHealthPoll()
 			network.stopOnce.Do(func() { close(network.done) })
+			// A worker waiting on the queue returns, and the queue is free for
+			// a network added again under the same name. With done closed, a
+			// worker that finds the queue closed does not stop the node.
+			if network.unconfirmedQueue != nil {
+				if err := network.unconfirmedQueue.Close(); err != nil {
+					m.logger.Debugf("queue of removed EVM network %d: %v", chainId, err)
+				}
+			}
 			m.evmNetworks = append(m.evmNetworks[:idx], m.evmNetworks[idx+1:]...)
 			return
 		}
@@ -362,6 +431,63 @@ func (m *NetworksManager) NetworksLength() int {
 
 func (m *NetworksManager) Networks() []*evmNetwork {
 	return m.networks()
+}
+
+// EvmBatch is the EVM networks one signing round is for, in the order of the
+// round's messages. A signature from the round is only ever sent to the
+// network its message was made for.
+type EvmBatch struct {
+	networks []*evmNetwork
+}
+
+// Len is the number of networks in the batch.
+func (b EvmBatch) Len() int { return len(b.networks) }
+
+// EvmBatch returns the EVM networks the bridge lists now.
+func (m *NetworksManager) EvmBatch() EvmBatch {
+	return EvmBatch{networks: m.networks()}
+}
+
+// Covers reports whether every EVM network the bridge lists now is in batch.
+func (m *NetworksManager) Covers(batch EvmBatch) bool {
+	for _, network := range m.networks() {
+		if !slices.Contains(batch.networks, network) {
+			return false
+		}
+	}
+	return true
+}
+
+// ErrNetworksChanged is returned when the bridge lists an EVM network that a
+// round's messages were not made for. A new round is needed to include it.
+var ErrNetworksChanged = errors.New("the bridge lists an EVM network this round's messages were not made for")
+
+type batchTarget struct {
+	network *evmNetwork
+	index   int // of the network's message and signatures in the round
+}
+
+// targets returns the networks of batch that the bridge still lists, each
+// with its index in the round. A network the bridge removed needs nothing
+// more. It returns ErrNetworksChanged when the bridge lists a network the
+// batch does not, and an error when a set of signatures is not one per
+// network of the batch.
+func (m *NetworksManager) targets(batch EvmBatch, signatures ...[][]byte) ([]batchTarget, error) {
+	for _, set := range signatures {
+		if len(set) != len(batch.networks) {
+			return nil, fmt.Errorf("%d signatures for a round of %d EVM networks", len(set), len(batch.networks))
+		}
+	}
+	if !m.Covers(batch) {
+		return nil, ErrNetworksChanged
+	}
+	targets := make([]batchTarget, 0, len(batch.networks))
+	for idx, network := range batch.networks {
+		if m.hasNetwork(network) {
+			targets = append(targets, batchTarget{network: network, index: idx})
+		}
+	}
+	return targets, nil
 }
 
 ///////// state
@@ -543,7 +669,14 @@ func (m *NetworksManager) Evm(chainId uint32) *evmNetwork {
 	panic(errors.Errorf("evm network with chainId: %d not found", chainId))
 }
 
-func (m *NetworksManager) SetTssEcdsaPubKeyEvm(oldKeySignatures, newKeySignatures [][]byte, newCompressedPubKey string, ecdsaPrivateKey *ecdsa.PrivateKey, evmAddress ecommon.Address) (bool, error) {
+// SetTssEcdsaPubKeyEvm sends the key change, signed for the networks in
+// batch, to each of them that the bridge still lists and that does not have
+// the new key yet.
+func (m *NetworksManager) SetTssEcdsaPubKeyEvm(batch EvmBatch, oldKeySignatures, newKeySignatures [][]byte, newCompressedPubKey string, ecdsaPrivateKey *ecdsa.PrivateKey, evmAddress ecommon.Address) (bool, error) {
+	targets, err := m.targets(batch, oldKeySignatures, newKeySignatures)
+	if err != nil {
+		return false, err
+	}
 	newCompressedPubKeyBytes, err := base64.StdEncoding.DecodeString(newCompressedPubKey)
 	if err != nil {
 		m.logger.Debug(err)
@@ -558,7 +691,8 @@ func (m *NetworksManager) SetTssEcdsaPubKeyEvm(oldKeySignatures, newKeySignature
 	m.logger.Debugf("New tss address: %s", newTss.String())
 	// true means that all evm networks have the new tss
 	ok := true
-	for idx, network := range m.networks() {
+	for _, target := range targets {
+		network, idx := target.network, target.index
 		tss, err := network.GetCurrentTss()
 		if err != nil {
 			// A network whose key cannot be read has not been seen to
@@ -630,10 +764,17 @@ func (m *NetworksManager) CheckNewTssEcdsaPubKeyEvm(newCompressedPubKey string) 
 	return ok, nil
 }
 
-func (m *NetworksManager) SendHaltEvm(signatures [][]byte, ecdsaPrivateKey *ecdsa.PrivateKey, evmAddress ecommon.Address) (bool, error) {
+// SendHaltEvm sends the halt, signed for the networks in batch, to the first
+// of them that the bridge still lists and that is not halted yet.
+func (m *NetworksManager) SendHaltEvm(batch EvmBatch, signatures [][]byte, ecdsaPrivateKey *ecdsa.PrivateKey, evmAddress ecommon.Address) (bool, error) {
+	targets, err := m.targets(batch, signatures)
+	if err != nil {
+		return false, err
+	}
 	// true means that all evm networks are halted
 	ok := true
-	for idx, network := range m.networks() {
+	for _, target := range targets {
+		network, idx := target.network, target.index
 		halted, err := network.IsHalted()
 		if err != nil {
 			return false, err
@@ -662,22 +803,29 @@ func (m *NetworksManager) SendHaltEvm(signatures [][]byte, ecdsaPrivateKey *ecds
 	return ok, nil
 }
 
-func (m *NetworksManager) GetHaltMessages() ([][]byte, error) {
+// GetHaltMessages returns the halt message of every EVM network the bridge
+// lists, and the batch of those networks, in the same order.
+func (m *NetworksManager) GetHaltMessages() (EvmBatch, [][]byte, error) {
+	batch := m.EvmBatch()
 	ans := make([][]byte, 0)
-	for _, network := range m.networks() {
+	for _, network := range batch.networks {
 		msg, err := network.GetHaltEvmMessage()
 		if err != nil {
-			return nil, err
+			return EvmBatch{}, nil, err
 		}
 		ans = append(ans, msg)
 	}
-	return ans, nil
+	return batch, ans, nil
 }
 
-func (m *NetworksManager) GetHaltEvmTxs(signatures [][]byte, tss ecommon.Address) ([]*etypes.Transaction, error) {
+func (m *NetworksManager) GetHaltEvmTxs(batch EvmBatch, signatures [][]byte, tss ecommon.Address) ([]*etypes.Transaction, error) {
+	targets, err := m.targets(batch, signatures)
+	if err != nil {
+		return nil, err
+	}
 	txs := make([]*etypes.Transaction, 0)
-	for idx, network := range m.networks() {
-		tx, err := network.GetHaltEvmTx(signatures[idx], tss)
+	for _, target := range targets {
+		tx, err := target.network.GetHaltEvmTx(signatures[target.index], tss)
 		if err != nil {
 			return nil, err
 		}
@@ -686,13 +834,18 @@ func (m *NetworksManager) GetHaltEvmTxs(signatures [][]byte, tss ecommon.Address
 	return txs, nil
 }
 
-// SendHaltEvmAdministrator return value represent if the network is halted or not
-func (m *NetworksManager) SendHaltEvmAdministrator(idx int, ecdsaPrivateKey *ecdsa.PrivateKey, evmAddress ecommon.Address) (bool, error) {
-	networks := m.networks()
-	if idx > len(networks) {
+// SendHaltEvmAdministrator sends the administrator's halt to the network at
+// idx in batch. It reports whether that network is halted, and reports true
+// for a network the bridge no longer lists, which needs no halt.
+func (m *NetworksManager) SendHaltEvmAdministrator(batch EvmBatch, idx int, ecdsaPrivateKey *ecdsa.PrivateKey, evmAddress ecommon.Address) (bool, error) {
+	if idx < 0 || idx >= len(batch.networks) {
 		return false, errors.New("network index non existent")
 	}
-	network := networks[idx]
+	network := batch.networks[idx]
+	if !m.hasNetwork(network) {
+		m.logger.Infof("network with chainId %d was removed by the bridge; it needs no halt", network.ChainId())
+		return true, nil
+	}
 	halted, err := network.IsHalted()
 	if err != nil {
 		return false, err
@@ -726,7 +879,11 @@ func (m *NetworksManager) GetSigners() []etypes.Signer {
 	return ans
 }
 
-func (m *NetworksManager) GetChangeTssEcdsaPubKeysEvmTxs(oldPublicKey, newPublicKey string, oldKeyFullSignatures, newKeyFullSignatures [][]byte) ([]*etypes.Transaction, error) {
+func (m *NetworksManager) GetChangeTssEcdsaPubKeysEvmTxs(batch EvmBatch, oldPublicKey, newPublicKey string, oldKeyFullSignatures, newKeyFullSignatures [][]byte) ([]*etypes.Transaction, error) {
+	targets, err := m.targets(batch, oldKeyFullSignatures, newKeyFullSignatures)
+	if err != nil {
+		return nil, err
+	}
 	oldPublicKeyBytes, err := base64.StdEncoding.DecodeString(oldPublicKey)
 	if err != nil {
 		return nil, err
@@ -750,8 +907,8 @@ func (m *NetworksManager) GetChangeTssEcdsaPubKeysEvmTxs(oldPublicKey, newPublic
 	newTss := crypto.PubkeyToAddress(*newPublicKeyECDSA)
 
 	txs := make([]*etypes.Transaction, 0)
-	for idx, network := range m.networks() {
-		tx, err := network.GetSetTssEcdsaPubKeyEvmTx(oldTss, newTss, oldKeyFullSignatures[idx], newKeyFullSignatures[idx])
+	for _, target := range targets {
+		tx, err := target.network.GetSetTssEcdsaPubKeyEvmTx(oldTss, newTss, oldKeyFullSignatures[target.index], newKeyFullSignatures[target.index])
 		if err != nil {
 			return nil, err
 		}
@@ -760,29 +917,33 @@ func (m *NetworksManager) GetChangeTssEcdsaPubKeysEvmTxs(oldPublicKey, newPublic
 	return txs, nil
 }
 
-func (m *NetworksManager) GetSetTssEcdsaPubKeysEvmMessages(newCompressedPubKey string) ([][]byte, error) {
+// GetSetTssEcdsaPubKeysEvmMessages returns the key change message of every
+// EVM network the bridge lists, and the batch of those networks, in the same
+// order.
+func (m *NetworksManager) GetSetTssEcdsaPubKeysEvmMessages(newCompressedPubKey string) (EvmBatch, [][]byte, error) {
 	newCompressedPubKeyBytes, err := base64.StdEncoding.DecodeString(newCompressedPubKey)
 	if err != nil {
 		m.logger.Debug(err)
-		return nil, err
+		return EvmBatch{}, nil, err
 	}
 	newPubKey, errDecompress := crypto.DecompressPubkey(newCompressedPubKeyBytes)
 	if errDecompress != nil {
 		m.logger.Debug(err)
-		return nil, err
+		return EvmBatch{}, nil, err
 	}
 	newTss := crypto.PubkeyToAddress(*newPubKey)
 
+	batch := m.EvmBatch()
 	ans := make([][]byte, 0)
-	for _, network := range m.networks() {
+	for _, network := range batch.networks {
 		msg, err := network.GetSetTssEcdsaPubKeyEvmMessage(newTss)
 		if err != nil {
-			return nil, err
+			return EvmBatch{}, nil, err
 		}
 		m.logger.Info("2nd msg: ", hex.EncodeToString(msg))
 		ans = append(ans, msg)
 	}
-	return ans, nil
+	return batch, ans, nil
 }
 
 func (m *NetworksManager) GetEvmUnwrapRequestByHashAndLog(chainId uint32, txHash ecommon.Hash, logIndex uint32) (*events.UnwrapRequestEvm, error) {

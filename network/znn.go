@@ -892,13 +892,13 @@ func (rC *znnNetwork) interpretSendBlockData(ctx context.Context, sendBlock *api
 			rC.logger.Info("update request non existent")
 			break
 		} else {
-			if localRequest, err := rC.eventsStore().GetWrapRequestById(param.Id); err != nil {
+			// The record is added only if it is still missing: this node's
+			// scan of the destination chain may have written it, with a
+			// redeem, since the bridge was asked.
+			if added, err := rC.eventsStore().AddWrapRequestIfMissing(wrapEvent(request)); err != nil {
 				return err
-			} else if localRequest == nil {
-				rC.logger.Info("request does not exist locally, will add it")
-				if err := rC.AddWrapEvent(request); err != nil {
-					return err
-				}
+			} else if added {
+				rC.logger.Info("request did not exist locally and was added")
 			}
 			if param.Signature == request.Signature {
 				if err = rC.SetResignStatus(request.Id, false); err != nil {

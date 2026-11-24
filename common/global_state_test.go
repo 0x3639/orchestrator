@@ -128,32 +128,93 @@ func TestNodeReadyIsSignalledOnce(t *testing.T) {
 }
 
 // The policy under a program the node has not applied is the one it would
-// have once it had applied it, and a program that does not list the chain
-// changes nothing.
+// have once it had applied it. A program that does not list the chain leaves
+// the chain as earlier updates set it, which the node knows only when the
+// program is the one it applied last.
 func TestAffiliatePolicyUnderAProgram(t *testing.T) {
 	gs := NewGlobalState(new(uint8))
 	gs.SetTokensMap(1, "zts1znnxxxxxxxxxxxxx9z4ulx", "0xAA")
-	gs.SetIsAffiliateProgram(AffiliateProgram{Networks: map[uint32]AffiliateNetwork{1: {StartingHeight: 10, WZNN: true}}})
+	applied := AffiliateProgram{Networks: map[uint32]AffiliateNetwork{1: {StartingHeight: 10, WZNN: true}, 3: {StartingHeight: 5}}}
+	gs.SetIsAffiliateProgram(applied)
 	held := gs.AffiliatePolicyAt(1, "0xaa", 20)
 	if held != SplitAffiliate {
 		t.Fatalf("policy in force %d, want split", held)
 	}
+	gs.SetIsAffiliateProgram(AffiliateProgram{Networks: map[uint32]AffiliateNetwork{1: {StartingHeight: 10, WZNN: true}}})
+	appliedLast := AffiliateProgram{Networks: map[uint32]AffiliateNetwork{1: {StartingHeight: 10, WZNN: true}}}
 	for _, tc := range []struct {
 		name    string
+		chain   uint32
 		program AffiliateProgram
 		height  uint64
 		want    AffiliatePolicy
+		known   bool
 	}{
-		{"chain not listed", AffiliateProgram{Networks: map[uint32]AffiliateNetwork{2: {StartingHeight: 1}}}, 20, held},
-		{"no split", AffiliateProgram{Networks: map[uint32]AffiliateNetwork{1: {StartingHeight: 10}}}, 20, 0},
-		{"same settings", AffiliateProgram{Networks: map[uint32]AffiliateNetwork{1: {StartingHeight: 10, WZNN: true}}}, 20, held},
-		{"before the starting height", AffiliateProgram{Networks: map[uint32]AffiliateNetwork{1: {StartingHeight: 30, WZNN: true}}}, 20, 0},
+		{"chain not listed, another program", 1, AffiliateProgram{Networks: map[uint32]AffiliateNetwork{2: {StartingHeight: 1}}}, 20, 0, false},
+		{"chain not listed, the program applied last", 2, appliedLast, 20, 0, true},
+		{"no split", 1, AffiliateProgram{Networks: map[uint32]AffiliateNetwork{1: {StartingHeight: 10}}}, 20, 0, true},
+		{"same settings", 1, AffiliateProgram{Networks: map[uint32]AffiliateNetwork{1: {StartingHeight: 10, WZNN: true}}}, 20, held, true},
+		{"before the starting height", 1, AffiliateProgram{Networks: map[uint32]AffiliateNetwork{1: {StartingHeight: 30, WZNN: true}}}, 20, 0, true},
 	} {
-		if got := gs.AffiliatePolicyUnder(tc.program, 1, "0xAA", tc.height); got != tc.want {
-			t.Errorf("%s: policy %d, want %d", tc.name, got, tc.want)
+		if got, known := gs.AffiliatePolicyUnder(tc.program, tc.chain, "0xAA", tc.height); got != tc.want || known != tc.known {
+			t.Errorf("%s: policy %d known %v, want %d known %v", tc.name, got, known, tc.want, tc.known)
 		}
 	}
 	if gs.AffiliatePolicyAt(1, "0xaa", 20) != held {
 		t.Fatal("asking about a program applied it")
+	}
+}
+
+// A change to the affiliate settings or the token map ends what was decided
+// under the settings before it; applying the same settings again does not.
+func TestAffiliateSettingsChangeEndsWhatWasDecidedBeforeIt(t *testing.T) {
+	gs := NewGlobalState(new(uint8))
+	program := AffiliateProgram{Networks: map[uint32]AffiliateNetwork{1: {StartingHeight: 10, WZNN: true}}}
+	gs.SetTokensMap(1, "zts1znnxxxxxxxxxxxxx9z4ulx", "0xAA")
+	gs.SetIsAffiliateProgram(program)
+	for _, change := range []struct {
+		name    string
+		apply   func()
+		changes bool
+	}{
+		{"the same program again", func() { gs.SetIsAffiliateProgram(program) }, false},
+		{"the same token pair again", func() { gs.SetTokensMap(1, "zts1znnxxxxxxxxxxxxx9z4ulx", "0xaa") }, false},
+		{"the same starting height again", func() { gs.SetAffiliateStartingHeight(1, 10) }, false},
+		{"a program that no longer splits", func() {
+			gs.SetIsAffiliateProgram(AffiliateProgram{Networks: map[uint32]AffiliateNetwork{1: {StartingHeight: 10}}})
+		}, true},
+		{"another token pair", func() { gs.SetTokensMap(1, "zts1qsrxxxxxxxxxxxxxmrhjll", "0xBB") }, true},
+		{"another starting height", func() { gs.SetAffiliateStartingHeight(1, 11) }, true},
+	} {
+		_, generation := gs.AffiliatePolicyWithGeneration(1, "0xaa", 20)
+		change.apply()
+		ran := false
+		current, err := gs.WhileAffiliateSettingsAre(generation, func() error { ran = true; return nil })
+		if err != nil || current == change.changes || ran == change.changes {
+			t.Errorf("%s: current %v, ran %v, err %v; want current %v", change.name, current, ran, err, !change.changes)
+		}
+	}
+}
+
+// A halt read at startup moves every state that signs to HaltedState, as one
+// the listener reads does. An emergency stays: it has the halt to sign.
+func TestHaltSigningLeavesAnEmergency(t *testing.T) {
+	for _, tc := range []struct {
+		from   uint8
+		want   uint8
+		halted bool
+	}{
+		{LiveState, HaltedState, true},
+		{KeyGenState, HaltedState, true},
+		{ReSignState, HaltedState, true},
+		{EmergencyState, EmergencyState, false},
+		{HaltedState, HaltedState, false},
+	} {
+		state := tc.from
+		gs := NewGlobalState(&state)
+		halted, err := gs.HaltSigning()
+		if err != nil || halted != tc.halted || state != tc.want {
+			t.Errorf("from %s: halted %v, state %s, err %v; want %s", StateToText(tc.from), halted, StateToText(state), err, StateToText(tc.want))
+		}
 	}
 }

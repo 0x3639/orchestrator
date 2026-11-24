@@ -35,7 +35,9 @@ func TestKeyChangeIsNotReportedDoneWhenANetworkCannotBeRead(t *testing.T) {
 	if changed, err := m.CheckNewTssEcdsaPubKeyEvm(newKey); err != nil || changed {
 		t.Fatalf("check: changed %v, err %v; want not changed", changed, err)
 	}
-	if changed, err := m.SetTssEcdsaPubKeyEvm(nil, nil, newKey, key, crypto.PubkeyToAddress(key.PublicKey)); err != nil || changed {
+	batch := m.EvmBatch()
+	signatures := make([][]byte, batch.Len())
+	if changed, err := m.SetTssEcdsaPubKeyEvm(batch, signatures, signatures, newKey, key, crypto.PubkeyToAddress(key.PublicKey)); err != nil || changed {
 		t.Fatalf("set: changed %v, err %v; want not changed", changed, err)
 	}
 }

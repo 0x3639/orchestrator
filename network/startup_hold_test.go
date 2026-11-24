@@ -59,6 +59,10 @@ type heldZenon struct {
 	syncing   bool
 	request   *definition.UnwrapTokenRequest
 	metadata  string
+	// The bridge allows key generation.
+	allowKeyGen bool
+	// The node returns no bridge info.
+	noBridgeInfo bool
 	// A read of the account waits here once it has said so on stalled.
 	stall, stalled chan struct{}
 	// The requests the bridge holds by log index, when a test sets them
@@ -163,7 +167,10 @@ func (z *heldZenon) GetNetworkInfo(_, id uint32) (*definition.NetworkInfo, error
 func (z *heldZenon) GetBridgeInfo() *definition.BridgeInfoVariable {
 	z.mu.Lock()
 	defer z.mu.Unlock()
-	return &definition.BridgeInfoVariable{Metadata: z.metadata}
+	if z.noBridgeInfo {
+		return nil
+	}
+	return &definition.BridgeInfoVariable{Metadata: z.metadata, AllowKeyGen: z.allowKeyGen}
 }
 
 func (z *heldZenon) Momentums(ctx context.Context) (*zserver.Subscription, error) {
@@ -216,15 +223,19 @@ type heldEvm struct {
 	url      string
 	hasEvent atomic.Bool
 	// The recipient the event names, when it is not the bridge's own.
-	eventTo  atomic.Pointer[string]
-	syncing  atomic.Bool
-	halted   atomic.Bool // the bridge contract on this chain is halted
-	gate     chan struct{}
-	opening  sync.Once
-	calls    atomic.Int32
-	receipts atomic.Int32
-	scans    atomic.Int32
-	starts   atomic.Int32 // times a network asked whether the node is synced
+	eventTo atomic.Pointer[string]
+	syncing atomic.Bool
+	halted  atomic.Bool // the bridge contract on this chain is halted
+	// The halt flag cannot be read.
+	haltedFails atomic.Bool
+	// Runs, once, when the signer first asks for the halt flag.
+	onHaltedRead atomic.Pointer[func()]
+	gate         chan struct{}
+	opening      sync.Once
+	calls        atomic.Int32
+	receipts     atomic.Int32
+	scans        atomic.Int32
+	starts       atomic.Int32 // times a network asked whether the node is synced
 }
 
 func newHeldEvm(t *testing.T, b *replayBridge) *heldEvm {
@@ -276,6 +287,12 @@ func (e *heldEvm) answer(method string, params []json.RawMessage) (interface{}, 
 			e.t.Errorf("unexpected call %s", params)
 		}
 		if selector := append(call.Data, call.Input...); len(selector) >= 4 && string(selector[:4]) == string(haltedSelector(e.t)) {
+			if hook := e.onHaltedRead.Swap(nil); hook != nil {
+				(*hook)()
+			}
+			if e.haltedFails.Load() {
+				return nil, &replayRPCError{-32000, "upstream timeout"}
+			}
 			if e.halted.Load() {
 				return "0x" + strings.Repeat("0", 63) + "1", nil
 			}
@@ -448,6 +465,10 @@ func (h *heldStart) start() error {
 	go func() { result <- h.m.Start() }()
 	select {
 	case err := <-result:
+		if err == nil && !h.m.CompletesStartupLater() {
+			// The node completes a startup that waited for the scans.
+			err = h.m.CompleteStartup()
+		}
 		if err == nil {
 			// The node goes on to apply what it reads from the bridge.
 			h.n.state.MarkNodeReady()
@@ -773,8 +794,8 @@ func TestBlockedStartupEndsASignerThatIsSigningTransfers(t *testing.T) {
 	}
 }
 
-// A start that nothing holds waits for the EVM scans, as before, and startup
-// is complete when it returns.
+// A start that nothing holds waits for the EVM scans, as before, and the node
+// completes startup when it returns.
 func TestStartWaitsForTheEvmScansAndCompletesStartup(t *testing.T) {
 	h := newHeldStart(t)
 	h.plainReceive()
@@ -798,7 +819,12 @@ func TestStartWaitsForTheEvmScansAndCompletesStartup(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("the start did not return")
 	}
-	h.expect("started", common.LiveState, 2, true)
+	// The node completes startup once it has looked at the halt flags.
+	h.expect("started", common.LiveState, 2, false)
+	if err := h.m.CompleteStartup(); err != nil {
+		t.Fatal(err)
+	}
+	h.expect("completed", common.LiveState, 2, true)
 	if h.m.CompletesStartupLater() {
 		t.Fatal("the manager says it completes later a startup that was complete when it returned")
 	}
@@ -1600,6 +1626,12 @@ func TestScanAheadOfTheBridgeAccountAsksTheBridgeForTheRegisteredRequest(t *test
 			`{"affiliateProgram":{"networks":{"1":{"startingHeight":1,"wZNN":true}}}}`},
 		{"account read, the bridge's settings changed", false, false, false, false,
 			`{"affiliateProgram":{"networks":{"1":{"startingHeight":1,"wZNN":false}}}}`},
+		// The bridge's settings no longer list the chain, so they leave it as
+		// updates the read has not reached set it.
+		{"ahead, no request registered, the bridge's settings no longer list the chain", true, false, false, true,
+			`{"affiliateProgram":{"networks":{"2":{"startingHeight":1,"wZNN":true}}}}`},
+		{"ahead, no request registered, the bridge's settings are the ones applied", true, false, false, false,
+			`{"affiliateProgram":{"networks":{"1":{"startingHeight":1,"wZNN":true}}}}`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			h := newHeldStart(t)
@@ -1618,6 +1650,9 @@ func TestScanAheadOfTheBridgeAccountAsksTheBridgeForTheRegisteredRequest(t *test
 			}
 			h.zenon.change(func(z *heldZenon) {
 				z.registered = registered
+				// Unless the case says otherwise, the bridge holds the
+				// settings the node applied.
+				z.metadata = `{"affiliateProgram":{"networks":{"1":{"startingHeight":1,"wZNN":true}}}}`
 				if tc.metadata != "" {
 					z.metadata = tc.metadata
 				}
@@ -1699,21 +1734,32 @@ func TestNetworkListIsReadWhileItChanges(t *testing.T) {
 }
 
 // A network the bridge removed before a background start reached it is not
-// started.
+// started. Here the bridge removes it during the first read of the bridge
+// account, after the start has taken the list of networks.
 func TestBackgroundStartSkipsANetworkTheBridgeRemoved(t *testing.T) {
 	h := newHeldStart(t)
 	h.setState(common.EmergencyState)
 	h.plainReceive()
+	h.evm.open()
 	second := newHeldEvm(t, h.bridge)
 	second.open()
 	t.Cleanup(h.addEvmNetwork(2, second.url).Stop)
-	if err := h.start(); err != nil {
+	stall, stalled := make(chan struct{}), make(chan struct{}, 1)
+	var release sync.Once
+	t.Cleanup(func() { release.Do(func() { close(stall) }) })
+	h.zenon.change(func(z *heldZenon) { z.stall, z.stalled = stall, stalled })
+	result := make(chan error, 1)
+	go func() { result <- h.start() }()
+	select {
+	case <-stalled:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the first read did not begin")
+	}
+	h.m.RemoveEvmNetwork(2)
+	release.Do(func() { close(stall) })
+	if err := <-result; err != nil {
 		t.Fatal(err)
 	}
-	// The first network is still at its scan.
-	waitFor(t, "the first network's scan to begin", func() bool { return h.evm.calls.Load() > 3 })
-	h.m.RemoveEvmNetwork(2)
-	h.evm.open()
 	waitFor(t, "startup to complete", h.complete)
 	if calls := second.calls.Load(); calls != 0 {
 		t.Fatalf("%d calls to the endpoint of a network the bridge removed", calls)

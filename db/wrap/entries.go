@@ -40,6 +40,22 @@ func (es *eventStore) AddWrapRequestKeepingStatus(event events.WrapRequestZnn) e
 	return es.putWrapRequest(event)
 }
 
+// AddWrapRequestIfMissing stores the request unless a record of it exists,
+// and reports whether it stored it. The read and the write are one operation
+// under the record lock.
+func (es *eventStore) AddWrapRequestIfMissing(event events.WrapRequestZnn) (bool, error) {
+	es.mu.Lock()
+	defer es.mu.Unlock()
+	existing, err := es.GetWrapRequestById(event.Id)
+	if err != nil {
+		return false, err
+	}
+	if existing != nil {
+		return false, nil
+	}
+	return true, es.putWrapRequest(event)
+}
+
 // putWrapRequest writes the record. Callers must hold es.mu.
 func (es *eventStore) putWrapRequest(event events.WrapRequestZnn) error {
 	if eventBytes, err := event.Serialize(); err != nil {

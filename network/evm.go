@@ -625,12 +625,8 @@ func (eN *evmNetwork) InterpretLog(log etypes.Log, live bool) error {
 					}
 				}
 			} else {
-				if event, storageErr := eN.dbManager.ZnnStorage().GetWrapRequestById(id); storageErr != nil {
+				if _, storageErr := eN.dbManager.ZnnStorage().AddWrapRequestIfMissing(common.ZnnWrapToOrchestratorWrap(rpcEvent)); storageErr != nil {
 					return storageErr
-				} else if event == nil {
-					if storageErr = eN.dbManager.ZnnStorage().AddWrapRequest(common.ZnnWrapToOrchestratorWrap(rpcEvent)); storageErr != nil {
-						return storageErr
-					}
 				}
 				if err := eN.dbManager.ZnnStorage().SetWrapRequestStatus(id, common.PendingRedeemStatus); err != nil {
 					return err

@@ -61,6 +61,10 @@ type ZnnStorage interface {
 	// AddWrapRequestKeepingStatus stores a request read from the bridge and
 	// keeps the redeem status an existing record already holds.
 	AddWrapRequestKeepingStatus(events.WrapRequestZnn) error
+	// AddWrapRequestIfMissing stores the request unless a record of it
+	// exists, and reports whether it stored it. The check and the write are
+	// one operation.
+	AddWrapRequestIfMissing(events.WrapRequestZnn) (bool, error)
 	SetWrapRequestStatus(types.Hash, uint32) error
 	SetWrapRequestSignature(types.Hash, string) error
 	SetWrapRequestSentSignature(types.Hash, bool) error
