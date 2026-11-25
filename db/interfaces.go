@@ -101,6 +101,10 @@ type ZnnStorage interface {
 	SaveBridgeWatchFrom(uint64) error
 
 	GetResignStatus(types.Hash) (bool, error)
+	// IsPublishedResignWrap reports whether the wrap's resign marker was written
+	// by PublishResignWraps after finality verification (as opposed to a legacy
+	// pre-upgrade SetResignStatus flag).
+	IsPublishedResignWrap(types.Hash) (bool, error)
 	SetResignStatus(types.Hash, bool) error
 	// PublishResignWraps atomically stores any missing wrap rows and marks all
 	// still-unredeemed wraps in the batch for re-signing in one durable write.

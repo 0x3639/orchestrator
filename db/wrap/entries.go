@@ -154,6 +154,21 @@ func (es *eventStore) SaveSignedWrapRequest(id types.Hash, signature string) err
 		es.SendSigInt()
 		return err
 	}
+	checked, err := es.withRedeemStatus(event)
+	if err != nil {
+		es.SendSigInt()
+		return err
+	}
+	var clearResign [4]byte
+	if checked.RedeemStatus != common.UnredeemedStatus {
+		// Wrap settled on EVM during signing: clear any pending resign marker
+		// without queuing a signature for submission.
+		if err := es.putBatchDurable(kvEntry{key: getResignedStatusKey(id), value: clearResign[:]}); err != nil {
+			es.SendSigInt()
+			return err
+		}
+		return nil
+	}
 	event.Signature = signature
 	event.SentSignature = false
 	serialized, err := event.Serialize()
@@ -161,7 +176,6 @@ func (es *eventStore) SaveSignedWrapRequest(id types.Hash, signature string) err
 		es.SendSigInt()
 		return err
 	}
-	var clearResign [4]byte
 	if err := es.putBatchDurable(
 		kvEntry{key: getWrapEventKey(id), value: serialized},
 		kvEntry{key: getResignedStatusKey(id), value: clearResign[:]},
@@ -460,30 +474,52 @@ func (es *eventStore) SetLastUpdateHeight(accBlHeight uint64) error {
 	return nil
 }
 
+const (
+	resignStatusNone      uint32 = 0
+	resignStatusLegacy    uint32 = 1
+	resignStatusPublished uint32 = 2
+)
+
 func getResignedStatusKey(id types.Hash) []byte {
 	return zcommon.JoinBytes(resignedStatusPrefix, id.Bytes())
 }
 
-func (es *eventStore) GetResignStatus(id types.Hash) (bool, error) {
+func (es *eventStore) getResignStatusValue(id types.Hash) (uint32, error) {
 	data, err := es.DB.Get(getResignedStatusKey(id))
 	if errors.Is(err, leveldb.ErrNotFound) {
-		return false, nil
+		return resignStatusNone, nil
 	}
 	if err != nil {
 		es.SendSigInt()
-		return false, err
+		return resignStatusNone, err
 	}
 	if err := db.CheckFixedWidth(fmt.Sprintf("Zenon wrap resign status for %s (key 0x02)", id), data, 4); err != nil {
 		es.SendSigInt()
+		return resignStatusNone, err
+	}
+	return binary.LittleEndian.Uint32(data), nil
+}
+
+func (es *eventStore) GetResignStatus(id types.Hash) (bool, error) {
+	value, err := es.getResignStatusValue(id)
+	if err != nil {
 		return false, err
 	}
-	return binary.LittleEndian.Uint32(data) > 0, nil
+	return value > resignStatusNone, nil
+}
+
+func (es *eventStore) IsPublishedResignWrap(id types.Hash) (bool, error) {
+	value, err := es.getResignStatusValue(id)
+	if err != nil {
+		return false, err
+	}
+	return value >= resignStatusPublished, nil
 }
 
 func (es *eventStore) SetResignStatus(id types.Hash, status bool) error {
 	bytes := make([]byte, 4)
 	if status {
-		binary.LittleEndian.PutUint32(bytes, 1)
+		binary.LittleEndian.PutUint32(bytes, resignStatusLegacy)
 	}
 	if err := es.DB.Put(getResignedStatusKey(id), bytes); err != nil {
 		es.SendSigInt()
@@ -504,7 +540,7 @@ func (es *eventStore) PublishResignWraps(wraps []events.WrapRequestZnn) error {
 	defer es.mu.Unlock()
 
 	var resignTrue [4]byte
-	binary.LittleEndian.PutUint32(resignTrue[:], 1)
+	binary.LittleEndian.PutUint32(resignTrue[:], resignStatusPublished)
 
 	entries := make([]kvEntry, 0, len(wraps)*2)
 	seen := make(map[types.Hash]struct{}, len(wraps))

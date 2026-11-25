@@ -19,7 +19,6 @@ import (
 	"orchestrator/common"
 	oconfig "orchestrator/common/config"
 	"os"
-	"path/filepath"
 	"slices"
 	"sync"
 	"time"
@@ -34,6 +33,7 @@ type TssManager struct {
 	voteMu            sync.Mutex
 	unwrapVotes       *leveldb.DB
 	stateDir          *oconfig.OwnedDir
+	votesDir          *oconfig.OwnedDir
 	logsDir           *oconfig.OwnedDir
 	keyShareDir       string
 	server            *tss.TssServer
@@ -116,7 +116,16 @@ func NewTssManager(conf oconfig.TssManagerConfig, privateKey string) (_ *TssMana
 
 	common.GlobalLogger.Infof("peerId: %s\n", id.String())
 
-	votes, err := leveldb.OpenFile(filepath.Join(conf.BaseDir, "unwrap-pool-votes"), nil)
+	votesDir, err := stateDir.OpenSubDir("unwrap-pool-votes")
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		if retErr != nil {
+			_ = votesDir.Close()
+		}
+	}()
+	votes, err := leveldb.OpenFile(votesDir.AnchoredPath(), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -176,6 +185,7 @@ func NewTssManager(conf oconfig.TssManagerConfig, privateKey string) (_ *TssMana
 	return &TssManager{
 		unwrapVotes:       votes,
 		stateDir:          stateDir,
+		votesDir:          votesDir,
 		logsDir:           logsDir,
 		keyShareDir:       conf.BaseDir,
 		port:              conf.Port,
@@ -198,6 +208,9 @@ func (m *TssManager) Start() error {
 func (m *TssManager) Stop() {
 	m.server.Stop()
 	m.unwrapVotes.Close()
+	if m.votesDir != nil {
+		_ = m.votesDir.Close()
+	}
 	if m.logsDir != nil {
 		_ = m.logsDir.Close()
 	}

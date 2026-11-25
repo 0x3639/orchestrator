@@ -798,14 +798,15 @@ func (node *Node) processSignatures() {
 				node.tssManager.SetPubKey(keyGenResponse.PubKey)
 
 				newKeySignResponse, err := node.signMessages(messagesToSign, msgsIndexes)
+				// Always restore oldKey immediately so a failed or rejected
+				// candidate signing response never leaves the uninstalled key
+				// active locally.
+				node.tssManager.SetPubKey(oldKey)
 				if err != nil {
-					// we set back the old key
-					node.tssManager.SetPubKey(oldKey)
 					node.logger.Debug(err)
 					node.logger.Debug(" Error after signing with the new generated key 1")
 					continue
 				} else if newKeySignResponse.Status != tcommon.Success {
-					node.tssManager.SetPubKey(oldKey)
 					node.logger.Debugf("keySignStatus: %d", newKeySignResponse.Status)
 					node.logger.Debug(" Error after signing with the new generated key 2")
 					continue
@@ -820,8 +821,6 @@ func (node *Node) processSignatures() {
 				node.logger.Debug("Signatures generated from the new key are valid!")
 
 				// Old key sign of messages
-				node.tssManager.SetPubKey(oldKey)
-
 				oldKeySignResponse, err := node.signMessages(messagesToSign, msgsIndexes)
 				if err != nil {
 					node.logger.Debug(err)
@@ -1035,8 +1034,10 @@ func (node *Node) processSignatures() {
 					node.workerSleep(10 * time.Second)
 					continue
 				}
-				if err := node.state.SetState(common.KeyGenState); err != nil {
+				if changed, err := node.state.SetStateIf(common.LiveState, common.KeyGenState); err != nil {
 					node.logger.Debug(err.Error())
+				} else if !changed {
+					node.logger.Debug("State is no longer LiveState; skipping transition to KeyGenState")
 				}
 			} else if node.tssManager.CanProcessSignatures() && bridgeInfo.CompressedTssECDSAPubKey == node.tssManager.GetPubKey() {
 				currentCeremony, err := node.networksManager.Znn().CurrentCeremony()
@@ -1306,6 +1307,23 @@ var resignRPCTimeout = rpc.ZnnLedgerTimeout
 // ReSignState (overridable in tests to exercise multi-page scans).
 var resignPageSize uint32 = 100
 
+// expectedWrapPageLen returns the exact number of wrap entries expected on
+// pageIndex when Count total requests exist on Zenon.
+func expectedWrapPageLen(pageIndex, pageSize uint32, count int) int {
+	if count <= 0 || pageSize == 0 {
+		return 0
+	}
+	start := int(pageIndex) * int(pageSize)
+	if start >= count {
+		return 0
+	}
+	rem := count - start
+	if rem > int(pageSize) {
+		return int(pageSize)
+	}
+	return rem
+}
+
 // runReSignScan enumerates wrap requests for the configured resign network,
 // defers unfinalized wraps until ConfirmationsToFinality == 0 (or vanished),
 // retries transient EVM eligibility errors, publishes all eligible wraps
@@ -1344,7 +1362,26 @@ func (node *Node) runReSignScan() bool {
 			}
 			continue
 		}
-		if wrapRequests == nil || len(wrapRequests.List) == 0 {
+		if wrapRequests == nil || wrapRequests.Count < 0 {
+			node.logger.Debugf("invalid wrap request page at index %d; retrying", pageIndex)
+			if !node.workerSleep(resignRetryDelay) {
+				return false
+			}
+			continue
+		}
+		if wrapRequests.Count == 0 {
+			break
+		}
+		expected := expectedWrapPageLen(pageIndex, pageSize, wrapRequests.Count)
+		if len(wrapRequests.List) != expected {
+			node.logger.Debugf("incomplete wrap request page %d: got %d entries, expected %d for count %d; retrying",
+				pageIndex, len(wrapRequests.List), expected, wrapRequests.Count)
+			if !node.workerSleep(resignRetryDelay) {
+				return false
+			}
+			continue
+		}
+		if expected == 0 {
 			break
 		}
 		node.logger.Debugf("len(wrapRequests.List): %d, pageIndex: %d", len(wrapRequests.List), pageIndex)
@@ -1361,8 +1398,7 @@ func (node *Node) runReSignScan() bool {
 			}
 			snapshot = append(snapshot, wrap)
 		}
-		if len(wrapRequests.List) < int(pageSize) ||
-			(wrapRequests.Count > 0 && int(pageIndex+1)*int(pageSize) >= wrapRequests.Count) {
+		if int(pageIndex+1)*int(pageSize) >= wrapRequests.Count {
 			break
 		}
 		pageIndex++
@@ -1559,9 +1595,34 @@ func (node *Node) requireLiveTransfers() error {
 	return nil
 }
 
+// revalidateLegacyResignWrap checks a pre-upgrade resign marker (written by
+// SetResignStatus before PublishResignWraps existed) by ID against the trusted
+// Zenon RPC: clears obsolete missing markers, skips unfinalized wraps, and
+// upgrades finalized wraps via PublishResignWraps.
+func (node *Node) revalidateLegacyResignWrap(id types.Hash) (*definition.WrapTokenRequest, bool, error) {
+	ctx, cancel := context.WithTimeout(node.workers.context(), resignRPCTimeout)
+	wrap, err := node.networksManager.Znn().GetWrapTokenRequestByIdContext(ctx, id)
+	cancel()
+	if rpc.WrapNotFound(err) {
+		if clearErr := node.networksManager.SetResignStatus(id, false); clearErr != nil {
+			return nil, false, clearErr
+		}
+		return nil, false, nil
+	}
+	if err != nil || wrap == nil || wrap.WrapTokenRequest == nil || wrap.Id != id || wrap.ConfirmationsToFinality != 0 {
+		return nil, false, nil
+	}
+	if err := node.networksManager.PublishResignWraps([]*definition.WrapTokenRequest{wrap.WrapTokenRequest}); err != nil {
+		return nil, false, err
+	}
+	return wrap.WrapTokenRequest, true, nil
+}
+
 // buildWrapSigningBatch collects and deduplicates wrap candidates for signing.
 // Local resignable rows take precedence over unsigned RPC rows for the same
-// wrap ID, and settled wraps (RedeemStatus != UnredeemedStatus) are excluded.
+// wrap ID, pre-upgrade legacy markers are revalidated by ID against Zenon
+// before signing, and settled wraps (RedeemStatus != UnredeemedStatus) are
+// excluded.
 func (node *Node) buildWrapSigningBatch() ([]*definition.WrapTokenRequest, [][]byte, map[string]int, error) {
 	unsignedWraps, err := node.networksManager.GetUnsignedWrapRequests()
 	if err != nil {
@@ -1577,12 +1638,32 @@ func (node *Node) buildWrapSigningBatch() ([]*definition.WrapTokenRequest, [][]b
 
 	wrapRequestsIds := make([]*definition.WrapTokenRequest, 0, len(resignableWraps)+len(unsignedWraps))
 	seen := make(map[types.Hash]struct{}, len(resignableWraps)+len(unsignedWraps))
+	blockedLegacy := make(map[types.Hash]struct{})
 	for _, req := range resignableWraps {
 		if req == nil {
 			continue
 		}
 		if _, dup := seen[req.Id]; dup {
 			continue
+		}
+		published, err := node.networksManager.IsPublishedResignWrap(req.Id)
+		if err != nil {
+			node.logger.Error(err)
+			common.RequestStop(node.stopChan)
+			return nil, nil, nil, err
+		}
+		if !published {
+			refreshed, ok, err := node.revalidateLegacyResignWrap(req.Id)
+			if err != nil {
+				node.logger.Error(err)
+				common.RequestStop(node.stopChan)
+				return nil, nil, nil, err
+			}
+			if !ok {
+				blockedLegacy[req.Id] = struct{}{}
+				continue
+			}
+			req = refreshed
 		}
 		seen[req.Id] = struct{}{}
 		wrapRequestsIds = append(wrapRequestsIds, req)
@@ -1592,6 +1673,9 @@ func (node *Node) buildWrapSigningBatch() ([]*definition.WrapTokenRequest, [][]b
 			continue
 		}
 		if _, dup := seen[req.Id]; dup {
+			continue
+		}
+		if _, blocked := blockedLegacy[req.Id]; blocked {
 			continue
 		}
 		seen[req.Id] = struct{}{}
@@ -1613,7 +1697,7 @@ func (node *Node) buildWrapSigningBatch() ([]*definition.WrapTokenRequest, [][]b
 			common.RequestStop(node.stopChan)
 			return nil, nil, nil, err
 		}
-		resignStatus := false
+		publishedResign := false
 		if event == nil {
 			// if the rpc returns it but we don't have it locally there was a problem
 			// if we don't have it we just add it now
@@ -1635,7 +1719,7 @@ func (node *Node) buildWrapSigningBatch() ([]*definition.WrapTokenRequest, [][]b
 			if event.RedeemStatus != common.UnredeemedStatus {
 				continue
 			}
-			resignStatus, err = node.networksManager.GetResignStatus(event.Id)
+			resignStatus, err := node.networksManager.GetResignStatus(event.Id)
 			if err != nil {
 				node.logger.Error(err)
 				common.RequestStop(node.stopChan)
@@ -1644,13 +1728,24 @@ func (node *Node) buildWrapSigningBatch() ([]*definition.WrapTokenRequest, [][]b
 			if !resignStatus && len(event.Signature) > 0 {
 				continue
 			}
+			if resignStatus {
+				publishedResign, err = node.networksManager.IsPublishedResignWrap(event.Id)
+				if err != nil {
+					node.logger.Error(err)
+					common.RequestStop(node.stopChan)
+					return nil, nil, nil, err
+				}
+				if !publishedResign {
+					continue
+				}
+			}
 		}
 		if event.RedeemStatus != common.UnredeemedStatus {
 			continue
 		}
 
 		var signingEvent events.WrapRequestZnn
-		if resignStatus {
+		if publishedResign {
 			signingEvent = *event
 			wrapRequestsIds[idx] = common.OrchestratorWrapToZnnWrap(event)
 		} else {
@@ -2044,6 +2139,13 @@ func (node *Node) sendSignaturesWrap(seenEventsCount map[string]uint32) {
 
 	producerPubKey := base64.StdEncoding.EncodeToString(node.producerKeyPair.Public)
 	for _, req := range requests {
+		if req.RedeemStatus != common.UnredeemedStatus {
+			if _, errSet := node.networksManager.MarkWrapRequestSignatureSent(req.Id, req.Signature); errSet != nil {
+				node.logger.Debug(errSet)
+			}
+			delete(seenEventsCount, req.Id.String())
+			continue
+		}
 		//node.logger.Debugf("Local wrap: Id: %s, Signature: %s, SentSignature: %v",
 		//	req.Id.String(), req.Signature, req.SentSignature)
 		rpcRequest, err := node.networksManager.GetWrapRequestByIdRPC(req.Id)

@@ -864,6 +864,10 @@ func (m *NetworksManager) GetResignStatus(id types.Hash) (bool, error) {
 	return m.znnNetwork.GetResignStatus(id)
 }
 
+func (m *NetworksManager) IsPublishedResignWrap(id types.Hash) (bool, error) {
+	return m.znnNetwork.IsPublishedResignWrap(id)
+}
+
 func (m *NetworksManager) GetWrapEventById(id types.Hash) (*events.WrapRequestZnn, error) {
 	return m.znnNetwork.GetWrapEventById(id)
 }

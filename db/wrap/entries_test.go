@@ -194,4 +194,40 @@ func TestPublishResignWrapsReplacesStalePayloadAndResetsStaleSignature(t *testin
 	if err != nil || !resign {
 		t.Fatalf("expected resign flag true, got %v err=%v", resign, err)
 	}
+	published, err := store.IsPublishedResignWrap(canonical.Id)
+	if err != nil || !published {
+		t.Fatalf("expected published resign flag true after PublishResignWraps, got %v err=%v", published, err)
+	}
+}
+
+func TestSaveSignedWrapRequestSkipsSettledWrap(t *testing.T) {
+	store := NewZnnStorage(zdb.NewMemDB(), nil)
+	settledDuringTSS := sampleWrap(1)
+	if err := store.AddWrapRequest(settledDuringTSS); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetResignStatus(settledDuringTSS.Id, true); err != nil {
+		t.Fatal(err)
+	}
+
+	// EVM settlement arrives before SaveSignedWrapRequest.
+	if err := store.ApplyRedeemLog(settledDuringTSS.ChainId, settledDuringTSS.Id, 100, 0, common.RedeemedStatus); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveSignedWrapRequest(settledDuringTSS.Id, "late-sig"); err != nil {
+		t.Fatal(err)
+	}
+	if resign, err := store.GetResignStatus(settledDuringTSS.Id); err != nil || resign {
+		t.Fatalf("expected resign flag cleared for settled wrap, resign=%v err=%v", resign, err)
+	}
+	if got, err := store.GetWrapRequestById(settledDuringTSS.Id); err != nil || got == nil || got.Signature != "" {
+		t.Fatalf("expected late signature not to be queued for settled wrap, got=%+v err=%v", got, err)
+	}
+	unsent, err := store.GetUnsentSignedWrapRequests()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(unsent) != 0 {
+		t.Fatalf("expected settled wrap not to enter unsent queue, got %+v", unsent)
+	}
 }

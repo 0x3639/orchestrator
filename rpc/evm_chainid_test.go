@@ -9,10 +9,14 @@ import (
 	"net/http/httptest"
 	"os"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	ecommon "github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/ethclient"
+	"github.com/gorilla/websocket"
 
 	"orchestrator/common/config"
 )
@@ -243,5 +247,178 @@ func TestEvmDialAndChainIDErrorsRedactCredentials(t *testing.T) {
 	}
 	if strings.Contains(malformedErr.Error(), "malformed-key-segment-888") || strings.Contains(malformedErr.Error(), "NOTHTTP") {
 		t.Fatalf("malformed WebSocket error leaked provider text or path segment: %v", malformedErr)
+	}
+}
+
+func TestWebSocketReconnectReverifiesChainID(t *testing.T) {
+	var servedChain atomic.Uint64
+	servedChain.Store(73405)
+	var blockCalls atomic.Int32
+	var (
+		connMu    sync.Mutex
+		activeCon *websocket.Conn
+	)
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		connMu.Lock()
+		activeCon = conn
+		connMu.Unlock()
+		defer conn.Close()
+		for {
+			var req struct {
+				ID     json.RawMessage `json:"id"`
+				Method string          `json:"method"`
+			}
+			if err := conn.ReadJSON(&req); err != nil {
+				return
+			}
+			var res string
+			switch req.Method {
+			case "eth_chainId":
+				res = fmt.Sprintf("0x%x", servedChain.Load())
+			case "eth_blockNumber":
+				blockCalls.Add(1)
+				res = "0x10"
+			default:
+				res = "0x0"
+			}
+			if err := conn.WriteJSON(map[string]any{
+				"jsonrpc": "2.0",
+				"id":      req.ID,
+				"result":  res,
+			}); err != nil {
+				return
+			}
+		}
+	}))
+	defer srv.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+	client, err := NewEvmRpcClientForChain(config.BaseNetworkConfig{
+		Urls: []string{wsURL},
+	}, 73405, "Supernova", ecommon.HexToAddress("0x0000000000000000000000000000000000000001"))
+	if err != nil {
+		t.Fatalf("initial WebSocket dial failed: %v", err)
+	}
+	defer client.Stop()
+
+	if num, err := client.BlockNumber(); err != nil || num != 0x10 {
+		t.Fatalf("initial BlockNumber failed: num=%d err=%v", num, err)
+	}
+
+	// Simulate outage + provider switching to the wrong chain before reconnect.
+	servedChain.Store(1)
+	connMu.Lock()
+	if activeCon != nil {
+		_ = activeCon.Close()
+	}
+	connMu.Unlock()
+	// Give the client read loop a moment to observe the server close, then call
+	// BlockNumber until reconnect is triggered.
+	var reconnErr error
+	for i := 0; i < 5; i++ {
+		_, reconnErr = client.BlockNumber()
+		if reconnErr != nil && strings.Contains(reconnErr.Error(), "eth_chainId mismatch") {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if reconnErr == nil || !strings.Contains(reconnErr.Error(), "eth_chainId mismatch") {
+		t.Fatalf("expected eth_chainId mismatch on wrong-chain WebSocket reconnect, got: %v", reconnErr)
+	}
+	if calls := blockCalls.Load(); calls != 1 {
+		t.Fatalf("expected eth_blockNumber never to run on unverified wrong-chain reconnect, got %d calls", calls)
+	}
+
+	// Restore correct chain: next call reconnects, verifies eth_chainId, and succeeds.
+	servedChain.Store(73405)
+	if num, err := client.BlockNumber(); err != nil || num != 0x10 {
+		t.Fatalf("expected BlockNumber to recover once endpoint serves expected chain again, num=%d err=%v", num, err)
+	}
+}
+
+func TestSecondaryEndpointChargesSeparatePermitsForChainIDAndRead(t *testing.T) {
+	primarySrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			ID     json.RawMessage `json:"id"`
+			Method string          `json:"method"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		w.Header().Set("Content-Type", "application/json")
+		if req.Method == "eth_chainId" {
+			_ = json.NewEncoder(w).Encode(map[string]any{"jsonrpc": "2.0", "id": req.ID, "result": "0x1"})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"jsonrpc": "2.0",
+			"id":      req.ID,
+			"result": map[string]any{
+				"hash":   ecommon.HexToHash("0x1234").Hex(),
+				"number": "0x5",
+			},
+		})
+	}))
+	defer primarySrv.Close()
+
+	var (
+		mu         sync.Mutex
+		chainTime  time.Time
+		blockTime  time.Time
+	)
+	secondarySrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			ID     json.RawMessage `json:"id"`
+			Method string          `json:"method"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		w.Header().Set("Content-Type", "application/json")
+		mu.Lock()
+		if req.Method == "eth_chainId" {
+			chainTime = time.Now()
+		} else if req.Method == "eth_getBlockByNumber" {
+			blockTime = time.Now()
+		}
+		mu.Unlock()
+		if req.Method == "eth_chainId" {
+			_ = json.NewEncoder(w).Encode(map[string]any{"jsonrpc": "2.0", "id": req.ID, "result": "0x1"})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"jsonrpc": "2.0",
+			"id":      req.ID,
+			"result": map[string]any{
+				"hash":   ecommon.HexToHash("0x1234").Hex(),
+				"number": "0x5",
+			},
+		})
+	}))
+	defer secondarySrv.Close()
+
+	client, err := NewEvmRpcClientForChain(config.BaseNetworkConfig{
+		Urls:                 []string{primarySrv.URL, secondarySrv.URL},
+		RpcRequestsPerSecond: 4, // 250ms per permit
+		RpcBurst:             1,
+	}, 1, "Ethereum", ecommon.HexToAddress("0x0000000000000000000000000000000000000001"))
+	if err != nil {
+		t.Fatalf("NewEvmRpcClientForChain failed: %v", err)
+	}
+	defer client.Stop()
+
+	hash, err := client.CanonicalHash(5)
+	if err != nil {
+		t.Fatalf("CanonicalHash failed: %v", err)
+	}
+	if hash != ecommon.HexToHash("0x1234") {
+		t.Fatalf("unexpected canonical hash %s", hash.Hex())
+	}
+	mu.Lock()
+	gap := blockTime.Sub(chainTime)
+	mu.Unlock()
+	if gap < 180*time.Millisecond {
+		t.Fatalf("expected secondary eth_chainId and eth_getBlockByNumber to be rate-limited separately (>=180ms at 4 req/s burst 1), got %v", gap)
 	}
 }

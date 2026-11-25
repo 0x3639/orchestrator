@@ -2337,6 +2337,10 @@ func (rC *znnNetwork) GetResignStatus(id types.Hash) (bool, error) {
 	return rC.eventsStore().GetResignStatus(id)
 }
 
+func (rC *znnNetwork) IsPublishedResignWrap(id types.Hash) (bool, error) {
+	return rC.eventsStore().IsPublishedResignWrap(id)
+}
+
 func (rC *znnNetwork) GetWrapEventById(id types.Hash) (*events.WrapRequestZnn, error) {
 	return rC.eventsStore().GetWrapRequestById(id)
 }

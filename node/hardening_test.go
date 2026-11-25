@@ -1341,6 +1341,143 @@ func TestBuildWrapSigningBatchDeduplicatesAndExcludesSettledWraps(t *testing.T) 
 	}
 }
 
+func TestReSignStateRetriesShortPageBeforeCompleting(t *testing.T) {
+	prevDelay := resignRetryDelay
+	prevPageSize := resignPageSize
+	resignRetryDelay = 10 * time.Millisecond
+	resignPageSize = 2
+	t.Cleanup(func() {
+		resignRetryDelay = prevDelay
+		resignPageSize = prevPageSize
+	})
+
+	evmSrv := fakeEvmRpcServer(t)
+	defer evmSrv.Close()
+
+	w1 := &embedded.WrapTokenRequest{
+		WrapTokenRequest: &definition.WrapTokenRequest{
+			NetworkClass: definition.EvmClass, ChainId: 1, Id: types.Hash{0xf1},
+			ToAddress: "0x000000000000000000000000000000000000beef", Amount: big.NewInt(10), Fee: big.NewInt(1), CreationMomentumHeight: 10,
+		},
+		ConfirmationsToFinality: 0,
+	}
+	w2 := &embedded.WrapTokenRequest{
+		WrapTokenRequest: &definition.WrapTokenRequest{
+			NetworkClass: definition.EvmClass, ChainId: 1, Id: types.Hash{0xf2},
+			ToAddress: "0x000000000000000000000000000000000000beef", Amount: big.NewInt(20), Fee: big.NewInt(2), CreationMomentumHeight: 11,
+		},
+		ConfirmationsToFinality: 0,
+	}
+	w3 := &embedded.WrapTokenRequest{
+		WrapTokenRequest: &definition.WrapTokenRequest{
+			NetworkClass: definition.EvmClass, ChainId: 1, Id: types.Hash{0xf3},
+			ToAddress: "0x000000000000000000000000000000000000beef", Amount: big.NewInt(30), Fee: big.NewInt(3), CreationMomentumHeight: 12,
+		},
+		ConfirmationsToFinality: 0,
+	}
+
+	var page0Calls atomic.Int32
+	bridge := &wrapTestBridge{
+		networks: &embedded.NetworkInfoList{
+			Count: 1,
+			List: []*definition.NetworkInfo{{
+				NetworkClass: definition.EvmClass, Id: 1, Name: "Ethereum",
+				ContractAddress: "0x0000000000000000000000000000000000000001",
+			}},
+		},
+		pageHandler: func(pageIndex, _ uint32, _ int32) *embedded.WrapTokenRequestList {
+			if pageIndex == 0 {
+				if page0Calls.Add(1) == 1 {
+					// Short page: Count=3, pageSize=2, only 1 item returned.
+					return &embedded.WrapTokenRequestList{Count: 3, List: []*embedded.WrapTokenRequest{w1}}
+				}
+				return &embedded.WrapTokenRequestList{Count: 3, List: []*embedded.WrapTokenRequest{w1, w2}}
+			}
+			if pageIndex == 1 {
+				return &embedded.WrapTokenRequestList{Count: 3, List: []*embedded.WrapTokenRequest{w3}}
+			}
+			return &embedded.WrapTokenRequestList{Count: 3, List: []*embedded.WrapTokenRequest{}}
+		},
+	}
+
+	n := wrapTestNodeWithEvm(t, common.LiveState, bridge, map[string]string{"Ethereum": evmSrv.URL})
+	if _, err := n.state.ActivateResign(definition.EvmClass, 1); err != nil {
+		t.Fatal(err)
+	}
+	if !n.runReSignScan() {
+		t.Fatal("runReSignScan returned false")
+	}
+	for _, id := range []types.Hash{w1.Id, w2.Id, w3.Id} {
+		resign, err := n.dbManager.ZnnStorage().GetResignStatus(id)
+		if err != nil || !resign {
+			t.Fatalf("expected wrap %s marked for resign after short-page retry, resign=%v err=%v", id, resign, err)
+		}
+	}
+}
+
+func TestBuildWrapSigningBatchRevalidatesLegacyResignMarkersByID(t *testing.T) {
+	evmSrv := fakeEvmRpcServer(t)
+	defer evmSrv.Close()
+
+	missingID := types.Hash{0xe5}
+	unfinalizedID := types.Hash{0xe6}
+	finalizedID := types.Hash{0xe7}
+
+	makeWrap := func(id types.Hash, conf uint64, amt int64) *embedded.WrapTokenRequest {
+		return &embedded.WrapTokenRequest{
+			WrapTokenRequest: &definition.WrapTokenRequest{
+				NetworkClass: definition.EvmClass, ChainId: 1, Id: id,
+				ToAddress: "0x000000000000000000000000000000000000beef",
+				TokenAddress: "0x0000000000000000000000000000000000001111",
+				Amount: big.NewInt(amt), Fee: big.NewInt(1), CreationMomentumHeight: 50,
+			},
+			ConfirmationsToFinality: conf,
+		}
+	}
+
+	bridge := &wrapTestBridge{
+		networks: &embedded.NetworkInfoList{
+			Count: 1,
+			List: []*definition.NetworkInfo{{
+				NetworkClass: definition.EvmClass, Id: 1, Name: "Ethereum",
+				ContractAddress: "0x0000000000000000000000000000000000000001",
+			}},
+		},
+		byID: map[types.Hash]*embedded.WrapTokenRequest{
+			unfinalizedID: makeWrap(unfinalizedID, 3, 200),
+			finalizedID:   makeWrap(finalizedID, 0, 300),
+		},
+	}
+
+	n := wrapTestNodeWithEvm(t, common.LiveState, bridge, map[string]string{"Ethereum": evmSrv.URL})
+	for _, w := range []*embedded.WrapTokenRequest{
+		makeWrap(missingID, 0, 100),
+		makeWrap(unfinalizedID, 0, 200),
+		makeWrap(finalizedID, 0, 111), // stale local amount; Zenon has 300
+	} {
+		if err := n.dbManager.ZnnStorage().AddWrapRequest(common.ZnnWrapToOrchestratorWrap(w.WrapTokenRequest)); err != nil {
+			t.Fatal(err)
+		}
+		if err := n.dbManager.ZnnStorage().SetResignStatus(w.Id, true); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	reqs, msgs, _, err := n.buildWrapSigningBatch()
+	if err != nil {
+		t.Fatalf("buildWrapSigningBatch failed: %v", err)
+	}
+	if len(reqs) != 1 || len(msgs) != 1 || reqs[0].Id != finalizedID || reqs[0].Amount.Cmp(big.NewInt(300)) != 0 {
+		t.Fatalf("expected only finalizedID with refreshed amount 300, got reqs=%+v msgs=%d", reqs, len(msgs))
+	}
+	if resign, err := n.dbManager.ZnnStorage().GetResignStatus(missingID); err != nil || resign {
+		t.Fatalf("expected obsolete missingID legacy marker to be cleared, resign=%v err=%v", resign, err)
+	}
+	if pub, err := n.dbManager.ZnnStorage().IsPublishedResignWrap(finalizedID); err != nil || !pub {
+		t.Fatalf("expected finalizedID to be upgraded to published marker, pub=%v err=%v", pub, err)
+	}
+}
+
 func TestReSignStateBoundsAndCancelsStalledDeferredWrapRPC(t *testing.T) {
 	prevDelay := resignRetryDelay
 	prevTimeout := resignRPCTimeout
