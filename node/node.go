@@ -1383,6 +1383,8 @@ type reSignChainAnchor struct {
 	cutoffHash     types.Hash
 	finalityMom    uint64
 	finalityHash   types.Hash
+	observedMom    uint64
+	observedHash   types.Hash
 	bridgeBlock    *api.AccountBlock
 }
 
@@ -1535,6 +1537,8 @@ func (node *Node) checkZenonAnchorConsistent(anchor reSignChainAnchor, advanceFi
 	}
 
 	next = anchor
+	next.observedMom = curMom.Height
+	next.observedHash = curMom.Hash
 	next.bridgeBlock = curAcct
 	if advanceFinality {
 		next.finalityMom = curMom.Height
@@ -1638,11 +1642,110 @@ func (node *Node) readAnchoredWrapConfirmations(anchor reSignChainAnchor, advanc
 		if !ok {
 			return 0, reSignChainAnchor{}, false, false, false
 		}
-		if !sameAccountBlockFrontier(preAnchor.bridgeBlock, postAnchor.bridgeBlock) {
+		if !sameAccountBlockFrontier(preAnchor.bridgeBlock, postAnchor.bridgeBlock) ||
+			preAnchor.observedMom != postAnchor.observedMom ||
+			preAnchor.observedHash != postAnchor.observedHash {
 			cur = postAnchor
 			continue
 		}
 		return info.ConfirmationsToFinality, postAnchor, true, false, false
+	}
+}
+
+// verifyWrapConfirmedInLedger verifies directly against Zenon's momentum-confirmed
+// ledger store (GetAccountBlockByHash reads exclusively from momentumStore, never
+// from the unconfirmed account pool) that wrapID has a confirmed send block and a
+// confirmed paired bridge receive block anchored in the canonical momentum chain
+// and canonical bridge account chain at or below anchor.
+func (node *Node) verifyWrapConfirmedInLedger(wrapID types.Hash, anchor reSignChainAnchor, resignGen uint64) (confirmed, stale, stop bool) {
+	for {
+		if node.workerStopping() {
+			return false, false, true
+		}
+		if !node.state.IsResignGenerationCurrent(resignGen) {
+			return false, true, false
+		}
+		ctx, cancel := context.WithTimeout(node.workers.context(), resignRPCTimeout)
+		send, err := node.networksManager.Znn().GetAccountBlockByHashContext(ctx, wrapID)
+		cancel()
+		if node.workerStopping() {
+			return false, false, true
+		}
+		if err != nil {
+			node.logger.Debugf("failed to verify wrap %s in confirmed ledger store: %v", wrapID, err)
+			if !node.workerSleep(resignRetryDelay) {
+				return false, false, true
+			}
+			continue
+		}
+		if send == nil || send.Hash != wrapID || !isConfirmedBridgeBlock(send) {
+			return false, false, false
+		}
+		recv := send.PairedAccountBlock
+		if recv == nil || recv.Address != types.BridgeContract || recv.FromBlockHash != wrapID || !isConfirmedBridgeBlock(recv) {
+			return false, false, false
+		}
+
+		// Verify the confirming momentum of the bridge receive block is canonical
+		// and within the verified anchor momentum chain.
+		maxMom := anchor.observedMom
+		if anchor.finalityMom > maxMom {
+			maxMom = anchor.finalityMom
+		}
+		recvMom := recv.ConfirmationDetail.MomentumHeight
+		recvMomHash := recv.ConfirmationDetail.MomentumHash
+		if maxMom > 0 && recvMom > maxMom {
+			return false, false, false
+		}
+		momCtx, momCancel := context.WithTimeout(node.workers.context(), resignRPCTimeout)
+		momList, err := node.networksManager.Znn().GetMomentumsByHeightContext(momCtx, recvMom, 1)
+		momCancel()
+		if node.workerStopping() {
+			return false, false, true
+		}
+		if err != nil {
+			node.logger.Debugf("failed to verify receive momentum %d for wrap %s: %v", recvMom, wrapID, err)
+			if !node.workerSleep(resignRetryDelay) {
+				return false, false, true
+			}
+			continue
+		}
+		if momList == nil || len(momList.List) == 0 || momList.List[0] == nil || momList.List[0].Momentum == nil ||
+			momList.List[0].Height != recvMom || momList.List[0].Hash != recvMomHash {
+			return false, false, false
+		}
+
+		// Verify the bridge receive block itself is on the canonical bridge
+		// account chain at or below anchor.bridgeBlock.
+		if anchor.bridgeBlock != nil && anchor.bridgeBlock.Height > 0 {
+			if recv.Height == 0 || recv.Height > anchor.bridgeBlock.Height {
+				return false, false, false
+			}
+			if recv.Height == anchor.bridgeBlock.Height {
+				if !sameAccountBlockFrontier(anchor.bridgeBlock, recv) {
+					return false, false, false
+				}
+			} else {
+				ancCtx, ancCancel := context.WithTimeout(node.workers.context(), resignRPCTimeout)
+				blocks, err := node.networksManager.Znn().GetAccountBlocksByHeightContext(ancCtx, types.BridgeContract, recv.Height, 1)
+				ancCancel()
+				if node.workerStopping() {
+					return false, false, true
+				}
+				if err != nil {
+					node.logger.Debugf("failed to verify bridge receive block %d for wrap %s: %v", recv.Height, wrapID, err)
+					if !node.workerSleep(resignRetryDelay) {
+						return false, false, true
+					}
+					continue
+				}
+				if blocks == nil || len(blocks.List) == 0 || blocks.List[0] == nil ||
+					!isConfirmedBridgeBlock(blocks.List[0]) || !sameAccountBlockFrontier(recv, blocks.List[0]) {
+					return false, false, false
+				}
+			}
+		}
+		return true, false, false
 	}
 }
 
@@ -1788,6 +1891,13 @@ func (node *Node) verifyStraddledWraps(wraps []*embedded.WrapTokenRequest, strad
 				// (pre == post) that remains an ancestor of the terminating boundary.
 				cur.bridgeBlock = postAnchor.bridgeBlock
 				continue
+			}
+			ledgerConfirmed, staleLedger, stopLedger := node.verifyWrapConfirmedInLedger(w.Id, postAnchor, resignGen)
+			if staleLedger || stopLedger {
+				return reSignChainAnchor{}, false, staleLedger, stopLedger
+			}
+			if !ledgerConfirmed {
+				return reSignChainAnchor{}, false, false, false
 			}
 			if got.ConfirmationsToFinality == 0 {
 				cur = postAnchor
@@ -2386,8 +2496,9 @@ func (node *Node) runReSignScan() bool {
 			continue
 		}
 
-		// Revalidate the snapshot, finality anchor, and confirmation threshold
-		// bound to a single verified bridge snapshot (pre == post) before
+		// Revalidate the snapshot, finality anchor, confirmation threshold
+		// (bound to a single verified momentum + confirmed bridge snapshot),
+		// and momentum-confirmed ledger membership of every staged wrap before
 		// publishing any staged flags.
 		reqConf, finalAnchor, consistent, staleConf, stopConf := node.readAnchoredWrapConfirmations(anchor, false, resignGen)
 		if stopConf {
@@ -2403,6 +2514,45 @@ func (node *Node) runReSignScan() bool {
 				if !wrapDefFinalizedAtMomentum(w, finalAnchor.finalityMom, reqConf) {
 					node.logger.Debugf("staged wrap %s is no longer finalized at verified momentum %d (required %d); discarding staged batch and restarting", w.Id, finalAnchor.finalityMom, reqConf)
 					rolledBack = true
+					break
+				}
+				ledgerConfirmed, staleLedger, stopLedger := node.verifyWrapConfirmedInLedger(w.Id, finalAnchor, resignGen)
+				if stopLedger {
+					return false
+				}
+				if staleLedger {
+					staleResign = true
+					break
+				}
+				if !ledgerConfirmed {
+					node.logger.Debugf("staged wrap %s is not confirmed in Zenon canonical ledger store; discarding staged batch and restarting", w.Id)
+					rolledBack = true
+					break
+				}
+			}
+			if !staleResign && !rolledBack && len(stagedEligible) > 0 {
+				for {
+					if node.workerStopping() {
+						return false
+					}
+					if !node.state.IsResignGenerationCurrent(resignGen) {
+						staleResign = true
+						break
+					}
+					_, postConsistent, retryCheck, stopCheck := node.checkZenonAnchorConsistent(finalAnchor, false)
+					if stopCheck {
+						return false
+					}
+					if retryCheck {
+						if !node.workerSleep(resignRetryDelay) {
+							return false
+						}
+						continue
+					}
+					if !postConsistent {
+						node.logger.Debug("Zenon frontier rolled back during pre-publish confirmed-ledger verification; discarding staged batch and restarting")
+						rolledBack = true
+					}
 					break
 				}
 			}

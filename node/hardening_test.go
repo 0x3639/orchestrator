@@ -459,6 +459,7 @@ type wrapTestBridge struct {
 	frontierMomCalls atomic.Int32
 	frontierMomFn    func(ctx context.Context, call int32) (*api.Momentum, error)
 	momByHeightFn    func(ctx context.Context, height uint64) (*api.MomentumList, error)
+	blockByHashFn    func(ctx context.Context, hash types.Hash) (*api.AccountBlock, error)
 	orchInfo         *definition.OrchestratorInfo
 	orchInfoCalls    atomic.Int32
 	orchInfoFn       func(call int32) *definition.OrchestratorInfo
@@ -475,9 +476,10 @@ func testAccountBlock(height uint64, hash types.Hash) *api.AccountBlock {
 func testAccountBlockAtMom(height uint64, hash types.Hash, momHeight uint64, momHash types.Hash) *api.AccountBlock {
 	return &api.AccountBlock{
 		AccountBlock: nom.AccountBlock{
-			Height: height,
-			Hash:   hash,
-			Amount: big.NewInt(0),
+			Address: types.BridgeContract,
+			Height:  height,
+			Hash:    hash,
+			Amount:  big.NewInt(0),
 		},
 		ConfirmationDetail: &api.AccountBlockConfirmationDetail{
 			NumConfirmations: 1,
@@ -490,9 +492,10 @@ func testAccountBlockAtMom(height uint64, hash types.Hash, momHeight uint64, mom
 func testUnconfirmedAccountBlock(height uint64, hash types.Hash) *api.AccountBlock {
 	return &api.AccountBlock{
 		AccountBlock: nom.AccountBlock{
-			Height: height,
-			Hash:   hash,
-			Amount: big.NewInt(0),
+			Address: types.BridgeContract,
+			Height:  height,
+			Hash:    hash,
+			Amount:  big.NewInt(0),
 		},
 	}
 }
@@ -527,6 +530,43 @@ func (l *wrapTestLedger) GetAccountBlocksByHeight(ctx context.Context, _ types.A
 	return &api.AccountBlockList{
 		Count: int(height),
 		List:  []*api.AccountBlock{testAccountBlock(height, types.Hash{0xaa, byte(height >> 8), byte(height)})},
+	}, nil
+}
+
+func (l *wrapTestLedger) GetAccountBlockByHash(ctx context.Context, hash types.Hash) (*api.AccountBlock, error) {
+	l.bridge.mu.Lock()
+	fn := l.bridge.blockByHashFn
+	l.bridge.mu.Unlock()
+	if fn != nil {
+		return fn(ctx, hash)
+	}
+	// Default: derive a confirmed send + paired bridge receive block consistent
+	// with the fixture's height-1 bridge block and momentum-1 hash.
+	acctList, err := l.GetAccountBlocksByHeight(ctx, types.BridgeContract, 1, 1)
+	if err != nil || acctList == nil || len(acctList.List) == 0 || acctList.List[0] == nil {
+		return nil, err
+	}
+	recv := *acctList.List[0]
+	recv.Address = types.BridgeContract
+	recv.FromBlockHash = hash
+	momHeight := uint64(1)
+	momHash := testMomentum(1).Hash
+	if recv.ConfirmationDetail != nil {
+		momHeight = recv.ConfirmationDetail.MomentumHeight
+		momHash = recv.ConfirmationDetail.MomentumHash
+	}
+	return &api.AccountBlock{
+		AccountBlock: nom.AccountBlock{
+			Hash:   hash,
+			Height: 1,
+			Amount: big.NewInt(0),
+		},
+		ConfirmationDetail: &api.AccountBlockConfirmationDetail{
+			NumConfirmations: 1,
+			MomentumHeight:   momHeight,
+			MomentumHash:     momHash,
+		},
+		PairedAccountBlock: &recv,
 	}, nil
 }
 
@@ -3589,18 +3629,22 @@ func TestReSignStateRequiresMomentumConfirmationForBridgeSnapshot(t *testing.T) 
 		evmSrv := fakeEvmRpcServer(t)
 		defer evmSrv.Close()
 
-		// Exact regression for Round 14 Finding 1 (threshold lowering):
-		// - Confirmed bridge block B10 has ConfirmationsToFinality = 20; wrap W
-		//   (CreationMomentumHeight = 99) is deferred at momentum 105 (6 < 20).
-		// - A pending UNCONFIRMED bridge block B11 (ConfirmationDetail == nil)
-		//   enters Zenon's account pool lowering ConfirmationsToFinality to 1,
-		//   so both GetOrchestratorInfo and GetWrapTokenRequestById reflect the
-		//   lowered threshold while GetFrontierAccountBlock returns unconfirmed B11.
-		// - The worker must refuse to accept unconfirmed B11, keep W unmarked in
-		//   ReSignState, and only accept the threshold once B11 is confirmed in
-		//   the verified canonical momentum chain.
+		// Exact regression for Round 14/15:
+		// - Pagination and initial staging complete cleanly on confirmed B10
+		//   (threshold = 20), deferring wrap W (CreationMomentumHeight = 99) at
+		//   momentum 105 (6 < 20).
+		// - Inside deferred by-ID polling, W reports ConfirmationsToFinality = 0,
+		//   and inside readAnchoredWrapConfirmations's GetOrchestratorInfo call,
+		//   an UNCONFIRMED pool block B11 (ConfirmationDetail == nil) enters the
+		//   pool lowering ConfirmationsToFinality to 1!
+		// - readAnchoredWrapConfirmations itself must execute GetOrchestratorInfo
+		//   against the unconfirmed pool block, reject unconfirmed B11 on its
+		//   post-check, keep W unmarked in ReSignState, and only accept the
+		//   lowered threshold once B11 is confirmed in canonical momentum 105.
 		wrapID := types.Hash{0x64}
 		var stage atomic.Int32 // 0 = confirmed B10 (thresh 20), 1 = unconfirmed B11 in pool (thresh 1), 2 = confirmed B11 (thresh 1)
+		var deferredPolls atomic.Int32
+		var unconfirmedOrchReads atomic.Int32
 		var unconfirmedFrontierReads atomic.Int32
 
 		makeWrap := func(confs uint64) *embedded.WrapTokenRequest {
@@ -3621,7 +3665,17 @@ func TestReSignStateRequiresMomentumConfirmationForBridgeSnapshot(t *testing.T) 
 					ContractAddress: "0x0000000000000000000000000000000000000001",
 				}},
 			},
-			orchInfoFn: func(_ int32) *definition.OrchestratorInfo {
+			orchInfoFn: func(call int32) *definition.OrchestratorInfo {
+				// Call 1: networks.Init
+				// Call 2: initial staging read in runReSignScan (confirmed B10, thresh 20)
+				// Call 3+: deferred finality readAnchoredWrapConfirmations!
+				if call >= 3 && stage.CompareAndSwap(0, 1) {
+					unconfirmedOrchReads.Add(1)
+					return &definition.OrchestratorInfo{WindowSize: 10, KeyGenThreshold: 1, ConfirmationsToFinality: 1, EstimatedMomentumTime: 1}
+				}
+				if stage.Load() == 1 {
+					unconfirmedOrchReads.Add(1)
+				}
 				confs := uint32(20)
 				if stage.Load() >= 1 {
 					confs = 1
@@ -3643,19 +3697,16 @@ func TestReSignStateRequiresMomentumConfirmationForBridgeSnapshot(t *testing.T) 
 				}
 			},
 			pageHandler: func(pageIndex, pageSize uint32, _ int32) *embedded.WrapTokenRequestList {
-				// After initial snapshot captures W deferred on confirmed B10,
-				// inject unconfirmed pool block B11 lowering threshold to 1.
-				stage.CompareAndSwap(0, 1)
 				return paginateZenonWraps([]*embedded.WrapTokenRequest{makeWrap(14)}, pageIndex, pageSize)
 			},
 			byIDHandler: func(_ context.Context, id types.Hash, _ int32) (*embedded.WrapTokenRequest, error) {
 				if id != wrapID {
 					return nil, constants.ErrDataNonExistent
 				}
-				if stage.Load() >= 1 {
-					return makeWrap(0), nil
-				}
-				return makeWrap(14), nil
+				deferredPolls.Add(1)
+				// Report ConfirmationsToFinality = 0 so runReSignScan enters
+				// readAnchoredWrapConfirmations to validate the threshold.
+				return makeWrap(0), nil
 			},
 		}
 
@@ -3671,8 +3722,8 @@ func TestReSignStateRequiresMomentumConfirmationForBridgeSnapshot(t *testing.T) 
 			<-done
 		})
 
-		eventually(t, "worker to observe unconfirmed pool bridge block multiple times", func() bool {
-			return unconfirmedFrontierReads.Load() >= 4
+		eventually(t, "readAnchoredWrapConfirmations to read threshold under unconfirmed B11 and reject it", func() bool {
+			return deferredPolls.Load() >= 1 && unconfirmedOrchReads.Load() >= 1 && unconfirmedFrontierReads.Load() >= 4
 		})
 		if st, _ := n.state.GetState(); st != common.ReSignState {
 			t.Fatalf("state while pool block B11 is unconfirmed = %d, want ReSignState (%d)", st, common.ReSignState)
@@ -3735,14 +3786,17 @@ func TestReSignStateRequiresMomentumConfirmationForBridgeSnapshot(t *testing.T) 
 		}
 
 		// Calls 1..4 advance confirmed bridge blocks (10 -> 14) with attempt 1
-		// of page 1 serving orphanWrap on a straddled page. After the boundary
-		// settles at confirmed B14, while verifyStraddledWraps is checking
-		// orphanWrap, an UNCONFIRMED pool block B15 enters the pool and serves
-		// orphanWrap by ID. After 4 unconfirmed reads, B15 is replaced by
-		// confirmed canonical B15 without orphanWrap.
+		// of page 1 serving orphanWrap on a straddled page. Page 0 then
+		// completes cleanly on confirmed B14 (done == true), entering
+		// verifyStraddledWraps. Inside byIDHandler for orphanWrap (call 1), an
+		// UNCONFIRMED pool block B15 enters the pool and serves orphanWrap by ID.
+		// verifyStraddledWraps itself must reject unconfirmed B15 on its post-check,
+		// retry after B15 is replaced by confirmed canonical B15 (without orphanWrap),
+		// restart cleanly, and mark canonicalWrap.
 		var bridgeHeight atomic.Uint64
 		bridgeHeight.Store(10)
 		var page1Calls atomic.Int32
+		var orphanIDCalls atomic.Int32
 		var unconfirmedPoolActive atomic.Bool
 		var unconfirmedReads atomic.Int32
 
@@ -3775,17 +3829,14 @@ func TestReSignStateRequiresMomentumConfirmationForBridgeSnapshot(t *testing.T) 
 				if pageIndex == 1 && page1Calls.Add(1) == 2 {
 					return paginateZenonWraps(forkPage, pageIndex, pageSize)
 				}
-				if call == 5 {
-					// Right after the non-straddling boundary at B14, activate
-					// the unconfirmed pool block B15 while verifyStraddledWraps
-					// checks orphanWrap.
-					unconfirmedPoolActive.Store(true)
-				}
 				return paginateZenonWraps(canonicalTable, pageIndex, pageSize)
 			},
 			byIDHandler: func(_ context.Context, id types.Hash, _ int32) (*embedded.WrapTokenRequest, error) {
 				if id == orphanWrap {
-					if unconfirmedPoolActive.Load() {
+					if orphanIDCalls.Add(1) == 1 {
+						// Activate unconfirmed pool block B15 strictly inside
+						// verifyStraddledWraps's by-ID call!
+						unconfirmedPoolActive.Store(true)
 						return makeEntry(orphanWrap, 98), nil
 					}
 					return nil, constants.ErrDataNonExistent
@@ -3809,7 +3860,7 @@ func TestReSignStateRequiresMomentumConfirmationForBridgeSnapshot(t *testing.T) 
 			<-done
 		})
 
-		eventually(t, "ReSignState to reject unconfirmed pool membership and mark canonicalWrap", func() bool {
+		eventually(t, "ReSignState to reject unconfirmed pool membership inside verifyStraddledWraps and mark canonicalWrap", func() bool {
 			st, _ := n.state.GetState()
 			for _, id := range []types.Hash{w2, w1, canonicalWrap} {
 				r, err := n.dbManager.ZnnStorage().GetResignStatus(id)
@@ -3819,6 +3870,9 @@ func TestReSignStateRequiresMomentumConfirmationForBridgeSnapshot(t *testing.T) 
 			}
 			return st == common.LiveState
 		})
+		if orphanIDCalls.Load() < 2 {
+			t.Fatalf("expected verifyStraddledWraps to call by-ID for orphanWrap and retry after unconfirmed pool block, calls=%d", orphanIDCalls.Load())
+		}
 		if unconfirmedReads.Load() < 4 {
 			t.Fatalf("expected unconfirmed pool block to be rejected before confirmation, reads=%d", unconfirmedReads.Load())
 		}
@@ -3827,6 +3881,94 @@ func TestReSignStateRequiresMomentumConfirmationForBridgeSnapshot(t *testing.T) 
 		}
 		if ev, err := n.dbManager.ZnnStorage().GetWrapRequestById(orphanWrap); err != nil || ev != nil {
 			t.Fatalf("orphanWrap from unconfirmed pool block must not be stored: ev=%+v err=%v", ev, err)
+		}
+	})
+
+	t.Run("rejects discarded transient pool wrap during pre-publish confirmed-ledger verification", func(t *testing.T) {
+		evmSrv := fakeEvmRpcServer(t)
+		defer evmSrv.Close()
+
+		// Exact regression for Round 15 Finding 1:
+		// Page 0 returns transientPoolWrap on a "stable" page where both pre-
+		// and post-read frontier checks observe the same confirmed B10 (modeling
+		// a transient pool view cleared before post-read). Pre-publish
+		// verifyWrapConfirmedInLedger queries momentumStore (GetAccountBlockByHash),
+		// sees transientPoolWrap is NOT confirmed on the canonical ledger, discards
+		// the batch, restarts on canonicalWrap, and never marks transientPoolWrap.
+		transientPoolWrap := types.Hash{0xc1}
+		canonicalWrap := types.Hash{0xc2}
+		makeEntry := func(id types.Hash) *embedded.WrapTokenRequest {
+			return &embedded.WrapTokenRequest{
+				WrapTokenRequest: &definition.WrapTokenRequest{
+					NetworkClass: definition.EvmClass, ChainId: 1, Id: id,
+					Amount: big.NewInt(10), Fee: big.NewInt(1), CreationMomentumHeight: 99,
+				},
+				ConfirmationsToFinality: 0,
+			}
+		}
+
+		var transientChecked atomic.Bool
+		bridge := &wrapTestBridge{
+			networks: &embedded.NetworkInfoList{
+				Count: 1,
+				List: []*definition.NetworkInfo{{
+					NetworkClass: definition.EvmClass, Id: 1, Name: "Ethereum",
+					ContractAddress: "0x0000000000000000000000000000000000000001",
+				}},
+			},
+			frontierMomFn: func(_ context.Context, _ int32) (*api.Momentum, error) {
+				return testMomentum(105), nil
+			},
+			frontierFn: func(_ context.Context, _ int32) (*api.AccountBlock, error) {
+				return testAccountBlock(10, types.Hash{0xaa, 0, 10}), nil
+			},
+			pageHandler: func(pageIndex, pageSize uint32, call int32) *embedded.WrapTokenRequestList {
+				if call == 1 {
+					return paginateZenonWraps([]*embedded.WrapTokenRequest{makeEntry(transientPoolWrap)}, pageIndex, pageSize)
+				}
+				return paginateZenonWraps([]*embedded.WrapTokenRequest{makeEntry(canonicalWrap)}, pageIndex, pageSize)
+			},
+			blockByHashFn: func(_ context.Context, hash types.Hash) (*api.AccountBlock, error) {
+				if hash == transientPoolWrap {
+					transientChecked.Store(true)
+					// Absent from momentumStore (never confirmed).
+					return nil, nil
+				}
+				recv := testAccountBlock(1, types.Hash{0xaa, 0, 1})
+				recv.FromBlockHash = hash
+				return &api.AccountBlock{
+					AccountBlock:       nom.AccountBlock{Hash: hash, Height: 1, Amount: big.NewInt(0)},
+					ConfirmationDetail: &api.AccountBlockConfirmationDetail{NumConfirmations: 1, MomentumHeight: 1, MomentumHash: testMomentum(1).Hash},
+					PairedAccountBlock: recv,
+				}, nil
+			},
+		}
+
+		n := wrapTestNodeWithEvm(t, common.LiveState, bridge, map[string]string{"Ethereum": evmSrv.URL})
+		if activated, err := n.state.ActivateResign(definition.EvmClass, 1); err != nil || !activated {
+			t.Fatalf("ActivateResign failed: activated=%v err=%v", activated, err)
+		}
+		n.state.CompleteStartup()
+
+		n.workers.start(n.processSignatures)
+		t.Cleanup(func() {
+			done := n.workers.shutdown()
+			<-done
+		})
+
+		eventually(t, "ReSignState to reject unconfirmed transientPoolWrap at pre-publish and mark canonicalWrap", func() bool {
+			st, _ := n.state.GetState()
+			r, err := n.dbManager.ZnnStorage().GetResignStatus(canonicalWrap)
+			return err == nil && r && st == common.LiveState
+		})
+		if !transientChecked.Load() {
+			t.Fatal("expected pre-publish confirmed-ledger verification to check transientPoolWrap")
+		}
+		if resign, err := n.dbManager.ZnnStorage().GetResignStatus(transientPoolWrap); err != nil || resign {
+			t.Fatalf("discarded transientPoolWrap must not be marked: resign=%v err=%v", resign, err)
+		}
+		if ev, err := n.dbManager.ZnnStorage().GetWrapRequestById(transientPoolWrap); err != nil || ev != nil {
+			t.Fatalf("discarded transientPoolWrap must not be stored: ev=%+v err=%v", ev, err)
 		}
 	})
 }

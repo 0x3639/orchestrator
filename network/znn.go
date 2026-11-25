@@ -2189,6 +2189,10 @@ func (rC *znnNetwork) GetAccountBlocksByHeightContext(ctx context.Context, addre
 	return rC.ZnnRpc().GetAccountBlocksByHeightContext(ctx, address, height, count)
 }
 
+func (rC *znnNetwork) GetAccountBlockByHashContext(ctx context.Context, hash types.Hash) (*api.AccountBlock, error) {
+	return rC.ZnnRpc().GetAccountBlockByHashContext(ctx, hash)
+}
+
 func (rC *znnNetwork) GetAllPillars() (*embedded.PillarInfoList, error) {
 	return rC.ZnnRpc().GetAllPillars()
 }

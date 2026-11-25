@@ -410,11 +410,17 @@ func (r *ZnnRpc) GetAccountBlockByHash(hash types.Hash) (*api.AccountBlock, erro
 }
 
 func (r *ZnnRpc) GetAccountBlockByHashContext(ctx context.Context, hash types.Hash) (*api.AccountBlock, error) {
-	var block *api.AccountBlock
-	if err := r.settingsClient.CallContext(ctx, &block, "ledger.getAccountBlockByHash", hash); err != nil {
+	// Decode via AccountBlockMarshal because go-zenon's AccountBlock.UnmarshalJSON
+	// checks block.PairedAccountBlock != nil instead of aux.PairedAccountBlock != nil,
+	// silently dropping PairedAccountBlock and TokenInfo on fresh structs.
+	var raw *api.AccountBlockMarshal
+	if err := r.settingsClient.CallContext(ctx, &raw, "ledger.getAccountBlockByHash", hash); err != nil {
 		return nil, err
 	}
-	return block, nil
+	if raw == nil {
+		return nil, nil
+	}
+	return raw.FromApiMarshalJson(), nil
 }
 
 func (r *ZnnRpc) GetFrontierAccountBlockContext(ctx context.Context, address types.Address) (*api.AccountBlock, error) {
