@@ -76,3 +76,37 @@ func TestWrapNeedsSignatureFollowsSignatureAndResignStatus(t *testing.T) {
 		})
 	}
 }
+
+func TestWrapNeedsSignatureExcludesSettledWraps(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		status   uint32
+		viaLog   bool
+	}{
+		{"redeemed wrap marked for resign via status", common.RedeemedStatus, false},
+		{"revoked wrap marked for resign via status", common.RevokedStatus, false},
+		{"redeemed wrap marked for resign via EVM redeem log", common.RedeemedStatus, true},
+		{"pending redeem wrap marked for resign via EVM redeem log", common.PendingRedeemStatus, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := wrap.NewZnnStorage(zdb.NewMemDB(), nil)
+			id := storedWrap(t, store, "sig")
+			if err := store.SetResignStatus(id, true); err != nil {
+				t.Fatal(err)
+			}
+			if tc.viaLog {
+				if err := store.ApplyRedeemLog(1, id, 100, 0, tc.status); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				if err := store.SetWrapRequestStatus(id, tc.status); err != nil {
+					t.Fatal(err)
+				}
+			}
+			needed, err := wrapNeedsSignature(store, id)
+			if err != nil || needed {
+				t.Fatalf("settled wrap (%s) gave needed=%v err=%v, want false, nil", tc.name, needed, err)
+			}
+		})
+	}
+}

@@ -1623,6 +1623,35 @@ func isAcceptedReceiveBlock(recv *api.AccountBlock) bool {
 type confirmedThresholdCache struct {
 	atBlock   *api.AccountBlock
 	threshold uint32
+
+	// Anchored in-progress backward scan cursor retained across batches when a
+	// multi-page threshold scan stops early on a transient error or deadline.
+	// Invariant: every block in (scanNextHeight..scanAnchorBlock.Height] has
+	// been verified confirmed, PreviousHash-linked from scanAnchorBlock, and
+	// contains no accepted SetOrchestratorInfo receive block.
+	scanAnchorBlock *api.AccountBlock
+	scanNextHeight  uint64
+	scanNextHash    types.Hash
+	scanMinHeight   uint64
+}
+
+func (c *confirmedThresholdCache) clearScan() {
+	if c == nil {
+		return
+	}
+	c.scanAnchorBlock = nil
+	c.scanNextHeight = 0
+	c.scanNextHash = types.ZeroHash
+	c.scanMinHeight = 0
+}
+
+func (c *confirmedThresholdCache) reset() {
+	if c == nil {
+		return
+	}
+	c.atBlock = nil
+	c.threshold = 0
+	c.clearScan()
 }
 
 // readConfirmedWrapConfirmations derives OrchestratorInfo.ConfirmationsToFinality
@@ -1630,7 +1659,8 @@ type confirmedThresholdCache struct {
 // on the canonical bridge account chain (never from the mutable account-pool
 // GetOrchestratorInfo RPC). When cache is non-nil and its block remains a
 // confirmed canonical ancestor, only newly confirmed bridge blocks above
-// cache.atBlock are scanned.
+// cache.atBlock are scanned; an interrupted multi-page scan retains its
+// anchored downward cursor so subsequent batches resume instead of restarting.
 func (node *Node) readConfirmedWrapConfirmations(ctx context.Context, anchor reSignChainAnchor, advanceFinality bool, cache *confirmedThresholdCache, resignGen uint64) (required uint32, nextAnchor reSignChainAnchor, consistent, stale, stop bool) {
 	setOrchID := definition.ABIBridge.Methods[definition.SetOrchestratorInfoMethodName].Id()
 	cur := anchor
@@ -1696,8 +1726,7 @@ func (node *Node) readConfirmedWrapConfirmations(ctx context.Context, anchor reS
 			}
 			if blocks == nil || len(blocks.List) == 0 || blocks.List[0] == nil ||
 				!isConfirmedBridgeBlock(blocks.List[0]) || !sameAccountBlockFrontier(cache.atBlock, blocks.List[0]) {
-				cache.atBlock = nil
-				cache.threshold = 0
+				cache.reset()
 				return 0, reSignChainAnchor{}, false, false, false
 			}
 			minHeight = cache.atBlock.Height + 1
@@ -1710,12 +1739,37 @@ func (node *Node) readConfirmedWrapConfirmations(ctx context.Context, anchor reS
 		rolledBack := false
 		expectedHash := curAnchor.bridgeBlock.Hash
 		hi := curAnchor.bridgeBlock.Height
+		nextHeight := curAnchor.bridgeBlock.Height
+		var resumeAnchor *api.AccountBlock
+		var resumeNextHeight uint64
+		var resumeNextHash types.Hash
+		if cache != nil && cache.scanAnchorBlock != nil {
+			if cache.scanMinHeight == minHeight &&
+				cache.scanNextHeight >= minHeight &&
+				cache.scanNextHeight < cache.scanAnchorBlock.Height {
+				if sameAccountBlockFrontier(cache.scanAnchorBlock, curAnchor.bridgeBlock) {
+					hi = cache.scanNextHeight
+					nextHeight = cache.scanNextHeight
+					expectedHash = cache.scanNextHash
+				} else if curAnchor.bridgeBlock.Height > cache.scanAnchorBlock.Height {
+					resumeAnchor = cache.scanAnchorBlock
+					resumeNextHeight = cache.scanNextHeight
+					resumeNextHash = cache.scanNextHash
+				} else {
+					cache.clearScan()
+				}
+			} else {
+				cache.clearScan()
+			}
+		}
+
 		for hi >= minHeight {
 			if node.workerStopping() {
 				return 0, reSignChainAnchor{}, false, false, true
 			}
 			if ctx != nil && ctx.Err() != nil {
-				return 0, reSignChainAnchor{}, false, false, false
+				needRetry = true
+				break
 			}
 			if resignGen != 0 && !node.state.IsResignGenerationCurrent(resignGen) {
 				return 0, reSignChainAnchor{}, false, true, false
@@ -1723,6 +1777,12 @@ func (node *Node) readConfirmedWrapConfirmations(ctx context.Context, anchor reS
 			lo := minHeight
 			if hi-minHeight >= api.RpcMaxCountSize {
 				lo = hi - (api.RpcMaxCountSize - 1)
+			}
+			// If the chain grew past a prior anchored scan tip, stop this page
+			// at resumeAnchor.Height so we verify the short delta and jump over
+			// the already-scanned range without re-reading it.
+			if resumeAnchor != nil && hi > resumeAnchor.Height && lo < resumeAnchor.Height {
+				lo = resumeAnchor.Height
 			}
 			count := (hi - lo) + 1
 
@@ -1738,30 +1798,31 @@ func (node *Node) readConfirmedWrapConfirmations(ctx context.Context, anchor reS
 				break
 			}
 			if page == nil || len(page.List) < int(count) {
-				stillCanonical, _, stopCheck := node.isBridgeBlockStillCanonical(ctx, curAnchor.bridgeBlock)
+				stillCanonical, transientErr, stopCheck := node.isBridgeBlockStillCanonical(ctx, curAnchor.bridgeBlock)
 				if stopCheck {
 					return 0, reSignChainAnchor{}, false, false, true
 				}
-				if !stillCanonical {
-					rolledBack = true
-				} else {
+				if transientErr || stillCanonical {
 					needRetry = true
+				} else {
+					rolledBack = true
 				}
 				break
 			}
 
+			jumped := false
 			for i := int(count) - 1; i >= 0; i-- {
 				b := page.List[i]
 				expectedHeight := lo + uint64(i)
 				if b == nil || b.Height != expectedHeight || !isConfirmedBridgeBlock(b) {
-					stillCanonical, _, stopCheck := node.isBridgeBlockStillCanonical(ctx, curAnchor.bridgeBlock)
+					stillCanonical, transientErr, stopCheck := node.isBridgeBlockStillCanonical(ctx, curAnchor.bridgeBlock)
 					if stopCheck {
 						return 0, reSignChainAnchor{}, false, false, true
 					}
-					if !stillCanonical {
-						rolledBack = true
-					} else {
+					if transientErr || stillCanonical {
 						needRetry = true
+					} else {
+						rolledBack = true
 					}
 					break
 				}
@@ -1773,85 +1834,113 @@ func (node *Node) readConfirmedWrapConfirmations(ctx context.Context, anchor reS
 					rolledBack = true
 					break
 				}
-				expectedHash = b.PreviousHash
-				if !isAcceptedReceiveBlock(b) {
-					continue
-				}
-				// Fast filter when PairedAccountBlock is already present and
-				// matches the receive block's committed FromBlockHash.
-				if b.PairedAccountBlock != nil && b.PairedAccountBlock.Hash == b.FromBlockHash {
-					if b.PairedAccountBlock.ToAddress != types.BridgeContract ||
-						len(b.PairedAccountBlock.Data) < len(setOrchID) ||
-						!bytes.Equal(b.PairedAccountBlock.Data[:len(setOrchID)], setOrchID) {
-						continue
+				if resumeAnchor != nil && expectedHeight == resumeAnchor.Height {
+					if sameAccountBlockFrontier(resumeAnchor, b) {
+						nextHeight = resumeNextHeight
+						expectedHash = resumeNextHash
+						resumeAnchor = nil
+						jumped = true
+						break
+					}
+					resumeAnchor = nil
+					if cache != nil {
+						cache.clearScan()
 					}
 				}
 
-				// Verify the SetOrchestratorInfo send + receive directly in
-				// momentumStore (GetAccountBlockByHash never reads accountPool).
-				sendCtx, sendCancel := node.resignRPCContext(ctx)
-				send, err := node.networksManager.Znn().GetAccountBlockByHashContext(sendCtx, b.FromBlockHash)
-				sendCancel()
-				if node.workerStopping() {
-					return 0, reSignChainAnchor{}, false, false, true
+				checkSend := isAcceptedReceiveBlock(b)
+				// Fast filter when PairedAccountBlock is already present and
+				// matches the receive block's committed FromBlockHash.
+				if checkSend && b.PairedAccountBlock != nil && b.PairedAccountBlock.Hash == b.FromBlockHash {
+					if b.PairedAccountBlock.ToAddress != types.BridgeContract ||
+						len(b.PairedAccountBlock.Data) < len(setOrchID) ||
+						!bytes.Equal(b.PairedAccountBlock.Data[:len(setOrchID)], setOrchID) {
+						checkSend = false
+					}
 				}
-				if err != nil {
-					node.logger.Debugf("failed to verify SetOrchestratorInfo send %s in momentumStore: %v", b.FromBlockHash, err)
-					needRetry = true
-					break
-				}
-				if send == nil || send.Hash != b.FromBlockHash || !isConfirmedBridgeBlock(send) {
-					rolledBack = true
-					break
-				}
-				recv := send.PairedAccountBlock
-				if recv == nil || !isConfirmedBridgeBlock(recv) || !sameAccountBlockFrontier(b, recv) || !isAcceptedReceiveBlock(recv) {
-					rolledBack = true
-					break
-				}
-				if send.ToAddress != types.BridgeContract ||
-					len(send.Data) < len(setOrchID) ||
-					!bytes.Equal(send.Data[:len(setOrchID)], setOrchID) {
-					continue
-				}
-				param := new(definition.OrchestratorInfoParam)
-				if err := definition.ABIBridge.UnpackMethod(param, definition.SetOrchestratorInfoMethodName, send.Data); err != nil || param.ConfirmationsToFinality == 0 {
-					continue
+				if checkSend {
+					// Verify the SetOrchestratorInfo send + receive directly in
+					// momentumStore (GetAccountBlockByHash never reads accountPool).
+					sendCtx, sendCancel := node.resignRPCContext(ctx)
+					send, err := node.networksManager.Znn().GetAccountBlockByHashContext(sendCtx, b.FromBlockHash)
+					sendCancel()
+					if node.workerStopping() {
+						return 0, reSignChainAnchor{}, false, false, true
+					}
+					if err != nil {
+						node.logger.Debugf("failed to verify SetOrchestratorInfo send %s in momentumStore: %v", b.FromBlockHash, err)
+						needRetry = true
+						break
+					}
+					if send == nil || send.Hash != b.FromBlockHash || !isConfirmedBridgeBlock(send) {
+						rolledBack = true
+						break
+					}
+					recv := send.PairedAccountBlock
+					if recv == nil || !isConfirmedBridgeBlock(recv) || !sameAccountBlockFrontier(b, recv) || !isAcceptedReceiveBlock(recv) {
+						rolledBack = true
+						break
+					}
+					if send.ToAddress == types.BridgeContract &&
+						len(send.Data) >= len(setOrchID) &&
+						bytes.Equal(send.Data[:len(setOrchID)], setOrchID) {
+						param := new(definition.OrchestratorInfoParam)
+						if err := definition.ABIBridge.UnpackMethod(param, definition.SetOrchestratorInfoMethodName, send.Data); err == nil && param.ConfirmationsToFinality != 0 {
+							// Verify the confirming momentum of this SetOrchestratorInfo
+							// receive block is canonical.
+							momCtx, momCancel := node.resignRPCContext(ctx)
+							momList, err := node.networksManager.Znn().GetMomentumsByHeightContext(momCtx, b.ConfirmationDetail.MomentumHeight, 1)
+							momCancel()
+							if node.workerStopping() {
+								return 0, reSignChainAnchor{}, false, false, true
+							}
+							if err != nil {
+								needRetry = true
+								break
+							}
+							if momList == nil || len(momList.List) == 0 || momList.List[0] == nil || momList.List[0].Momentum == nil ||
+								momList.List[0].Height != b.ConfirmationDetail.MomentumHeight || momList.List[0].Hash != b.ConfirmationDetail.MomentumHash {
+								rolledBack = true
+								break
+							}
+
+							foundThreshold = param.ConfirmationsToFinality
+							found = true
+							break
+						}
+					}
 				}
 
-				// Verify the confirming momentum of this SetOrchestratorInfo
-				// receive block is canonical.
-				momCtx, momCancel := node.resignRPCContext(ctx)
-				momList, err := node.networksManager.Znn().GetMomentumsByHeightContext(momCtx, b.ConfirmationDetail.MomentumHeight, 1)
-				momCancel()
-				if node.workerStopping() {
-					return 0, reSignChainAnchor{}, false, false, true
-				}
-				if err != nil {
-					needRetry = true
-					break
-				}
-				if momList == nil || len(momList.List) == 0 || momList.List[0] == nil || momList.List[0].Momentum == nil ||
-					momList.List[0].Height != b.ConfirmationDetail.MomentumHeight || momList.List[0].Hash != b.ConfirmationDetail.MomentumHash {
-					rolledBack = true
-					break
-				}
-
-				foundThreshold = param.ConfirmationsToFinality
-				found = true
+				expectedHash = b.PreviousHash
+				nextHeight = expectedHeight - 1
+			}
+			if found || needRetry || rolledBack {
 				break
 			}
-			if found || needRetry || rolledBack || lo == minHeight {
+			if jumped {
+				hi = nextHeight
+				continue
+			}
+			if lo == minHeight {
 				break
 			}
 			hi = lo - 1
 		}
 
 		if rolledBack {
+			if cache != nil {
+				cache.clearScan()
+			}
 			return 0, reSignChainAnchor{}, false, false, false
 		}
 		if needRetry {
-			if resignGen == 0 {
+			if cache != nil && nextHeight >= minHeight && nextHeight < curAnchor.bridgeBlock.Height {
+				cache.scanAnchorBlock = curAnchor.bridgeBlock
+				cache.scanNextHeight = nextHeight
+				cache.scanNextHash = expectedHash
+				cache.scanMinHeight = minHeight
+			}
+			if resignGen == 0 || (ctx != nil && ctx.Err() != nil) {
 				return 0, reSignChainAnchor{}, false, false, false
 			}
 			if !node.workerSleep(resignRetryDelay) {
@@ -1862,8 +1951,7 @@ func (node *Node) readConfirmedWrapConfirmations(ctx context.Context, anchor reS
 		if !found {
 			if haveCached {
 				if expectedHash != cache.atBlock.Hash {
-					cache.atBlock = nil
-					cache.threshold = 0
+					cache.reset()
 					return 0, reSignChainAnchor{}, false, false, false
 				}
 				foundThreshold = cache.threshold
@@ -1896,11 +1984,15 @@ func (node *Node) readConfirmedWrapConfirmations(ctx context.Context, anchor reS
 			continue
 		}
 		if !ok {
+			if cache != nil {
+				cache.clearScan()
+			}
 			return 0, reSignChainAnchor{}, false, false, false
 		}
 		if cache != nil {
 			cache.atBlock = curAnchor.bridgeBlock
 			cache.threshold = foundThreshold
+			cache.clearScan()
 		}
 		if !sameAccountBlockFrontier(curAnchor.bridgeBlock, postAnchor.bridgeBlock) {
 			if resignGen == 0 {
@@ -2208,14 +2300,14 @@ func (node *Node) ensureConfirmedTokenPairHistory(ctx context.Context, targetBlo
 				break
 			}
 			if page == nil || len(page.List) < int(count) {
-				stillCanonical, _, stopCheck := node.isBridgeBlockStillCanonical(ctx, targetBlock)
+				stillCanonical, transientErr, stopCheck := node.isBridgeBlockStillCanonical(ctx, targetBlock)
 				if stopCheck {
 					return false, false, true
 				}
-				if !stillCanonical {
-					rolledBack = true
-				} else {
+				if transientErr || stillCanonical {
 					needRetry = true
+				} else {
+					rolledBack = true
 				}
 				break
 			}
@@ -2224,14 +2316,14 @@ func (node *Node) ensureConfirmedTokenPairHistory(ctx context.Context, targetBlo
 				b := page.List[i]
 				expectedHeight := lo + uint64(i)
 				if b == nil || b.Height != expectedHeight || !isConfirmedBridgeBlock(b) {
-					stillCanonical, _, stopCheck := node.isBridgeBlockStillCanonical(ctx, targetBlock)
+					stillCanonical, transientErr, stopCheck := node.isBridgeBlockStillCanonical(ctx, targetBlock)
 					if stopCheck {
 						return false, false, true
 					}
-					if !stillCanonical {
-						rolledBack = true
-					} else {
+					if transientErr || stillCanonical {
 						needRetry = true
+					} else {
+						rolledBack = true
 					}
 					break
 				}
@@ -3722,6 +3814,9 @@ func (node *Node) buildWrapSigningBatch() ([]*definition.WrapTokenRequest, [][]b
 				return nil, nil, nil, err
 			}
 		} else {
+			if event.RedeemStatus != common.UnredeemedStatus {
+				continue
+			}
 			resignStatus, err := node.networksManager.GetResignStatus(event.Id)
 			if err != nil {
 				node.logger.Error(err)

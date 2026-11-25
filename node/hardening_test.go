@@ -6004,6 +6004,224 @@ func TestReSignStateRequiresMomentumConfirmationForBridgeSnapshot(t *testing.T) 
 			t.Fatalf("expected legacyID to be promoted to verified after resumed replay, verified=%v err=%v", verified, err)
 		}
 	})
+
+	t.Run("resumes multi-page finality-threshold backward scan across batches instead of restarting from tip", func(t *testing.T) {
+		prevBudget := legacyRevalidateBudget
+		legacyRevalidateBudget = 2 * time.Second
+		t.Cleanup(func() { legacyRevalidateBudget = prevBudget })
+
+		evmSrv := fakeEvmRpcServer(t)
+		defer evmSrv.Close()
+
+		// Exact regression for Round 23 Finding 1:
+		// Bridge history has RpcMaxCountSize + 20 blocks so the backward
+		// finality-threshold scan spans two pages: [21..1044] then [1..20].
+		// On batch 1, [21..1044] succeeds and [1..20] stalls past the budget.
+		// Batch 1 must persist the anchored downward cursor at height 20; batch 2
+		// must resume at height 20 without re-reading height 1044, then complete
+		// replay and promote legacyID.
+		const pageSize = uint64(api.RpcMaxCountSize)
+		const totalHeight = pageSize + 20
+		legacyID := types.Hash{0xdf}
+		legacyWrap := &embedded.WrapTokenRequest{
+			WrapTokenRequest: &definition.WrapTokenRequest{
+				NetworkClass:           definition.EvmClass,
+				ChainId:                1,
+				Id:                     legacyID,
+				ToAddress:              "0x000000000000000000000000000000000000beef",
+				Amount:                 big.NewInt(100),
+				Fee:                    big.NewInt(10),
+				CreationMomentumHeight: 99,
+			},
+			ConfirmationsToFinality: 0,
+		}
+
+		var stallLowerPage atomic.Bool
+		var tipReads atomic.Int32
+		stallLowerPage.Store(true)
+
+		bridge := &wrapTestBridge{
+			networks: &embedded.NetworkInfoList{
+				Count: 1,
+				List: []*definition.NetworkInfo{{
+					NetworkClass: definition.EvmClass, Id: 1, Name: "Ethereum",
+					ContractAddress: "0x0000000000000000000000000000000000000001",
+				}},
+			},
+			frontierMomFn: func(_ context.Context, _ int32) (*api.Momentum, error) {
+				return testMomentum(105), nil
+			},
+			frontierFn: func(_ context.Context, _ int32) (*api.AccountBlock, error) {
+				return testAccountBlock(totalHeight, types.Hash{0xaa, byte(totalHeight >> 8), byte(totalHeight & 0xff)}), nil
+			},
+			acctByHeightFn: func(ctx context.Context, height uint64) (*api.AccountBlockList, error) {
+				if height == totalHeight {
+					tipReads.Add(1)
+				}
+				if height <= 20 && stallLowerPage.Load() {
+					<-ctx.Done()
+					return nil, ctx.Err()
+				}
+				blk := testAccountBlock(height, types.Hash{0xaa, byte(height >> 8), byte(height)})
+				return &api.AccountBlockList{Count: 1, List: []*api.AccountBlock{blk}}, nil
+			},
+			byID: map[types.Hash]*embedded.WrapTokenRequest{
+				legacyID: legacyWrap,
+			},
+			unsigned: &embedded.WrapTokenRequestList{Count: 0},
+		}
+
+		n := wrapTestNodeWithEvm(t, common.LiveState, bridge, map[string]string{"Ethereum": evmSrv.URL})
+		if err := n.dbManager.ZnnStorage().AddWrapRequest(common.ZnnWrapToOrchestratorWrap(legacyWrap.WrapTokenRequest)); err != nil {
+			t.Fatal(err)
+		}
+		if err := n.dbManager.ZnnStorage().SetResignStatus(legacyID, true); err != nil {
+			t.Fatal(err)
+		}
+
+		// Batch 1: upper threshold page [21..1044] finishes; lower page [1..20] stalls.
+		reqs, _, _, err := n.buildWrapSigningBatch()
+		if err != nil {
+			t.Fatalf("batch 1 buildWrapSigningBatch failed: %v", err)
+		}
+		if len(reqs) != 0 {
+			t.Fatalf("expected batch 1 to defer legacy wrap when threshold page 2 timed out, got %+v", reqs)
+		}
+		n.legacyRevalidateMu.Lock()
+		savedNext := uint64(0)
+		if n.legacyThresholdCache != nil && n.legacyThresholdCache.scanAnchorBlock != nil {
+			savedNext = n.legacyThresholdCache.scanNextHeight
+		}
+		n.legacyRevalidateMu.Unlock()
+		if savedNext != 20 {
+			t.Fatalf("expected batch 1 to persist anchored threshold scan cursor at height 20, got %d", savedNext)
+		}
+
+		// Batch 2: lower threshold page unblocks; threshold scan must resume at
+		// height 20 (tip 1044 is read at most once by token-pair replay, NOT re-read
+		// by the threshold scan) and promote legacyID.
+		tipReads.Store(0)
+		stallLowerPage.Store(false)
+		reqs, msgs, _, err := n.buildWrapSigningBatch()
+		if err != nil {
+			t.Fatalf("batch 2 buildWrapSigningBatch failed: %v", err)
+		}
+		if len(reqs) != 1 || len(msgs) != 1 || reqs[0].Id != legacyID {
+			t.Fatalf("expected batch 2 to resume threshold scan and select legacyID, got reqs=%+v msgs=%d", reqs, len(msgs))
+		}
+		// Height totalHeight should be read only once (for token-pair replay), not twice.
+		if reads := tipReads.Load(); reads != 1 {
+			t.Fatalf("expected height %d to be read only once (token-pair replay) without restarting threshold scan, got %d reads", totalHeight, reads)
+		}
+	})
+
+	t.Run("preserves token-pair replay progress when canonicality check times out on a short page", func(t *testing.T) {
+		evmSrv := fakeEvmRpcServer(t)
+		defer evmSrv.Close()
+
+		// Exact regression for Round 23 Finding 2:
+		// Page 1 (1..RpcMaxCountSize) validates completely; page 2 returns a short
+		// page and the subsequent isBridgeBlockStillCanonical check times out.
+		// The transient error must NOT be treated as a rollback, so the validated
+		// page 1 prefix (tipBlock.Height == RpcMaxCountSize) must stay cached.
+		const pageSize = uint64(api.RpcMaxCountSize)
+		const totalHeight = pageSize + 20
+		targetBlock := testAccountBlock(totalHeight, types.Hash{0xaa, byte(totalHeight >> 8), byte(totalHeight & 0xff)})
+
+		bridge := &wrapTestBridge{
+			networks: &embedded.NetworkInfoList{
+				Count: 1,
+				List: []*definition.NetworkInfo{{
+					NetworkClass: definition.EvmClass, Id: 1, Name: "Ethereum",
+					ContractAddress: "0x0000000000000000000000000000000000000001",
+				}},
+			},
+			acctByHeightFn: func(ctx context.Context, height uint64) (*api.AccountBlockList, error) {
+				if height == pageSize+1 {
+					// Short page triggers isBridgeBlockStillCanonical(targetBlock).
+					return &api.AccountBlockList{Count: 0, List: []*api.AccountBlock{}}, nil
+				}
+				if height == totalHeight {
+					// Simulate transient timeout during isBridgeBlockStillCanonical.
+					return nil, context.DeadlineExceeded
+				}
+				blk := testAccountBlock(height, types.Hash{0xaa, byte(height >> 8), byte(height)})
+				return &api.AccountBlockList{Count: 1, List: []*api.AccountBlock{blk}}, nil
+			},
+		}
+
+		n := wrapTestNodeWithEvm(t, common.LiveState, bridge, map[string]string{"Ethereum": evmSrv.URL})
+		history := &confirmedTokenPairHistory{}
+		consistent, stale, stop := n.ensureConfirmedTokenPairHistory(context.Background(), targetBlock, history, 0)
+		if consistent || stale || stop {
+			t.Fatalf("expected (false, false, false) on transient canonicality timeout, got (%v, %v, %v)", consistent, stale, stop)
+		}
+		if history.tipBlock == nil || history.tipBlock.Height != pageSize || uint64(len(history.blocks)) != pageSize {
+			t.Fatalf("expected validated page 1 prefix (height %d) to be preserved on transient canonicality error, got tip=%v len=%d", pageSize, history.tipBlock, len(history.blocks))
+		}
+	})
+
+	t.Run("excludes settled wraps from signing pool even after verified resign publication", func(t *testing.T) {
+		evmSrv := fakeEvmRpcServer(t)
+		defer evmSrv.Close()
+
+		// Exact regression for Round 23 Finding 3:
+		// Publish a verified re-sign wrap, then record an EVM redemption log for it
+		// via ApplyRedeemLog. Both GetResignableWrapRequests and
+		// buildWrapSigningBatch (including wrapNeedsSignature) must exclude the
+		// settled wrap even if Zenon still returns it as unsigned.
+		settledID := types.Hash{0xe0}
+		settledWrap := &embedded.WrapTokenRequest{
+			WrapTokenRequest: &definition.WrapTokenRequest{
+				NetworkClass:           definition.EvmClass,
+				ChainId:                1,
+				Id:                     settledID,
+				ToAddress:              "0x000000000000000000000000000000000000beef",
+				Amount:                 big.NewInt(100),
+				Fee:                    big.NewInt(10),
+				CreationMomentumHeight: 99,
+			},
+			ConfirmationsToFinality: 0,
+		}
+
+		bridge := &wrapTestBridge{
+			networks: &embedded.NetworkInfoList{
+				Count: 1,
+				List: []*definition.NetworkInfo{{
+					NetworkClass: definition.EvmClass, Id: 1, Name: "Ethereum",
+					ContractAddress: "0x0000000000000000000000000000000000000001",
+				}},
+			},
+			unsigned: &embedded.WrapTokenRequestList{
+				Count: 1,
+				List:  []*embedded.WrapTokenRequest{settledWrap},
+			},
+		}
+
+		n := wrapTestNodeWithEvm(t, common.LiveState, bridge, map[string]string{"Ethereum": evmSrv.URL})
+		if err := n.networksManager.PublishResignWraps([]*definition.WrapTokenRequest{settledWrap.WrapTokenRequest}); err != nil {
+			t.Fatal(err)
+		}
+		if err := n.dbManager.ZnnStorage().ApplyRedeemLog(1, settledID, 200, 0, common.RedeemedStatus); err != nil {
+			t.Fatal(err)
+		}
+
+		resignable, err := n.dbManager.ZnnStorage().GetResignableWrapRequests()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(resignable) != 0 {
+			t.Fatalf("expected settled wrap to be excluded from GetResignableWrapRequests, got %+v", resignable)
+		}
+
+		_, msgs, msgsIndexes, err := n.buildWrapSigningBatch()
+		if err != nil {
+			t.Fatalf("buildWrapSigningBatch failed: %v", err)
+		}
+		if len(msgs) != 0 || len(msgsIndexes) != 0 {
+			t.Fatalf("expected settled wrap to produce zero signing messages, got msgs=%d msgsIndexes=%v", len(msgs), msgsIndexes)
+		}
+	})
 }
 
 func TestReSignStateBoundsAndCancelsStalledDeferredWrapRPC(t *testing.T) {

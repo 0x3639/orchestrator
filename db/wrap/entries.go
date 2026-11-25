@@ -300,6 +300,9 @@ func (es *eventStore) GetResignableWrapRequests() ([]*events.WrapRequestZnn, err
 			es.SendSigInt()
 			return nil, err
 		}
+		if event.RedeemStatus != common.UnredeemedStatus {
+			continue
+		}
 		resignable, err := es.GetResignStatus(event.Id)
 		if err != nil {
 			es.SendSigInt()

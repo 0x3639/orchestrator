@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -173,5 +174,42 @@ func TestEvmDialAndChainIDErrorsRedactCredentials(t *testing.T) {
 				t.Fatalf("%s: RedactErrorForURL leaked credential %q: %s", tc.name, secret, redacted)
 			}
 		}
+	}
+
+	// 5. WebSocket handshake failures must suppress provider-supplied HTTP
+	// status text (which can echo a standalone credential-bearing path segment)
+	// while retaining a safe numeric status code.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go func() {
+		for {
+			conn, acceptErr := ln.Accept()
+			if acceptErr != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				buf := make([]byte, 1024)
+				_, _ = c.Read(buf)
+				_, _ = c.Write([]byte("HTTP/1.1 401 unauthorized key-segment-999\r\nContent-Length: 0\r\n\r\n"))
+			}(conn)
+		}
+	}()
+	wsHandshakeURL := "ws://" + ln.Addr().String() + "/v2/key-segment-999"
+	wsMgr := &Manager{evmClients: make(map[uint32]*EvmRpc), stopChan: make(chan os.Signal, 1)}
+	wsErr := wsMgr.AddEvmClient(config.BaseNetworkConfig{
+		Urls: []string{wsHandshakeURL},
+	}, 73405, "Supernova", ecommon.HexToAddress("0x0000000000000000000000000000000000000001"))
+	if wsErr == nil {
+		t.Fatal("expected WebSocket handshake failure")
+	}
+	if !strings.Contains(wsErr.Error(), "HTTP 401") {
+		t.Fatalf("expected WebSocket handshake error to retain numeric HTTP 401 status, got: %v", wsErr)
+	}
+	if strings.Contains(wsErr.Error(), "key-segment-999") || strings.Contains(wsErr.Error(), "unauthorized") {
+		t.Fatalf("WebSocket handshake error leaked provider status text or path segment: %v", wsErr)
 	}
 }

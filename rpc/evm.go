@@ -25,6 +25,7 @@ import (
 	"orchestrator/common/config"
 	"orchestrator/common/storage"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -68,6 +69,38 @@ type secondaryClient struct {
 	mu      sync.Mutex
 	client  *ethclient.Client
 	limiter *rate.Limiter
+}
+
+// sanitizeEvmDialError prevents provider-supplied HTTP status text or error
+// bodies (such as go-ethereum's wsHandshakeError " (HTTP status <code> <text>)")
+// from echoing credential-bearing path segments or query values into startup
+// errors and logs while preserving safe transport diagnostics and numeric HTTP
+// status codes.
+func sanitizeEvmDialError(err error, rawURL string) error {
+	if err == nil {
+		return nil
+	}
+	var httpErr gethrpc.HTTPError
+	if stderrors.As(err, &httpErr) {
+		return fmt.Errorf("HTTP %d", httpErr.StatusCode)
+	}
+	msg := err.Error()
+	const wsStatusMarker = " (HTTP status "
+	if idx := strings.Index(msg, wsStatusMarker); idx >= 0 {
+		rest := strings.TrimSpace(msg[idx+len(wsStatusMarker):])
+		codeText := rest
+		if end := strings.IndexAny(rest, " )"); end >= 0 {
+			codeText = rest[:end]
+		}
+		if code, parseErr := strconv.Atoi(codeText); parseErr == nil && code >= 100 && code <= 599 {
+			return fmt.Errorf("websocket handshake failed: HTTP %d", code)
+		}
+		return errors.New("websocket handshake failed")
+	}
+	if strings.Contains(msg, "websocket: bad handshake") {
+		return errors.New("websocket handshake failed")
+	}
+	return errors.New(config.RedactErrorForURL(err, rawURL))
 }
 
 func verifyEvmChainID(parent context.Context, client *ethclient.Client, expectedChainId uint32, networkName, url string) error {
@@ -134,7 +167,7 @@ func NewEvmRpcClientForChainContext(parent context.Context, networkConfig config
 		}
 		newRpcClient, err = ethclient.DialContext(parent, currentUrl)
 		if err != nil {
-			sanitizedErr := errors.New(config.RedactErrorForURL(err, currentUrl))
+			sanitizedErr := sanitizeEvmDialError(err, currentUrl)
 			lastErr = sanitizedErr
 			logger.Infof("Error when dialing %s, got: %s\n", config.RedactURL(currentUrl), sanitizedErr.Error())
 		} else if err = verifyEvmChainID(parent, newRpcClient, chainId, networkName, currentUrl); err != nil {
@@ -791,7 +824,7 @@ func (r *EvmRpc) callEndpoint(idx int, read func(context.Context, *ethclient.Cli
 	if entry.client == nil {
 		client, err := ethclient.DialContext(ctx, url)
 		if err != nil {
-			return errors.New(config.RedactErrorForURL(err, url))
+			return sanitizeEvmDialError(err, url)
 		}
 		if err := verifyEvmChainID(ctx, client, r.chainId, r.networkName, url); err != nil {
 			client.Close()
