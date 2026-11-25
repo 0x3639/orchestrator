@@ -18,6 +18,7 @@ import (
 	"github.com/syndtr/goleveldb/leveldb"
 	"orchestrator/common"
 	oconfig "orchestrator/common/config"
+	"os"
 	"path/filepath"
 	"slices"
 	"sync"
@@ -33,6 +34,7 @@ type TssManager struct {
 	voteMu            sync.Mutex
 	unwrapVotes       *leveldb.DB
 	stateDir          *oconfig.OwnedDir
+	runtimeDir        string
 	keyShareDir       string
 	server            *tss.TssServer
 	port              int
@@ -68,16 +70,22 @@ func NewTssManager(conf oconfig.TssManagerConfig, privateKey string) (_ *TssMana
 	if err := stateDir.SecureKeyShareFiles(""); err != nil {
 		return nil, err
 	}
+	secureStateMgr := newSecureLocalStateManager(stateDir)
+	savedPeers, err := secureStateMgr.RetrieveP2PAddresses()
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return nil, fmt.Errorf("failed to read anchored TSS address book: %w", err)
+	}
 
 	var peerIDs []maddr.Multiaddr
+	if len(savedPeers) > 0 {
+		peerIDs = append(peerIDs, savedPeers...)
+	}
 	if len(conf.Bootstrap) > 0 {
 		multiAddr, err := maddr.NewMultiaddr(conf.Bootstrap)
 		if err != nil {
 			return nil, fmt.Errorf("invalid bootstrap multiaddr: %w", err)
 		}
-		peerIDs = []maddr.Multiaddr{multiAddr}
-	} else {
-		peerIDs = nil
+		peerIDs = append(peerIDs, multiAddr)
 	}
 
 	priv, err := ic.UnmarshalEd25519PrivateKey(priKey.Bytes())
@@ -112,6 +120,20 @@ func NewTssManager(conf oconfig.TssManagerConfig, privateKey string) (_ *TssMana
 	if err != nil {
 		return nil, err
 	}
+	// Pass a private empty 0700 runtime directory to go-tss's NewTss so it
+	// cannot read address_book.seed from conf.BaseDir via its pathname-based
+	// FileStateMgr before installSecureStateManager installs secureStateMgr.
+	// Saved bootstrap peers were already read above through secureStateMgr.
+	runtimeDir, err := os.MkdirTemp("", "orchestrator-tss-runtime-*")
+	if err != nil {
+		votes.Close()
+		return nil, err
+	}
+	defer func() {
+		if retErr != nil {
+			_ = os.RemoveAll(runtimeDir)
+		}
+	}()
 	var server *tss.TssServer
 	var wg sync.WaitGroup
 	wg.Add(1)
@@ -125,14 +147,14 @@ func NewTssManager(conf oconfig.TssManagerConfig, privateKey string) (_ *TssMana
 		}
 
 		// we call pre params with nil because we want to recompute it when we key gen, at key signs it takes it from the pubKey file
-		server, err = tss.NewTss(peerIDs, conf.Port, priKey, "Zenon", conf.BaseDir, conf.BaseConfig, nil, "", algo, conf.PubKeyWhitelist)
+		server, err = tss.NewTss(peerIDs, conf.Port, priKey, "Zenon", runtimeDir, conf.BaseConfig, nil, "", algo, conf.PubKeyWhitelist)
 	}()
 	wg.Wait()
 	if err != nil {
 		votes.Close()
 		return nil, err
 	}
-	if err := installSecureStateManager(server, newSecureLocalStateManager(stateDir)); err != nil {
+	if err := installSecureStateManager(server, secureStateMgr); err != nil {
 		server.Stop()
 		votes.Close()
 		return nil, err
@@ -141,6 +163,7 @@ func NewTssManager(conf oconfig.TssManagerConfig, privateKey string) (_ *TssMana
 	return &TssManager{
 		unwrapVotes:       votes,
 		stateDir:          stateDir,
+		runtimeDir:        runtimeDir,
 		keyShareDir:       conf.BaseDir,
 		port:              conf.Port,
 		server:            server,
@@ -164,6 +187,9 @@ func (m *TssManager) Stop() {
 	m.unwrapVotes.Close()
 	if m.stateDir != nil {
 		_ = m.stateDir.Close()
+	}
+	if m.runtimeDir != "" {
+		_ = os.RemoveAll(m.runtimeDir)
 	}
 }
 

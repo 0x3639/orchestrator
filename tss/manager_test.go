@@ -8,7 +8,9 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"syscall"
 	"testing"
+	"time"
 
 	tcommon "github.com/HyperCore-Team/go-tss/common"
 	"github.com/HyperCore-Team/go-tss/keygen"
@@ -419,4 +421,77 @@ func TestSignUnwrapPoolUsesAnchoredStateReaderAfterDirSubstitution(t *testing.T)
 	if _, err := mgr.SignUnwrapPool(common.CeremonyWindow{Number: 2, Size: 100}, pool, func() error { return nil }); err != nil {
 		t.Fatalf("SignUnwrapPool failed when substituted pathname was removed: %v", err)
 	}
+}
+
+func TestNewTssManagerUsesAnchoredAddressBookAndRejectsUnsafeSeed(t *testing.T) {
+	// 1. Symlinked address_book.seed must be rejected before go-tss runs.
+	t.Run("rejects symlinked address_book.seed", func(t *testing.T) {
+		dir := t.TempDir()
+		target := filepath.Join(dir, "real-seed.txt")
+		if err := os.WriteFile(target, []byte("/ip4/127.0.0.1/tcp/1234/p2p/12D3KooWEyoppNCUx8Yx66oV9fJnriXwCcXwDDUA2kj6vnc6iDEp\n"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(target, filepath.Join(dir, addressBookFileName)); err != nil {
+			t.Skipf("symlinks unavailable: %v", err)
+		}
+		mgr, err := NewTssManager(oconfig.TssManagerConfig{BaseDir: dir, Bootstrap: "invalid"}, testPrivateKeyBase64(t))
+		if err == nil {
+			mgr.Stop()
+			t.Fatal("expected NewTssManager to reject symlinked address_book.seed")
+		}
+		if err.Error() == "invalid bootstrap multiaddr: failed to parse multiaddr \"invalid\": must begin with /" {
+			t.Fatalf("NewTssManager bypassed address_book.seed validation and reached bootstrap check: %v", err)
+		}
+	})
+
+	// 2. FIFO address_book.seed must fail promptly without blocking startup.
+	t.Run("rejects FIFO address_book.seed without stalling", func(t *testing.T) {
+		dir := t.TempDir()
+		fifoPath := filepath.Join(dir, addressBookFileName)
+		if err := syscall.Mkfifo(fifoPath, 0600); err != nil {
+			t.Skipf("mkfifo unavailable: %v", err)
+		}
+
+		done := make(chan error, 1)
+		go func() {
+			mgr, err := NewTssManager(oconfig.TssManagerConfig{BaseDir: dir, Bootstrap: "invalid"}, testPrivateKeyBase64(t))
+			if err == nil {
+				mgr.Stop()
+			}
+			done <- err
+		}()
+		select {
+		case err := <-done:
+			if err == nil {
+				t.Fatal("expected NewTssManager to reject FIFO address_book.seed")
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("NewTssManager stalled on FIFO address_book.seed")
+		}
+	})
+
+	// 3. Valid regular address_book.seed with loose 0644 perms is tightened to
+	// 0600 through the anchored reader during NewTssManager initialization.
+	t.Run("tightens valid address_book.seed to 0600", func(t *testing.T) {
+		dir := t.TempDir()
+		seedPath := filepath.Join(dir, addressBookFileName)
+		if err := os.WriteFile(seedPath, []byte("/ip4/127.0.0.1/tcp/1234/p2p/12D3KooWEyoppNCUx8Yx66oV9fJnriXwCcXwDDUA2kj6vnc6iDEp\n"), 0644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(seedPath, 0644); err != nil {
+			t.Fatal(err)
+		}
+		// Use invalid bootstrap so NewTssManager returns right after anchored
+		// address_book.seed reading + tightening without spinning up libp2p.
+		if _, err := NewTssManager(oconfig.TssManagerConfig{BaseDir: dir, Bootstrap: "invalid"}, testPrivateKeyBase64(t)); err == nil {
+			t.Fatal("expected invalid bootstrap error")
+		}
+		info, err := os.Stat(seedPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.Mode().Perm() != oconfig.ConfigFilePerm {
+			t.Fatalf("address_book.seed mode = %04o, want %04o", info.Mode().Perm(), oconfig.ConfigFilePerm)
+		}
+	})
 }

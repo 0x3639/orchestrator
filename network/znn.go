@@ -2177,6 +2177,18 @@ func (rC *znnNetwork) GetFrontierMomentumContext(ctx context.Context) (*api.Mome
 	return rC.ZnnRpc().GetFrontierMomentumContext(ctx)
 }
 
+func (rC *znnNetwork) GetMomentumsByHeightContext(ctx context.Context, height, count uint64) (*api.MomentumList, error) {
+	return rC.ZnnRpc().GetMomentumsByHeightContext(ctx, height, count)
+}
+
+func (rC *znnNetwork) GetFrontierAccountBlockContext(ctx context.Context, address types.Address) (*api.AccountBlock, error) {
+	return rC.ZnnRpc().GetFrontierAccountBlockContext(ctx, address)
+}
+
+func (rC *znnNetwork) GetAccountBlocksByHeightContext(ctx context.Context, address types.Address, height, count uint64) (*api.AccountBlockList, error) {
+	return rC.ZnnRpc().GetAccountBlocksByHeightContext(ctx, address, height, count)
+}
+
 func (rC *znnNetwork) GetAllPillars() (*embedded.PillarInfoList, error) {
 	return rC.ZnnRpc().GetAllPillars()
 }

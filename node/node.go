@@ -40,6 +40,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/prometheus/tsdb/fileutil"
 	"github.com/zenon-network/go-zenon/common/types"
+	"github.com/zenon-network/go-zenon/rpc/api"
 	"github.com/zenon-network/go-zenon/rpc/api/embedded"
 	"github.com/zenon-network/go-zenon/vm/constants"
 	"github.com/zenon-network/go-zenon/vm/embedded/definition"
@@ -1377,20 +1378,86 @@ func (node *Node) fetchCompleteWrapPage(pageIndex, pageSize uint32, resignGen ui
 	}
 }
 
+// checkZenonFrontierConsistent verifies that Zenon has NOT rolled back past
+// cutoffHeight/cutoffHash or past the previously observed bridge account block
+// prevAcct, while permitting arbitrary forward chain/account growth.
+func (node *Node) checkZenonFrontierConsistent(cutoffHeight uint64, cutoffHash types.Hash, prevAcct *api.AccountBlock) (curAcct *api.AccountBlock, consistent, retry, stop bool) {
+	if node.workerStopping() {
+		return nil, false, false, true
+	}
+
+	acctCtx, acctCancel := context.WithTimeout(node.workers.context(), resignRPCTimeout)
+	curAcct, err := node.networksManager.Znn().GetFrontierAccountBlockContext(acctCtx, types.BridgeContract)
+	acctCancel()
+	if node.workerStopping() {
+		return nil, false, false, true
+	}
+	if err != nil {
+		node.logger.Debugf("failed to read bridge account frontier during resign consistency check: %v", err)
+		return nil, false, true, false
+	}
+
+	momCtx, momCancel := context.WithTimeout(node.workers.context(), resignRPCTimeout)
+	momList, err := node.networksManager.Znn().GetMomentumsByHeightContext(momCtx, cutoffHeight, 1)
+	momCancel()
+	if node.workerStopping() {
+		return nil, false, false, true
+	}
+	if err != nil {
+		node.logger.Debugf("failed to read momentum %d during resign consistency check: %v", cutoffHeight, err)
+		return nil, false, true, false
+	}
+	if momList == nil || len(momList.List) == 0 || momList.List[0] == nil || momList.List[0].Momentum == nil ||
+		momList.List[0].Height != cutoffHeight || momList.List[0].Hash != cutoffHash {
+		return nil, false, false, false
+	}
+
+	if prevAcct != nil && prevAcct.Height > 0 {
+		if curAcct == nil || curAcct.Height < prevAcct.Height {
+			return nil, false, false, false
+		}
+		if curAcct.Height == prevAcct.Height {
+			if curAcct.Hash != prevAcct.Hash {
+				return nil, false, false, false
+			}
+			return curAcct, true, false, false
+		}
+		// Bridge account grew forward: verify prevAcct is still the canonical
+		// ancestor at prevAcct.Height (rules out a rollback + forward re-extension).
+		ancCtx, ancCancel := context.WithTimeout(node.workers.context(), resignRPCTimeout)
+		blocks, err := node.networksManager.Znn().GetAccountBlocksByHeightContext(ancCtx, types.BridgeContract, prevAcct.Height, 1)
+		ancCancel()
+		if node.workerStopping() {
+			return nil, false, false, true
+		}
+		if err != nil {
+			node.logger.Debugf("failed to verify bridge account ancestor %d during resign scan: %v", prevAcct.Height, err)
+			return nil, false, true, false
+		}
+		if blocks == nil || len(blocks.List) == 0 || blocks.List[0] == nil ||
+			blocks.List[0].Height != prevAcct.Height || blocks.List[0].Hash != prevAcct.Hash {
+			return nil, false, false, false
+		}
+	}
+	return curAcct, true, false, false
+}
+
 // captureReSignSnapshot collects every wrap request matching
 // (resignNetworkClass, resignChainId) created at or before a live Zenon
-// frontier momentum cutoff.
+// frontier momentum cutoff on a single consistent (rollback-free) chain view.
 //
 // Zenon stores wrap requests in descending CreationMomentumHeight order
 // (breaking ties by ascending Id), so new arrivals prepend at index 0 while
-// older wraps keep a fixed reverse index (revIdx = Count - 1 - idx) from the
-// tail. Scanning contiguously from the tail (revIdx = 0) upward until either
-// index 0 or the first wrap with CreationMomentumHeight > cutoffMomentum:
+// older wraps keep a reverse index (revIdx = Count - 1 - idx) from the tail.
+// Scanning contiguously from the tail (revIdx = 0) upward until either index 0
+// or a cutoff boundary verified on the current RPC, while verifying canonical
+// momentum and bridge-account ancestry across reads:
 //   - guarantees no wrap within cutoffMomentum is missed (including same-height
-//     insertions before already-read offsets),
-//   - terminates cleanly even under sustained arrivals at >= pageSize per RPC
-//     by anchoring progress to the fixed tail membership and compensating for
-//     observed prefix growth, and
+//     insertions and delayed receives strictly below the cutoff),
+//   - invalidates cached membership and restarts cleanly if Zenon rolls back
+//     (including same-count rollbacks),
+//   - terminates cleanly even under sustained or oscillating arrivals at the
+//     max page size cap, and
 //   - never falls back to a stale cached frontier height.
 func (node *Node) captureReSignSnapshot(resignNetworkClass, resignChainId uint32, resignGen uint64) (wraps []*embedded.WrapTokenRequest, stale, stop bool) {
 	pageSize := resignPageSize
@@ -1398,9 +1465,6 @@ func (node *Node) captureReSignSnapshot(resignNetworkClass, resignChainId uint32
 		pageSize = 100
 	}
 
-	// Read a live Zenon frontier momentum as the fixed cutoff for this scan.
-	// Never fall back to a stale cached height.
-	var cutoffMomentum uint64
 	for {
 		if node.workerStopping() {
 			return nil, false, true
@@ -1408,213 +1472,282 @@ func (node *Node) captureReSignSnapshot(resignNetworkClass, resignChainId uint32
 		if !node.state.IsResignGenerationCurrent(resignGen) {
 			return nil, true, false
 		}
-		momCtx, momCancel := context.WithTimeout(node.workers.context(), resignRPCTimeout)
-		mom, err := node.networksManager.Znn().GetFrontierMomentumContext(momCtx)
-		momCancel()
-		if node.workerStopping() {
-			return nil, false, true
-		}
-		if err == nil && mom != nil && mom.Momentum != nil && mom.Height > 0 {
+
+		// Read a live Zenon frontier momentum (height + hash) and bridge account
+		// frontier as the canonical anchor for this scan. Never fall back to a
+		// stale cached height.
+		var cutoffMomentum uint64
+		var cutoffHash types.Hash
+		var anchorAcct *api.AccountBlock
+		for {
+			if node.workerStopping() {
+				return nil, false, true
+			}
+			if !node.state.IsResignGenerationCurrent(resignGen) {
+				return nil, true, false
+			}
+			momCtx, momCancel := context.WithTimeout(node.workers.context(), resignRPCTimeout)
+			mom, err := node.networksManager.Znn().GetFrontierMomentumContext(momCtx)
+			momCancel()
+			if node.workerStopping() {
+				return nil, false, true
+			}
+			if err != nil || mom == nil || mom.Momentum == nil || mom.Height == 0 || mom.Hash == types.ZeroHash {
+				node.logger.Debugf("failed to read live frontier momentum before resign scan: %v", err)
+				if !node.workerSleep(resignRetryDelay) {
+					return nil, false, true
+				}
+				continue
+			}
+			acctCtx, acctCancel := context.WithTimeout(node.workers.context(), resignRPCTimeout)
+			acct, err := node.networksManager.Znn().GetFrontierAccountBlockContext(acctCtx, types.BridgeContract)
+			acctCancel()
+			if node.workerStopping() {
+				return nil, false, true
+			}
+			if err != nil {
+				node.logger.Debugf("failed to read bridge account frontier before resign scan: %v", err)
+				if !node.workerSleep(resignRetryDelay) {
+					return nil, false, true
+				}
+				continue
+			}
 			cutoffMomentum = mom.Height
+			cutoffHash = mom.Hash
+			anchorAcct = acct
 			break
 		}
-		node.logger.Debugf("failed to read live frontier momentum before resign scan: %v", err)
-		if !node.workerSleep(resignRetryDelay) {
-			return nil, false, true
-		}
-	}
 
-	// Probe page 0 to learn the initial Count. Small tables (<= pageSize)
-	// complete atomically in a single verified RPC.
-	probe, stale, stop := node.fetchCompleteWrapPage(0, pageSize, resignGen)
-	if stale || stop {
-		return nil, stale, stop
-	}
-	node.logger.Debugf("len(wrapRequests.List): %d, count: %d, pageIndex: 0", len(probe.List), probe.Count)
-	if probe.Count == 0 {
-		return nil, false, false
-	}
-
-	snapshotByID := make(map[types.Hash]*embedded.WrapTokenRequest)
-	snapshotOrder := make([]types.Hash, 0)
-	recordWrap := func(wrap *embedded.WrapTokenRequest) {
-		if wrap.NetworkClass != resignNetworkClass || wrap.ChainId != resignChainId {
-			return
-		}
-		if wrap.CreationMomentumHeight > cutoffMomentum {
-			return
-		}
-		if _, exists := snapshotByID[wrap.Id]; !exists {
-			snapshotOrder = append(snapshotOrder, wrap.Id)
-		}
-		snapshotByID[wrap.Id] = wrap
-	}
-
-	if probe.Count <= int(pageSize) {
-		for _, wrap := range probe.List {
-			recordWrap(wrap)
-		}
-		snapshot := make([]*embedded.WrapTokenRequest, 0, len(snapshotOrder))
-		for _, id := range snapshotOrder {
-			snapshot = append(snapshot, snapshotByID[id])
-		}
-		return snapshot, false, false
-	}
-
-	// Walk contiguously from the oldest tail wrap (revIdx = 0) upward until
-	// index 0 or the first wrap with CreationMomentumHeight > cutoffMomentum.
-	// Because Zenon derives a wrap's CreationMomentumHeight from the momentum
-	// that confirmed its send, a delayed bridge receive can appear later at a
-	// height strictly below cutoffMomentum and shift already-read reverse
-	// indices. We therefore keep the revIdx -> wrap and id -> revIdx maps across
-	// the entire scanned tail: any shift in a previously observed revIdx or ID
-	// is detected immediately, resets the shifted cache cleanly, and re-reads
-	// from revIdx 0 so no wrap within cutoffMomentum can be skipped.
-	maxPageSize := resignMaxPageSize
-	if maxPageSize < pageSize {
-		maxPageSize = pageSize
-	}
-	curPageSize := pageSize
-	estCount := probe.Count
-	prevCount := probe.Count
-	estGrowth := 0
-	stalledReads := 0
-	coveredByRevIdx := make(map[int]*embedded.WrapTokenRequest)
-	revIdxByID := make(map[types.Hash]int)
-
-	for {
-		if node.workerStopping() {
-			return nil, false, true
-		}
-		if !node.state.IsResignGenerationCurrent(resignGen) {
-			return nil, true, false
-		}
-
-		doneFromTail := 0
-		for {
-			wrap, ok := coveredByRevIdx[doneFromTail]
-			if !ok || wrap.CreationMomentumHeight > cutoffMomentum {
-				break
-			}
-			doneFromTail++
-		}
-
-		predCount := estCount + estGrowth
-		wantEnd := predCount - doneFromTail
-		if wantEnd <= 0 {
-			wantEnd = 1
-		}
-		pageIndex := uint32((wantEnd - 1) / int(curPageSize))
-
-		wrapRequests, stale, stop := node.fetchCompleteWrapPage(pageIndex, curPageSize, resignGen)
+		// Probe page 0 to learn the initial Count. Small tables (<= pageSize)
+		// complete atomically in a single verified RPC.
+		probe, stale, stop := node.fetchCompleteWrapPage(0, pageSize, resignGen)
 		if stale || stop {
 			return nil, stale, stop
 		}
-		node.logger.Debugf("len(wrapRequests.List): %d, count: %d, pageIndex: %d", len(wrapRequests.List), wrapRequests.Count, pageIndex)
+		node.logger.Debugf("len(wrapRequests.List): %d, count: %d, pageIndex: 0", len(probe.List), probe.Count)
 
-		actualCount := wrapRequests.Count
-		actualDelta := 0
-		if actualCount > prevCount {
-			actualDelta = actualCount - prevCount
+		// Verify the chain did not roll back between anchoring and page 0.
+		curAcct, consistent, retryCheck, stopCheck := node.checkZenonFrontierConsistent(cutoffMomentum, cutoffHash, anchorAcct)
+		if stopCheck {
+			return nil, false, true
 		}
-		prevCount = actualCount
-		estCount = actualCount
-
-		startIdx := int(pageIndex) * int(curPageSize)
-		pageMinRevIdx := actualCount - (startIdx + len(wrapRequests.List))
-		pageMaxRevIdx := actualCount - 1 - startIdx
-		tailShifted := false
-		for i, wrap := range wrapRequests.List {
-			revIdx := actualCount - 1 - (startIdx + i)
-			if prevRev, seen := revIdxByID[wrap.Id]; seen && prevRev != revIdx {
-				tailShifted = true
-				break
+		if retryCheck || !consistent {
+			if !consistent {
+				node.logger.Debug("Zenon frontier rolled back during ReSignState probe; restarting snapshot")
 			}
-			if prevWrap, occupied := coveredByRevIdx[revIdx]; occupied && prevWrap.Id != wrap.Id {
-				tailShifted = true
-				break
+			if !node.workerSleep(resignRetryDelay) {
+				return nil, false, true
 			}
+			continue
 		}
-		if tailShifted {
-			node.logger.Debug("Detected shifted wrap tail position during ReSignState scan; re-verifying tail")
-			clear(coveredByRevIdx)
-			clear(revIdxByID)
-			doneFromTail = 0
+		anchorAcct = curAcct
+
+		if probe.Count == 0 {
+			return nil, false, false
 		}
 
-		for i, wrap := range wrapRequests.List {
-			revIdx := actualCount - 1 - (startIdx + i)
-			if revIdx >= 0 {
-				coveredByRevIdx[revIdx] = wrap
-				revIdxByID[wrap.Id] = revIdx
-			}
-		}
-
-		r := 0
-		done := false
-		for {
-			wrap, ok := coveredByRevIdx[r]
-			if !ok {
-				break
+		snapshotByID := make(map[types.Hash]*embedded.WrapTokenRequest)
+		snapshotOrder := make([]types.Hash, 0)
+		recordWrap := func(wrap *embedded.WrapTokenRequest) {
+			if wrap.NetworkClass != resignNetworkClass || wrap.ChainId != resignChainId {
+				return
 			}
 			if wrap.CreationMomentumHeight > cutoffMomentum {
-				// Only accept the > cutoffMomentum boundary at revIdx == r if it
-				// was observed on THIS RPC call. An earlier cached boundary row
-				// could be stale if a delayed receive took revIdx == r while an
-				// earlier gap was being filled. Confirming the boundary at r now
-				// proves all r distinct <= cutoff wraps in [0..r-1] are complete.
-				if len(wrapRequests.List) > 0 && r >= pageMinRevIdx && r <= pageMaxRevIdx {
-					for k := 0; k < r; k++ {
-						recordWrap(coveredByRevIdx[k])
-					}
-					done = true
-				} else {
-					for k, w := range coveredByRevIdx {
-						if k >= r {
-							delete(revIdxByID, w.Id)
-							delete(coveredByRevIdx, k)
-						}
-					}
-				}
-				break
+				return
 			}
-			r++
-		}
-		if !done && r == actualCount {
-			// Contiguously covered all actualCount distinct wraps at the current Count.
-			for k := 0; k < actualCount; k++ {
-				recordWrap(coveredByRevIdx[k])
+			if _, exists := snapshotByID[wrap.Id]; !exists {
+				snapshotOrder = append(snapshotOrder, wrap.Id)
 			}
-			done = true
-		} else if !done && r > actualCount {
-			clear(coveredByRevIdx)
-			clear(revIdxByID)
-			r = 0
+			snapshotByID[wrap.Id] = wrap
 		}
-		if done {
+
+		if probe.Count <= int(pageSize) {
+			for _, wrap := range probe.List {
+				recordWrap(wrap)
+			}
 			snapshot := make([]*embedded.WrapTokenRequest, 0, len(snapshotOrder))
 			for _, id := range snapshotOrder {
 				snapshot = append(snapshot, snapshotByID[id])
 			}
 			return snapshot, false, false
 		}
-		if r > doneFromTail {
-			stalledReads = 0
-			estGrowth = actualDelta
-		} else {
-			stalledReads++
-			if stalledReads%2 == 0 && curPageSize < maxPageSize {
-				curPageSize *= 2
-				if curPageSize > maxPageSize {
-					curPageSize = maxPageSize
+
+		// Walk contiguously from the oldest tail wrap (revIdx = 0) upward until
+		// index 0 or the first wrap with CreationMomentumHeight > cutoffMomentum
+		// confirmed on the current RPC.
+		maxPageSize := resignMaxPageSize
+		if maxPageSize < pageSize {
+			maxPageSize = pageSize
+		}
+		curPageSize := pageSize
+		estCount := probe.Count
+		prevCount := probe.Count
+		estGrowth := 0
+		stalledReads := 0
+		coveredByRevIdx := make(map[int]*embedded.WrapTokenRequest)
+		revIdxByID := make(map[types.Hash]int)
+		rolledBack := false
+
+		for {
+			if node.workerStopping() {
+				return nil, false, true
+			}
+			if !node.state.IsResignGenerationCurrent(resignGen) {
+				return nil, true, false
+			}
+
+			doneFromTail := 0
+			for {
+				wrap, ok := coveredByRevIdx[doneFromTail]
+				if !ok || wrap.CreationMomentumHeight > cutoffMomentum {
+					break
+				}
+				doneFromTail++
+			}
+
+			predCount := estCount + estGrowth
+			wantEnd := predCount - doneFromTail
+			if wantEnd <= 0 {
+				wantEnd = 1
+			}
+			pageIndex := uint32((wantEnd - 1) / int(curPageSize))
+
+			wrapRequests, stale, stop := node.fetchCompleteWrapPage(pageIndex, curPageSize, resignGen)
+			if stale || stop {
+				return nil, stale, stop
+			}
+			node.logger.Debugf("len(wrapRequests.List): %d, count: %d, pageIndex: %d", len(wrapRequests.List), wrapRequests.Count, pageIndex)
+
+			// Verify Zenon did not roll back since the previous read before
+			// incorporating this page into the snapshot cache.
+			curAcct, consistent, retryCheck, stopCheck := node.checkZenonFrontierConsistent(cutoffMomentum, cutoffHash, anchorAcct)
+			if stopCheck {
+				return nil, false, true
+			}
+			if retryCheck {
+				if !node.workerSleep(resignRetryDelay) {
+					return nil, false, true
+				}
+				continue
+			}
+			if !consistent {
+				node.logger.Debug("Zenon frontier rolled back during ReSignState pagination; restarting snapshot")
+				rolledBack = true
+				break
+			}
+			anchorAcct = curAcct
+
+			actualCount := wrapRequests.Count
+			actualDelta := 0
+			if actualCount > prevCount {
+				actualDelta = actualCount - prevCount
+			}
+			prevCount = actualCount
+			estCount = actualCount
+
+			startIdx := int(pageIndex) * int(curPageSize)
+			pageMinRevIdx := actualCount - (startIdx + len(wrapRequests.List))
+			pageMaxRevIdx := actualCount - 1 - startIdx
+			tailShifted := false
+			for i, wrap := range wrapRequests.List {
+				revIdx := actualCount - 1 - (startIdx + i)
+				if prevRev, seen := revIdxByID[wrap.Id]; seen && prevRev != revIdx {
+					tailShifted = true
+					break
+				}
+				if prevWrap, occupied := coveredByRevIdx[revIdx]; occupied && prevWrap.Id != wrap.Id {
+					tailShifted = true
+					break
 				}
 			}
-			// Update estGrowth only at powers of two while stalled so periodic
-			// arrival bursts (e.g. alternating +1024/+2048 at the max page size
-			// cap) cannot phase-lock the estimator.
-			if stalledReads&(stalledReads-1) == 0 {
-				estGrowth = actualDelta
+			if tailShifted {
+				node.logger.Debug("Detected shifted wrap tail position during ReSignState scan; re-verifying tail")
+				clear(coveredByRevIdx)
+				clear(revIdxByID)
+				doneFromTail = 0
 			}
+
+			for i, wrap := range wrapRequests.List {
+				revIdx := actualCount - 1 - (startIdx + i)
+				if revIdx >= 0 {
+					coveredByRevIdx[revIdx] = wrap
+					revIdxByID[wrap.Id] = revIdx
+				}
+			}
+
+			r := 0
+			done := false
+			for {
+				wrap, ok := coveredByRevIdx[r]
+				if !ok {
+					break
+				}
+				if wrap.CreationMomentumHeight > cutoffMomentum {
+					// Only accept the > cutoffMomentum boundary at revIdx == r if it
+					// was observed on THIS RPC call. An earlier cached boundary row
+					// could be stale if a delayed receive took revIdx == r while an
+					// earlier gap was being filled. Confirming the boundary at r now
+					// proves all r distinct <= cutoff wraps in [0..r-1] are complete.
+					if len(wrapRequests.List) > 0 && r >= pageMinRevIdx && r <= pageMaxRevIdx {
+						for k := 0; k < r; k++ {
+							recordWrap(coveredByRevIdx[k])
+						}
+						done = true
+					} else {
+						for k, w := range coveredByRevIdx {
+							if k >= r {
+								delete(revIdxByID, w.Id)
+								delete(coveredByRevIdx, k)
+							}
+						}
+					}
+					break
+				}
+				r++
+			}
+			if !done && r == actualCount {
+				// Contiguously covered all actualCount distinct wraps at the current Count.
+				for k := 0; k < actualCount; k++ {
+					recordWrap(coveredByRevIdx[k])
+				}
+				done = true
+			} else if !done && r > actualCount {
+				clear(coveredByRevIdx)
+				clear(revIdxByID)
+				r = 0
+			}
+			if done {
+				snapshot := make([]*embedded.WrapTokenRequest, 0, len(snapshotOrder))
+				for _, id := range snapshotOrder {
+					snapshot = append(snapshot, snapshotByID[id])
+				}
+				return snapshot, false, false
+			}
+			if r > doneFromTail {
+				stalledReads = 0
+				estGrowth = actualDelta
+			} else {
+				stalledReads++
+				if stalledReads%2 == 0 && curPageSize < maxPageSize {
+					curPageSize *= 2
+					if curPageSize > maxPageSize {
+						curPageSize = maxPageSize
+					}
+				}
+				// Update estGrowth only at powers of two while stalled so periodic
+				// arrival bursts (e.g. alternating +1024/+2048 at the max page size
+				// cap) cannot phase-lock the estimator.
+				if stalledReads&(stalledReads-1) == 0 {
+					estGrowth = actualDelta
+				}
+			}
+		}
+
+		if rolledBack {
+			if !node.workerSleep(resignRetryDelay) {
+				return nil, false, true
+			}
+			continue
 		}
 	}
 }

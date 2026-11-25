@@ -454,8 +454,10 @@ type wrapTestBridge struct {
 	onPage           func(page int32)
 	frontierCalls    atomic.Int32
 	frontierFn       func(ctx context.Context, call int32) (*api.AccountBlock, error)
+	acctByHeightFn   func(ctx context.Context, height uint64) (*api.AccountBlockList, error)
 	frontierMomCalls atomic.Int32
 	frontierMomFn    func(ctx context.Context, call int32) (*api.Momentum, error)
+	momByHeightFn    func(ctx context.Context, height uint64) (*api.MomentumList, error)
 }
 
 type wrapTestLedger struct {
@@ -476,7 +478,7 @@ func testMomentum(height uint64) *api.Momentum {
 	return &api.Momentum{
 		Momentum: &nom.Momentum{
 			Height: height,
-			Hash:   types.Hash{byte(height)},
+			Hash:   types.Hash{0xbb, byte(height >> 8), byte(height)},
 		},
 	}
 }
@@ -489,7 +491,20 @@ func (l *wrapTestLedger) GetFrontierAccountBlock(ctx context.Context, _ types.Ad
 	if fn != nil {
 		return fn(ctx, call)
 	}
-	return testAccountBlock(1, types.Hash{1}), nil
+	return testAccountBlock(1, types.Hash{0xaa, 0, 1}), nil
+}
+
+func (l *wrapTestLedger) GetAccountBlocksByHeight(ctx context.Context, _ types.Address, height, _ uint64) (*api.AccountBlockList, error) {
+	l.bridge.mu.Lock()
+	fn := l.bridge.acctByHeightFn
+	l.bridge.mu.Unlock()
+	if fn != nil {
+		return fn(ctx, height)
+	}
+	return &api.AccountBlockList{
+		Count: int(height),
+		List:  []*api.AccountBlock{testAccountBlock(height, types.Hash{0xaa, byte(height >> 8), byte(height)})},
+	}, nil
 }
 
 func (l *wrapTestLedger) GetFrontierMomentum(ctx context.Context) (*api.Momentum, error) {
@@ -501,6 +516,19 @@ func (l *wrapTestLedger) GetFrontierMomentum(ctx context.Context) (*api.Momentum
 		return fn(ctx, call)
 	}
 	return testMomentum(1000), nil
+}
+
+func (l *wrapTestLedger) GetMomentumsByHeight(ctx context.Context, height, _ uint64) (*api.MomentumList, error) {
+	l.bridge.mu.Lock()
+	fn := l.bridge.momByHeightFn
+	l.bridge.mu.Unlock()
+	if fn != nil {
+		return fn(ctx, height)
+	}
+	return &api.MomentumList{
+		Count: 1,
+		List:  []*api.Momentum{testMomentum(height)},
+	}, nil
 }
 
 func (b *wrapTestBridge) GetBridgeInfo() (*definition.BridgeInfoVariable, error) {
@@ -2048,6 +2076,149 @@ func TestReSignStateVerifiesCutoffBoundaryAgainstDelayedReceive(t *testing.T) {
 		if ev, err := n.dbManager.ZnnStorage().GetWrapRequestById(id); err != nil || ev != nil {
 			t.Fatalf("future wrap %s should not have been stored: ev=%+v err=%v", id, ev, err)
 		}
+	}
+}
+
+func TestReSignStateRestartsOnSameCountZenonFrontierRollback(t *testing.T) {
+	prevDelay := resignRetryDelay
+	prevPageSize := resignPageSize
+	resignRetryDelay = 20 * time.Millisecond
+	resignPageSize = 2
+	t.Cleanup(func() {
+		resignRetryDelay = prevDelay
+		resignPageSize = prevPageSize
+	})
+
+	evmSrv := fakeEvmRpcServer(t)
+	defer evmSrv.Close()
+
+	makeEntry := func(id types.Hash, height uint64) *embedded.WrapTokenRequest {
+		return &embedded.WrapTokenRequest{
+			WrapTokenRequest: &definition.WrapTokenRequest{
+				NetworkClass: definition.EvmClass, ChainId: 1, Id: id,
+				Amount: big.NewInt(10), Fee: big.NewInt(1), CreationMomentumHeight: height,
+			},
+			ConfirmationsToFinality: 0,
+		}
+	}
+
+	// Simulate a same-count Zenon rollback between page reads:
+	// - Fork 1 (epoch 0): [ f1(101), w2(99), w1(99), oldWrap(98) ] (Count=4),
+	//   bridge frontier (height=10, hash=0x01), momentum 100 hash=0x11.
+	// - Call 1 (probe page 0) sees Count=4 on Fork 1.
+	// - Call 2 (tail page 1) reads [ w1(99), oldWrap(98) ] (revIdx=1, 0) on Fork 1.
+	// - Before Call 3 (which reads page 0: [ f1(101), w2(99) ] — a valid cutoff
+	//   boundary on the current RPC with NO revIdx collision against revIdx=0,1!),
+	//   Zenon rolls back Fork 1 -> Fork 2 (epoch 1) with the SAME Count=4:
+	//     [ f1(101), w2(99), w1(99), replacementWrap(98) ]
+	//   updating bridge frontier hash to 0x02 (and momentum 100 hash to 0x22).
+	// The scanner must detect the rollback, discard oldWrap from Fork 1,
+	// restart cleanly on Fork 2, mark w2/w1/replacementWrap, and NOT mark oldWrap.
+	f1 := types.Hash{0xf1}
+	w2 := types.Hash{0x21}
+	w1 := types.Hash{0x22}
+	oldWrap := types.Hash{0x23}
+	replacementWrap := types.Hash{0x24}
+
+	fork1 := []*embedded.WrapTokenRequest{
+		makeEntry(f1, 101),
+		makeEntry(w2, 99),
+		makeEntry(w1, 99),
+		makeEntry(oldWrap, 98),
+	}
+	fork2 := []*embedded.WrapTokenRequest{
+		makeEntry(f1, 101),
+		makeEntry(w2, 99),
+		makeEntry(w1, 99),
+		makeEntry(replacementWrap, 98),
+	}
+	sortZenonWraps(fork1)
+	sortZenonWraps(fork2)
+
+	var epoch atomic.Int32 // 0 = fork1, 1 = fork2
+	bridge := &wrapTestBridge{
+		networks: &embedded.NetworkInfoList{
+			Count: 1,
+			List: []*definition.NetworkInfo{{
+				NetworkClass: definition.EvmClass, Id: 1, Name: "Ethereum",
+				ContractAddress: "0x0000000000000000000000000000000000000001",
+			}},
+		},
+		frontierMomFn: func(_ context.Context, _ int32) (*api.Momentum, error) {
+			hashByte := byte(0x11)
+			if epoch.Load() > 0 {
+				hashByte = 0x22
+			}
+			return &api.Momentum{Momentum: &nom.Momentum{Height: 100, Hash: types.Hash{hashByte}}}, nil
+		},
+		momByHeightFn: func(_ context.Context, height uint64) (*api.MomentumList, error) {
+			hashByte := byte(0x11)
+			if epoch.Load() > 0 {
+				hashByte = 0x22
+			}
+			return &api.MomentumList{
+				Count: 1,
+				List:  []*api.Momentum{{Momentum: &nom.Momentum{Height: height, Hash: types.Hash{hashByte}}}},
+			}, nil
+		},
+		frontierFn: func(_ context.Context, _ int32) (*api.AccountBlock, error) {
+			hashByte := byte(0x01)
+			if epoch.Load() > 0 {
+				hashByte = 0x02
+			}
+			return testAccountBlock(10, types.Hash{hashByte}), nil
+		},
+		acctByHeightFn: func(_ context.Context, height uint64) (*api.AccountBlockList, error) {
+			hashByte := byte(0x01)
+			if epoch.Load() > 0 {
+				hashByte = 0x02
+			}
+			return &api.AccountBlockList{
+				Count: int(height),
+				List:  []*api.AccountBlock{testAccountBlock(height, types.Hash{hashByte})},
+			}, nil
+		},
+		pageHandler: func(pageIndex, pageSize uint32, call int32) *embedded.WrapTokenRequestList {
+			if call == 3 {
+				// Trigger same-count rollback right before the page that returns
+				// the cutoff boundary [f1(101), w2(99)].
+				epoch.Store(1)
+			}
+			if epoch.Load() == 0 {
+				return paginateZenonWraps(fork1, pageIndex, pageSize)
+			}
+			return paginateZenonWraps(fork2, pageIndex, pageSize)
+		},
+	}
+
+	n := wrapTestNodeWithEvm(t, common.LiveState, bridge, map[string]string{"Ethereum": evmSrv.URL})
+	if activated, err := n.state.ActivateResign(definition.EvmClass, 1); err != nil || !activated {
+		t.Fatalf("ActivateResign failed: activated=%v err=%v", activated, err)
+	}
+	n.state.CompleteStartup()
+
+	n.workers.start(n.processSignatures)
+	t.Cleanup(func() {
+		done := n.workers.shutdown()
+		<-done
+	})
+
+	eventually(t, "ReSignState to restart on same-count rollback and mark replacementWrap", func() bool {
+		st, _ := n.state.GetState()
+		for _, id := range []types.Hash{w2, w1, replacementWrap} {
+			r, err := n.dbManager.ZnnStorage().GetResignStatus(id)
+			if err != nil || !r {
+				return false
+			}
+		}
+		return st == common.LiveState
+	})
+
+	if resign, err := n.dbManager.ZnnStorage().GetResignStatus(oldWrap); err != nil || resign {
+		t.Fatalf("rolled-back wrap from old frontier should not have been marked: resign=%v err=%v", resign, err)
+	}
+	if ev, err := n.dbManager.ZnnStorage().GetWrapRequestById(oldWrap); err != nil || ev != nil {
+		t.Fatalf("rolled-back wrap from old frontier should not have been stored: ev=%+v err=%v", ev, err)
 	}
 }
 

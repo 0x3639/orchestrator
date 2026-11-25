@@ -88,8 +88,22 @@ func (*startupLedger) GetFrontierAccountBlock(types.Address) (*api.AccountBlock,
 	return &api.AccountBlock{AccountBlock: nom.AccountBlock{Height: 1, Hash: types.Hash{1}, Amount: big.NewInt(0)}}, nil
 }
 
+func (*startupLedger) GetAccountBlocksByHeight(_ types.Address, height, _ uint64) (*api.AccountBlockList, error) {
+	return &api.AccountBlockList{
+		Count: int(height),
+		List:  []*api.AccountBlock{{AccountBlock: nom.AccountBlock{Height: height, Hash: types.Hash{byte(height)}, Amount: big.NewInt(0)}}},
+	}, nil
+}
+
 func (*startupLedger) GetFrontierMomentum() (*api.Momentum, error) {
 	return &api.Momentum{Momentum: &nom.Momentum{Height: 100, Hash: types.Hash{1}}}, nil
+}
+
+func (*startupLedger) GetMomentumsByHeight(height, _ uint64) (*api.MomentumList, error) {
+	return &api.MomentumList{
+		Count: 1,
+		List:  []*api.Momentum{{Momentum: &nom.Momentum{Height: height, Hash: types.Hash{1}}}},
+	}, nil
 }
 
 // startupNode is a signer with the bridge above and no EVM network, in the
