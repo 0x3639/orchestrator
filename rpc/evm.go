@@ -107,6 +107,7 @@ type pendingAttempt struct {
 	txHash   ecommon.Hash
 	nonce    uint64
 	entry    *pendingEvmTx
+	inFlight bool
 	rejected bool
 }
 
@@ -720,10 +721,11 @@ func (r *EvmRpc) recordPendingTxAttempt(tx *etypes.Transaction) (*pendingAttempt
 		}
 	}
 	attempt := &pendingAttempt{
-		kind:   key.kind,
-		txHash: tx.Hash(),
-		nonce:  tx.Nonce(),
-		entry:  clonePendingEvmTx(entry),
+		kind:     key.kind,
+		txHash:   tx.Hash(),
+		nonce:    tx.Nonce(),
+		entry:    clonePendingEvmTx(entry),
+		inFlight: true,
 	}
 	r.nonceStack[nk] = append(r.nonceStack[nk], attempt)
 
@@ -940,6 +942,7 @@ func (r *EvmRpc) reconcileSentTx(tx *etypes.Transaction, attempt *pendingAttempt
 	}
 	r.pendingMu.Lock()
 	defer r.pendingMu.Unlock()
+	attempt.inFlight = false
 
 	nk := evmNonceKey{sender: key.sender, contract: key.contract, nonce: tx.Nonce()}
 	stack := r.nonceStack[nk]
@@ -1142,11 +1145,37 @@ func (r *EvmRpc) clearPendingTxIfMatchesLocked(key evmTxKey, expected *pendingEv
 	return cleared, nil
 }
 
+// isInFlightLocked reports whether an attempt matching key and rec currently
+// has an in-flight eth_sendRawTransaction RPC. Caller must hold r.pendingMu.
+func (r *EvmRpc) isInFlightLocked(key evmTxKey, rec *pendingEvmTx) bool {
+	if rec == nil {
+		return false
+	}
+	nk := evmNonceKey{sender: key.sender, contract: key.contract, nonce: rec.nonce}
+	for _, a := range r.nonceStack[nk] {
+		if a.inFlight && a.kind == key.kind && a.txHash == rec.txHash {
+			return true
+		}
+	}
+	return false
+}
+
+// hasFailedRollbacksLocked reports whether (sender, contract) has any failed
+// rollback awaiting retry. Caller must hold r.pendingMu.
+func (r *EvmRpc) hasFailedRollbacksLocked(sender, contract ecommon.Address) bool {
+	for nk := range r.failedRollbacks {
+		if nk.sender == sender && nk.contract == contract {
+			return true
+		}
+	}
+	return false
+}
+
 // clearObsoleteHaltLocked atomically clears an obsolete halt reservation if it
-// still matches expected, prunes confirmed stacks below confirmedNonce first,
-// and commits both the halt deletion and any surviving unconfirmed rotation
-// uncovered across nonces <= expected.nonce in a single ApplyPendingEvmTxBatch.
-// Caller must hold r.pendingMu.
+// still matches expected (and is not currently in flight), prunes confirmed
+// stacks below confirmedNonce first, and commits both the halt deletion and
+// any surviving unconfirmed rotation uncovered across nonces <= expected.nonce
+// in a single ApplyPendingEvmTxBatch. Caller must hold r.pendingMu.
 func (r *EvmRpc) clearObsoleteHaltLocked(key evmTxKey, expected *pendingEvmTx, confirmedNonce uint64) error {
 	r.pruneConfirmedNonceStacksLocked(key.sender, key.contract, confirmedNonce)
 	if err := r.retryFailedRollbacksLocked(key.sender, key.contract); err != nil {
@@ -1159,6 +1188,11 @@ func (r *EvmRpc) clearObsoleteHaltLocked(key evmTxKey, expected *pendingEvmTx, c
 	store := r.pendingTxStore
 	r.txMu.Unlock()
 	if cur == nil || cur.nonce != expected.nonce || cur.txHash != expected.txHash {
+		return nil
+	}
+	if r.isInFlightLocked(key, cur) {
+		// Defer cleanup while the matching halt broadcast is still in flight so
+		// a subsequent acceptance never loses its durable reservation.
 		return nil
 	}
 
@@ -1174,6 +1208,9 @@ func (r *EvmRpc) clearObsoleteHaltLocked(key evmTxKey, expected *pendingEvmTx, c
 		}
 		cut := len(st)
 		for cut > 0 && (st[cut-1].kind == evmTxKindHalt || st[cut-1].rejected) {
+			if st[cut-1].inFlight && st[cut-1].kind == evmTxKindHalt {
+				break
+			}
 			cut--
 		}
 		if cut == len(st) {
@@ -1251,20 +1288,14 @@ func (r *EvmRpc) ClearObsoleteHaltTx(sender ecommon.Address) error {
 
 func (r *EvmRpc) ClearObsoleteHaltTxContext(parent context.Context, sender ecommon.Address) error {
 	key := evmTxKey{sender: sender, contract: r.bridgeAddress, kind: evmTxKindHalt}
-	// Resolve any pending failed rollback BEFORE inspecting or clearing a halt
-	// reservation so an accepted rotation beneath a rejected halt is restored
-	// atomically rather than erased as an obsolete halt.
 	r.pendingMu.Lock()
-	if err := r.retryFailedRollbacksLocked(sender, r.bridgeAddress); err != nil {
-		r.pendingMu.Unlock()
-		return err
-	}
 	rec, err := r.loadPendingTxLocked(key)
+	hasFailed := r.hasFailedRollbacksLocked(sender, r.bridgeAddress)
 	r.pendingMu.Unlock()
 	if err != nil {
 		return err
 	}
-	if rec == nil {
+	if rec == nil && !hasFailed {
 		return nil
 	}
 	blockHeight, err := r.BlockNumberContext(parent)
@@ -1275,13 +1306,34 @@ func (r *EvmRpc) ClearObsoleteHaltTxContext(parent context.Context, sender ecomm
 	if err != nil {
 		return err
 	}
+	// Prune consumed stacks (< confirmedNonce) BEFORE retrying any failed
+	// rollbacks so a consumed rotation is never restored after confirmation.
+	r.pendingMu.Lock()
+	r.pruneConfirmedNonceStacksLocked(sender, r.bridgeAddress, confirmedNonce)
+	if err := r.retryFailedRollbacksLocked(sender, r.bridgeAddress); err != nil {
+		r.pendingMu.Unlock()
+		return err
+	}
+	rec, err = r.loadPendingTxLocked(key)
+	if err != nil {
+		r.pendingMu.Unlock()
+		return err
+	}
+	if rec == nil {
+		r.pendingMu.Unlock()
+		return nil
+	}
 	if rec.nonce < confirmedNonce {
-		r.pendingMu.Lock()
-		r.pruneConfirmedNonceStacksLocked(sender, r.bridgeAddress, confirmedNonce)
 		_, clrErr := r.clearPendingTxIfMatchesLocked(key, rec)
 		r.pendingMu.Unlock()
 		return clrErr
 	}
+	if r.isInFlightLocked(key, rec) {
+		r.pendingMu.Unlock()
+		return nil
+	}
+	r.pendingMu.Unlock()
+
 	pendingNonce, err := r.PendingNonceAtContext(parent, sender)
 	if err != nil {
 		// Fail safe: keep halt ownership when mempool state is unreadable.

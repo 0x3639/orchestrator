@@ -4128,4 +4128,245 @@ func TestClearObsoleteHaltAtomicAcrossNoncesPrunesConsumedAndPropagatesErrors(t 
 			t.Fatalf("durable setTss = (%+v, %v), want nil (must not restore consumed nonce 5)", gotSetTss, err)
 		}
 	})
+
+	t.Run("cleanup defers while matching halt broadcast is in flight", func(t *testing.T) {
+		key, err := crypto.GenerateKey()
+		if err != nil {
+			t.Fatal(err)
+		}
+		sender := crypto.PubkeyToAddress(key.PublicKey)
+		signer := etypes.LatestSignerForChainID(big.NewInt(1))
+		store := newMemPendingTxStore()
+
+		haltEntered := make(chan struct{})
+		releaseHalt := make(chan struct{})
+		var releaseOnce sync.Once
+		release := func() { releaseOnce.Do(func() { close(releaseHalt) }) }
+		var confirmedNonce, pendingNonce atomic.Uint64
+		confirmedNonce.Store(5)
+		pendingNonce.Store(5)
+
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			var req struct {
+				ID     json.RawMessage   `json:"id"`
+				Method string            `json:"method"`
+				Params []json.RawMessage `json:"params"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&req)
+			resp := map[string]interface{}{"jsonrpc": "2.0", "id": req.ID}
+			switch req.Method {
+			case "eth_chainId":
+				resp["result"] = hexutil.EncodeUint64(1)
+			case "eth_blockNumber":
+				resp["result"] = hexutil.EncodeUint64(100)
+			case "eth_getBalance":
+				resp["result"] = (*hexutil.Big)(new(big.Int).Mul(big.NewInt(10), big.NewInt(1e18)))
+			case "eth_getTransactionCount":
+				var tag string
+				if len(req.Params) >= 2 {
+					_ = json.Unmarshal(req.Params[1], &tag)
+				}
+				if tag == "pending" {
+					resp["result"] = hexutil.EncodeUint64(pendingNonce.Load())
+				} else {
+					resp["result"] = hexutil.EncodeUint64(confirmedNonce.Load())
+				}
+			case "eth_getBlockByNumber":
+				resp["result"] = map[string]interface{}{
+					"number":        hexutil.EncodeUint64(100),
+					"hash":          ecommon.HexToHash("0x11"),
+					"baseFeePerGas": (*hexutil.Big)(big.NewInt(20_000_000_000)),
+				}
+			case "eth_maxPriorityFeePerGas":
+				resp["result"] = (*hexutil.Big)(big.NewInt(2_000_000_000))
+			case "eth_estimateGas":
+				resp["result"] = hexutil.EncodeUint64(100_000)
+			case "eth_getTransactionByHash":
+				resp["result"] = nil
+			case "eth_sendRawTransaction":
+				var raw hexutil.Bytes
+				_ = json.Unmarshal(req.Params[0], &raw)
+				var tx etypes.Transaction
+				_ = tx.UnmarshalBinary(raw)
+				close(haltEntered)
+				select {
+				case <-releaseHalt:
+				case <-r.Context().Done():
+					return
+				}
+				pendingNonce.Store(6)
+				resp["result"] = tx.Hash().Hex()
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(resp)
+		}))
+		t.Cleanup(func() {
+			release()
+			srv.Close()
+		})
+
+		client, err := NewEvmRpcClient(config.BaseNetworkConfig{Urls: []string{srv.URL}}, "clear-defers-inflight-halt", contract)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer client.Stop()
+		client.SetChainID(1)
+		client.SetPendingTxStore(store)
+
+		halt5, err := client.GetHaltTxEvm(sender, []byte{1, 2, 3}, &contract)
+		if err != nil {
+			t.Fatal(err)
+		}
+		signedHalt5, err := etypes.SignTx(halt5, signer, key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		haltDone := make(chan error, 1)
+		go func() { haltDone <- client.SendTransaction(signedHalt5) }()
+		select {
+		case <-haltEntered:
+		case <-time.After(2 * time.Second):
+			t.Fatal("timed out waiting for halt5 broadcast to reach server")
+		}
+
+		// Cleanup while broadcast is in flight MUST defer rather than erasing durable halt(5).
+		if err := client.ClearObsoleteHaltTx(sender); err != nil {
+			t.Fatalf("ClearObsoleteHaltTx error: %v", err)
+		}
+		release()
+		if err := <-haltDone; err != nil {
+			t.Fatalf("halt5 broadcast failed: %v", err)
+		}
+		gotHalt, err := store.LoadPendingEvmTx(sender, contract, evmTxKindHalt)
+		if err != nil || gotHalt == nil || gotHalt.Nonce != 5 || gotHalt.TxHash != signedHalt5.Hash() {
+			t.Fatalf("after cleanup during in-flight broadcast, durable halt = (%+v, %v), want halt(5) %s", gotHalt, err, signedHalt5.Hash())
+		}
+		rotTx, err := client.GetSetTssEcdsaPubKeyEvmTx(newTss, sender, []byte{4}, []byte{5}, &contract)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if rotTx.Nonce() != 6 {
+			t.Fatalf("subsequent rotation nonce = %d, want 6 (must respect halt(5))", rotTx.Nonce())
+		}
+	})
+
+	t.Run("failed rollback does not restore consumed rotation after confirmedNonce advances", func(t *testing.T) {
+		key, err := crypto.GenerateKey()
+		if err != nil {
+			t.Fatal(err)
+		}
+		sender := crypto.PubkeyToAddress(key.PublicKey)
+		signer := etypes.LatestSignerForChainID(big.NewInt(1))
+		store := &failingPendingTxStore{memPendingTxStore: newMemPendingTxStore()}
+
+		var halt5Hash ecommon.Hash
+		var confirmedNonce, pendingNonce atomic.Uint64
+		confirmedNonce.Store(5)
+		pendingNonce.Store(5)
+
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			var req struct {
+				ID     json.RawMessage   `json:"id"`
+				Method string            `json:"method"`
+				Params []json.RawMessage `json:"params"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&req)
+			resp := map[string]interface{}{"jsonrpc": "2.0", "id": req.ID}
+			switch req.Method {
+			case "eth_chainId":
+				resp["result"] = hexutil.EncodeUint64(1)
+			case "eth_blockNumber":
+				resp["result"] = hexutil.EncodeUint64(100)
+			case "eth_getBalance":
+				resp["result"] = (*hexutil.Big)(new(big.Int).Mul(big.NewInt(10), big.NewInt(1e18)))
+			case "eth_getTransactionCount":
+				var tag string
+				if len(req.Params) >= 2 {
+					_ = json.Unmarshal(req.Params[1], &tag)
+				}
+				if tag == "pending" {
+					resp["result"] = hexutil.EncodeUint64(pendingNonce.Load())
+				} else {
+					resp["result"] = hexutil.EncodeUint64(confirmedNonce.Load())
+				}
+			case "eth_getBlockByNumber":
+				resp["result"] = map[string]interface{}{
+					"number":        hexutil.EncodeUint64(100),
+					"hash":          ecommon.HexToHash("0x11"),
+					"baseFeePerGas": (*hexutil.Big)(big.NewInt(20_000_000_000)),
+				}
+			case "eth_maxPriorityFeePerGas":
+				resp["result"] = (*hexutil.Big)(big.NewInt(2_000_000_000))
+			case "eth_estimateGas":
+				resp["result"] = hexutil.EncodeUint64(100_000)
+			case "eth_getTransactionByHash":
+				resp["result"] = nil
+			case "eth_sendRawTransaction":
+				var raw hexutil.Bytes
+				_ = json.Unmarshal(req.Params[0], &raw)
+				var tx etypes.Transaction
+				_ = tx.UnmarshalBinary(raw)
+				if tx.Hash() == halt5Hash {
+					resp["error"] = map[string]interface{}{"code": -32000, "message": "insufficient funds for gas * price + value"}
+				} else {
+					pendingNonce.Store(6)
+					resp["result"] = tx.Hash().Hex()
+				}
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(resp)
+		}))
+		t.Cleanup(srv.Close)
+
+		client, err := NewEvmRpcClient(config.BaseNetworkConfig{Urls: []string{srv.URL}}, "failed-rollback-prunes-consumed", contract)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer client.Stop()
+		client.SetChainID(1)
+		client.SetPendingTxStore(store)
+
+		// 1. Accept setTss(5) (batch call 1).
+		setTss5, err := client.GetSetTssEcdsaPubKeyEvmTx(newTss, sender, []byte{4}, []byte{5}, &contract)
+		if err != nil {
+			t.Fatal(err)
+		}
+		signedSetTss5, err := etypes.SignTx(setTss5, signer, key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := client.SendTransaction(signedSetTss5); err != nil {
+			t.Fatal(err)
+		}
+
+		// 2. Halt(5) supersedes setTss(5) (batch call 2) and is rejected; rollback (batch call 3) fails transiently.
+		halt5, err := client.GetHaltTxEvm(sender, []byte{1, 2, 3}, &contract)
+		if err != nil {
+			t.Fatal(err)
+		}
+		signedHalt5, err := etypes.SignTx(halt5, signer, key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		halt5Hash = signedHalt5.Hash()
+		store.failBatchOnCall = 3
+		if err := client.SendTransaction(signedHalt5); err == nil {
+			t.Fatal("expected halt5 rejection")
+		}
+
+		// 3. Confirmed nonce advances to 6 (nonce 5 is now consumed!).
+		// ClearObsoleteHaltTx MUST prune nonce 5 BEFORE retrying failed rollbacks
+		// so consumed setTss(5) is NOT restored and halt(5) is cleared!
+		confirmedNonce.Store(6)
+		pendingNonce.Store(6)
+		if err := client.ClearObsoleteHaltTx(sender); err != nil {
+			t.Fatalf("ClearObsoleteHaltTx error: %v", err)
+		}
+		if gotHalt, err := store.LoadPendingEvmTx(sender, contract, evmTxKindHalt); err != nil || gotHalt != nil {
+			t.Fatalf("durable halt = (%+v, %v), want nil", gotHalt, err)
+		}
+		if gotSetTss, err := store.LoadPendingEvmTx(sender, contract, evmTxKindSetTss); err != nil || gotSetTss != nil {
+			t.Fatalf("durable setTss = (%+v, %v), want nil (must not restore consumed nonce 5)", gotSetTss, err)
+		}
+	})
 }
