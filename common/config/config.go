@@ -8,6 +8,7 @@ import (
 	"orchestrator/common"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 var DefaultNodeConfigFileName = "config.json"
@@ -21,8 +22,9 @@ const (
 	// DataDirPerm and ConfigFilePerm are the owner-only modes enforced on the
 	// data directory and the configuration file, which sit next to the
 	// encrypted producer key.
-	DataDirPerm    = os.FileMode(0700)
-	ConfigFilePerm = os.FileMode(0600)
+	DataDirPerm      = os.FileMode(0700)
+	ConfigFilePerm   = os.FileMode(0600)
+	KeyShareFilePerm = os.FileMode(0600)
 )
 
 type BaseNetworkConfig struct {
@@ -202,6 +204,63 @@ func EnsureDataDir(dataPath string) error {
 			return fmt.Errorf("data directory %s has mode %04o and could not be restricted to %04o: %w", dataPath, info.Mode().Perm(), DataDirPerm, err)
 		}
 		common.GlobalLogger.Warnf("data directory %s had mode %04o; restricted it to %04o", dataPath, info.Mode().Perm(), DataDirPerm)
+	}
+	return nil
+}
+
+// SecureKeyShareFiles verifies ownership and tightens permissions to 0600 on
+// every localstate-*.json file in baseDir. Symlinks and non-regular files are
+// rejected.
+func SecureKeyShareFiles(baseDir string) error {
+	if err := VerifyOwnedPath(baseDir); err != nil {
+		return err
+	}
+	entries, err := os.ReadDir(baseDir)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		name := entry.Name()
+		if !strings.HasPrefix(name, "localstate-") || !strings.HasSuffix(name, ".json") {
+			continue
+		}
+		if err := secureKeyShareFile(filepath.Join(baseDir, name)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func secureKeyShareFile(path string) error {
+	linfo, err := os.Lstat(path)
+	if err != nil {
+		return fmt.Errorf("key share file %s: %w", path, err)
+	}
+	if !linfo.Mode().IsRegular() {
+		return fmt.Errorf("key share file %s is not a regular file", path)
+	}
+
+	f, err := openNoFollow(path)
+	if err != nil {
+		return fmt.Errorf("key share file %s: %w", path, err)
+	}
+	defer f.Close()
+
+	info, err := f.Stat()
+	if err != nil {
+		return fmt.Errorf("key share file %s: %w", path, err)
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("key share file %s is not a regular file", path)
+	}
+	if err := verifyOwnedInfo(path, info); err != nil {
+		return fmt.Errorf("key share file: %w", err)
+	}
+	if info.Mode().Perm()&0177 != 0 {
+		if err := f.Chmod(KeyShareFilePerm); err != nil {
+			return fmt.Errorf("key share file %s has mode %04o and could not be restricted to %04o: %w", path, info.Mode().Perm(), KeyShareFilePerm, err)
+		}
+		common.GlobalLogger.Warnf("key share file %s had mode %04o; restricted it to %04o", path, info.Mode().Perm(), KeyShareFilePerm)
 	}
 	return nil
 }

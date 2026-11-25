@@ -321,7 +321,7 @@ func (r *EvmRpc) GetSetTssEcdsaPubKeyEvmTx(newTss, sender ecommon.Address, oldFu
 			if balance.Cmp(big.NewInt(0)) == 0 {
 				return nil, errors.New("Balance is 0, not enough to send set ecdsa pub key tx")
 			}
-			r.logger.Debugf("Balance: %d", balance.Uint64())
+			r.logger.Debugf("Balance: %s", balance.String())
 			if nonce, err := r.NonceAt(sender, blockHeight); err != nil {
 				return nil, err
 			} else {
@@ -402,7 +402,7 @@ func (r *EvmRpc) GetHaltTxEvm(sender ecommon.Address, signature []byte, contract
 			if balance.Cmp(big.NewInt(0)) == 0 {
 				return nil, errors.New("Balance is 0, not enough to send halt evm tx")
 			}
-			r.logger.Debugf("Balance: %d", balance.Uint64())
+			r.logger.Debugf("Balance: %s", balance.String())
 			if nonce, err := r.NonceAt(sender, blockHeight); err != nil {
 				return nil, err
 			} else {

@@ -2,11 +2,14 @@ package app
 
 import (
 	"fmt"
+	"net"
 	"net/http"
+	_ "net/http/pprof"
 	"os"
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"time"
 
 	"orchestrator/common"
@@ -69,11 +72,11 @@ func beforeAction(ctx *cli.Context) error {
 
 		port := ctx.Int(PprofPortFlag.Name)
 
-		address := fmt.Sprintf("%s:%d", listenHost, port)
+		address := net.JoinHostPort(listenHost, strconv.Itoa(port))
 
 		go func() {
 			if err := http.ListenAndServe(address, nil); err != nil {
-				nodeManager.logger.Error(err.Error())
+				common.GlobalLogger.Errorf("pprof server failed on %s: %v", address, err)
 			}
 		}()
 	}

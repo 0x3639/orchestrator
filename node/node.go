@@ -26,7 +26,6 @@ import (
 	"sort"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"time"
 
 	tcommon "github.com/HyperCore-Team/go-tss/common"
@@ -173,6 +172,14 @@ func NewNode(config *oconfig.Config, logger *zap.Logger) (_ *Node, initErr error
 	for node.networksManager.Znn().IsSynced() == false {
 		node.logger.Info("node is syncing, will wait for it to finish")
 		time.Sleep(15 * time.Second)
+	}
+	if node.config.TssConfig.BaseDir != "" {
+		if err := oconfig.EnsureDataDir(node.config.TssConfig.BaseDir); err != nil {
+			return nil, err
+		}
+		if err := oconfig.SecureKeyShareFiles(node.config.TssConfig.BaseDir); err != nil {
+			return nil, err
+		}
 	}
 	if err := node.configurePubKey(); err != nil {
 		return nil, err
@@ -683,6 +690,11 @@ func (node *Node) processSignatures() {
 
 				// key gen was generated
 				if keyGenResponse.Status == tcommon.Success {
+					if err := oconfig.SecureKeyShareFiles(node.config.TssConfig.BaseDir); err != nil {
+						node.logger.Errorf("failed to secure key share files after KeyGen: %v", err)
+						keyGenResponse = nil
+						break
+					}
 					node.logger.Infof("Generated key: %s", keyGenResponse.PubKey)
 					break
 				} else {
@@ -987,7 +999,7 @@ func (node *Node) processSignatures() {
 			if stateErr := node.state.SetState(common.LiveState); stateErr != nil {
 				node.logger.Info("Could not set state to live after key gen")
 				node.logger.Debug(stateErr)
-				node.stopChan <- syscall.SIGINT
+				common.RequestStop(node.stopChan)
 				return
 			}
 			// todo delete it?
@@ -1292,6 +1304,12 @@ func (node *Node) processSignatures() {
 				} else {
 					node.logger.Debugf("len(wrapRequests.List): %d, pageIndex: %d", len(wrapRequests.List), pageIndex)
 					for _, wrap := range wrapRequests.List {
+						if wrap == nil || wrap.WrapTokenRequest == nil {
+							continue
+						}
+						if wrap.ConfirmationsToFinality != 0 {
+							continue
+						}
 						if wrap.NetworkClass != resignNetworkClass || wrap.ChainId != resignChainId {
 							continue
 						}
@@ -1357,7 +1375,7 @@ func (node *Node) processSignatures() {
 				pageIndex++
 			}
 			node.logger.Debug("Finished parsing all the wraps in resign state")
-			if err := node.state.SetState(common.LiveState); err != nil {
+			if _, err := node.state.SetStateIf(common.ReSignState, common.LiveState); err != nil {
 				node.logger.Debug(err.Error())
 			}
 		}
@@ -1455,7 +1473,12 @@ func (node *Node) processSignaturesWrap(window uint64) (error, bool) {
 			continue
 		}
 
-		msg, err := event.GetMessage(node.networksManager.Evm(event.ChainId).ContractAddress())
+		evmNetwork := node.networksManager.LookupEvm(event.ChainId)
+		if evmNetwork == nil {
+			node.logger.Infof("EVM network %d is no longer listed by the bridge; skipping wrap %s", event.ChainId, event.Id.String())
+			continue
+		}
+		msg, err := event.GetMessage(evmNetwork.ContractAddress())
 		if err != nil {
 			node.logger.Debug(err)
 			// todo set status to skipped
@@ -1470,11 +1493,18 @@ func (node *Node) processSignaturesWrap(window uint64) (error, bool) {
 		return nil, false
 	}
 
+	poolSize := common.GetSignCeremonyPoolSize()
 	right := len(messagesToSign)
-	if right > common.SignCeremonyPoolSize {
-		right = common.SignCeremonyPoolSize
+	if right > poolSize {
+		right = poolSize
 	}
 	messagesToSign = messagesToSign[:right]
+	selectedIndexes := make(map[string]int, len(messagesToSign))
+	for _, msg := range messagesToSign {
+		encoded := base64.StdEncoding.EncodeToString(msg)
+		selectedIndexes[encoded] = msgsIndexes[encoded]
+	}
+	msgsIndexes = selectedIndexes
 	if store != nil {
 		counts := make(map[uint32]int)
 		for _, msg := range messagesToSign {
@@ -1489,8 +1519,10 @@ func (node *Node) processSignaturesWrap(window uint64) (error, bool) {
 	response, err := node.signMessages(messagesToSign, msgsIndexes)
 	if err != nil {
 		return err, true
-	} else if response.Status != tcommon.Success {
-		node.logger.Debug(response.Status)
+	} else if response == nil || response.Status != tcommon.Success {
+		if response != nil {
+			node.logger.Debug(response.Status)
+		}
 		node.logger.Debug(" error signing wrap")
 		return nil, true
 	}
@@ -1500,46 +1532,52 @@ func (node *Node) processSignaturesWrap(window uint64) (error, bool) {
 	}
 
 	// we apply the signatures that don't return error
-	for idx, sig := range response.Signatures {
-		signature, err := base64.StdEncoding.DecodeString(sig.Signature)
+	node.applyWrapSignatures(response, wrapRequestsIds, msgsIndexes, window)
+	return nil, true
+}
+
+func (node *Node) applyWrapSignatures(response *keysign.Response, wrapRequestsIds []*definition.WrapTokenRequest, msgsIndexes map[string]int, window uint64) {
+	if response == nil {
+		return
+	}
+	store := node.state.HealthStore()
+	applied := make(map[string]bool, len(response.Signatures))
+	for _, sig := range response.Signatures {
+		reqIdx, ok := msgsIndexes[sig.Msg]
+		if !ok || reqIdx < 0 || reqIdx >= len(wrapRequestsIds) {
+			node.logger.Debugf("ignoring wrap signature for unknown or out-of-bounds message: %s", sig.Msg)
+			continue
+		}
+		if applied[sig.Msg] {
+			continue
+		}
+		fullSignatureStr, _, err := decodeAndVerifySignature(sig, node.config.TssConfig.DecompressedPublicKey)
 		if err != nil {
+			node.logger.Debugf("Error checking ecdsa signature for wrap: %s", err.Error())
+			continue
+		}
+
+		if err = node.networksManager.SetWrapRequestSignature(wrapRequestsIds[reqIdx].Id, fullSignatureStr); err != nil {
 			node.logger.Debug(err)
 			continue
 		}
-		recoverID, err := base64.StdEncoding.DecodeString(sig.RecoveryID)
-		fullSignature := append(signature, recoverID...)
-		fullSignatureStr := base64.StdEncoding.EncodeToString(fullSignature)
+		applied[sig.Msg] = true
 
-		ok, err := implementation.CheckECDSASignature(messagesToSign[idx], node.config.TssConfig.DecompressedPublicKey, fullSignatureStr)
-		if err != nil {
-			node.logger.Debug("Error checking ecdsa signature for wrap: %s", err.Error())
-			continue
-		} else if ok == false {
-			node.logger.Debugf("invalid signature when checking ecdsa signature for wrap msg: %s", messagesToSign[idx])
-			continue
-		}
-
-		if err = node.networksManager.SetWrapRequestSignature(wrapRequestsIds[msgsIndexes[sig.Msg]].Id, fullSignatureStr); err != nil {
-			node.logger.Debug(err)
-			continue
-		}
-
-		store.Signed(snapshot.Wrap, wrapRequestsIds[msgsIndexes[sig.Msg]].ChainId, window)
+		store.Signed(snapshot.Wrap, wrapRequestsIds[reqIdx].ChainId, window)
 
 		// Set it as unsent after setting the new signature for resigned requests
-		if err = node.networksManager.SetWrapRequestSentSignature(wrapRequestsIds[msgsIndexes[sig.Msg]].Id, false); err != nil {
+		if err = node.networksManager.SetWrapRequestSentSignature(wrapRequestsIds[reqIdx].Id, false); err != nil {
 			node.logger.Debug(err)
 			continue
 		}
 
-		if err = node.networksManager.Znn().SetResignStatus(wrapRequestsIds[msgsIndexes[sig.Msg]].Id, false); err != nil {
+		if err = node.networksManager.Znn().SetResignStatus(wrapRequestsIds[reqIdx].Id, false); err != nil {
 			node.logger.Debug(err)
 			continue
 		}
 
-		node.logger.Infof("%d. msg: %s sig: %s\n", msgsIndexes[sig.Msg], base64.StdEncoding.EncodeToString(messagesToSign[idx]), sig.Signature)
+		node.logger.Infof("%d. msg: %s sig: %s\n", reqIdx, sig.Msg, sig.Signature)
 	}
-	return nil, true
 }
 
 // ok == true means that we had a signing ceremony or at least we tried
@@ -1579,7 +1617,7 @@ func (node *Node) processSignaturesUnwrap(number, size uint64) (error, bool) {
 	messagesToSign := make([][]byte, 0)
 	for idx, req := range requests {
 		node.logger.Debugf("req.To: %s", req.To)
-		node.logger.Debugf("req.Amount: %d", req.Amount.Uint64())
+		node.logger.Debugf("req.Amount: %s", req.Amount.String())
 		node.logger.Debugf("req.Token: %s", req.Token.String())
 		node.logger.Debugf("req.TransactionHash: %s", req.TransactionHash.String())
 
@@ -1598,11 +1636,18 @@ func (node *Node) processSignaturesUnwrap(number, size uint64) (error, bool) {
 		return nil, false
 	}
 
+	poolSize := common.GetSignCeremonyPoolSize()
 	right := len(messagesToSign)
-	if right > common.SignCeremonyPoolSize {
-		right = common.SignCeremonyPoolSize
+	if right > poolSize {
+		right = poolSize
 	}
 	messagesToSign = messagesToSign[:right]
+	selectedIndexes := make(map[string]int, len(messagesToSign))
+	for _, msg := range messagesToSign {
+		encoded := base64.StdEncoding.EncodeToString(msg)
+		selectedIndexes[encoded] = msgsIndexes[encoded]
+	}
+	msgsIndexes = selectedIndexes
 	//node.logger.Debug("MessagesToSign: ", messagesToSign)
 	if store != nil {
 		counts := make(map[uint32]int)
@@ -1627,8 +1672,10 @@ func (node *Node) processSignaturesUnwrap(number, size uint64) (error, bool) {
 	})
 	if err != nil {
 		return err, true
-	} else if response.Status != tcommon.Success {
-		node.logger.Debug(response.Status)
+	} else if response == nil || response.Status != tcommon.Success {
+		if response != nil {
+			node.logger.Debug(response.Status)
+		}
 		node.logger.Debug(" error signing unwrap")
 		return nil, true
 	}
@@ -1637,35 +1684,43 @@ func (node *Node) processSignaturesUnwrap(number, size uint64) (error, bool) {
 		return err, true
 	}
 	sortSignatures(response, msgsIndexes)
+	node.applyUnwrapSignatures(response, requests, msgsIndexes, number)
+	return nil, true
+}
+
+func (node *Node) applyUnwrapSignatures(response *keysign.Response, requests []*events.UnwrapRequestEvm, msgsIndexes map[string]int, number uint64) {
+	if response == nil {
+		return
+	}
+	store := node.state.HealthStore()
+	applied := make(map[string]bool, len(response.Signatures))
 	for idx, sig := range response.Signatures {
-		signature, err := base64.StdEncoding.DecodeString(sig.Signature)
-		if err != nil {
-			node.logger.Debug(err)
+		reqIdx, ok := msgsIndexes[sig.Msg]
+		if !ok || reqIdx < 0 || reqIdx >= len(requests) {
+			node.logger.Debugf("ignoring unwrap signature for unknown or out-of-bounds message: %s", sig.Msg)
 			continue
 		}
-		recoverID, err := base64.StdEncoding.DecodeString(sig.RecoveryID)
-		fullSignature := append(signature, recoverID...)
-		requests[msgsIndexes[sig.Msg]].Signature = base64.StdEncoding.EncodeToString(fullSignature)
-
-		ok, err := implementation.CheckECDSASignature(messagesToSign[idx], node.config.TssConfig.DecompressedPublicKey, requests[msgsIndexes[sig.Msg]].Signature)
-		if err != nil {
-			node.logger.Debug("Error checking ecdsa signature for unwrap: %s", err.Error())
+		if applied[sig.Msg] {
 			continue
-		} else if ok == false {
-			node.logger.Debugf("invalid signature when checking ecdsa signature for unwrap msg: %s", messagesToSign[idx])
+		}
+		fullSignatureStr, _, err := decodeAndVerifySignature(sig, node.config.TssConfig.DecompressedPublicKey)
+		if err != nil {
+			node.logger.Debugf("Error checking ecdsa signature for unwrap: %s", err.Error())
 			continue
 		}
 
-		if err = node.networksManager.SetEvmUnwrapRequestSignature(requests[msgsIndexes[sig.Msg]]); err != nil {
+		req := requests[reqIdx]
+		req.Signature = fullSignatureStr
+		if err = node.networksManager.SetEvmUnwrapRequestSignature(req); err != nil {
 			node.logger.Debug(err.Error())
 			continue
 		}
-		store.Signed(snapshot.Unwrap, requests[msgsIndexes[sig.Msg]].ChainId, number)
+		applied[sig.Msg] = true
+		store.Signed(snapshot.Unwrap, req.ChainId, number)
 
-		node.logger.Debugf("\n%d. msg: %s\n\n", idx, base64.StdEncoding.EncodeToString(messagesToSign[idx]))
-		node.logger.Debugf("\n%d. sig: %s, recoveryID: %s, FinalSig: %s \n", msgsIndexes[sig.Msg], sig.Signature, sig.RecoveryID, requests[msgsIndexes[sig.Msg]].Signature)
+		node.logger.Debugf("\n%d. msg: %s\n\n", idx, sig.Msg)
+		node.logger.Debugf("\n%d. sig: %s, recoveryID: %s, FinalSig: %s \n", reqIdx, sig.Signature, sig.RecoveryID, req.Signature)
 	}
-	return nil, true
 }
 
 // reconcileLookupsPerPool bounds Zenon lookups per ceremony to this multiple
@@ -1690,7 +1745,7 @@ const reconcileLookupsPerPool = 4
 // backlog off. Any Zenon RPC failure aborts the ceremony for this node:
 // guessing would produce a pool its peers do not share.
 func (node *Node) reconcileUnsignedUnwrapRequests(requests []*events.UnwrapRequestEvm) ([]*events.UnwrapRequestEvm, bool, error) {
-	poolSize := common.SignCeremonyPoolSize
+	poolSize := common.GetSignCeremonyPoolSize()
 	lookupCap := reconcileLookupsPerPool * poolSize
 	remaining := make([]*events.UnwrapRequestEvm, 0, poolSize)
 	reconciled := 0
@@ -1783,7 +1838,7 @@ func (node *Node) sendSignaturesWrap(seenEventsCount map[string]uint32) {
 			continue
 		} else if req.Signature == rpcRequest.Signature {
 			if errSet := node.networksManager.Znn().SetWrapRequestSentSignature(req.Id, true); errSet != nil {
-				node.logger.Debug(err)
+				node.logger.Debug(errSet)
 			} else {
 				//node.logger.Debugf("Set wrap %s as sent", req.Id.String())
 			}
@@ -2047,29 +2102,24 @@ func (node *Node) SetBridgeMetadata(metadata *common.BridgeMetadata) {
 
 		node.logger.Infof("ResignState.Active - new: %v", metadata.ResignState.Active)
 		if metadata.ResignState.Active {
-			if err := node.state.SetState(common.ReSignState); err != nil {
-				node.logger.Debug(err)
-			}
-
 			resignNetworkClass, resignChainId := node.state.GetResignNetwork()
 			node.logger.Infof("ResignState NetworkClass - old: %d, new: %d", resignNetworkClass, metadata.ResignState.NetworkClass)
 			node.logger.Infof("ResignState ChainId - old: %d, new: %d", resignChainId, metadata.ResignState.ChainId)
 			node.state.SetResignNetwork(metadata.ResignState.NetworkClass, metadata.ResignState.ChainId)
+
+			if _, err := node.state.SetStateIf(common.LiveState, common.ReSignState); err != nil {
+				node.logger.Debug(err)
+			}
 		} else {
-			state, errState := node.state.GetState()
-			if errState != nil {
-				node.logger.Debug(errState)
-			} else if state == common.ReSignState {
-				if err := node.state.SetState(common.LiveState); err != nil {
-					node.logger.Debug(err)
-				}
+			if _, err := node.state.SetStateIf(common.ReSignState, common.LiveState); err != nil {
+				node.logger.Debug(err)
 			}
 		}
 
-		if metadata.SignCeremonyPoolSize != 0 {
-			common.SignCeremonyPoolSize = metadata.SignCeremonyPoolSize
+		if metadata.SignCeremonyPoolSize > 0 {
+			common.SetSignCeremonyPoolSize(metadata.SignCeremonyPoolSize)
 		}
-		node.logger.Infof("SignCeremonyPoolSize: %d", common.SignCeremonyPoolSize)
+		node.logger.Infof("SignCeremonyPoolSize: %d", common.GetSignCeremonyPoolSize())
 	}
 }
 
@@ -2126,38 +2176,80 @@ func (node *Node) signMessages(messagesToSign [][]byte, msgsIndexes map[string]i
 	return response, err
 }
 
+const (
+	ecdsaSignatureLength  = 64
+	ecdsaRecoveryIDLength = 1
+)
+
+func decodeAndVerifySignature(sig keysign.Signature, pubKey string) (string, []byte, error) {
+	msgBytes, err := base64.StdEncoding.DecodeString(sig.Msg)
+	if err != nil {
+		return "", nil, fmt.Errorf("decode signed message: %w", err)
+	}
+	signature, err := base64.StdEncoding.DecodeString(sig.Signature)
+	if err != nil {
+		return "", nil, fmt.Errorf("decode signature: %w", err)
+	}
+	if len(signature) != ecdsaSignatureLength {
+		return "", nil, fmt.Errorf("invalid signature length %d, want %d", len(signature), ecdsaSignatureLength)
+	}
+	recoverID, err := base64.StdEncoding.DecodeString(sig.RecoveryID)
+	if err != nil {
+		return "", nil, fmt.Errorf("decode recovery id: %w", err)
+	}
+	if len(recoverID) != ecdsaRecoveryIDLength {
+		return "", nil, fmt.Errorf("invalid recovery id length %d, want %d", len(recoverID), ecdsaRecoveryIDLength)
+	}
+
+	fullSignatureBytes := make([]byte, 0, ecdsaSignatureLength+ecdsaRecoveryIDLength)
+	fullSignatureBytes = append(fullSignatureBytes, signature...)
+	fullSignatureBytes = append(fullSignatureBytes, recoverID...)
+	fullSignature := base64.StdEncoding.EncodeToString(fullSignatureBytes)
+
+	ok, err := implementation.CheckECDSASignature(msgBytes, pubKey, fullSignature)
+	if err != nil {
+		return "", nil, err
+	}
+	if !ok {
+		return "", nil, errors.New("invalid signature when checking ecdsa signature")
+	}
+	return fullSignature, fullSignatureBytes, nil
+}
+
 func sortSignatures(response *keysign.Response, msgsIndexes map[string]int) {
+	if response == nil {
+		return
+	}
 	sort.Slice(response.Signatures, func(i, j int) bool {
 		return msgsIndexes[response.Signatures[i].Msg] < msgsIndexes[response.Signatures[j].Msg]
 	})
 }
 
 func (node *Node) validateSignatures(response *keysign.Response, pubKey string, messagesToSign [][]byte) (string, [][]byte, error) {
+	if response == nil {
+		return "", nil, errors.New("nil keysign response")
+	}
+	if len(messagesToSign) == 0 {
+		return "", nil, errors.New("no messages to validate")
+	}
+	if len(response.Signatures) != len(messagesToSign) {
+		return "", nil, fmt.Errorf("signature count mismatch: got %d, want %d", len(response.Signatures), len(messagesToSign))
+	}
 	var znnSignature string
-	evmFullSignatures := make([][]byte, 0)
+	evmFullSignatures := make([][]byte, 0, len(messagesToSign)-1)
 	for idx, sig := range response.Signatures {
-		signature, err := base64.StdEncoding.DecodeString(sig.Signature)
-		if err != nil {
-			return "", nil, err
+		expectedMsg := base64.StdEncoding.EncodeToString(messagesToSign[idx])
+		if sig.Msg != expectedMsg {
+			return "", nil, fmt.Errorf("signature %d message mismatch: got %s, want %s", idx, sig.Msg, expectedMsg)
 		}
-
-		recoverID, err := base64.StdEncoding.DecodeString(sig.RecoveryID)
+		fullSignature, fullSignatureBytes, err := decodeAndVerifySignature(sig, pubKey)
 		if err != nil {
 			return "", nil, err
-		}
-		fullSignatureBytes := append(signature, recoverID...)
-		fullSignature := base64.StdEncoding.EncodeToString(fullSignatureBytes)
-
-		ok, err := implementation.CheckECDSASignature(messagesToSign[idx], pubKey, fullSignature)
-		if err != nil {
-			return "", nil, err
-		} else if ok == false {
-			return "", nil, errors.New("invalid signature when checking ecdsa signature")
 		}
 
 		// znn sig
 		if idx == 0 {
-			znnSignature = base64.StdEncoding.EncodeToString(fullSignatureBytes)
+			znnSignature = fullSignature
 			continue
 		}
 
@@ -2261,7 +2353,10 @@ func (node *Node) configurePubKey() error {
 	if err != nil {
 		return err
 	}
-	if _, err := os.Stat(pubKeyPath); os.IsNotExist(err) {
+	if _, err := os.Stat(pubKeyPath); err != nil {
+		if !os.IsNotExist(err) {
+			return err
+		}
 		// 1. we had a hard reset, in this case we can no longer sign be cause we don't have the pubKey files
 		// 2. we have not participated yet in a keyGen ceremony
 		// 3. there was no key gen (bootstrap), in this case participatingPubKeys will be empty
@@ -2270,26 +2365,16 @@ func (node *Node) configurePubKey() error {
 		node.config.TssConfig.PublicKey = ""
 		node.config.TssConfig.DecompressedPublicKey = ""
 	} else {
-		node.config.TssConfig.PublicKey = bridgeInfo.CompressedTssECDSAPubKey
-		node.config.TssConfig.DecompressedPublicKey = bridgeInfo.DecompressedTssECDSAPubKey
-		jsonFile, err := os.Open(pubKeyPath)
+		participantKeys, err := readLocalStateParticipantKeys(pubKeyPath)
 		if err != nil {
 			return err
 		}
+		node.config.TssConfig.PublicKey = bridgeInfo.CompressedTssECDSAPubKey
+		node.config.TssConfig.DecompressedPublicKey = bridgeInfo.DecompressedTssECDSAPubKey
 
-		bytesValue, _ := io.ReadAll(jsonFile)
-		if err := jsonFile.Close(); err != nil {
-			return err
-		}
-
-		var result map[string]interface{}
-		if err := json.Unmarshal(bytesValue, &result); err != nil {
-			return err
-		}
-
-		for _, publicKey := range result["participant_keys"].([]interface{}) {
-			node.logger.Info(publicKey.(string))
-			publicKeyBytes, err := base64.StdEncoding.DecodeString(publicKey.(string))
+		for _, publicKey := range participantKeys {
+			node.logger.Info(publicKey)
+			publicKeyBytes, err := base64.StdEncoding.DecodeString(publicKey)
 			if err != nil {
 				return err
 			}
@@ -2303,10 +2388,35 @@ func (node *Node) configurePubKey() error {
 			}
 
 			node.config.TssConfig.PubKeyWhitelist[peerId.String()] = true
-			node.config.TssConfig.LocalPubKeys = append(node.config.TssConfig.LocalPubKeys, publicKey.(string))
+			node.config.TssConfig.LocalPubKeys = append(node.config.TssConfig.LocalPubKeys, publicKey)
 		}
 	}
 	sort.Strings(node.config.TssConfig.LocalPubKeys)
 
 	return nil
+}
+
+type localStateFile struct {
+	ParticipantKeys []string `json:"participant_keys"`
+}
+
+func readLocalStateParticipantKeys(pubKeyPath string) ([]string, error) {
+	jsonFile, err := os.Open(pubKeyPath)
+	if err != nil {
+		return nil, err
+	}
+	bytesValue, readErr := io.ReadAll(jsonFile)
+	closeErr := jsonFile.Close()
+	if readErr != nil {
+		return nil, readErr
+	}
+	if closeErr != nil {
+		return nil, closeErr
+	}
+
+	var localState localStateFile
+	if err := json.Unmarshal(bytesValue, &localState); err != nil {
+		return nil, err
+	}
+	return localState.ParticipantKeys, nil
 }

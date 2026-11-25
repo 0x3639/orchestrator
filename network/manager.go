@@ -869,7 +869,7 @@ func (m *NetworksManager) GetUnsentSignedWrapRequests() ([]*events.WrapRequestZn
 }
 
 func (m *NetworksManager) GetUnredeemedWrapRequests() ([]*events.WrapRequestZnn, error) {
-	return m.Znn().GetUnsentSignedWrapRequests()
+	return m.Znn().GetUnredeemedWrapRequests()
 }
 
 func (m *NetworksManager) GetUnsignedWrapRequests() ([]*definition.WrapTokenRequest, error) {

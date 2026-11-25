@@ -435,3 +435,95 @@ func TestWriteConfigLeavesNoTempFiles(t *testing.T) {
 		t.Fatalf("expected only config.json, got %v", names)
 	}
 }
+
+func TestSecureKeyShareFilesTightensPermissionsAndRejectsUnsafeEntries(t *testing.T) {
+	dir := t.TempDir()
+	shareA := filepath.Join(dir, "localstate-aaaa.json")
+	shareB := filepath.Join(dir, "localstate-bbbb.json")
+	readOnlyShare := filepath.Join(dir, "localstate-cccc.json")
+	otherFile := filepath.Join(dir, "other.json")
+
+	if err := os.WriteFile(shareA, []byte(`{}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(shareA, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(shareB, []byte(`{}`), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(shareB, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(readOnlyShare, []byte(`{}`), 0400); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(readOnlyShare, 0400); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(otherFile, []byte(`{}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(otherFile, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := SecureKeyShareFiles(dir); err != nil {
+		t.Fatalf("SecureKeyShareFiles failed: %v", err)
+	}
+
+	for _, path := range []string{shareA, shareB} {
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.Mode().Perm() != KeyShareFilePerm {
+			t.Fatalf("%s mode = %04o, want %04o", path, info.Mode().Perm(), KeyShareFilePerm)
+		}
+	}
+	if info, err := os.Stat(readOnlyShare); err != nil {
+		t.Fatal(err)
+	} else if info.Mode().Perm() != 0400 {
+		t.Fatalf("read-only share mode = %04o, want 0400 (must not widen)", info.Mode().Perm())
+	}
+	if info, err := os.Stat(otherFile); err != nil {
+		t.Fatal(err)
+	} else if info.Mode().Perm() != 0644 {
+		t.Fatalf("non-share file mode = %04o, want unchanged 0644", info.Mode().Perm())
+	}
+
+	// Symlinked key share must be rejected.
+	linkPath := filepath.Join(dir, "localstate-link.json")
+	if err := os.Symlink(otherFile, linkPath); err == nil {
+		if err := SecureKeyShareFiles(dir); err == nil {
+			t.Fatal("expected error for symlinked localstate file")
+		}
+		_ = os.Remove(linkPath)
+	}
+
+	// Non-regular key share (directory) must be rejected.
+	subDir := filepath.Join(dir, "localstate-dir.json")
+	if err := os.Mkdir(subDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := SecureKeyShareFiles(dir); err == nil {
+		t.Fatal("expected error for directory named localstate-*.json")
+	}
+	_ = os.Remove(subDir)
+}
+
+func TestSecureKeyShareFilesFailsOnOwnershipMismatch(t *testing.T) {
+	dir := t.TempDir()
+	share := filepath.Join(dir, "localstate-deadbeef.json")
+	if err := os.WriteFile(share, []byte(`{}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	prev := currentEuid
+	currentEuid = func() int { return os.Geteuid() + 1 }
+	t.Cleanup(func() { currentEuid = prev })
+
+	if err := SecureKeyShareFiles(dir); err == nil {
+		t.Fatal("expected ownership error from SecureKeyShareFiles")
+	}
+}

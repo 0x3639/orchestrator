@@ -275,9 +275,9 @@ func (c reconciliationChain) reconcile(t *testing.T, requests []*events.UnwrapRe
 	t.Helper()
 	manager, closeNetworks := c.openNetworks(t, nil)
 	defer closeNetworks()
-	previous := common.SignCeremonyPoolSize
-	common.SignCeremonyPoolSize = slots
-	defer func() { common.SignCeremonyPoolSize = previous }()
+	previous := common.GetSignCeremonyPoolSize()
+	common.SetSignCeremonyPoolSize(slots)
+	defer func() { common.SetSignCeremonyPoolSize(previous) }()
 	n := Node{networksManager: manager, logger: zap.NewNop().Sugar()}
 	return n.reconcileUnsignedUnwrapRequests(requests)
 }

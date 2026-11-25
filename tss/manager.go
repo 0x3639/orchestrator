@@ -2,6 +2,7 @@ package tss
 
 import (
 	"encoding/base64"
+	"fmt"
 	tcommon "github.com/HyperCore-Team/go-tss/common"
 	"github.com/HyperCore-Team/go-tss/conversion"
 	"github.com/HyperCore-Team/go-tss/keygen"
@@ -15,8 +16,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/syndtr/goleveldb/leveldb"
 	"orchestrator/common"
-	"orchestrator/common/config"
-	"os"
+	oconfig "orchestrator/common/config"
 	"path/filepath"
 	"slices"
 	"sync"
@@ -39,23 +39,23 @@ type TssManager struct {
 	leaderBlockHeight int64
 }
 
-func NewTssManager(conf config.TssManagerConfig, privateKey string) (*TssManager, error) {
+func NewTssManager(conf oconfig.TssManagerConfig, privateKey string) (*TssManager, error) {
 	priKey, err := conversion.GetPriKey(privateKey)
 	if err != nil {
 		return nil, err
 	}
-	if _, err := os.Stat(conf.BaseDir); os.IsNotExist(err) {
-		err := os.MkdirAll(conf.BaseDir, os.ModePerm)
-		if err != nil {
-			return nil, err
-		}
+	if err := oconfig.EnsureDataDir(conf.BaseDir); err != nil {
+		return nil, err
+	}
+	if err := oconfig.SecureKeyShareFiles(conf.BaseDir); err != nil {
+		return nil, err
 	}
 
 	var peerIDs []maddr.Multiaddr
 	if len(conf.Bootstrap) > 0 {
 		multiAddr, err := maddr.NewMultiaddr(conf.Bootstrap)
 		if err != nil {
-			panic(err)
+			return nil, fmt.Errorf("invalid bootstrap multiaddr: %w", err)
 		}
 		peerIDs = []maddr.Multiaddr{multiAddr}
 	} else {
@@ -191,6 +191,11 @@ func (m *TssManager) KeyGen(algo messages.Algo) (*keygen.Response, error) {
 		response, err := m.server.Keygen(req)
 		if err != nil {
 			return nil, err
+		}
+		if response.Status == tcommon.Success {
+			if err := oconfig.SecureKeyShareFiles(m.keyShareDir); err != nil {
+				return nil, err
+			}
 		}
 
 		return &response, nil

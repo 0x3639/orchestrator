@@ -20,6 +20,9 @@ func VerifyOwnedPath(path string) error {
 	return verifyOwnedInfo(path, info)
 }
 
+// currentEuid is overridden in unit tests to simulate ownership mismatches.
+var currentEuid = os.Geteuid
+
 // verifyOwnedInfo applies the ownership check to an already obtained
 // FileInfo, typically from an open descriptor.
 func verifyOwnedInfo(path string, info os.FileInfo) error {
@@ -27,7 +30,7 @@ func verifyOwnedInfo(path string, info os.FileInfo) error {
 	if !ok {
 		return nil
 	}
-	if uid := os.Geteuid(); int(stat.Uid) != uid {
+	if uid := currentEuid(); int(stat.Uid) != uid {
 		return fmt.Errorf("%s is owned by uid %d but the orchestrator runs as uid %d", path, stat.Uid, uid)
 	}
 	return nil

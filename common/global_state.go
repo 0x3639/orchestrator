@@ -64,7 +64,7 @@ type GlobalState struct {
 	frontierMomentumHeight uint64
 	frontierMomSemaphore   *semaphore.Weighted
 	lastCeremony           CeremonyWindow
-	isAdministratorActive  bool
+	isAdministratorActive  atomic.Bool
 	tokensMap              map[uint32]map[string]string
 	affiliateMu            sync.RWMutex
 	// [chainId][token] -> bool
@@ -77,6 +77,7 @@ type GlobalState struct {
 	// The networks of the affiliate program SetIsAffiliateProgram applied
 	// last.
 	appliedAffiliate     map[uint32]AffiliateNetwork
+	resignMu             sync.RWMutex
 	resignNetworkClass   uint32
 	resignNetworkChainId uint32
 }
@@ -94,7 +95,6 @@ func NewPersistentGlobalState(state *uint8, persistEmergency func(uint8) error) 
 		state:                    state,
 		frontierMomentumHeight:   0,
 		frontierMomSemaphore:     semaphore.NewWeighted(1),
-		isAdministratorActive:    false,
 		tokensMap:                make(map[uint32]map[string]string),
 		isAffiliateProgramActive: make(map[uint32]map[string]bool),
 		affiliateStartingHeight:  make(map[uint32]uint64),
@@ -375,12 +375,12 @@ func (gs *GlobalState) GetTokensMap(chainId uint32, ztsOrToken string) string {
 }
 
 func (gs *GlobalState) SetIsAdministratorActive(value bool) {
-	gs.isAdministratorActive = value
+	gs.isAdministratorActive.Store(value)
 	GlobalLogger.Infof("SetAdministratorActive to : %t", value)
 }
 
 func (gs *GlobalState) GetIsAdministratorActive() bool {
-	return gs.isAdministratorActive
+	return gs.isAdministratorActive.Load()
 }
 
 func (gs *GlobalState) SetIsAffiliateProgram(program AffiliateProgram) {
@@ -514,10 +514,14 @@ func (gs *GlobalState) WhileAffiliateSettingsAre(generation uint64, do func() er
 }
 
 func (gs *GlobalState) GetResignNetwork() (uint32, uint32) {
+	gs.resignMu.RLock()
+	defer gs.resignMu.RUnlock()
 	return gs.resignNetworkClass, gs.resignNetworkChainId
 }
 
 func (gs *GlobalState) SetResignNetwork(networkClass, chainId uint32) {
+	gs.resignMu.Lock()
+	defer gs.resignMu.Unlock()
 	gs.resignNetworkClass = networkClass
 	gs.resignNetworkChainId = chainId
 }

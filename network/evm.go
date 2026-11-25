@@ -661,8 +661,8 @@ func (eN *evmNetwork) InterpretLog(log etypes.Log, live bool) error {
 		for _, ev := range eventsToProcess {
 			// we enqueue the event only if we are live or we don't have confirmations
 			if live {
-				eN.logger.Infof("Trying to enqueue event - chainId: %d, txHash: %s, logIndex: %d, To: %s, From: %s, Token: %s, Amount: %d",
-					ev.ChainId, ev.TransactionHash.String(), ev.LogIndex, ev.To, ev.From.String(), ev.Token.String(), ev.Amount.Uint64())
+				eN.logger.Infof("Trying to enqueue event - chainId: %d, txHash: %s, logIndex: %d, To: %s, From: %s, Token: %s, Amount: %s",
+					ev.ChainId, ev.TransactionHash.String(), ev.LogIndex, ev.To, ev.From.String(), ev.Token.String(), ev.Amount.String())
 
 				err := eN.unconfirmedQueue.Enqueue(ev)
 				if err != nil {
@@ -791,7 +791,7 @@ func (eN *evmNetwork) InterpretLog(log etypes.Log, live bool) error {
 			if errParse != nil {
 				return errParse
 			}
-			common.AdministratorLogger.Info("SetSoftDelay %s", delay.Arg0.String())
+			common.AdministratorLogger.Infof("SetSoftDelay %s", delay.Arg0.String())
 		}
 	case common.SetUnhaltDurationSigHash.Hex():
 		if live {

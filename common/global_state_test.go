@@ -1,6 +1,9 @@
 package common
 
-import "testing"
+import (
+	"sync"
+	"testing"
+)
 
 // A transition that depends on the current state compares and changes it in
 // one step, so it cannot replace a state set in between.
@@ -216,5 +219,54 @@ func TestHaltSigningLeavesAnEmergency(t *testing.T) {
 		if err != nil || halted != tc.halted || state != tc.want {
 			t.Errorf("from %s: halted %v, state %s, err %v; want %s", StateToText(tc.from), halted, StateToText(state), err, StateToText(tc.want))
 		}
+	}
+}
+
+func TestGlobalStateConcurrencyResignAdminAndPoolSize(t *testing.T) {
+	prevPool := GetSignCeremonyPoolSize()
+	t.Cleanup(func() { SetSignCeremonyPoolSize(prevPool) })
+
+	state := LiveState
+	gs := NewGlobalState(&state)
+
+	const workers = 8
+	const iters = 200
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		w := w
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < iters; i++ {
+				if (w+i)%2 == 0 {
+					gs.SetResignNetwork(1, 100)
+					gs.SetIsAdministratorActive(true)
+					SetSignCeremonyPoolSize(25)
+				} else {
+					gs.SetResignNetwork(2, 200)
+					gs.SetIsAdministratorActive(false)
+					SetSignCeremonyPoolSize(50)
+				}
+				class, chain := gs.GetResignNetwork()
+				if !((class == 0 && chain == 0) || (class == 1 && chain == 100) || (class == 2 && chain == 200)) {
+					t.Errorf("torn resign network pair: (%d, %d)", class, chain)
+					return
+				}
+				_ = gs.GetIsAdministratorActive()
+				if got := GetSignCeremonyPoolSize(); got != 25 && got != 50 && got != prevPool {
+					t.Errorf("unexpected pool size: %d", got)
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+
+	// Non-positive pool sizes must be ignored.
+	SetSignCeremonyPoolSize(33)
+	SetSignCeremonyPoolSize(0)
+	SetSignCeremonyPoolSize(-5)
+	if got := GetSignCeremonyPoolSize(); got != 33 {
+		t.Fatalf("non-positive SetSignCeremonyPoolSize changed value to %d, want 33", got)
 	}
 }

@@ -31,7 +31,7 @@ var DefaultNodeConfig = config.Config{
 			RpcBurst:             5,
 		},
 		"Supernova": {
-			Urls:                 []string{"wss://rpc.novascan.io"},
+			Urls:                 []string{"ws://127.0.0.1:8545"},
 			FilterQuerySize:      2000,
 			RpcRequestsPerSecond: 3,
 			RpcBurst:             5,

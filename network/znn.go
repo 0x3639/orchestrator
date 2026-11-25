@@ -1082,7 +1082,7 @@ func (rC *znnNetwork) interpretSendBlockData(ctx context.Context, sendBlock *api
 		if err := definition.ABIBridge.UnpackMethod(param, definition.SetNetworkMethodName, sendBlock.Data); err != nil {
 			return constants.ErrUnpackError
 		}
-		common.AdministratorLogger.Info("SetNetworkMethodName NetworkClass: %d, ChainId: %d, Name: %s, ContractAddress: %s, Metadata: %s",
+		common.AdministratorLogger.Infof("SetNetworkMethodName NetworkClass: %d, ChainId: %d, Name: %s, ContractAddress: %s, Metadata: %s",
 			param.NetworkClass, param.ChainId, param.Name, param.ContractAddress, param.Metadata)
 		network, err := rC.ZnnRpc().GetNetworkByClassAndId(param.NetworkClass, param.ChainId)
 		if err != nil {
@@ -1125,7 +1125,7 @@ func (rC *znnNetwork) interpretSendBlockData(ctx context.Context, sendBlock *api
 		if err := definition.ABIBridge.UnpackMethod(param, definition.RemoveNetworkMethodName, sendBlock.Data); err != nil {
 			return constants.ErrUnpackError
 		}
-		common.AdministratorLogger.Info("RemoveNetworkMethodName NetworkClass: %d, ChainId: %d, Name: %s, ContractAddress: %s, Metadata: %s",
+		common.AdministratorLogger.Infof("RemoveNetworkMethodName NetworkClass: %d, ChainId: %d, Name: %s, ContractAddress: %s, Metadata: %s",
 			param.NetworkClass, param.ChainId, param.Name, param.ContractAddress, param.Metadata)
 		network, err := rC.ZnnRpc().GetNetworkByClassAndId(param.NetworkClass, param.ChainId)
 		if err != nil {
