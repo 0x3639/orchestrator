@@ -212,4 +212,36 @@ func TestEvmDialAndChainIDErrorsRedactCredentials(t *testing.T) {
 	if strings.Contains(wsErr.Error(), "key-segment-999") || strings.Contains(wsErr.Error(), "unauthorized") {
 		t.Fatalf("WebSocket handshake error leaked provider status text or path segment: %v", wsErr)
 	}
+
+	// 6. Malformed HTTP response during WebSocket dial must also suppress
+	// provider-supplied text that echoes a credential-bearing path segment.
+	malformedLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer malformedLn.Close()
+	go func() {
+		for {
+			conn, acceptErr := malformedLn.Accept()
+			if acceptErr != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				buf := make([]byte, 1024)
+				_, _ = c.Read(buf)
+				_, _ = c.Write([]byte("NOTHTTP malformed-key-segment-888\r\n\r\n"))
+			}(conn)
+		}
+	}()
+	malformedWSURL := "ws://" + malformedLn.Addr().String() + "/v2/malformed-key-segment-888"
+	malformedErr := wsMgr.AddEvmClient(config.BaseNetworkConfig{
+		Urls: []string{malformedWSURL},
+	}, 73405, "Supernova", ecommon.HexToAddress("0x0000000000000000000000000000000000000001"))
+	if malformedErr == nil {
+		t.Fatal("expected malformed WebSocket HTTP response failure")
+	}
+	if strings.Contains(malformedErr.Error(), "malformed-key-segment-888") || strings.Contains(malformedErr.Error(), "NOTHTTP") {
+		t.Fatalf("malformed WebSocket error leaked provider text or path segment: %v", malformedErr)
+	}
 }

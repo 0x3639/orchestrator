@@ -2173,26 +2173,6 @@ func (rC *znnNetwork) GetFrontierMomentum() (*api.Momentum, error) {
 	return rC.ZnnRpc().GetFrontierMomentum()
 }
 
-func (rC *znnNetwork) GetFrontierMomentumContext(ctx context.Context) (*api.Momentum, error) {
-	return rC.ZnnRpc().GetFrontierMomentumContext(ctx)
-}
-
-func (rC *znnNetwork) GetMomentumsByHeightContext(ctx context.Context, height, count uint64) (*api.MomentumList, error) {
-	return rC.ZnnRpc().GetMomentumsByHeightContext(ctx, height, count)
-}
-
-func (rC *znnNetwork) GetFrontierAccountBlockContext(ctx context.Context, address types.Address) (*api.AccountBlock, error) {
-	return rC.ZnnRpc().GetFrontierAccountBlockContext(ctx, address)
-}
-
-func (rC *znnNetwork) GetAccountBlocksByHeightContext(ctx context.Context, address types.Address, height, count uint64) (*api.AccountBlockList, error) {
-	return rC.ZnnRpc().GetAccountBlocksByHeightContext(ctx, address, height, count)
-}
-
-func (rC *znnNetwork) GetAccountBlockByHashContext(ctx context.Context, hash types.Hash) (*api.AccountBlock, error) {
-	return rC.ZnnRpc().GetAccountBlockByHashContext(ctx, hash)
-}
-
 func (rC *znnNetwork) GetAllPillars() (*embedded.PillarInfoList, error) {
 	return rC.ZnnRpc().GetAllPillars()
 }
@@ -2254,10 +2234,6 @@ func (rC *znnNetwork) HaltFlagSet() (bool, error) {
 
 func (rC *znnNetwork) GetOrchestratorInfo() (*definition.OrchestratorInfo, error) {
 	return rC.ZnnRpc().GetOrchestratorInfo()
-}
-
-func (rC *znnNetwork) GetOrchestratorInfoContext(ctx context.Context) (*definition.OrchestratorInfo, error) {
-	return rC.ZnnRpc().GetOrchestratorInfoContext(ctx)
 }
 
 func (rC *znnNetwork) IsSynced() bool {
@@ -2359,10 +2335,6 @@ func (rC *znnNetwork) PublishResignWraps(wraps []*definition.WrapTokenRequest) e
 
 func (rC *znnNetwork) GetResignStatus(id types.Hash) (bool, error) {
 	return rC.eventsStore().GetResignStatus(id)
-}
-
-func (rC *znnNetwork) IsVerifiedResignWrap(id types.Hash) (bool, error) {
-	return rC.eventsStore().IsVerifiedResignWrap(id)
 }
 
 func (rC *znnNetwork) GetWrapEventById(id types.Hash) (*events.WrapRequestZnn, error) {

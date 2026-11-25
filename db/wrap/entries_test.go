@@ -168,9 +168,6 @@ func TestPublishResignWrapsReplacesStalePayloadAndResetsStaleSignature(t *testin
 	if err := store.SetResignStatus(stale.Id, true); err != nil {
 		t.Fatal(err)
 	}
-	if verified, err := store.IsVerifiedResignWrap(stale.Id); err != nil || verified {
-		t.Fatalf("legacy SetResignStatus should not set verified resign marker: verified=%v err=%v", verified, err)
-	}
 
 	canonical := sampleWrap(0)
 	canonical.ToAddress = "0x00000000000000000000000000000000000000aa"
@@ -196,9 +193,5 @@ func TestPublishResignWrapsReplacesStalePayloadAndResetsStaleSignature(t *testin
 	resign, err := store.GetResignStatus(canonical.Id)
 	if err != nil || !resign {
 		t.Fatalf("expected resign flag true, got %v err=%v", resign, err)
-	}
-	verified, err := store.IsVerifiedResignWrap(canonical.Id)
-	if err != nil || !verified {
-		t.Fatalf("expected verified resign marker after PublishResignWraps, got %v err=%v", verified, err)
 	}
 }

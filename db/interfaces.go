@@ -101,10 +101,6 @@ type ZnnStorage interface {
 	SaveBridgeWatchFrom(uint64) error
 
 	GetResignStatus(types.Hash) (bool, error)
-	// IsVerifiedResignWrap reports whether the wrap's resign marker was written
-	// by PublishResignWraps after ledger verification (as opposed to a legacy
-	// SetResignStatus flag persisted without payload verification).
-	IsVerifiedResignWrap(types.Hash) (bool, error)
 	SetResignStatus(types.Hash, bool) error
 	// PublishResignWraps atomically stores any missing wrap rows and marks all
 	// still-unredeemed wraps in the batch for re-signing in one durable write.

@@ -19,7 +19,9 @@ import (
 	"go.uber.org/zap"
 	"golang.org/x/crypto/sha3"
 	"golang.org/x/time/rate"
+	"io"
 	"math/big"
+	"net"
 	"orchestrator/common"
 	"orchestrator/common/bridge"
 	"orchestrator/common/config"
@@ -71,18 +73,52 @@ type secondaryClient struct {
 	limiter *rate.Limiter
 }
 
-// sanitizeEvmDialError prevents provider-supplied HTTP status text or error
-// bodies (such as go-ethereum's wsHandshakeError " (HTTP status <code> <text>)")
-// from echoing credential-bearing path segments or query values into startup
-// errors and logs while preserving safe transport diagnostics and numeric HTTP
-// status codes.
-func sanitizeEvmDialError(err error, rawURL string) error {
+func isWebSocketURL(rawURL string) bool {
+	lower := strings.ToLower(strings.TrimSpace(rawURL))
+	return strings.HasPrefix(lower, "ws://") || strings.HasPrefix(lower, "wss://")
+}
+
+func isSafeLocalTransportError(err error, msg string) bool {
+	var opErr *net.OpError
+	if stderrors.As(err, &opErr) {
+		return true
+	}
+	var dnsErr *net.DNSError
+	if stderrors.As(err, &dnsErr) {
+		return true
+	}
+	if stderrors.Is(err, io.EOF) || stderrors.Is(err, io.ErrUnexpectedEOF) {
+		return true
+	}
+	return strings.HasPrefix(msg, "dial tcp") ||
+		strings.HasPrefix(msg, "dial udp") ||
+		strings.HasPrefix(msg, "dial unix") ||
+		strings.HasPrefix(msg, "tls:") ||
+		strings.HasPrefix(msg, "x509:") ||
+		msg == "evm rpc stopped"
+}
+
+// sanitizeEvmEndpointError strips provider-supplied HTTP bodies, JSON-RPC error
+// text, WebSocket handshake status lines, and malformed HTTP parser text (all
+// of which can echo credential-bearing path segments or query values) while
+// preserving safe local transport diagnostics and numeric HTTP/JSON-RPC codes.
+func sanitizeEvmEndpointError(err error, rawURL string) error {
 	if err == nil {
 		return nil
+	}
+	if stderrors.Is(err, context.Canceled) {
+		return context.Canceled
+	}
+	if stderrors.Is(err, context.DeadlineExceeded) {
+		return context.DeadlineExceeded
 	}
 	var httpErr gethrpc.HTTPError
 	if stderrors.As(err, &httpErr) {
 		return fmt.Errorf("HTTP %d", httpErr.StatusCode)
+	}
+	var rpcErr gethrpc.Error
+	if stderrors.As(err, &rpcErr) {
+		return fmt.Errorf("JSON-RPC error %d", rpcErr.ErrorCode())
 	}
 	msg := err.Error()
 	const wsStatusMarker = " (HTTP status "
@@ -100,6 +136,17 @@ func sanitizeEvmDialError(err error, rawURL string) error {
 	if strings.Contains(msg, "websocket: bad handshake") {
 		return errors.New("websocket handshake failed")
 	}
+	if strings.Contains(msg, "malformed HTTP") ||
+		strings.Contains(msg, "malformed MIME") ||
+		strings.Contains(msg, "bad Content-Length") {
+		if isWebSocketURL(rawURL) {
+			return errors.New("websocket handshake failed: malformed HTTP response")
+		}
+		return errors.New("malformed HTTP response")
+	}
+	if isWebSocketURL(rawURL) && !isSafeLocalTransportError(err, msg) {
+		return errors.New("websocket error")
+	}
 	return errors.New(config.RedactErrorForURL(err, rawURL))
 }
 
@@ -111,17 +158,7 @@ func verifyEvmChainID(parent context.Context, client *ethclient.Client, expected
 	defer cancel()
 	got, err := client.ChainID(ctx)
 	if err != nil {
-		// Never surface provider-supplied HTTP bodies or JSON-RPC error text,
-		// which can echo credential-bearing path segments or query values.
-		var httpErr gethrpc.HTTPError
-		if stderrors.As(err, &httpErr) {
-			return fmt.Errorf("network %s (%s): failed to verify eth_chainId: HTTP %d", networkName, config.RedactURL(url), httpErr.StatusCode)
-		}
-		var rpcErr gethrpc.Error
-		if stderrors.As(err, &rpcErr) {
-			return fmt.Errorf("network %s (%s): failed to verify eth_chainId: JSON-RPC error %d", networkName, config.RedactURL(url), rpcErr.ErrorCode())
-		}
-		return fmt.Errorf("network %s (%s): failed to verify eth_chainId: %s", networkName, config.RedactURL(url), config.RedactErrorForURL(err, url))
+		return fmt.Errorf("network %s (%s): failed to verify eth_chainId: %s", networkName, config.RedactURL(url), sanitizeEvmEndpointError(err, url).Error())
 	}
 	if got == nil || !got.IsUint64() || got.Uint64() != uint64(expectedChainId) {
 		return fmt.Errorf("network %s (%s): eth_chainId mismatch: endpoint serves chain %v, expected %d", networkName, config.RedactURL(url), got, expectedChainId)
@@ -167,7 +204,7 @@ func NewEvmRpcClientForChainContext(parent context.Context, networkConfig config
 		}
 		newRpcClient, err = ethclient.DialContext(parent, currentUrl)
 		if err != nil {
-			sanitizedErr := sanitizeEvmDialError(err, currentUrl)
+			sanitizedErr := sanitizeEvmEndpointError(err, currentUrl)
 			lastErr = sanitizedErr
 			logger.Infof("Error when dialing %s, got: %s\n", config.RedactURL(currentUrl), sanitizedErr.Error())
 		} else if err = verifyEvmChainID(parent, newRpcClient, chainId, networkName, currentUrl); err != nil {
@@ -734,7 +771,7 @@ func (r *EvmRpc) CanonicalHash(number uint64) (ecommon.Hash, error) {
 				return err
 			})
 			if err != nil {
-				err = errors.New(config.RedactErrorForURL(err, urls[idx]))
+				err = sanitizeEvmEndpointError(err, urls[idx])
 			}
 			results[idx] = headerResult{endpoint: idx, hash: hash, err: err}
 		}(idx)
@@ -824,7 +861,7 @@ func (r *EvmRpc) callEndpoint(idx int, read func(context.Context, *ethclient.Cli
 	if entry.client == nil {
 		client, err := ethclient.DialContext(ctx, url)
 		if err != nil {
-			return sanitizeEvmDialError(err, url)
+			return sanitizeEvmEndpointError(err, url)
 		}
 		if err := verifyEvmChainID(ctx, client, r.chainId, r.networkName, url); err != nil {
 			client.Close()

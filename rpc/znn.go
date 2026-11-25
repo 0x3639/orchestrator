@@ -423,14 +423,6 @@ func (r *ZnnRpc) GetAccountBlockByHashContext(ctx context.Context, hash types.Ha
 	return raw.FromApiMarshalJson(), nil
 }
 
-func (r *ZnnRpc) GetFrontierAccountBlockContext(ctx context.Context, address types.Address) (*api.AccountBlock, error) {
-	var block *api.AccountBlock
-	if err := r.settingsClient.CallContext(ctx, &block, "ledger.getFrontierAccountBlock", address); err != nil {
-		return nil, err
-	}
-	return block, nil
-}
-
 func (r *ZnnRpc) GetAccountBlocksByHeight(address types.Address, height, count uint64) (*api.AccountBlockList, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), ZnnLedgerTimeout)
 	defer cancel()
@@ -458,14 +450,6 @@ func (r *ZnnRpc) GetAccountBlocksByHeightContext(ctx context.Context, address ty
 
 func (r *ZnnRpc) GetMomentumsByHeight(height, count uint64) (*api.MomentumList, error) {
 	return r.rpcClient.LedgerApi.GetMomentumsByHeight(height, count)
-}
-
-func (r *ZnnRpc) GetMomentumsByHeightContext(ctx context.Context, height, count uint64) (*api.MomentumList, error) {
-	var list *api.MomentumList
-	if err := r.settingsClient.CallContext(ctx, &list, "ledger.getMomentumsByHeight", height, count); err != nil {
-		return nil, err
-	}
-	return list, nil
 }
 
 func (r *ZnnRpc) GetFrontierMomentum() (*api.Momentum, error) {
