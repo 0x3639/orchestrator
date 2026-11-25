@@ -592,6 +592,7 @@ type partialRotateZenon struct {
 func (z *partialRotateZenon) GetBridgeInfo() (*definition.BridgeInfoVariable, error) {
 	return &definition.BridgeInfoVariable{
 		Administrator:            types.ZeroAddress,
+		Halted:                   z.halted,
 		CompressedTssECDSAPubKey: z.compressedTss,
 	}, nil
 }
@@ -2151,11 +2152,16 @@ func TestUnsignedEvmChainRotatingToSignableKeyRefreshesHaltRound(t *testing.T) {
 
 	done := make(chan bool, 1)
 	go func() {
-		done <- node.publishEmergencyHalt(evmBatch, plan, oldCompressed, 1, signedEvmTss, signedEvmNonces)
+		done <- node.publishEmergencyHalt(evmBatch, plan, oldCompressed, 0, signedEvmTss, signedEvmNonces)
 	}()
 
 	// Rotate the previously unsigned EVM 2 chain to oldAddr (locally held!).
-	time.Sleep(100 * time.Millisecond)
+	time.Sleep(150 * time.Millisecond)
+	select {
+	case <-done:
+		t.Fatal("publishEmergencyHalt aborted before unsigned EVM 2 chain rotated")
+	default:
+	}
 	evm2Mu.Lock()
 	evm2Tss = oldAddr
 	evm2Mu.Unlock()
@@ -2167,5 +2173,217 @@ func TestUnsignedEvmChainRotatingToSignableKeyRefreshesHaltRound(t *testing.T) {
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("publishEmergencyHalt stayed active instead of refreshing the signing plan after unsigned EVM chain rotated")
+	}
+}
+
+func TestUnsignedRotationDefersRefreshUntilUnhaltedSignedChainGetsTurn(t *testing.T) {
+	oldKey, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	thirdKey, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldAddr := crypto.PubkeyToAddress(oldKey.PublicKey)
+	thirdAddr := crypto.PubkeyToAddress(thirdKey.PublicKey)
+	oldCompressed := base64.StdEncoding.EncodeToString(crypto.CompressPubkey(&oldKey.PublicKey))
+
+	c1 := ecommon.HexToAddress("0xa1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1")
+	c2 := ecommon.HexToAddress("0xa2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2")
+	c3 := ecommon.HexToAddress("0xa3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3")
+
+	// Three-chain scenario:
+	// - Chain 1: ALREADY halted, 1 participant (producer scheduled on tick 1)
+	// - Chain 2: UNHALTED, signed, 2 participants (producer scheduled on tick 2!)
+	// - Chain 3: UNHALTED, unsigned (thirdAddr -> rotated to oldAddr BEFORE tick 1!)
+	zMock := &partialRotateZenon{
+		haltedTestZenon: haltedTestZenon{halted: true},
+		compressedTss:   oldCompressed,
+		evmContracts: []*definition.NetworkInfo{
+			{NetworkClass: definition.EvmClass, Id: 1, Name: "eth-halted-1", ContractAddress: c1.Hex()},
+			{NetworkClass: definition.EvmClass, Id: 2, Name: "eth-signed-next-tick", ContractAddress: c2.Hex()},
+			{NetworkClass: definition.EvmClass, Id: 3, Name: "eth-unsigned-rotated", ContractAddress: c3.Hex()},
+		},
+	}
+	znnSrv := server.NewServer()
+	if err := znnSrv.RegisterName("embedded.bridge", zMock); err != nil {
+		t.Fatal(err)
+	}
+	znnHTTP := httptest.NewServer(znnSrv.WebsocketHandler([]string{"*"}))
+	t.Cleanup(func() { znnSrv.Stop(); znnHTTP.Close() })
+
+	var chain2Sends atomic.Int32
+	var chain2Halted atomic.Bool
+	var chain3Mu sync.Mutex
+	chain3Tss := thirdAddr
+
+	makeEvm := func(chainID uint64, tssFn func() ecommon.Address, haltedFn func() bool, onSend func()) *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			var req struct {
+				ID     json.RawMessage   `json:"id"`
+				Method string            `json:"method"`
+				Params []json.RawMessage `json:"params"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&req)
+			resp := map[string]interface{}{"jsonrpc": "2.0", "id": req.ID}
+			switch req.Method {
+			case "eth_chainId":
+				resp["result"] = hexutil.EncodeUint64(chainID)
+			case "eth_blockNumber":
+				resp["result"] = hexutil.EncodeUint64(100)
+			case "eth_getBalance":
+				resp["result"] = (*hexutil.Big)(new(big.Int).Mul(big.NewInt(10), big.NewInt(1e18)))
+			case "eth_getTransactionCount":
+				resp["result"] = hexutil.EncodeUint64(1)
+			case "eth_getBlockByNumber":
+				resp["result"] = map[string]interface{}{
+					"number":        hexutil.EncodeUint64(100),
+					"hash":          ecommon.HexToHash("0x11"),
+					"baseFeePerGas": (*hexutil.Big)(big.NewInt(20_000_000_000)),
+				}
+			case "eth_maxPriorityFeePerGas":
+				resp["result"] = (*hexutil.Big)(big.NewInt(2_000_000_000))
+			case "eth_estimateGas":
+				resp["result"] = hexutil.EncodeUint64(100_000)
+			case "eth_sendRawTransaction":
+				if onSend != nil {
+					onSend()
+				}
+				resp["result"] = ecommon.HexToHash("0xbeef").Hex()
+			case "eth_call":
+				var call struct {
+					Data  hexutil.Bytes `json:"data"`
+					Input hexutil.Bytes `json:"input"`
+				}
+				_ = json.Unmarshal(req.Params[0], &call)
+				sel := append(call.Data, call.Input...)
+				switch {
+				case len(sel) >= 4 && string(sel[:4]) == string(common.EvmContractAbi.Methods["tss"].ID):
+					resp["result"] = ecommon.BytesToHash(tssFn().Bytes()).Hex()
+				case len(sel) >= 4 && string(sel[:4]) == string(common.EvmContractAbi.Methods["actionsNonce"].ID):
+					resp["result"] = ecommon.BigToHash(big.NewInt(3)).Hex()
+				default:
+					if haltedFn() {
+						resp["result"] = "0x" + strings.Repeat("0", 63) + "1"
+					} else {
+						resp["result"] = "0x" + strings.Repeat("0", 64)
+					}
+				}
+			default:
+				resp["result"] = "0x" + strings.Repeat("0", 64)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(resp)
+		}))
+	}
+	evm1 := makeEvm(1, func() ecommon.Address { return oldAddr }, func() bool { return true }, nil)
+	t.Cleanup(evm1.Close)
+	evm2 := makeEvm(2, func() ecommon.Address { return oldAddr }, chain2Halted.Load, func() {
+		chain2Sends.Add(1)
+		chain2Halted.Store(true)
+	})
+	t.Cleanup(evm2.Close)
+	evm3 := makeEvm(3, func() ecommon.Address {
+		chain3Mu.Lock()
+		defer chain3Mu.Unlock()
+		return chain3Tss
+	}, func() bool { return false }, nil)
+	t.Cleanup(evm3.Close)
+
+	stopChan := make(chan os.Signal, 1)
+	stateVal := common.EmergencyState
+	gs := common.NewGlobalState(&stateVal)
+	t.Setenv("HOME", t.TempDir())
+	nm, err := network.NewNetworksManager(stopChan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dbMgr, err := manager.NewDbManager(stopChan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nets := map[string]config.BaseNetworkConfig{
+		common.ZenonNetworkName: {Urls: []string{"ws" + strings.TrimPrefix(znnHTTP.URL, "http")}},
+		"eth-halted-1":          {Urls: []string{evm1.URL}},
+		"eth-signed-next-tick":  {Urls: []string{evm2.URL}},
+		"eth-unsigned-rotated":  {Urls: []string{evm3.URL}},
+	}
+	if err := nm.Init(nets, dbMgr, gs, func(*common.BridgeMetadata) {}); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { nm.Stop() })
+
+	evmBatch, _, signedEvmNonces, signedEvmTss, err := nm.GetHaltMessagesWithState()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Rotate unsigned Chain 3 to oldAddr BEFORE tick 1!
+	chain3Mu.Lock()
+	chain3Tss = oldAddr
+	chain3Mu.Unlock()
+
+	producerPub := []byte("test-producer-pubkey-32-bytes!!!")
+	producerPubB64 := base64.StdEncoding.EncodeToString(producerPub)
+	otherParty := base64.StdEncoding.EncodeToString([]byte("other-participant-pubkey-32bytes"))
+	// With sig[0]==0, tick 1 has (0+1)%2==1 (otherParty), tick 2 has (0+2)%2==0 (producerPubB64)!
+	sig0 := make([]byte, 65)
+	sig2 := make([]byte, 65)
+
+	plan := &emergencyHaltPlan{
+		znnSignature:      "AAAA",
+		znnParticipants:   []string{producerPubB64},
+		evmFullSignatures: make([][]byte, len(signedEvmTss)),
+		evmParticipants:   make([][]string, len(signedEvmTss)),
+		hasFailedGroups:   false,
+	}
+	for i := range signedEvmTss {
+		if signedEvmTss[i] == thirdAddr {
+			// Chain 3: unsigned
+			continue
+		}
+		halted, err := nm.IsBatchNetworkHaltedContext(context.Background(), evmBatch, i)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if halted {
+			// Chain 1: already halted, 1 participant (scheduled on tick 1)
+			plan.evmFullSignatures[i] = sig0
+			plan.evmParticipants[i] = []string{producerPubB64}
+		} else {
+			// Chain 2: unhalted, 2 participants (producer scheduled on tick 2)
+			plan.evmFullSignatures[i] = sig2
+			plan.evmParticipants[i] = []string{producerPubB64, otherParty}
+		}
+	}
+
+	node := &Node{
+		config:          &config.Config{TssConfig: config.TssManagerConfig{PublicKey: oldCompressed, LocalPubKeys: []string{producerPubB64}}},
+		networksManager: nm,
+		dbManager:       dbMgr,
+		producerKeyPair: &wallet.KeyPair{Public: producerPub},
+		ecdsaPrivateKey: oldKey,
+		evmAddress:      oldAddr,
+		state:           gs,
+		stopChan:        stopChan,
+		logger:          zap.NewNop().Sugar(),
+	}
+
+	done := make(chan bool, 1)
+	go func() {
+		done <- node.publishEmergencyHalt(evmBatch, plan, oldCompressed, 0, signedEvmTss, signedEvmNonces)
+	}()
+
+	select {
+	case aborted := <-done:
+		if !aborted {
+			t.Fatal("expected publishEmergencyHalt to abort after Chain 2 got its turn so Chain 3 refreshes")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("publishEmergencyHalt timed out waiting for Chain 2 turn and Chain 3 refresh")
+	}
+	if chain2Sends.Load() == 0 || !chain2Halted.Load() {
+		t.Fatalf("unsigned Chain 3 rotation aborted round before Chain 2 got its tick-2 turn: sends=%d halted=%v", chain2Sends.Load(), chain2Halted.Load())
 	}
 }

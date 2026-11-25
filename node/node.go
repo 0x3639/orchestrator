@@ -2261,13 +2261,24 @@ func (node *Node) publishEmergencyHalt(evmBatch network.EvmBatch, plan *emergenc
 		senders.Add(1)
 		go func() {
 			defer senders.Done()
+			attemptedSignedEvm := make([]bool, len(plan.evmFullSignatures))
 			var turnStep uint32
 			for !stopSender() {
 				turnStep++
+				allPriorAttempted := node.allSignedEvmHaltedOrAttempted(roundCtx, evmBatch, plan.evmFullSignatures, attemptedSignedEvm)
+				if roundCtx.Err() != nil {
+					return
+				}
 				turnSigs := make([][]byte, len(plan.evmFullSignatures))
-				anySubmittedTurn := false
+				unhaltedTurnSlot := -1
 				for i, sig := range plan.evmFullSignatures {
 					if len(sig) == 0 {
+						continue
+					}
+					if !allPriorAttempted && attemptedSignedEvm[i] {
+						// Let every remaining unhalted signed chain get a
+						// submission opportunity before retrying an already
+						// attempted slot.
 						continue
 					}
 					var parties []string
@@ -2278,9 +2289,19 @@ func (node *Node) publishEmergencyHalt(evmBatch network.EvmBatch, plan *emergenc
 						continue
 					}
 					idx := (uint32(sig[0]) + turnStep) % uint32(len(parties))
-					if producerPubKey == parties[idx] {
-						turnSigs[i] = sig
-						anySubmittedTurn = true
+					if producerPubKey != parties[idx] {
+						continue
+					}
+					halted, err := node.networksManager.IsBatchNetworkHaltedContext(roundCtx, evmBatch, i)
+					if roundCtx.Err() != nil {
+						return
+					}
+					if err == nil && halted {
+						continue
+					}
+					turnSigs[i] = sig
+					if unhaltedTurnSlot == -1 {
+						unhaltedTurnSlot = i
 					}
 				}
 				changed, err := node.networksManager.SendHaltEvmWithExpectedContext(roundCtx, evmBatch, turnSigs, signedEvmTss, signedEvmNonces, node.ecdsaPrivateKey, node.evmAddress, node.state.WhileEmergency)
@@ -2304,6 +2325,9 @@ func (node *Node) publishEmergencyHalt(evmBatch network.EvmBatch, plan *emergenc
 				case changed:
 					return
 				default:
+					if unhaltedTurnSlot >= 0 {
+						attemptedSignedEvm[unhaltedTurnSlot] = true
+					}
 					allSignedHalted, checkErr := node.allSignedEvmHalted(roundCtx, evmBatch, plan.evmFullSignatures)
 					if plan.hasFailedGroups && hasSignedEvm && checkErr == nil && allSignedHalted {
 						// When another local TSS group failed to sign, return
@@ -2311,19 +2335,18 @@ func (node *Node) publishEmergencyHalt(evmBatch network.EvmBatch, plan *emergenc
 						// halted so the failed group is retried promptly.
 						return
 					}
-					// After fresh signed targets have had their turn (either
-					// every signed EVM chain is halted, or this tick submitted
-					// a signed halt), check if any unhalted unsigned EVM chain
-					// rotated its active TSS key (e.g. becoming locally
-					// signable) and refresh the signing plan.
-					if (checkErr == nil && allSignedHalted) || anySubmittedTurn {
+					// Only refresh for an unsigned EVM chain's key rotation
+					// once EVERY signed EVM target is either confirmed halted
+					// or has had an actual submission opportunity.
+					allHandled := (checkErr == nil && allSignedHalted) || node.allSignedEvmHaltedOrAttempted(roundCtx, evmBatch, plan.evmFullSignatures, attemptedSignedEvm)
+					if allHandled {
 						if node.anyUnsignedEvmKeyChanged(roundCtx, evmBatch, plan.evmFullSignatures, signedEvmTss) {
 							node.logger.Info("an unsigned EVM bridge rotated its TSS key during halt publishing; refreshing halt signing plan")
 							abortRound()
 							return
 						}
 					}
-					if anySubmittedTurn {
+					if unhaltedTurnSlot >= 0 && allHandled {
 						if !sleepRound(15 * time.Second) {
 							return
 						}
@@ -2351,6 +2374,22 @@ func (node *Node) allSignedEvmHalted(ctx context.Context, batch network.EvmBatch
 		}
 	}
 	return true, nil
+}
+
+func (node *Node) allSignedEvmHaltedOrAttempted(ctx context.Context, batch network.EvmBatch, sigs [][]byte, attempted []bool) bool {
+	for i, sig := range sigs {
+		if len(sig) == 0 {
+			continue
+		}
+		if i < len(attempted) && attempted[i] {
+			continue
+		}
+		halted, err := node.networksManager.IsBatchNetworkHaltedContext(ctx, batch, i)
+		if err != nil || !halted {
+			return false
+		}
+	}
+	return true
 }
 
 func (node *Node) anyUnsignedEvmKeyChanged(ctx context.Context, batch network.EvmBatch, sigs [][]byte, expectedTss []ecommon.Address) bool {

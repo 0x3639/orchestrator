@@ -621,6 +621,7 @@ func (r *EvmRpc) recordPendingTxAttempt(tx *etypes.Transaction) (*pendingAttempt
 	if _, err := r.loadPendingTxLocked(otherKey); err != nil {
 		return nil, false, fmt.Errorf("load competing EVM tx record before broadcast: %w", err)
 	}
+	r.reconcileDeferredOwnersLocked(key.sender, key.contract)
 
 	r.txMu.Lock()
 	if r.pendingTx == nil {
@@ -732,13 +733,13 @@ func (r *EvmRpc) recordPendingTxAttempt(tx *etypes.Transaction) (*pendingAttempt
 	return attempt, true, nil
 }
 
-// findFallbackOwnerLocked scans r.nonceStack across all nonces != excludeNonce
-// for (sender, contract) and returns the highest-nonce surviving top owner
-// matching kind. Caller must hold r.pendingMu.
-func (r *EvmRpc) findFallbackOwnerLocked(sender, contract ecommon.Address, kind string, excludeNonce uint64) *pendingAttempt {
+// findFallbackOwnerLocked scans r.nonceStack across nonces for (sender, contract)
+// (skipping excludeNonce when exclude is true) and returns the highest-nonce
+// surviving top owner matching kind. Caller must hold r.pendingMu.
+func (r *EvmRpc) findFallbackOwnerLocked(sender, contract ecommon.Address, kind string, exclude bool, excludeNonce uint64) *pendingAttempt {
 	var best *pendingAttempt
 	for nk, st := range r.nonceStack {
-		if nk.sender != sender || nk.contract != contract || nk.nonce == excludeNonce {
+		if nk.sender != sender || nk.contract != contract || (exclude && nk.nonce == excludeNonce) {
 			continue
 		}
 		var top *pendingAttempt
@@ -756,6 +757,61 @@ func (r *EvmRpc) findFallbackOwnerLocked(sender, contract ecommon.Address, kind 
 		}
 	}
 	return best
+}
+
+// reconcileDeferredOwnersLocked retries restoring any surviving action owner
+// still present in r.nonceStack whose durable/in-memory slot is nil because an
+// earlier rollback batch write transiently failed. Caller must hold r.pendingMu.
+func (r *EvmRpc) reconcileDeferredOwnersLocked(sender, contract ecommon.Address) {
+	r.txMu.Lock()
+	store := r.pendingTxStore
+	r.txMu.Unlock()
+
+	var ops []common.PendingEvmTxOp
+	type restoreItem struct {
+		key   evmTxKey
+		entry *pendingEvmTx
+	}
+	var items []restoreItem
+	for _, kind := range []string{evmTxKindHalt, evmTxKindSetTss} {
+		k := evmTxKey{sender: sender, contract: contract, kind: kind}
+		r.txMu.Lock()
+		cur := r.pendingTx[k]
+		r.txMu.Unlock()
+		if cur != nil {
+			continue
+		}
+		best := r.findFallbackOwnerLocked(sender, contract, kind, false, 0)
+		if best == nil {
+			continue
+		}
+		ops = append(ops, common.PendingEvmTxOp{
+			Sender:   sender,
+			Contract: contract,
+			Kind:     kind,
+			Record:   toCommonPendingEvmTx(best.entry),
+		})
+		items = append(items, restoreItem{key: k, entry: clonePendingEvmTx(best.entry)})
+	}
+	if len(ops) == 0 {
+		return
+	}
+	if store != nil {
+		if err := store.ApplyPendingEvmTxBatch(ops); err != nil {
+			r.logger.Errorf("failed to recover deferred pending EVM tx record: %v", err)
+			return
+		}
+	}
+	r.txMu.Lock()
+	if r.pendingTx == nil {
+		r.pendingTx = make(map[evmTxKey]*pendingEvmTx)
+	}
+	for _, item := range items {
+		if r.pendingTx[item.key] == nil {
+			r.pendingTx[item.key] = item.entry
+		}
+	}
+	r.txMu.Unlock()
 }
 
 // pruneConfirmedNonceStacksLocked discards nonce-lineage stacks for nonces
@@ -778,7 +834,8 @@ func (r *EvmRpc) pruneConfirmedNonceStacksLocked(sender, contract ecommon.Addres
 //     never mutates durable storage while a newer owner is active.
 //   - When the top attempt is definitively rejected, ALL trailing rejected
 //     attempts across both actions unwind together in one atomic batch,
-//     reconciling surviving ownership across nonces before deleting any slot.
+//     reconciling surviving ownership across nonces (including any deferred
+//     restoration whose earlier write transiently failed) before deleting any slot.
 func (r *EvmRpc) reconcileSentTx(tx *etypes.Transaction, attempt *pendingAttempt, sendErr error) {
 	if attempt == nil {
 		return
@@ -799,6 +856,7 @@ func (r *EvmRpc) reconcileSentTx(tx *etypes.Transaction, attempt *pendingAttempt
 				break
 			}
 		}
+		r.reconcileDeferredOwnersLocked(key.sender, key.contract)
 		return
 	}
 
@@ -811,6 +869,7 @@ func (r *EvmRpc) reconcileSentTx(tx *etypes.Transaction, attempt *pendingAttempt
 		shouldDelete := cur != nil && (cur.nonce < tx.Nonce() || (cur.nonce == tx.Nonce() && cur.txHash == tx.Hash()))
 		r.txMu.Unlock()
 		if !shouldDelete {
+			r.reconcileDeferredOwnersLocked(key.sender, key.contract)
 			return
 		}
 		if store != nil {
@@ -824,6 +883,7 @@ func (r *EvmRpc) reconcileSentTx(tx *etypes.Transaction, attempt *pendingAttempt
 			delete(r.pendingTx, key)
 		}
 		r.txMu.Unlock()
+		r.reconcileDeferredOwnersLocked(key.sender, key.contract)
 		return
 	}
 	if !isDefinitivePreMempoolRejection(sendErr) {
@@ -862,6 +922,10 @@ func (r *EvmRpc) reconcileSentTx(tx *etypes.Transaction, attempt *pendingAttempt
 	//     still restoring any uncovered competing-action owner (e.g. accepted
 	//     setTss(5) beneath rejected halt(5)) if no newer reservation occupies
 	//     otherKey.
+	//   - If otherKey's slot is currently nil and another nonce still holds a
+	//     surviving owner of otherKey.kind (e.g. from an earlier rollback batch
+	//     write that transiently failed), include it in this atomic batch so
+	//     clearing the last halt slot never leaves accepted rotations lost.
 	ownsKey := curKey != nil && curKey.nonce == tx.Nonce() && curKey.txHash == tx.Hash()
 	var keyReplacement *pendingAttempt
 	var otherReplacement *pendingAttempt
@@ -869,13 +933,18 @@ func (r *EvmRpc) reconcileSentTx(tx *etypes.Transaction, attempt *pendingAttempt
 		if surviving != nil && surviving.kind == key.kind {
 			keyReplacement = surviving
 		} else {
-			keyReplacement = r.findFallbackOwnerLocked(key.sender, key.contract, key.kind, tx.Nonce())
+			keyReplacement = r.findFallbackOwnerLocked(key.sender, key.contract, key.kind, true, tx.Nonce())
 			if surviving != nil && (curOther == nil || curOther.nonce <= surviving.nonce) {
 				otherReplacement = surviving
 			}
 		}
 	} else if surviving != nil && surviving.kind != key.kind && (curOther == nil || curOther.nonce <= surviving.nonce) {
 		otherReplacement = surviving
+	}
+	if otherReplacement == nil && curOther == nil {
+		if deferredOther := r.findFallbackOwnerLocked(key.sender, key.contract, otherKey.kind, true, tx.Nonce()); deferredOther != nil {
+			otherReplacement = deferredOther
+		}
 	}
 
 	var ops []common.PendingEvmTxOp
@@ -1071,6 +1140,7 @@ func (r *EvmRpc) lookupPendingTx(key evmTxKey, confirmedNonce, pendingNonce uint
 	if _, err := r.loadPendingTxLocked(key); err != nil {
 		return nil, err
 	}
+	r.reconcileDeferredOwnersLocked(key.sender, key.contract)
 
 	r.txMu.Lock()
 	prev := r.pendingTx[key]
@@ -1110,6 +1180,7 @@ func (r *EvmRpc) otherTrackedNonces(key evmTxKey, confirmedNonce uint64) (maxNex
 			return 0, 0, nil, false, loadErr
 		}
 	}
+	r.reconcileDeferredOwnersLocked(key.sender, key.contract)
 	type staleEntry struct {
 		key evmTxKey
 		rec *pendingEvmTx
