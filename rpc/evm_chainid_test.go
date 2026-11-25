@@ -138,14 +138,40 @@ func TestEvmDialAndChainIDErrorsRedactCredentials(t *testing.T) {
 		}
 	}
 
-	// 4. RedactErrorForURL must scrub complete paths before individual query
-	// values and scrub overlapping query values longest first.
-	overlapURL := "http://127.0.0.1:8545/v2/abc123secret?env=abc&a=foo&b=foobarbaz"
-	overlapErr := fmt.Errorf("upstream rejected /v2/abc123secret and foobarbaz")
-	redacted := config.RedactErrorForURL(overlapErr, overlapURL)
-	for _, secret := range []string{"abc123secret", "123secret", "foobarbaz", "barbaz"} {
-		if strings.Contains(redacted, secret) {
-			t.Fatalf("RedactErrorForURL leaked credential %q: %s", secret, redacted)
+	// 4. RedactErrorForURL must merge overlapping sensitive spans in BOTH
+	// directions: query value as prefix of path, path as prefix of decoded
+	// query credential, and partial path/query overlap.
+	overlapCases := []struct {
+		name    string
+		rawURL  string
+		errText string
+		leaks   []string
+	}{
+		{
+			name:    "query value prefix of path and overlapping query values",
+			rawURL:  "http://127.0.0.1:8545/v2/abc123secret?env=abc&a=foo&b=foobarbaz",
+			errText: "upstream rejected /v2/abc123secret and foobarbaz",
+			leaks:   []string{"abc123secret", "123secret", "foobarbaz", "barbaz"},
+		},
+		{
+			name:    "path prefix of decoded query credential",
+			rawURL:  "http://127.0.0.1:8545/v2/key?secret=%2Fv2%2Fkey-tail-secret",
+			errText: "upstream rejected /v2/key-tail-secret",
+			leaks:   []string{"/v2/key", "tail-secret", "-tail-secret"},
+		},
+		{
+			name:    "partial overlap between path and query credential",
+			rawURL:  "http://127.0.0.1:8545/v2/shared?secret=shared-secret-suffix",
+			errText: "upstream rejected /v2/shared-secret-suffix",
+			leaks:   []string{"/v2/shared", "shared", "secret-suffix"},
+		},
+	}
+	for _, tc := range overlapCases {
+		redacted := config.RedactErrorForURL(fmt.Errorf("%s", tc.errText), tc.rawURL)
+		for _, secret := range tc.leaks {
+			if strings.Contains(redacted, secret) {
+				t.Fatalf("%s: RedactErrorForURL leaked credential %q: %s", tc.name, secret, redacted)
+			}
 		}
 	}
 }

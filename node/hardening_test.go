@@ -5783,6 +5783,227 @@ func TestReSignStateRequiresMomentumConfirmationForBridgeSnapshot(t *testing.T) 
 			t.Fatalf("expected (false, false, false) for erroneous MaxUint64 height, got (%v, %v, %v)", consistent, stale, stop)
 		}
 	})
+
+	t.Run("rotates legacy revalidation across batches so one slow row cannot starve healthy legacy rows", func(t *testing.T) {
+		prevBudget := legacyRevalidateBudget
+		legacyRevalidateBudget = 120 * time.Millisecond
+		t.Cleanup(func() { legacyRevalidateBudget = prevBudget })
+
+		evmSrv := fakeEvmRpcServer(t)
+		defer evmSrv.Close()
+
+		// Exact regression for Round 22 Finding 1 (part A):
+		// slowID sorts before healthyID. On batch 1, slowID stalls and consumes
+		// legacyRevalidateBudget so healthyID is skipped. On batch 2, rotation
+		// starts at healthyID, verifies and promotes it to verified, and includes
+		// it in the signing batch even while slowID remains stalled.
+		slowID := types.Hash{0x01}
+		healthyID := types.Hash{0x02}
+		slowWrap := &embedded.WrapTokenRequest{
+			WrapTokenRequest: &definition.WrapTokenRequest{
+				NetworkClass:           definition.EvmClass,
+				ChainId:                1,
+				Id:                     slowID,
+				ToAddress:              "0x000000000000000000000000000000000000beef",
+				Amount:                 big.NewInt(100),
+				Fee:                    big.NewInt(10),
+				CreationMomentumHeight: 99,
+			},
+			ConfirmationsToFinality: 0,
+		}
+		healthyWrap := &embedded.WrapTokenRequest{
+			WrapTokenRequest: &definition.WrapTokenRequest{
+				NetworkClass:           definition.EvmClass,
+				ChainId:                1,
+				Id:                     healthyID,
+				ToAddress:              "0x000000000000000000000000000000000000beef",
+				Amount:                 big.NewInt(100),
+				Fee:                    big.NewInt(10),
+				CreationMomentumHeight: 99,
+			},
+			ConfirmationsToFinality: 0,
+		}
+
+		bridge := &wrapTestBridge{
+			networks: &embedded.NetworkInfoList{
+				Count: 1,
+				List: []*definition.NetworkInfo{{
+					NetworkClass: definition.EvmClass, Id: 1, Name: "Ethereum",
+					ContractAddress: "0x0000000000000000000000000000000000000001",
+				}},
+			},
+			frontierMomFn: func(_ context.Context, _ int32) (*api.Momentum, error) {
+				return testMomentum(105), nil
+			},
+			byID: map[types.Hash]*embedded.WrapTokenRequest{
+				healthyID: healthyWrap,
+			},
+			byIDHandler: func(ctx context.Context, id types.Hash, _ int32) (*embedded.WrapTokenRequest, error) {
+				if id == slowID {
+					<-ctx.Done()
+					return nil, ctx.Err()
+				}
+				return healthyWrap, nil
+			},
+			unsigned: &embedded.WrapTokenRequestList{Count: 0},
+		}
+
+		n := wrapTestNodeWithEvm(t, common.LiveState, bridge, map[string]string{"Ethereum": evmSrv.URL})
+		for _, w := range []*embedded.WrapTokenRequest{slowWrap, healthyWrap} {
+			if err := n.dbManager.ZnnStorage().AddWrapRequest(common.ZnnWrapToOrchestratorWrap(w.WrapTokenRequest)); err != nil {
+				t.Fatal(err)
+			}
+			if err := n.dbManager.ZnnStorage().SetResignStatus(w.Id, true); err != nil {
+				t.Fatal(err)
+			}
+		}
+
+		// Batch 1: slowID runs first and exhausts budget; healthyID is skipped.
+		reqs, _, _, err := n.buildWrapSigningBatch()
+		if err != nil {
+			t.Fatalf("batch 1 buildWrapSigningBatch failed: %v", err)
+		}
+		if len(reqs) != 0 {
+			t.Fatalf("expected batch 1 to skip both legacy wraps after slowID exhausted budget, got %+v", reqs)
+		}
+
+		// Batch 2: cursor rotates to healthyID first, promoting and returning it
+		// even while slowID remains stalled.
+		reqs, msgs, _, err := n.buildWrapSigningBatch()
+		if err != nil {
+			t.Fatalf("batch 2 buildWrapSigningBatch failed: %v", err)
+		}
+		if len(reqs) != 1 || len(msgs) != 1 || reqs[0].Id != healthyID {
+			t.Fatalf("expected batch 2 to promote healthyID via round-robin rotation, got reqs=%+v msgs=%d", reqs, len(msgs))
+		}
+		verified, err := n.dbManager.ZnnStorage().IsVerifiedResignWrap(healthyID)
+		if err != nil || !verified {
+			t.Fatalf("expected healthyID to be promoted to verified resign marker, verified=%v err=%v", verified, err)
+		}
+		slowVerified, err := n.dbManager.ZnnStorage().IsVerifiedResignWrap(slowID)
+		if err != nil || slowVerified {
+			t.Fatalf("expected slowID to remain unverified, verified=%v err=%v", slowVerified, err)
+		}
+	})
+
+	t.Run("retains validated token-pair replay progress across batches when history exceeds legacy budget", func(t *testing.T) {
+		prevBudget := legacyRevalidateBudget
+		legacyRevalidateBudget = 2 * time.Second
+		t.Cleanup(func() { legacyRevalidateBudget = prevBudget })
+
+		evmSrv := fakeEvmRpcServer(t)
+		defer evmSrv.Close()
+
+		// Exact regression for Round 22 Finding 1 (part B):
+		// Bridge history spans two RPC pages (RpcMaxCountSize + 20 blocks). On
+		// batch 1, threshold verification finishes and token-pair replay
+		// validates page 1 (heights 1..RpcMaxCountSize), then page 2
+		// (height RpcMaxCountSize+1) stalls past the budget. Batch 1 must
+		// retain the validated 1..RpcMaxCountSize prefix on Node; batch 2 must
+		// resume at RpcMaxCountSize+1 without re-reading height 1 and promote
+		// the wrap.
+		const pageSize = uint64(api.RpcMaxCountSize)
+		const totalHeight = pageSize + 20
+		legacyID := types.Hash{0xde}
+		legacyWrap := &embedded.WrapTokenRequest{
+			WrapTokenRequest: &definition.WrapTokenRequest{
+				NetworkClass:           definition.EvmClass,
+				ChainId:                1,
+				Id:                     legacyID,
+				ToAddress:              "0x000000000000000000000000000000000000beef",
+				Amount:                 big.NewInt(100),
+				Fee:                    big.NewInt(10),
+				CreationMomentumHeight: 99,
+			},
+			ConfirmationsToFinality: 0,
+		}
+
+		var stallPage2 atomic.Bool
+		var height1Reads atomic.Int32
+		var sawHeight1Once atomic.Bool
+		stallPage2.Store(true)
+
+		bridge := &wrapTestBridge{
+			networks: &embedded.NetworkInfoList{
+				Count: 1,
+				List: []*definition.NetworkInfo{{
+					NetworkClass: definition.EvmClass, Id: 1, Name: "Ethereum",
+					ContractAddress: "0x0000000000000000000000000000000000000001",
+				}},
+			},
+			frontierMomFn: func(_ context.Context, _ int32) (*api.Momentum, error) {
+				return testMomentum(105), nil
+			},
+			frontierFn: func(_ context.Context, _ int32) (*api.AccountBlock, error) {
+				return testAccountBlock(totalHeight, types.Hash{0xaa, byte(totalHeight >> 8), byte(totalHeight & 0xff)}), nil
+			},
+			acctByHeightFn: func(ctx context.Context, height uint64) (*api.AccountBlockList, error) {
+				if height == 1 {
+					height1Reads.Add(1)
+					sawHeight1Once.Store(true)
+				}
+				// Stall page 2 (height pageSize+1) ONLY after height 1 has been read
+				// (so readConfirmedWrapConfirmations backward scan completes first,
+				// then ensureConfirmedTokenPairHistory validates 1..pageSize and
+				// stalls when requesting pageSize+1..totalHeight).
+				if height == pageSize+1 && sawHeight1Once.Load() && stallPage2.Load() {
+					<-ctx.Done()
+					return nil, ctx.Err()
+				}
+				blk := testAccountBlock(height, types.Hash{0xaa, byte(height >> 8), byte(height)})
+				return &api.AccountBlockList{Count: 1, List: []*api.AccountBlock{blk}}, nil
+			},
+			byID: map[types.Hash]*embedded.WrapTokenRequest{
+				legacyID: legacyWrap,
+			},
+			unsigned: &embedded.WrapTokenRequestList{Count: 0},
+		}
+
+		n := wrapTestNodeWithEvm(t, common.LiveState, bridge, map[string]string{"Ethereum": evmSrv.URL})
+		if err := n.dbManager.ZnnStorage().AddWrapRequest(common.ZnnWrapToOrchestratorWrap(legacyWrap.WrapTokenRequest)); err != nil {
+			t.Fatal(err)
+		}
+		if err := n.dbManager.ZnnStorage().SetResignStatus(legacyID, true); err != nil {
+			t.Fatal(err)
+		}
+
+		// Batch 1: validates heights 1..pageSize, stalls on pageSize+1, retains prefix.
+		reqs, _, _, err := n.buildWrapSigningBatch()
+		if err != nil {
+			t.Fatalf("batch 1 buildWrapSigningBatch failed: %v", err)
+		}
+		if len(reqs) != 0 {
+			t.Fatalf("expected batch 1 to defer legacy wrap when page 2 timed out, got %+v", reqs)
+		}
+		n.legacyRevalidateMu.Lock()
+		savedTip := uint64(0)
+		if n.legacyPairHistory != nil && n.legacyPairHistory.tipBlock != nil {
+			savedTip = n.legacyPairHistory.tipBlock.Height
+		}
+		n.legacyRevalidateMu.Unlock()
+		if savedTip != pageSize {
+			t.Fatalf("expected batch 1 to persist validated token-pair replay tip at height %d, got %d", pageSize, savedTip)
+		}
+
+		// Batch 2: lift page 2 stall, reset height-1 read counter, verify batch 2
+		// resumes from pageSize+1 without re-reading height 1 and promotes legacyID.
+		height1Reads.Store(0)
+		stallPage2.Store(false)
+		reqs, msgs, _, err := n.buildWrapSigningBatch()
+		if err != nil {
+			t.Fatalf("batch 2 buildWrapSigningBatch failed: %v", err)
+		}
+		if len(reqs) != 1 || len(msgs) != 1 || reqs[0].Id != legacyID {
+			t.Fatalf("expected batch 2 to resume replay and select legacyID, got reqs=%+v msgs=%d", reqs, len(msgs))
+		}
+		if reads := height1Reads.Load(); reads != 0 {
+			t.Fatalf("expected batch 2 to resume from cached height %d without re-reading height 1, got %d reads", pageSize, reads)
+		}
+		verified, err := n.dbManager.ZnnStorage().IsVerifiedResignWrap(legacyID)
+		if err != nil || !verified {
+			t.Fatalf("expected legacyID to be promoted to verified after resumed replay, verified=%v err=%v", verified, err)
+		}
+	})
 }
 
 func TestReSignStateBoundsAndCancelsStalledDeferredWrapRPC(t *testing.T) {

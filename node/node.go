@@ -83,6 +83,14 @@ type Node struct {
 	stopped chan struct{}
 	// Prevents concurrent use of instance directory
 	dataDirLock fileutil.Releaser
+
+	// Bounded live-signing legacy revalidation state persisted across batches:
+	// rotates retries so one slow row cannot starve healthy legacy rows, and
+	// retains validated threshold/token-pair replay progress across batches.
+	legacyRevalidateMu     sync.Mutex
+	legacyRevalidateLastID types.Hash
+	legacyThresholdCache   *confirmedThresholdCache
+	legacyPairHistory      *confirmedTokenPairHistory
 }
 
 func NewNode(config *oconfig.Config, logger *zap.Logger) (_ *Node, initErr error) {
@@ -1688,6 +1696,8 @@ func (node *Node) readConfirmedWrapConfirmations(ctx context.Context, anchor reS
 			}
 			if blocks == nil || len(blocks.List) == 0 || blocks.List[0] == nil ||
 				!isConfirmedBridgeBlock(blocks.List[0]) || !sameAccountBlockFrontier(cache.atBlock, blocks.List[0]) {
+				cache.atBlock = nil
+				cache.threshold = 0
 				return 0, reSignChainAnchor{}, false, false, false
 			}
 			minHeight = cache.atBlock.Height + 1
@@ -1852,6 +1862,8 @@ func (node *Node) readConfirmedWrapConfirmations(ctx context.Context, anchor reS
 		if !found {
 			if haveCached {
 				if expectedHash != cache.atBlock.Hash {
+					cache.atBlock = nil
+					cache.threshold = 0
 					return 0, reSignChainAnchor{}, false, false, false
 				}
 				foundThreshold = cache.threshold
@@ -2163,6 +2175,7 @@ func (node *Node) ensureConfirmedTokenPairHistory(ctx context.Context, targetBlo
 		// from an untrusted RPC-reported frontier height.
 		var deltaBlocks []confirmedBlockIdentity
 		var deltaEvents []confirmedTokenPairEvent
+		var lastValidatedBlock *api.AccountBlock
 		needRetry := false
 		rolledBack := false
 
@@ -2171,7 +2184,8 @@ func (node *Node) ensureConfirmedTokenPairHistory(ctx context.Context, targetBlo
 				return false, false, true
 			}
 			if ctx != nil && ctx.Err() != nil {
-				return false, false, false
+				needRetry = true
+				break
 			}
 			if resignGen != 0 && !node.state.IsResignGenerationCurrent(resignGen) {
 				return false, true, false
@@ -2234,104 +2248,99 @@ func (node *Node) ensureConfirmedTokenPairHistory(ctx context.Context, targetBlo
 					rolledBack = true
 					break
 				}
+
+				checkSend := isAcceptedReceiveBlock(b)
+				if checkSend && b.PairedAccountBlock != nil && b.PairedAccountBlock.Hash == b.FromBlockHash {
+					if b.PairedAccountBlock.ToAddress != types.BridgeContract || !isPairMethod(b.PairedAccountBlock.Data) {
+						checkSend = false
+					}
+				}
+				if checkSend {
+					sendCtx, sendCancel := node.resignRPCContext(ctx)
+					send, err := node.networksManager.Znn().GetAccountBlockByHashContext(sendCtx, b.FromBlockHash)
+					sendCancel()
+					if node.workerStopping() {
+						return false, false, true
+					}
+					if err != nil {
+						node.logger.Debugf("failed to verify token pair send %s in momentumStore: %v", b.FromBlockHash, err)
+						needRetry = true
+						break
+					}
+					if send == nil || send.Hash != b.FromBlockHash || !nom.IsSendBlock(send.BlockType) || !isConfirmedBridgeBlock(send) {
+						rolledBack = true
+						break
+					}
+					recv := send.PairedAccountBlock
+					if recv == nil || !isConfirmedBridgeBlock(recv) || !sameAccountBlockFrontier(b, recv) || !isAcceptedReceiveBlock(recv) {
+						rolledBack = true
+						break
+					}
+					if send.ToAddress == types.BridgeContract && isPairMethod(send.Data) {
+						momCtx, momCancel := node.resignRPCContext(ctx)
+						momList, err := node.networksManager.Znn().GetMomentumsByHeightContext(momCtx, b.ConfirmationDetail.MomentumHeight, 1)
+						momCancel()
+						if node.workerStopping() {
+							return false, false, true
+						}
+						if err != nil {
+							needRetry = true
+							break
+						}
+						if momList == nil || len(momList.List) == 0 || momList.List[0] == nil || momList.List[0].Momentum == nil ||
+							momList.List[0].Height != b.ConfirmationDetail.MomentumHeight || momList.List[0].Hash != b.ConfirmationDetail.MomentumHash {
+							rolledBack = true
+							break
+						}
+
+						switch {
+						case len(send.Data) >= len(setPairID) && bytes.Equal(send.Data[:len(setPairID)], setPairID):
+							param := new(definition.TokenPairParam)
+							if err := definition.ABIBridge.UnpackMethod(param, definition.SetTokenPairMethod, send.Data); err == nil {
+								deltaEvents = append(deltaEvents, confirmedTokenPairEvent{
+									height:    expectedHeight,
+									kind:      tokenPairEventSetPair,
+									pairParam: param,
+								})
+							}
+						case len(send.Data) >= len(removePairID) && bytes.Equal(send.Data[:len(removePairID)], removePairID):
+							param := new(definition.TokenPairParam)
+							if err := definition.ABIBridge.UnpackMethod(param, definition.RemoveTokenPairMethodName, send.Data); err == nil {
+								deltaEvents = append(deltaEvents, confirmedTokenPairEvent{
+									height:    expectedHeight,
+									kind:      tokenPairEventRemovePair,
+									pairParam: param,
+								})
+							}
+						case len(send.Data) >= len(setNetID) && bytes.Equal(send.Data[:len(setNetID)], setNetID):
+							param := new(definition.NetworkInfoParam)
+							if err := definition.ABIBridge.UnpackMethod(param, definition.SetNetworkMethodName, send.Data); err == nil {
+								deltaEvents = append(deltaEvents, confirmedTokenPairEvent{
+									height:   expectedHeight,
+									kind:     tokenPairEventSetNetwork,
+									netParam: param,
+								})
+							}
+						case len(send.Data) >= len(removeNetID) && bytes.Equal(send.Data[:len(removeNetID)], removeNetID):
+							param := new(definition.NetworkInfoParam)
+							if err := definition.ABIBridge.UnpackMethod(param, definition.RemoveNetworkMethodName, send.Data); err == nil {
+								deltaEvents = append(deltaEvents, confirmedTokenPairEvent{
+									height:   expectedHeight,
+									kind:     tokenPairEventRemoveNetwork,
+									netParam: param,
+								})
+							}
+						}
+					}
+				}
+
 				prevHash = b.Hash
+				lastValidatedBlock = b
 				deltaBlocks = append(deltaBlocks, confirmedBlockIdentity{
 					hash:      b.Hash,
 					momHeight: b.ConfirmationDetail.MomentumHeight,
 					momHash:   b.ConfirmationDetail.MomentumHash,
 				})
-
-				if !isAcceptedReceiveBlock(b) {
-					continue
-				}
-				if b.PairedAccountBlock != nil && b.PairedAccountBlock.Hash == b.FromBlockHash {
-					if b.PairedAccountBlock.ToAddress != types.BridgeContract || !isPairMethod(b.PairedAccountBlock.Data) {
-						continue
-					}
-				}
-
-				sendCtx, sendCancel := node.resignRPCContext(ctx)
-				send, err := node.networksManager.Znn().GetAccountBlockByHashContext(sendCtx, b.FromBlockHash)
-				sendCancel()
-				if node.workerStopping() {
-					return false, false, true
-				}
-				if err != nil {
-					node.logger.Debugf("failed to verify token pair send %s in momentumStore: %v", b.FromBlockHash, err)
-					needRetry = true
-					break
-				}
-				if send == nil || send.Hash != b.FromBlockHash || !nom.IsSendBlock(send.BlockType) || !isConfirmedBridgeBlock(send) {
-					rolledBack = true
-					break
-				}
-				recv := send.PairedAccountBlock
-				if recv == nil || !isConfirmedBridgeBlock(recv) || !sameAccountBlockFrontier(b, recv) || !isAcceptedReceiveBlock(recv) {
-					rolledBack = true
-					break
-				}
-				if send.ToAddress != types.BridgeContract || !isPairMethod(send.Data) {
-					continue
-				}
-
-				momCtx, momCancel := node.resignRPCContext(ctx)
-				momList, err := node.networksManager.Znn().GetMomentumsByHeightContext(momCtx, b.ConfirmationDetail.MomentumHeight, 1)
-				momCancel()
-				if node.workerStopping() {
-					return false, false, true
-				}
-				if err != nil {
-					needRetry = true
-					break
-				}
-				if momList == nil || len(momList.List) == 0 || momList.List[0] == nil || momList.List[0].Momentum == nil ||
-					momList.List[0].Height != b.ConfirmationDetail.MomentumHeight || momList.List[0].Hash != b.ConfirmationDetail.MomentumHash {
-					rolledBack = true
-					break
-				}
-
-				switch {
-				case len(send.Data) >= len(setPairID) && bytes.Equal(send.Data[:len(setPairID)], setPairID):
-					param := new(definition.TokenPairParam)
-					if err := definition.ABIBridge.UnpackMethod(param, definition.SetTokenPairMethod, send.Data); err != nil {
-						continue
-					}
-					deltaEvents = append(deltaEvents, confirmedTokenPairEvent{
-						height:    expectedHeight,
-						kind:      tokenPairEventSetPair,
-						pairParam: param,
-					})
-				case len(send.Data) >= len(removePairID) && bytes.Equal(send.Data[:len(removePairID)], removePairID):
-					param := new(definition.TokenPairParam)
-					if err := definition.ABIBridge.UnpackMethod(param, definition.RemoveTokenPairMethodName, send.Data); err != nil {
-						continue
-					}
-					deltaEvents = append(deltaEvents, confirmedTokenPairEvent{
-						height:    expectedHeight,
-						kind:      tokenPairEventRemovePair,
-						pairParam: param,
-					})
-				case len(send.Data) >= len(setNetID) && bytes.Equal(send.Data[:len(setNetID)], setNetID):
-					param := new(definition.NetworkInfoParam)
-					if err := definition.ABIBridge.UnpackMethod(param, definition.SetNetworkMethodName, send.Data); err != nil {
-						continue
-					}
-					deltaEvents = append(deltaEvents, confirmedTokenPairEvent{
-						height:   expectedHeight,
-						kind:     tokenPairEventSetNetwork,
-						netParam: param,
-					})
-				case len(send.Data) >= len(removeNetID) && bytes.Equal(send.Data[:len(removeNetID)], removeNetID):
-					param := new(definition.NetworkInfoParam)
-					if err := definition.ABIBridge.UnpackMethod(param, definition.RemoveNetworkMethodName, send.Data); err != nil {
-						continue
-					}
-					deltaEvents = append(deltaEvents, confirmedTokenPairEvent{
-						height:   expectedHeight,
-						kind:     tokenPairEventRemoveNetwork,
-						netParam: param,
-					})
-				}
 			}
 
 			if needRetry || rolledBack || hi == targetBlock.Height {
@@ -2345,7 +2354,15 @@ func (node *Node) ensureConfirmedTokenPairHistory(ctx context.Context, targetBlo
 			return false, false, false
 		}
 		if needRetry {
-			if resignGen == 0 {
+			// Retain any fully validated prefix so a long replay that exceeds a
+			// batch budget (or hits a transient RPC error) resumes from the last
+			// verified block instead of restarting from height 1.
+			if len(deltaBlocks) > 0 && lastValidatedBlock != nil {
+				cache.blocks = append(cache.blocks, deltaBlocks...)
+				cache.events = append(cache.events, deltaEvents...)
+				cache.tipBlock = lastValidatedBlock
+			}
+			if resignGen == 0 || (ctx != nil && ctx.Err() != nil) {
 				return false, false, false
 			}
 			if !node.workerSleep(resignRetryDelay) {
@@ -3572,9 +3589,8 @@ func (node *Node) buildWrapSigningBatch() ([]*definition.WrapTokenRequest, [][]b
 	wrapRequestsIds := make([]*definition.WrapTokenRequest, 0, len(resignableWraps)+len(unsignedWraps))
 	seen := make(map[types.Hash]struct{}, len(resignableWraps)+len(unsignedWraps))
 	blockedLegacy := make(map[types.Hash]struct{})
-	var legacyCtx context.Context
-	var legacyThresholdCache *confirmedThresholdCache
-	var legacyPairHistory *confirmedTokenPairHistory
+	var legacyWraps []*definition.WrapTokenRequest
+	legacySeen := make(map[types.Hash]struct{})
 	for _, req := range resignableWraps {
 		if req == nil {
 			continue
@@ -3589,36 +3605,74 @@ func (node *Node) buildWrapSigningBatch() ([]*definition.WrapTokenRequest, [][]b
 			return nil, nil, nil, err
 		}
 		if !verified {
-			if legacyCtx == nil {
-				var cancel context.CancelFunc
-				legacyCtx, cancel = context.WithTimeout(node.workers.context(), legacyRevalidateBudget)
-				defer cancel()
+			if _, dup := legacySeen[req.Id]; !dup {
+				legacySeen[req.Id] = struct{}{}
+				legacyWraps = append(legacyWraps, req)
 			}
+			continue
+		}
+		seen[req.Id] = struct{}{}
+		wrapRequestsIds = append(wrapRequestsIds, req)
+	}
+	if len(legacyWraps) == 0 {
+		node.legacyRevalidateMu.Lock()
+		node.legacyThresholdCache = nil
+		node.legacyPairHistory = nil
+		node.legacyRevalidateLastID = types.ZeroHash
+		node.legacyRevalidateMu.Unlock()
+	} else {
+		// Sort deterministically and rotate starting after legacyRevalidateLastID
+		// so one slow legacy row cannot indefinitely starve healthy legacy rows
+		// behind it, while retaining validated threshold and token-pair replay
+		// progress across batches.
+		sort.Slice(legacyWraps, func(i, j int) bool {
+			return bytes.Compare(legacyWraps[i].Id.Bytes(), legacyWraps[j].Id.Bytes()) < 0
+		})
+		node.legacyRevalidateMu.Lock()
+		if node.legacyThresholdCache == nil {
+			node.legacyThresholdCache = &confirmedThresholdCache{}
+		}
+		if node.legacyPairHistory == nil {
+			node.legacyPairHistory = &confirmedTokenPairHistory{}
+		}
+		startIdx := 0
+		if node.legacyRevalidateLastID != types.ZeroHash {
+			for i, req := range legacyWraps {
+				if bytes.Compare(req.Id.Bytes(), node.legacyRevalidateLastID.Bytes()) > 0 {
+					startIdx = i
+					break
+				}
+			}
+		}
+		legacyCtx, cancel := context.WithTimeout(node.workers.context(), legacyRevalidateBudget)
+		var legacyErr error
+		for offset := 0; offset < len(legacyWraps); offset++ {
+			req := legacyWraps[(startIdx+offset)%len(legacyWraps)]
 			if legacyCtx.Err() != nil {
 				blockedLegacy[req.Id] = struct{}{}
 				continue
 			}
-			if legacyThresholdCache == nil {
-				legacyThresholdCache = &confirmedThresholdCache{}
-			}
-			if legacyPairHistory == nil {
-				legacyPairHistory = &confirmedTokenPairHistory{}
-			}
-			refreshed, ok, err := node.revalidateLegacyResignWrap(legacyCtx, req.Id, legacyThresholdCache, legacyPairHistory)
+			node.legacyRevalidateLastID = req.Id
+			refreshed, ok, err := node.revalidateLegacyResignWrap(legacyCtx, req.Id, node.legacyThresholdCache, node.legacyPairHistory)
 			if err != nil {
-				node.logger.Error(err)
-				common.RequestStop(node.stopChan)
-				return nil, nil, nil, err
+				legacyErr = err
+				break
 			}
 			if !ok {
 				node.logger.Debugf("skipping unverified legacy resign wrap %s until confirmed ledger revalidation succeeds", req.Id)
 				blockedLegacy[req.Id] = struct{}{}
 				continue
 			}
-			req = refreshed
+			seen[req.Id] = struct{}{}
+			wrapRequestsIds = append(wrapRequestsIds, refreshed)
 		}
-		seen[req.Id] = struct{}{}
-		wrapRequestsIds = append(wrapRequestsIds, req)
+		cancel()
+		node.legacyRevalidateMu.Unlock()
+		if legacyErr != nil {
+			node.logger.Error(legacyErr)
+			common.RequestStop(node.stopChan)
+			return nil, nil, nil, legacyErr
+		}
 	}
 	for _, req := range unsignedWraps {
 		if req == nil {

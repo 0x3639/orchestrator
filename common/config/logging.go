@@ -117,61 +117,109 @@ func RedactURLs(raw []string) []string {
 	return out
 }
 
+type redactSpan struct {
+	start int
+	end   int
+	repl  string
+}
+
+func appendNeedleSpans(spans []redactSpan, msg, needle, repl string) []redactSpan {
+	if needle == "" {
+		return spans
+	}
+	for offset := 0; offset < len(msg); {
+		idx := strings.Index(msg[offset:], needle)
+		if idx < 0 {
+			break
+		}
+		start := offset + idx
+		spans = append(spans, redactSpan{start: start, end: start + len(needle), repl: repl})
+		offset = start + 1
+	}
+	return spans
+}
+
 // RedactErrorForURL renders err for logging with the raw URL, complete
 // request URI / path / query components, credentials, and individual query
-// values replaced (complete components before substrings, and overlapping
-// tokens longest first). Client libraries and HTTP error responses can echo
-// the full URL or only its path/query components.
+// values replaced. Sensitive spans are located on the original error string
+// and overlapping spans are merged before a single replacement pass so neither
+// path-vs-query overlaps nor replacement text can leak credential suffixes.
 func RedactErrorForURL(err error, raw string) string {
 	if err == nil {
 		return ""
 	}
 	msg := err.Error()
-	if raw != "" {
-		msg = strings.ReplaceAll(msg, raw, RedactURL(raw))
+	if msg == "" || raw == "" {
+		return msg
 	}
+	var spans []redactSpan
+	spans = appendNeedleSpans(spans, msg, raw, RedactURL(raw))
 	if parsed, perr := url.Parse(raw); perr == nil {
-		// Replace complete URI, path, and raw query components BEFORE
-		// individual credentials or query values so a matching prefix cannot
-		// disrupt a longer component match.
 		if reqURI := parsed.RequestURI(); len(reqURI) > 1 {
-			msg = strings.ReplaceAll(msg, reqURI, "/"+redactedPlaceholder)
+			spans = appendNeedleSpans(spans, msg, reqURI, "/"+redactedPlaceholder)
 		}
 		if escPath := parsed.EscapedPath(); len(escPath) > 1 {
-			msg = strings.ReplaceAll(msg, escPath, "/"+redactedPlaceholder)
+			spans = appendNeedleSpans(spans, msg, escPath, "/"+redactedPlaceholder)
 		}
 		if len(parsed.Path) > 1 {
-			msg = strings.ReplaceAll(msg, parsed.Path, "/"+redactedPlaceholder)
+			spans = appendNeedleSpans(spans, msg, parsed.Path, "/"+redactedPlaceholder)
 		}
 		if parsed.RawQuery != "" {
-			msg = strings.ReplaceAll(msg, parsed.RawQuery, redactedPlaceholder)
+			spans = appendNeedleSpans(spans, msg, parsed.RawQuery, redactedPlaceholder)
 		}
-		tokens := make([]string, 0, 4)
 		if parsed.User != nil {
 			if password, ok := parsed.User.Password(); ok && password != "" {
-				tokens = append(tokens, password)
+				spans = appendNeedleSpans(spans, msg, password, redactedPlaceholder)
 			}
 			if username := parsed.User.Username(); username != "" {
-				tokens = append(tokens, username)
+				spans = appendNeedleSpans(spans, msg, username, redactedPlaceholder)
 			}
 		}
 		if parsed.RawQuery != "" {
 			for _, vals := range parsed.Query() {
 				for _, v := range vals {
 					if v != "" {
-						tokens = append(tokens, v)
+						spans = appendNeedleSpans(spans, msg, v, redactedPlaceholder)
 					}
 				}
 			}
 		}
-		sort.Slice(tokens, func(i, j int) bool {
-			return len(tokens[i]) > len(tokens[j])
-		})
-		for _, tok := range tokens {
-			msg = strings.ReplaceAll(msg, tok, redactedPlaceholder)
-		}
 	}
-	return msg
+	if len(spans) == 0 {
+		return msg
+	}
+	sort.Slice(spans, func(i, j int) bool {
+		if spans[i].start != spans[j].start {
+			return spans[i].start < spans[j].start
+		}
+		return spans[i].end > spans[j].end
+	})
+	merged := make([]redactSpan, 0, len(spans))
+	for _, sp := range spans {
+		if len(merged) == 0 {
+			merged = append(merged, sp)
+			continue
+		}
+		last := &merged[len(merged)-1]
+		if sp.start < last.end {
+			if sp.end > last.end {
+				last.end = sp.end
+				last.repl = redactedPlaceholder
+			}
+			continue
+		}
+		merged = append(merged, sp)
+	}
+	var out strings.Builder
+	out.Grow(len(msg))
+	pos := 0
+	for _, sp := range merged {
+		out.WriteString(msg[pos:sp.start])
+		out.WriteString(sp.repl)
+		pos = sp.end
+	}
+	out.WriteString(msg[pos:])
+	return out.String()
 }
 
 const redactedPlaceholder = common.RedactedPlaceholder
