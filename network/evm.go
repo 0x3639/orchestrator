@@ -55,9 +55,14 @@ type evmNetwork struct {
 	// for it, so removing or re-adding the chain ID never causes an in-flight
 	// worker to dereference nil or write into a replacement store.
 	store db.EvmStorage
-	// workersWg tracks background loops started by Start (SubscribeToEvents
-	// and ProcessEvents) so RemoveEvmNetwork / Stop drain them before closing
-	// the backing store.
+	// useMu guards external readers (e.g. health status and signing loops that
+	// already captured this network from Networks()) against concurrent store
+	// closure during RemoveEvmNetwork.
+	useMu    sync.RWMutex
+	detached bool
+	// workersWg tracks Start's initial scan and background loops
+	// (SubscribeToEvents and ProcessEvents) so RemoveEvmNetwork / Stop drain
+	// them before closing the backing store.
 	workersWg sync.WaitGroup
 	// stopHealth is set by Start and read by Stop and by a runtime removal,
 	// which can run on other goroutines; healthMu guards it and workersWg.Add.
@@ -273,6 +278,17 @@ func (eN *evmNetwork) recordSync(synced bool, err error) bool {
 }
 
 func (eN *evmNetwork) Start() (startErr error) {
+	eN.healthMu.Lock()
+	select {
+	case <-eN.done:
+		eN.healthMu.Unlock()
+		return context.Canceled
+	default:
+	}
+	eN.workersWg.Add(1)
+	eN.healthMu.Unlock()
+	defer eN.workersWg.Done()
+
 	client := eN.EvmRpc()
 	for !eN.recordSync(client.SyncState()) {
 		eN.logger.Infof("evm node for network %d is not synced, will wait for it to sync", eN.ChainId())
@@ -1462,6 +1478,12 @@ func (eN *evmNetwork) drainWorkers(stopClient bool) {
 		eN.logger.Debugf("queue of stopped EVM network %d: %v", eN.ChainId(), err)
 	}
 	eN.workersWg.Wait()
+	// Wait for any external callers (e.g. health status or signing loops that
+	// already captured this network) to finish reading its store before the
+	// caller closes LevelDB.
+	eN.useMu.Lock()
+	eN.detached = true
+	eN.useMu.Unlock()
 }
 
 func (eN *evmNetwork) Stop() {
@@ -1475,37 +1497,93 @@ func (eN *evmNetwork) SignTx(tx *etypes.Transaction, ecdsaPrivateKey *ecdsa.Priv
 
 // Local storage
 
+// LastUpdateHeight returns this network instance's persisted EVM scan height,
+// reporting ok=false if the network has already been detached for removal.
+func (eN *evmNetwork) LastUpdateHeight() (uint64, bool, error) {
+	eN.useMu.RLock()
+	defer eN.useMu.RUnlock()
+	if eN.detached {
+		return 0, false, nil
+	}
+	store := eN.eventsStore()
+	if store == nil {
+		return 0, false, nil
+	}
+	h, err := store.GetLastUpdateHeight()
+	return h, true, err
+}
+
 func (eN *evmNetwork) GetUnsignedUnwrapRequests() ([]*events.UnwrapRequestEvm, error) {
+	eN.useMu.RLock()
+	defer eN.useMu.RUnlock()
+	if eN.detached {
+		return nil, nil
+	}
 	requests, err := eN.eventsStore().GetUnsignedUnwrapRequests()
 	observeUnwraps(eN.health, eN.ChainId(), requests, err)
 	return requests, err
 }
 
 func (eN *evmNetwork) AddUnwrapRequest(event events.UnwrapRequestEvm) error {
+	eN.useMu.RLock()
+	defer eN.useMu.RUnlock()
+	if eN.detached {
+		return context.Canceled
+	}
 	return eN.eventsStore().AddUnwrapRequest(event)
 }
 
 func (eN *evmNetwork) GetUnwrapRequestByHashAndLog(txHash ecommon.Hash, logIndex uint32) (*events.UnwrapRequestEvm, error) {
+	eN.useMu.RLock()
+	defer eN.useMu.RUnlock()
+	if eN.detached {
+		return nil, nil
+	}
 	return eN.eventsStore().GetUnwrapRequestByHashAndLog(txHash, logIndex)
 }
 
 func (eN *evmNetwork) SetUnwrapRequestStatus(txHash ecommon.Hash, logIndex, status uint32) error {
+	eN.useMu.RLock()
+	defer eN.useMu.RUnlock()
+	if eN.detached {
+		return context.Canceled
+	}
 	return eN.eventsStore().SetUnwrapRequestStatus(txHash, logIndex, status)
 }
 
 func (eN *evmNetwork) SetUnwrapRequestSignature(txHash ecommon.Hash, logIndex uint32, signature string) error {
+	eN.useMu.RLock()
+	defer eN.useMu.RUnlock()
+	if eN.detached {
+		return context.Canceled
+	}
 	return eN.eventsStore().SetUnwrapRequestSignature(txHash, logIndex, signature)
 }
 
 func (eN *evmNetwork) SetUnsentUnwrapRequestAsUnsigned(txHash ecommon.Hash, logIndex uint32) error {
+	eN.useMu.RLock()
+	defer eN.useMu.RUnlock()
+	if eN.detached {
+		return context.Canceled
+	}
 	return eN.eventsStore().SetUnsentUnwrapRequestAsUnsigned(txHash, logIndex)
 }
 
 func (eN *evmNetwork) GetUnwrapRequestsByStatus(status uint32) ([]*events.UnwrapRequestEvm, error) {
+	eN.useMu.RLock()
+	defer eN.useMu.RUnlock()
+	if eN.detached {
+		return nil, nil
+	}
 	return eN.eventsStore().GetUnwrapRequestsByStatus(status)
 }
 
 func (eN *evmNetwork) GetUnsentSignedUnwrapRequests() ([]*events.UnwrapRequestEvm, error) {
+	eN.useMu.RLock()
+	defer eN.useMu.RUnlock()
+	if eN.detached {
+		return nil, nil
+	}
 	requests, err := eN.eventsStore().GetUnsentSignedUnwrapRequests()
 	eN.health.UpdateNetwork(eN.ChainId(), func(n *snapshot.Network) { n.Unwrap.SignedAwaitingSubmission = snapshot.Reading(len(requests), err) })
 	return requests, err

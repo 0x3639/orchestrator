@@ -173,7 +173,10 @@ func (s *Handler) buildStatus() (Status, error) {
 
 	networksStatus := make(map[string]StatusNetworkInfo)
 	for _, evmNetwork := range s.networksManager.Networks() {
-		lastUpdateHeight, err := s.dbManager.EvmStorage(evmNetwork.ChainId()).GetLastUpdateHeight()
+		lastUpdateHeight, ok, err := evmNetwork.LastUpdateHeight()
+		if !ok {
+			continue
+		}
 		if err != nil {
 			return Status{}, fmt.Errorf("read sync cursor for chainId %d: %w", evmNetwork.ChainId(), err)
 		}

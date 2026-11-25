@@ -178,6 +178,18 @@ func (m *Manager) HasEvmStorage(chainId uint32) bool {
 	return ok
 }
 
+// LookupEvmStorage returns the active EVM store for chainId without requesting
+// a stop when none is registered.
+func (m *Manager) LookupEvmStorage(chainId uint32) (db.EvmStorage, bool) {
+	m.evmMu.RLock()
+	store, ok := m.evmStorage[chainId]
+	m.evmMu.RUnlock()
+	if !ok || store == nil {
+		return nil, false
+	}
+	return store, true
+}
+
 func (m *Manager) EvmStorage(chainId uint32) db.EvmStorage {
 	m.evmMu.RLock()
 	store, ok := m.evmStorage[chainId]

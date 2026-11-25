@@ -403,13 +403,13 @@ func (r *EvmRpc) SendTransaction(tx *etypes.Transaction) error {
 			return err
 		}
 	}
-	prevSnapshot, tracked, err := r.recordPendingTxAttempt(tx)
+	prevSnapshot, superseded, tracked, err := r.recordPendingTxAttempt(tx)
 	if err != nil {
 		return err
 	}
 	sendErr := r.rpcClient.SendTransaction(ctx, tx)
 	if tracked {
-		r.reconcileSentTx(tx, prevSnapshot, sendErr)
+		r.reconcileSentTx(tx, prevSnapshot, superseded, sendErr)
 	}
 	return sendErr
 }
@@ -528,14 +528,24 @@ func toCommonPendingEvmTx(p *pendingEvmTx) *common.PendingEvmTx {
 	}
 }
 
+type supersededTx struct {
+	key   evmTxKey
+	entry *pendingEvmTx
+}
+
 // recordPendingTxAttempt durably records tx's nonce and fee watermark BEFORE
 // broadcast so a process crash or dropped connection after node acceptance
-// cannot erase the watermark. Returns a snapshot of the previous entry (for
-// rollback on definitive pre-mempool rejections) and whether tx is tracked.
-func (r *EvmRpc) recordPendingTxAttempt(tx *etypes.Transaction) (*pendingEvmTx, bool, error) {
+// cannot erase the watermark. When an emergency halt supersedes an unconfirmed
+// setTss at the same nonce, ownership is explicitly transferred (deleting the
+// superseded setTss record and returning it for rollback on definitive
+// pre-mempool rejection).
+func (r *EvmRpc) recordPendingTxAttempt(tx *etypes.Transaction) (*pendingEvmTx, *supersededTx, bool, error) {
 	key, ok := evmTxKeyFromTx(tx)
 	if !ok {
-		return nil, false, nil
+		return nil, nil, false, nil
+	}
+	if key.kind == evmTxKindHalt {
+		_ = r.loadPendingTx(evmTxKey{sender: key.sender, contract: key.contract, kind: evmTxKindSetTss})
 	}
 	r.txMu.Lock()
 	if r.pendingTx == nil {
@@ -544,6 +554,14 @@ func (r *EvmRpc) recordPendingTxAttempt(tx *etypes.Transaction) (*pendingEvmTx, 
 	prev := r.pendingTx[key]
 	prevSnapshot := clonePendingEvmTx(prev)
 	store := r.pendingTxStore
+
+	var superseded *supersededTx
+	if key.kind == evmTxKindHalt {
+		setTssKey := evmTxKey{sender: key.sender, contract: key.contract, kind: evmTxKindSetTss}
+		if other := r.pendingTx[setTssKey]; other != nil && other.nonce == tx.Nonce() {
+			superseded = &supersededTx{key: setTssKey, entry: clonePendingEvmTx(other)}
+		}
+	}
 
 	entry := &pendingEvmTx{
 		nonce:     tx.Nonce(),
@@ -558,7 +576,7 @@ func (r *EvmRpc) recordPendingTxAttempt(tx *etypes.Transaction) (*pendingEvmTx, 
 	if prev != nil {
 		if prev.nonce > entry.nonce {
 			r.txMu.Unlock()
-			return prevSnapshot, true, nil
+			return prevSnapshot, nil, true, nil
 		}
 		if prev.nonce == entry.nonce {
 			entry.gasPrice = maxBigInt(prev.gasPrice, entry.gasPrice)
@@ -568,6 +586,9 @@ func (r *EvmRpc) recordPendingTxAttempt(tx *etypes.Transaction) (*pendingEvmTx, 
 	}
 	toSave := toCommonPendingEvmTx(entry)
 	r.pendingTx[key] = entry
+	if superseded != nil {
+		delete(r.pendingTx, superseded.key)
+	}
 	r.txMu.Unlock()
 
 	if store != nil {
@@ -580,18 +601,26 @@ func (r *EvmRpc) recordPendingTxAttempt(tx *etypes.Transaction) (*pendingEvmTx, 
 					delete(r.pendingTx, key)
 				}
 			}
+			if superseded != nil {
+				r.pendingTx[superseded.key] = clonePendingEvmTx(superseded.entry)
+			}
 			r.txMu.Unlock()
 			r.logger.Errorf("failed to persist pending EVM tx record before broadcast: %v", err)
-			return nil, false, fmt.Errorf("persist pending EVM tx before broadcast: %w", err)
+			return nil, nil, false, fmt.Errorf("persist pending EVM tx before broadcast: %w", err)
+		}
+		if superseded != nil {
+			if err := store.DeletePendingEvmTx(superseded.key.sender, superseded.key.contract, superseded.key.kind); err != nil {
+				r.logger.Errorf("failed to clear superseded pending EVM tx record: %v", err)
+			}
 		}
 	}
-	return prevSnapshot, true, nil
+	return prevSnapshot, superseded, true, nil
 }
 
 // reconcileSentTx updates or rolls back the pre-broadcast watermark based on
 // the broadcast outcome. Ambiguous failures (EOF, timeouts, connection resets)
 // and mempool pricing/duplicate errors keep the persisted watermark.
-func (r *EvmRpc) reconcileSentTx(tx *etypes.Transaction, prevSnapshot *pendingEvmTx, sendErr error) {
+func (r *EvmRpc) reconcileSentTx(tx *etypes.Transaction, prevSnapshot *pendingEvmTx, superseded *supersededTx, sendErr error) {
 	if sendErr == nil {
 		return
 	}
@@ -625,6 +654,9 @@ func (r *EvmRpc) reconcileSentTx(tx *etypes.Transaction, prevSnapshot *pendingEv
 	} else if cur := r.pendingTx[key]; cur != nil && cur.nonce == tx.Nonce() {
 		delete(r.pendingTx, key)
 	}
+	if superseded != nil {
+		r.pendingTx[superseded.key] = clonePendingEvmTx(superseded.entry)
+	}
 	r.txMu.Unlock()
 	if store != nil {
 		if prevSnapshot != nil {
@@ -633,6 +665,11 @@ func (r *EvmRpc) reconcileSentTx(tx *etypes.Transaction, prevSnapshot *pendingEv
 			}
 		} else if err := store.DeletePendingEvmTx(key.sender, key.contract, key.kind); err != nil {
 			r.logger.Errorf("failed to roll back rejected pending EVM tx record: %v", err)
+		}
+		if superseded != nil {
+			if err := store.SavePendingEvmTx(superseded.key.sender, superseded.key.contract, superseded.key.kind, toCommonPendingEvmTx(superseded.entry)); err != nil {
+				r.logger.Errorf("failed to restore superseded pending EVM tx record: %v", err)
+			}
 		}
 	}
 }
@@ -707,8 +744,9 @@ func (r *EvmRpc) lookupPendingTx(key evmTxKey, confirmedNonce, pendingNonce uint
 // for all other tracked actions of key.sender independently of PendingNonceAt.
 // Entries already mined (< confirmedNonce) are cleared. It returns the highest
 // nonce+1 owned by another tracked action at or above confirmedNonce, the
-// lowest such owned nonce, and whether any such owner exists.
-func (r *EvmRpc) otherTrackedNonces(key evmTxKey, confirmedNonce uint64) (maxNext uint64, minOwned uint64, hasOwner bool) {
+// lowest such owned nonce, any entry owning confirmedNonce itself, and whether
+// any such owner exists.
+func (r *EvmRpc) otherTrackedNonces(key evmTxKey, confirmedNonce uint64) (maxNext uint64, minOwned uint64, atConfirmed *pendingEvmTx, hasOwner bool) {
 	for _, otherKind := range []string{evmTxKindHalt, evmTxKindSetTss} {
 		if otherKind == key.kind {
 			continue
@@ -729,6 +767,9 @@ func (r *EvmRpc) otherTrackedNonces(key evmTxKey, confirmedNonce uint64) (maxNex
 		if !hasOwner || entry.nonce < minOwned {
 			minOwned = entry.nonce
 		}
+		if entry.nonce == confirmedNonce && atConfirmed == nil {
+			atConfirmed = clonePendingEvmTx(entry)
+		}
 		if entry.nonce+1 > maxNext {
 			maxNext = entry.nonce + 1
 		}
@@ -738,7 +779,7 @@ func (r *EvmRpc) otherTrackedNonces(key evmTxKey, confirmedNonce uint64) (maxNex
 	for _, k := range toClear {
 		r.clearPendingTx(k)
 	}
-	return maxNext, minOwned, hasOwner
+	return maxNext, minOwned, atConfirmed, hasOwner
 }
 
 func (r *EvmRpc) buildContractTx(sender ecommon.Address, contractAddress *ecommon.Address, kind string, encodedData []byte, label string) (*etypes.Transaction, error) {
@@ -768,16 +809,25 @@ func (r *EvmRpc) buildContractTx(sender ecommon.Address, contractAddress *ecommo
 	key := evmTxKey{sender: sender, contract: *contractAddress, kind: kind}
 	// Always reconcile persisted ownership for all other actions of sender
 	// BEFORE checking PendingNonceAt so a stale (pending == confirmed) or
-	// unavailable pending nonce RPC can never silently steal another action's
-	// persisted nonce after an ambiguous broadcast + restart.
-	otherNext, otherMin, hasOtherOwner := r.otherTrackedNonces(key, confirmedNonce)
+	// unavailable pending nonce RPC can never silently collide with another
+	// action's persisted nonce after an ambiguous broadcast + restart.
+	otherNext, otherMin, otherAtConfirmed, hasOtherOwner := r.otherTrackedNonces(key, confirmedNonce)
 	otherOwnsLower := hasOtherOwner && otherMin >= confirmedNonce && (!havePending || otherMin <= pendingNonce)
 	prev := r.lookupPendingTx(key, confirmedNonce, pendingNonce, havePending, otherOwnsLower)
 	nonce := confirmedNonce
 	if prev != nil {
 		nonce = prev.nonce
+	} else if kind == evmTxKindHalt && otherAtConfirmed != nil {
+		// An emergency halt must never be stranded behind a dropped or
+		// un-retried key-rotation (setTss) tx at confirmedNonce. Explicitly
+		// supersede setTss at confirmedNonce using >=20% bumped fees above
+		// setTss's persisted fee watermark so halt either mines immediately
+		// (if setTss was lost in transit) or cleanly replaces setTss in the
+		// mempool without underpriced retry loops.
+		nonce = confirmedNonce
+		prev = otherAtConfirmed
 	} else if hasOtherOwner {
-		// Another tracked action owns at least one unconfirmed nonce >= confirmedNonce;
+		// Non-halt actions (setTss) never supersede an active emergency halt;
 		// allocate past both its persisted nonce and the node's pending nonce.
 		if otherNext > nonce {
 			nonce = otherNext

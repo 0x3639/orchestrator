@@ -2030,6 +2030,103 @@ func TestRemovalAndReadditionDrainsPausedConfirmationWorkerWithoutPanicOrCrossSt
 	}
 }
 
+func TestRemovalDrainsInitialStartScanAndExternalStatusReadersSafely(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	stopChan := make(chan os.Signal, 1)
+	dbMgr, err := manager.NewDbManager(stopChan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := common.NewGlobalState(new(uint8))
+	state.Health = snapshot.New("test", "")
+	t.Cleanup(state.Health.Close)
+
+	contract := ecommon.HexToAddress("0x1111111111111111111111111111111111111111")
+	inInitialScan := make(chan struct{})
+	var scanOnce sync.Once
+	var ethCallCount atomic.Int32
+	evmURL := replayServerWithErrors(t, func(method string, params []json.RawMessage) (interface{}, *replayRPCError) {
+		switch method {
+		case "eth_syncing":
+			return false, nil
+		case "eth_call":
+			val := big.NewInt(1)
+			if ethCallCount.Add(1)%3 == 1 {
+				val = big.NewInt(5)
+			}
+			return hexutil.Bytes(ecommon.LeftPadBytes(val.Bytes(), 32)), nil
+		case "eth_blockNumber":
+			return hexutil.EncodeUint64(50), nil
+		case "eth_getLogs":
+			scanOnce.Do(func() { close(inInitialScan) })
+			time.Sleep(50 * time.Millisecond)
+			return []etypes.Log{}, nil
+		default:
+			return nil, &replayRPCError{-32601, "unsupported " + method}
+		}
+	})
+
+	client, err := rpc.NewEvmRpcClient(config.BaseNetworkConfig{Urls: []string{evmURL}}, "eth", contract)
+	if err != nil {
+		t.Fatal(err)
+	}
+	info := &definition.NetworkInfo{NetworkClass: definition.EvmClass, Id: 1, Name: "eth", ContractAddress: contract.Hex()}
+	net, err := NewEvmNetwork(info, dbMgr, nil, state, stopChan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	net.client = client
+	client.SetStorageName(net.StorageName())
+	mgr := &NetworksManager{health: state.Health, logger: zap.NewNop().Sugar()}
+	mgr.AddEvmNetwork(net)
+
+	// Start initial EVM scan in the background (matching startEvmNetworksInBackground).
+	startDone := make(chan error, 1)
+	go func() { startDone <- net.Start() }()
+
+	// Concurrently hammer external status/store readers that already captured net.
+	readerStop := make(chan struct{})
+	var readerWg sync.WaitGroup
+	readerWg.Add(1)
+	go func() {
+		defer readerWg.Done()
+		for {
+			select {
+			case <-readerStop:
+				return
+			default:
+				_, _, _ = net.LastUpdateHeight()
+				_, _ = net.GetUnsignedUnwrapRequests()
+			}
+		}
+	}()
+
+	select {
+	case <-inInitialScan:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Start did not reach initial Sync scan")
+	}
+
+	// RemoveEvmNetwork MUST drain both the in-flight Start() initial scan AND
+	// detach external readers before RemoveEvmEventStore closes LevelDB.
+	mgr.RemoveEvmNetwork(1)
+	if err := dbMgr.RemoveEvmEventStore(1); err != nil {
+		t.Fatalf("RemoveEvmEventStore: %v", err)
+	}
+	client.DeleteDirectories()
+
+	close(readerStop)
+	readerWg.Wait()
+	select {
+	case <-startDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Start did not exit after RemoveEvmNetwork")
+	}
+	if _, ok, err := net.LastUpdateHeight(); ok || err != nil {
+		t.Fatalf("detached net.LastUpdateHeight() = (_, %v, %v), want (0, false, nil)", ok, err)
+	}
+}
+
 func TestLateUnknownUnwrapHoldsOnMatchingQueuedEventAtAnyHeightAndSecondaryHeadLag(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 

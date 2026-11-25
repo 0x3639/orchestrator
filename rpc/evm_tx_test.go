@@ -744,15 +744,41 @@ func TestFirstActionAfterRestartRespectsOtherActionPersistedNonce(t *testing.T) 
 			c1.Stop()
 
 			// Process 2 starts fresh and builds secondAction FIRST.
-			// It MUST load firstAction's persisted ownership of nonce 5 and allocate pendingNonce 6.
 			c2 := makeClient()
 			defer c2.Stop()
 			tx2, err := build(c2, secondAction)
 			if err != nil {
 				t.Fatal(err)
 			}
-			if tx2.Nonce() != 6 {
-				t.Fatalf("after restart, %s stole %s's nonce: got %d, want 6", secondAction, firstAction, tx2.Nonce())
+			if firstAction == "halt" {
+				// setTss MUST NEVER supersede an active emergency halt at nonce 5.
+				if tx2.Nonce() != 6 {
+					t.Fatalf("after restart, setTss stole halt's nonce: got %d, want 6", tx2.Nonce())
+				}
+			} else {
+				// Emergency halt explicitly supersedes an unconfirmed setTss at
+				// confirmedNonce 5 with >=20% bumped fees and transfers ownership
+				// on send so emergency halts are never stranded behind stuck setTss.
+				if tx2.Nonce() != 5 {
+					t.Fatalf("after restart, emergency halt got nonce %d, want 5 (superseding setTss)", tx2.Nonce())
+				}
+				if tx2.GasTipCap().Cmp(bumpFee(tx1.GasTipCap())) < 0 || tx2.GasFeeCap().Cmp(bumpFee(tx1.GasFeeCap())) < 0 {
+					t.Fatalf("superseding halt did not bump >=20%% over setTss: setTss=(%s,%s) halt=(%s,%s)",
+						tx1.GasTipCap(), tx1.GasFeeCap(), tx2.GasTipCap(), tx2.GasFeeCap())
+				}
+				signed2, err := etypes.SignTx(tx2, signer, key)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := c2.SendTransaction(signed2); err != nil {
+					t.Fatal(err)
+				}
+				if oldRec, err := store.LoadPendingEvmTx(sender, contract, evmTxKindSetTss); err != nil || oldRec != nil {
+					t.Fatalf("expected superseded setTss record to be cleared, got (%+v, %v)", oldRec, err)
+				}
+				if newRec, err := store.LoadPendingEvmTx(sender, contract, evmTxKindHalt); err != nil || newRec == nil || newRec.Nonce != 5 {
+					t.Fatalf("expected halt to own nonce 5 in store, got (%+v, %v)", newRec, err)
+				}
 			}
 		})
 	}
@@ -1126,9 +1152,34 @@ func TestAmbiguousBroadcastPersistedOwnerRespectedWithStaleOrFailingPendingNonce
 				if err != nil {
 					t.Fatal(err)
 				}
-				if tx2.Nonce() != 6 {
-					t.Fatalf("%s stole persisted nonce 5 owned by %s (%s): got nonce %d, want 6",
-						secondAction, firstAction, mode, tx2.Nonce())
+				if firstAction == "halt" {
+					// setTss must NEVER steal halt's persisted nonce 5 even when pending RPC is stale or unavailable.
+					if tx2.Nonce() != 6 {
+						t.Fatalf("setTss stole persisted nonce 5 owned by halt (%s): got nonce %d, want 6", mode, tx2.Nonce())
+					}
+				} else {
+					// Emergency halt must NOT strand itself at nonce 6 behind an ambiguous/lost setTss at 5;
+					// it explicitly supersedes nonce 5 with >=20% bumped fees and transfers ownership.
+					if tx2.Nonce() != 5 {
+						t.Fatalf("emergency halt after ambiguous setTss (%s) got nonce %d, want 5", mode, tx2.Nonce())
+					}
+					if tx2.GasTipCap().Cmp(bumpFee(tx1.GasTipCap())) < 0 || tx2.GasFeeCap().Cmp(bumpFee(tx1.GasFeeCap())) < 0 {
+						t.Fatalf("superseding halt (%s) did not bump >=20%% over setTss: setTss=(%s,%s) halt=(%s,%s)",
+							mode, tx1.GasTipCap(), tx1.GasFeeCap(), tx2.GasTipCap(), tx2.GasFeeCap())
+					}
+					signed2, err := etypes.SignTx(tx2, signer, key)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if err := c2.SendTransaction(signed2); err != nil {
+						t.Fatal(err)
+					}
+					if oldRec, err := store.LoadPendingEvmTx(sender, contract, evmTxKindSetTss); err != nil || oldRec != nil {
+						t.Fatalf("superseded setTss record still in store: (%+v, %v)", oldRec, err)
+					}
+					if newRec, err := store.LoadPendingEvmTx(sender, contract, evmTxKindHalt); err != nil || newRec == nil || newRec.Nonce != 5 {
+						t.Fatalf("halt record missing after ownership transfer: (%+v, %v)", newRec, err)
+					}
 				}
 			})
 		}
