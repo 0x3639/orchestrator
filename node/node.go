@@ -1532,28 +1532,65 @@ func wrapDefFinalizedAtMomentum(wrap *definition.WrapTokenRequest, frontierHeigh
 		frontierHeight-wrap.CreationMomentumHeight >= uint64(requiredConfirmations)
 }
 
-func (node *Node) readRequiredWrapConfirmations(resignGen uint64) (required uint32, stale, stop bool) {
+// readAnchoredWrapConfirmations reads OrchestratorInfo.ConfirmationsToFinality
+// bracketed by verified bridge account frontiers (pre == post) so the finality
+// threshold is bound to a single verified canonical bridge snapshot and cannot
+// lag behind an administrator threshold increase in a newer bridge block.
+func (node *Node) readAnchoredWrapConfirmations(anchor reSignChainAnchor, advanceFinality bool, resignGen uint64) (required uint32, nextAnchor reSignChainAnchor, consistent, stale, stop bool) {
+	cur := anchor
 	for {
 		if node.workerStopping() {
-			return 0, false, true
+			return 0, reSignChainAnchor{}, false, false, true
 		}
 		if !node.state.IsResignGenerationCurrent(resignGen) {
-			return 0, true, false
+			return 0, reSignChainAnchor{}, false, true, false
 		}
+		preAnchor, ok, retryCheck, stopCheck := node.checkZenonAnchorConsistent(cur, advanceFinality)
+		if stopCheck {
+			return 0, reSignChainAnchor{}, false, false, true
+		}
+		if retryCheck {
+			if !node.workerSleep(resignRetryDelay) {
+				return 0, reSignChainAnchor{}, false, false, true
+			}
+			continue
+		}
+		if !ok {
+			return 0, reSignChainAnchor{}, false, false, false
+		}
+
 		ctx, cancel := context.WithTimeout(node.workers.context(), resignRPCTimeout)
 		info, err := node.networksManager.Znn().GetOrchestratorInfoContext(ctx)
 		cancel()
 		if node.workerStopping() {
-			return 0, false, true
+			return 0, reSignChainAnchor{}, false, false, true
 		}
 		if err != nil || info == nil {
 			node.logger.Debugf("failed to read orchestrator info during resign scan: %v", err)
 			if !node.workerSleep(resignRetryDelay) {
-				return 0, false, true
+				return 0, reSignChainAnchor{}, false, false, true
 			}
 			continue
 		}
-		return info.ConfirmationsToFinality, false, false
+
+		postAnchor, ok, retryCheck, stopCheck := node.checkZenonAnchorConsistent(preAnchor, advanceFinality)
+		if stopCheck {
+			return 0, reSignChainAnchor{}, false, false, true
+		}
+		if retryCheck {
+			if !node.workerSleep(resignRetryDelay) {
+				return 0, reSignChainAnchor{}, false, false, true
+			}
+			continue
+		}
+		if !ok {
+			return 0, reSignChainAnchor{}, false, false, false
+		}
+		if !sameAccountBlockFrontier(preAnchor.bridgeBlock, postAnchor.bridgeBlock) {
+			cur = postAnchor
+			continue
+		}
+		return info.ConfirmationsToFinality, postAnchor, true, false, false
 	}
 }
 
@@ -1692,6 +1729,13 @@ func (node *Node) verifyStraddledWraps(wraps []*embedded.WrapTokenRequest, strad
 			}
 			if !consistent {
 				return reSignChainAnchor{}, false, false, false
+			}
+			if !sameAccountBlockFrontier(preAnchor.bridgeBlock, postAnchor.bridgeBlock) {
+				// Bridge account advanced across the by-ID read; retry until
+				// membership is verified on a single canonical bridge snapshot
+				// (pre == post) that remains an ancestor of the terminating boundary.
+				cur.bridgeBlock = postAnchor.bridgeBlock
+				continue
 			}
 			if got.ConfirmationsToFinality == 0 {
 				cur = postAnchor
@@ -1980,7 +2024,7 @@ func (node *Node) captureReSignSnapshot(resignNetworkClass, resignChainId uint32
 				r = 0
 			}
 
-			if (done || needBoundaryRetry) && len(straddledIDs) > 0 && r > 0 {
+			if done && len(straddledIDs) > 0 && r > 0 {
 				collected := make([]*embedded.WrapTokenRequest, r)
 				for k := 0; k < r; k++ {
 					collected[k] = coveredByRevIdx[k]
@@ -2092,7 +2136,7 @@ func (node *Node) runReSignScan() bool {
 			stagedEligible = append(stagedEligible, wrap)
 		}
 
-		requiredConfirmations, staleInfo, stopInfo := node.readRequiredWrapConfirmations(resignGen)
+		requiredConfirmations, nextAnchor, consistentInfo, staleInfo, stopInfo := node.readAnchoredWrapConfirmations(anchor, false, resignGen)
 		if stopInfo {
 			return false
 		}
@@ -2100,6 +2144,14 @@ func (node *Node) runReSignScan() bool {
 			node.logger.Debug("ReSignState target or state changed during scan; discarding staged resign batch")
 			return true
 		}
+		if !consistentInfo {
+			node.logger.Debug("Zenon frontier rolled back while reading finality threshold; restarting scan")
+			if !node.workerSleep(resignRetryDelay) {
+				return false
+			}
+			continue
+		}
+		anchor = nextAnchor
 
 		for _, wrap := range snapshot {
 			if node.workerStopping() {
@@ -2224,23 +2276,17 @@ func (node *Node) runReSignScan() bool {
 					continue
 				}
 				// Verify the chain view that established finality survived the
-				// by-ID read AND independently verify finality on postAnchor's
-				// canonical momentum height so a transient finality spike that
-				// rolled back before postAnchor cannot be accepted.
-				reqConf, staleConf, stopConf := node.readRequiredWrapConfirmations(resignGen)
+				// by-ID read AND bind OrchestratorInfo.ConfirmationsToFinality
+				// to a verified bridge snapshot (pre == post) so neither a
+				// transient finality spike nor a concurrent threshold raise can
+				// be missed.
+				reqConf, postAnchor, consistent, staleConf, stopConf := node.readAnchoredWrapConfirmations(preAnchor, true, resignGen)
 				if stopConf {
 					return false
 				}
 				if staleConf {
 					staleResign = true
 					break
-				}
-				postAnchor, consistent, retryCheck, stopCheck := node.checkZenonAnchorConsistent(preAnchor, true)
-				if stopCheck {
-					return false
-				}
-				if retryCheck {
-					continue
 				}
 				if !consistent {
 					node.logger.Debug("Zenon frontier rolled back while confirming deferred wrap finality; discarding staged batch and restarting")
@@ -2281,47 +2327,26 @@ func (node *Node) runReSignScan() bool {
 			continue
 		}
 
-		// Revalidate the snapshot and finality anchor (plus current finality
-		// threshold for every staged wrap) before publishing any staged flags.
-		for {
-			if node.workerStopping() {
-				return false
-			}
-			if !node.state.IsResignGenerationCurrent(resignGen) {
-				staleResign = true
-				break
-			}
-			reqConf, staleConf, stopConf := node.readRequiredWrapConfirmations(resignGen)
-			if stopConf {
-				return false
-			}
-			if staleConf {
-				staleResign = true
-				break
-			}
-			finalAnchor, consistent, retryCheck, stopCheck := node.checkZenonAnchorConsistent(anchor, false)
-			if stopCheck {
-				return false
-			}
-			if retryCheck {
-				if !node.workerSleep(resignRetryDelay) {
-					return false
-				}
-				continue
-			}
-			if !consistent {
-				node.logger.Debug("Zenon frontier rolled back before publishing resign batch; discarding staged batch and restarting")
-				rolledBack = true
-				break
-			}
+		// Revalidate the snapshot, finality anchor, and confirmation threshold
+		// bound to a single verified bridge snapshot (pre == post) before
+		// publishing any staged flags.
+		reqConf, finalAnchor, consistent, staleConf, stopConf := node.readAnchoredWrapConfirmations(anchor, false, resignGen)
+		if stopConf {
+			return false
+		}
+		if staleConf {
+			staleResign = true
+		} else if !consistent {
+			node.logger.Debug("Zenon frontier rolled back before publishing resign batch; discarding staged batch and restarting")
+			rolledBack = true
+		} else {
 			for _, w := range stagedEligible {
 				if !wrapDefFinalizedAtMomentum(w, finalAnchor.finalityMom, reqConf) {
-					node.logger.Debugf("staged wrap %s is no longer finalized at verified momentum %d; discarding staged batch and restarting", w.Id, finalAnchor.finalityMom)
+					node.logger.Debugf("staged wrap %s is no longer finalized at verified momentum %d (required %d); discarding staged batch and restarting", w.Id, finalAnchor.finalityMom, reqConf)
 					rolledBack = true
 					break
 				}
 			}
-			break
 		}
 		if staleResign || !node.state.IsResignGenerationCurrent(resignGen) {
 			node.logger.Debug("ReSignState target or state changed during scan; discarding staged resign batch")

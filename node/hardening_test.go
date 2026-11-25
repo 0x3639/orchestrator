@@ -460,6 +460,8 @@ type wrapTestBridge struct {
 	frontierMomFn    func(ctx context.Context, call int32) (*api.Momentum, error)
 	momByHeightFn    func(ctx context.Context, height uint64) (*api.MomentumList, error)
 	orchInfo         *definition.OrchestratorInfo
+	orchInfoCalls    atomic.Int32
+	orchInfoFn       func(call int32) *definition.OrchestratorInfo
 }
 
 type wrapTestLedger struct {
@@ -542,6 +544,10 @@ func (b *wrapTestBridge) GetSecurityInfo() *definition.SecurityInfoVariable {
 }
 
 func (b *wrapTestBridge) GetOrchestratorInfo() *definition.OrchestratorInfo {
+	call := b.orchInfoCalls.Add(1)
+	if b.orchInfoFn != nil {
+		return b.orchInfoFn(call)
+	}
 	if b.orchInfo != nil {
 		return b.orchInfo
 	}
@@ -3304,6 +3310,254 @@ func TestReSignStateProgressesUnderContinuousForwardBridgeActivity(t *testing.T)
 		if ev, err := n.dbManager.ZnnStorage().GetWrapRequestById(orphanWrap); err != nil || ev != nil {
 			t.Fatalf("straddled orphanWrap should not have been stored: ev=%+v err=%v", ev, err)
 		}
+	})
+
+	t.Run("rejects straddled by-ID membership verified across a bridge account advance", func(t *testing.T) {
+		prevDelay := resignRetryDelay
+		prevPageSize := resignPageSize
+		resignRetryDelay = 20 * time.Millisecond
+		resignPageSize = 2
+		t.Cleanup(func() {
+			resignRetryDelay = prevDelay
+			resignPageSize = prevPageSize
+		})
+
+		evmSrv := fakeEvmRpcServer(t)
+		defer evmSrv.Close()
+
+		// Exact regression for Round 13 Finding 2:
+		// - An intermediate straddled page (call 4, attempt 1 of page 1) caches
+		//   orphanWrap from a temporary fork.
+		// - At the settled boundary, verifyStraddledWraps verifies orphanWrap
+		//   by ID. On the 1st by-ID call for orphanWrap, the bridge account
+		//   advances mid-read (B_k -> B_{k+1}, canonical ancestor preserved) and
+		//   returns orphanWrap from the temporary fork.
+		// - verifyStraddledWraps must NOT clear orphanWrap from straddledIDs
+		//   across a bridge advance; it retries orphanWrap on B_{k+1}, receives
+		//   ErrDataNonExistent, restarts the scan, marks canonicalWrap, and NEVER
+		//   marks or stores orphanWrap.
+		f1 := types.Hash{0xfa}
+		w2 := types.Hash{0xa1}
+		w1 := types.Hash{0xa2}
+		orphanWrap := types.Hash{0xa3}
+		canonicalWrap := types.Hash{0xa4}
+
+		forkPage := []*embedded.WrapTokenRequest{
+			makeEntry(1, f1, 101),
+			makeEntry(1, w2, 99),
+			makeEntry(1, w1, 99),
+			makeEntry(1, orphanWrap, 98),
+		}
+		canonicalTable := []*embedded.WrapTokenRequest{
+			makeEntry(1, f1, 101),
+			makeEntry(1, w2, 99),
+			makeEntry(1, w1, 99),
+			makeEntry(1, canonicalWrap, 98),
+		}
+		sortZenonWraps(forkPage)
+		sortZenonWraps(canonicalTable)
+		canonicalByID := make(map[types.Hash]*embedded.WrapTokenRequest, len(canonicalTable))
+		for _, w := range canonicalTable {
+			canonicalByID[w.Id] = w
+		}
+
+		var bridgeHeight atomic.Uint64
+		bridgeHeight.Store(10)
+		var page1Calls atomic.Int32
+		var orphanIDCalls atomic.Int32
+
+		bridge := &wrapTestBridge{
+			networks: &embedded.NetworkInfoList{
+				Count: 1,
+				List: []*definition.NetworkInfo{{
+					NetworkClass: definition.EvmClass, Id: 1, Name: "Ethereum",
+					ContractAddress: "0x0000000000000000000000000000000000000001",
+				}},
+			},
+			frontierMomFn: func(_ context.Context, _ int32) (*api.Momentum, error) {
+				return testMomentum(100), nil
+			},
+			frontierFn: func(_ context.Context, _ int32) (*api.AccountBlock, error) {
+				h := bridgeHeight.Load()
+				return testAccountBlock(h, types.Hash{0xaa, byte(h >> 8), byte(h)}), nil
+			},
+			pageHandler: func(pageIndex, pageSize uint32, call int32) *embedded.WrapTokenRequestList {
+				if call <= 4 {
+					bridgeHeight.Add(1)
+				}
+				if pageIndex == 1 && page1Calls.Add(1) == 2 {
+					return paginateZenonWraps(forkPage, pageIndex, pageSize)
+				}
+				return paginateZenonWraps(canonicalTable, pageIndex, pageSize)
+			},
+			byIDHandler: func(_ context.Context, id types.Hash, _ int32) (*embedded.WrapTokenRequest, error) {
+				if id == orphanWrap {
+					if orphanIDCalls.Add(1) == 1 {
+						// First by-ID call returns orphanWrap from a transient
+						// fork while advancing the canonical bridge account!
+						bridgeHeight.Add(1)
+						return makeEntry(1, orphanWrap, 98), nil
+					}
+					return nil, constants.ErrDataNonExistent
+				}
+				if w, ok := canonicalByID[id]; ok {
+					return w, nil
+				}
+				return nil, constants.ErrDataNonExistent
+			},
+		}
+
+		n := wrapTestNodeWithEvm(t, common.LiveState, bridge, map[string]string{"Ethereum": evmSrv.URL})
+		if activated, err := n.state.ActivateResign(definition.EvmClass, 1); err != nil || !activated {
+			t.Fatalf("ActivateResign failed: activated=%v err=%v", activated, err)
+		}
+		n.state.CompleteStartup()
+
+		n.workers.start(n.processSignatures)
+		t.Cleanup(func() {
+			done := n.workers.shutdown()
+			<-done
+		})
+
+		eventually(t, "ReSignState to retry straddled by-ID verification across bridge advance and mark canonicalWrap", func() bool {
+			st, _ := n.state.GetState()
+			for _, id := range []types.Hash{w2, w1, canonicalWrap} {
+				r, err := n.dbManager.ZnnStorage().GetResignStatus(id)
+				if err != nil || !r {
+					return false
+				}
+			}
+			return st == common.LiveState
+		})
+		if orphanIDCalls.Load() < 2 {
+			t.Fatalf("expected orphanWrap by-ID verification to retry after bridge advance, got %d calls", orphanIDCalls.Load())
+		}
+		if resign, err := n.dbManager.ZnnStorage().GetResignStatus(orphanWrap); err != nil || resign {
+			t.Fatalf("orphanWrap verified only across bridge advance must not be marked: resign=%v err=%v", resign, err)
+		}
+		if ev, err := n.dbManager.ZnnStorage().GetWrapRequestById(orphanWrap); err != nil || ev != nil {
+			t.Fatalf("orphanWrap verified only across bridge advance must not be stored: ev=%+v err=%v", ev, err)
+		}
+	})
+}
+
+func TestReSignStateBindsConfirmationThresholdToPrePublishBridgeSnapshot(t *testing.T) {
+	prevDelay := resignRetryDelay
+	resignRetryDelay = 20 * time.Millisecond
+	t.Cleanup(func() { resignRetryDelay = prevDelay })
+
+	evmSrv := fakeEvmRpcServer(t)
+	defer evmSrv.Close()
+
+	// Exact regression for Round 13 Finding 1:
+	// - Wrap W (CreationMomentumHeight = 99) is staged at momentum 105 when
+	//   OrchestratorInfo.ConfirmationsToFinality is 1 (105 - 99 = 6 >= 1).
+	// - On the pre-publish GetOrchestratorInfo call, it returns the old
+	//   threshold 1 while an administrator simultaneously raises the threshold
+	//   to 20 in bridge block B11 (advancing B10 -> B11 before the post-check).
+	// - readAnchoredWrapConfirmations must detect B10 != B11, retry at B11,
+	//   observe threshold 20, reject W (6 < 20), stay in ReSignState without
+	//   marking W, and only publish once momentum reaches 119.
+	wrapID := types.Hash{0x63}
+	var momHeight atomic.Uint64
+	momHeight.Store(105)
+	var bridgeHeight atomic.Uint64
+	bridgeHeight.Store(10)
+	var thresholdRaised atomic.Bool
+	var postRaisePolls atomic.Int32
+
+	makeWrap := func(confs uint64) *embedded.WrapTokenRequest {
+		return &embedded.WrapTokenRequest{
+			WrapTokenRequest: &definition.WrapTokenRequest{
+				NetworkClass: definition.EvmClass, ChainId: 1, Id: wrapID,
+				Amount: big.NewInt(10), Fee: big.NewInt(1), CreationMomentumHeight: 99,
+			},
+			ConfirmationsToFinality: confs,
+		}
+	}
+
+	var prePublishOrchTriggered atomic.Bool
+	bridge := &wrapTestBridge{
+		networks: &embedded.NetworkInfoList{
+			Count: 1,
+			List: []*definition.NetworkInfo{{
+				NetworkClass: definition.EvmClass, Id: 1, Name: "Ethereum",
+				ContractAddress: "0x0000000000000000000000000000000000000001",
+			}},
+		},
+		orchInfoFn: func(call int32) *definition.OrchestratorInfo {
+			// Call 1: networks.Init
+			// Call 2: initial staging read in runReSignScan (threshold = 1)
+			// Call 3: pre-publish read in runReSignScan: return old threshold 1
+			//   while advancing bridge block B10 -> B11 with new threshold 20!
+			if call == 3 && prePublishOrchTriggered.CompareAndSwap(false, true) {
+				thresholdRaised.Store(true)
+				bridgeHeight.Store(11)
+				return &definition.OrchestratorInfo{WindowSize: 10, KeyGenThreshold: 1, ConfirmationsToFinality: 1, EstimatedMomentumTime: 1}
+			}
+			confs := uint32(1)
+			if thresholdRaised.Load() {
+				confs = 20
+			}
+			return &definition.OrchestratorInfo{WindowSize: 10, KeyGenThreshold: 1, ConfirmationsToFinality: confs, EstimatedMomentumTime: 1}
+		},
+		frontierMomFn: func(_ context.Context, _ int32) (*api.Momentum, error) {
+			return testMomentum(momHeight.Load()), nil
+		},
+		frontierFn: func(_ context.Context, _ int32) (*api.AccountBlock, error) {
+			h := bridgeHeight.Load()
+			return testAccountBlock(h, types.Hash{0xaa, byte(h >> 8), byte(h)}), nil
+		},
+		pageHandler: func(pageIndex, pageSize uint32, _ int32) *embedded.WrapTokenRequestList {
+			confs := uint64(0)
+			if thresholdRaised.Load() && momHeight.Load() < 119 {
+				confs = 14
+			}
+			return paginateZenonWraps([]*embedded.WrapTokenRequest{makeWrap(confs)}, pageIndex, pageSize)
+		},
+		byIDHandler: func(_ context.Context, id types.Hash, _ int32) (*embedded.WrapTokenRequest, error) {
+			if id != wrapID {
+				return nil, constants.ErrDataNonExistent
+			}
+			if thresholdRaised.Load() && momHeight.Load() < 119 {
+				postRaisePolls.Add(1)
+				return makeWrap(14), nil
+			}
+			return makeWrap(0), nil
+		},
+	}
+
+	n := wrapTestNodeWithEvm(t, common.LiveState, bridge, map[string]string{"Ethereum": evmSrv.URL})
+	if activated, err := n.state.ActivateResign(definition.EvmClass, 1); err != nil || !activated {
+		t.Fatalf("ActivateResign failed: activated=%v err=%v", activated, err)
+	}
+	n.state.CompleteStartup()
+
+	n.workers.start(n.processSignatures)
+	t.Cleanup(func() {
+		done := n.workers.shutdown()
+		<-done
+	})
+
+	// Wait until the pre-publish threshold raise has been detected and the scan
+	// has restarted with W deferred under the new 20-confirmation threshold.
+	eventually(t, "ReSignState to detect mid-read threshold raise and defer W under threshold 20", func() bool {
+		return postRaisePolls.Load() >= 2
+	})
+	if st, _ := n.state.GetState(); st != common.ReSignState {
+		t.Fatalf("state after pre-publish threshold raise = %d, want ReSignState (%d)", st, common.ReSignState)
+	}
+	if resign, err := n.dbManager.ZnnStorage().GetResignStatus(wrapID); err != nil || resign {
+		t.Fatalf("wrap must not be marked under stale threshold 1 after raise to 20: resign=%v err=%v", resign, err)
+	}
+
+	// Now advance canonical momentum to 119 (119 - 99 = 20 >= 20): W finalizes
+	// under the raised threshold and completes cleanly.
+	momHeight.Store(119)
+	eventually(t, "ReSignState to mark wrap and return to LiveState at momentum 119", func() bool {
+		st, _ := n.state.GetState()
+		r, err := n.dbManager.ZnnStorage().GetResignStatus(wrapID)
+		return err == nil && r && st == common.LiveState
 	})
 }
 
