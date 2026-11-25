@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 )
 
 var DefaultNodeConfigFileName = "config.json"
@@ -187,11 +188,14 @@ func (c *Config) ConfigPath() string {
 	return filepath.Join(c.DataPath, DefaultNodeConfigFileName)
 }
 
+var nextOwnedDirID atomic.Uint64
+
 // OwnedDir holds an open descriptor to a verified, owner-only (0700)
 // directory. All file operations on it are anchored to this descriptor via
 // *at syscalls so ancestor directory substitution cannot redirect reads or
 // writes.
 type OwnedDir struct {
+	id   uint64
 	mu   sync.Mutex
 	file *os.File
 }
@@ -204,7 +208,7 @@ func OpenOwnedDir(dataPath string) (*OwnedDir, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &OwnedDir{file: dir}, nil
+	return &OwnedDir{id: nextOwnedDirID.Add(1), file: dir}, nil
 }
 
 // Close closes the underlying directory descriptor.
@@ -229,13 +233,14 @@ func (d *OwnedDir) verifyLocked() error {
 	return verifyAndChmodOwnedDir(d.file, d.file.Name())
 }
 
-// AnchoredPath returns a path bound to the open directory descriptor when the
-// OS supports /proc/self/fd (Linux), falling back to the original path.
-func (d *OwnedDir) AnchoredPath() string {
+// AnchoredPath returns a path bound to the open directory descriptor (via
+// /proc/self/fd on Linux) or an error if descriptor-anchored paths are
+// unavailable on this system.
+func (d *OwnedDir) AnchoredPath() (string, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if d.file == nil {
-		return ""
+		return "", fmt.Errorf("directory handle is closed")
 	}
 	return fdDirPath(d.file)
 }
@@ -262,7 +267,7 @@ func (d *OwnedDir) OpenSubDir(name string) (*OwnedDir, error) {
 		_ = sub.Close()
 		return nil, err
 	}
-	return &OwnedDir{file: sub}, nil
+	return &OwnedDir{id: nextOwnedDirID.Add(1), file: sub}, nil
 }
 
 // EnsureAbsent returns an error if any directory entry named name exists in d
@@ -287,21 +292,31 @@ func (d *OwnedDir) EnsureAbsent(name string) error {
 }
 
 // LinkOwnedFileTo ensures name exists as an owned regular file with exact mode
-// perm inside d and hardlinks that exact inode into dst under the same name.
+// perm inside d and atomically hardlinks that exact inode into dst under the
+// same name.
 func (d *OwnedDir) LinkOwnedFileTo(dst *OwnedDir, name string, perm os.FileMode) error {
 	if !isSafeDirEntryName(name) {
 		return fmt.Errorf("invalid file name %q", name)
 	}
+	if d == nil || dst == nil {
+		return fmt.Errorf("directory handle is closed")
+	}
 	if d == dst {
 		return fmt.Errorf("source and destination directories must differ")
 	}
-	d.mu.Lock()
-	defer d.mu.Unlock()
+	// Acquire both directory locks in deterministic handle-ID order so
+	// concurrent A.LinkOwnedFileTo(B) and B.LinkOwnedFileTo(A) cannot deadlock.
+	first, second := d, dst
+	if first.id > second.id {
+		first, second = dst, d
+	}
+	first.mu.Lock()
+	defer first.mu.Unlock()
+	second.mu.Lock()
+	defer second.mu.Unlock()
 	if err := d.verifyLocked(); err != nil {
 		return err
 	}
-	dst.mu.Lock()
-	defer dst.mu.Unlock()
 	if err := dst.verifyLocked(); err != nil {
 		return err
 	}
@@ -313,10 +328,20 @@ func (d *OwnedDir) LinkOwnedFileTo(dst *OwnedDir, name string, perm os.FileMode)
 	if err := verifyAndChmodOwnedFile(f, filepath.Join(d.file.Name(), name), perm); err != nil {
 		return err
 	}
-	if err := unlinkAt(dst.file, name); err != nil && !os.IsNotExist(err) {
+	var rnd [8]byte
+	if _, err := rand.Read(rnd[:]); err != nil {
 		return err
 	}
-	return linkAt(d.file, name, dst.file, name)
+	tmpName := fmt.Sprintf(".%s.%s.link.tmp", name, hex.EncodeToString(rnd[:]))
+	if err := linkAt(d.file, name, dst.file, tmpName); err != nil {
+		return err
+	}
+	// Always remove tmpName on exit: POSIX rename is a no-op when tmpName and
+	// name already refer to the same inode, leaving tmpName behind otherwise.
+	defer func() {
+		_ = unlinkAt(dst.file, tmpName)
+	}()
+	return renameAt(dst.file, tmpName, name)
 }
 
 // SecureKeyShareFiles enumerates the open directory, verifies ownership and

@@ -2307,8 +2307,8 @@ func (rC *znnNetwork) SetWrapRequestSentSignature(id types.Hash, sent bool) erro
 	return rC.eventsStore().SetWrapRequestSentSignature(id, sent)
 }
 
-func (rC *znnNetwork) SaveSignedWrapRequest(id types.Hash, signature string) error {
-	return rC.eventsStore().SaveSignedWrapRequest(id, signature)
+func (rC *znnNetwork) SaveSignedWrapRequest(expected events.WrapRequestZnn, signature string) (bool, error) {
+	return rC.eventsStore().SaveSignedWrapRequest(expected, signature)
 }
 
 func (rC *znnNetwork) MarkWrapRequestSignatureSent(id types.Hash, expectedSignature string) (bool, error) {
@@ -2326,6 +2326,10 @@ func (rC *znnNetwork) PublishResignWraps(wraps []*definition.WrapTokenRequest) e
 	eventsBatch := make([]events.WrapRequestZnn, 0, len(wraps))
 	for _, w := range wraps {
 		if w == nil {
+			continue
+		}
+		if w.Amount == nil || w.Fee == nil {
+			rC.logger.Warnf("skipping wrap request %s in resign publication: missing amount or fee", w.Id.String())
 			continue
 		}
 		eventsBatch = append(eventsBatch, wrapEvent(w))

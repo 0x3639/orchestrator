@@ -73,7 +73,12 @@ func NewTssManager(conf oconfig.TssManagerConfig, privateKey string) (_ *TssMana
 	secureStateMgr := newSecureLocalStateManager(stateDir)
 	savedPeers, err := secureStateMgr.RetrieveP2PAddresses()
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
-		return nil, fmt.Errorf("failed to read anchored TSS address book: %w", err)
+		if errors.Is(err, errInvalidAddressBook) {
+			common.GlobalLogger.Warnf("ignoring malformed TSS address book cache and falling back to configured bootstrap peers: %v", err)
+			savedPeers = nil
+		} else {
+			return nil, fmt.Errorf("failed to read anchored TSS address book: %w", err)
+		}
 	}
 
 	var peerIDs []maddr.Multiaddr
@@ -125,7 +130,11 @@ func NewTssManager(conf oconfig.TssManagerConfig, privateKey string) (_ *TssMana
 			_ = votesDir.Close()
 		}
 	}()
-	votes, err := leveldb.OpenFile(votesDir.AnchoredPath(), nil)
+	votesPath, err := votesDir.AnchoredPath()
+	if err != nil {
+		return nil, err
+	}
+	votes, err := leveldb.OpenFile(votesPath, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -155,7 +164,11 @@ func NewTssManager(conf oconfig.TssManagerConfig, privateKey string) (_ *TssMana
 			return nil, err
 		}
 	}
-	tssBaseDir := logsDir.AnchoredPath()
+	tssBaseDir, err := logsDir.AnchoredPath()
+	if err != nil {
+		votes.Close()
+		return nil, err
+	}
 	var server *tss.TssServer
 	var wg sync.WaitGroup
 	wg.Add(1)

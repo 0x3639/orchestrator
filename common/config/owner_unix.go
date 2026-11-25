@@ -129,12 +129,13 @@ func statAtNoFollowExists(dir *os.File, name string) (bool, error) {
 	return false, &os.PathError{Op: "fstatat", Path: filepath.Join(dir.Name(), name), Err: err}
 }
 
-func fdDirPath(dir *os.File) string {
+func fdDirPath(dir *os.File) (string, error) {
 	if runtime.GOOS == "linux" {
 		p := fmt.Sprintf("/proc/self/fd/%d", dir.Fd())
 		if info, err := os.Stat(p); err == nil && info.IsDir() {
-			return p
+			return p, nil
 		}
+		return "", fmt.Errorf("descriptor-anchored directory path %s is unavailable for %s", p, dir.Name())
 	}
-	return dir.Name()
+	return "", fmt.Errorf("descriptor-anchored directory paths are not supported on %s", runtime.GOOS)
 }

@@ -844,8 +844,8 @@ func (m *NetworksManager) SetWrapRequestSentSignature(id types.Hash, sent bool) 
 	return m.znnNetwork.SetWrapRequestSentSignature(id, sent)
 }
 
-func (m *NetworksManager) SaveSignedWrapRequest(id types.Hash, signature string) error {
-	return m.znnNetwork.SaveSignedWrapRequest(id, signature)
+func (m *NetworksManager) SaveSignedWrapRequest(expected events.WrapRequestZnn, signature string) (bool, error) {
+	return m.znnNetwork.SaveSignedWrapRequest(expected, signature)
 }
 
 func (m *NetworksManager) MarkWrapRequestSignatureSent(id types.Hash, expectedSignature string) (bool, error) {

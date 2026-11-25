@@ -139,52 +139,7 @@ func appendNeedleSpans(spans []redactSpan, msg, needle, repl string) []redactSpa
 	return spans
 }
 
-// RedactErrorForURL renders err for logging with the raw URL, complete
-// request URI / path / query components, credentials, and individual query
-// values replaced. Sensitive spans are located on the original error string
-// and overlapping spans are merged before a single replacement pass so neither
-// path-vs-query overlaps nor replacement text can leak credential suffixes.
-func RedactErrorForURL(err error, raw string) string {
-	if err == nil {
-		return ""
-	}
-	msg := err.Error()
-	if msg == "" || raw == "" {
-		return msg
-	}
-	var spans []redactSpan
-	spans = appendNeedleSpans(spans, msg, raw, RedactURL(raw))
-	if parsed, perr := url.Parse(raw); perr == nil {
-		if reqURI := parsed.RequestURI(); len(reqURI) > 1 {
-			spans = appendNeedleSpans(spans, msg, reqURI, "/"+redactedPlaceholder)
-		}
-		if escPath := parsed.EscapedPath(); len(escPath) > 1 {
-			spans = appendNeedleSpans(spans, msg, escPath, "/"+redactedPlaceholder)
-		}
-		if len(parsed.Path) > 1 {
-			spans = appendNeedleSpans(spans, msg, parsed.Path, "/"+redactedPlaceholder)
-		}
-		if parsed.RawQuery != "" {
-			spans = appendNeedleSpans(spans, msg, parsed.RawQuery, redactedPlaceholder)
-		}
-		if parsed.User != nil {
-			if password, ok := parsed.User.Password(); ok && password != "" {
-				spans = appendNeedleSpans(spans, msg, password, redactedPlaceholder)
-			}
-			if username := parsed.User.Username(); username != "" {
-				spans = appendNeedleSpans(spans, msg, username, redactedPlaceholder)
-			}
-		}
-		if parsed.RawQuery != "" {
-			for _, vals := range parsed.Query() {
-				for _, v := range vals {
-					if v != "" {
-						spans = appendNeedleSpans(spans, msg, v, redactedPlaceholder)
-					}
-				}
-			}
-		}
-	}
+func applyRedactSpans(msg string, spans []redactSpan) string {
 	if len(spans) == 0 {
 		return msg
 	}
@@ -220,6 +175,68 @@ func RedactErrorForURL(err error, raw string) string {
 	}
 	out.WriteString(msg[pos:])
 	return out.String()
+}
+
+// RedactErrorForURL renders err for logging with the raw URL, complete
+// request URI / path / query components, credentials, and individual query
+// values replaced. Sensitive spans are located on the original error string
+// and overlapping spans are merged before a single replacement pass so neither
+// path-vs-query overlaps nor replacement text can leak credential suffixes.
+func RedactErrorForURL(err error, raw string) string {
+	if err == nil {
+		return ""
+	}
+	msg := err.Error()
+	if msg == "" || raw == "" {
+		return msg
+	}
+	var spans []redactSpan
+	redactedURL := RedactURL(raw)
+	if parsed, perr := url.Parse(raw); perr == nil {
+		var hostSpans []redactSpan
+		if parsed.User != nil {
+			if password, ok := parsed.User.Password(); ok && password != "" {
+				hostSpans = appendNeedleSpans(hostSpans, parsed.Host, password, redactedPlaceholder)
+				spans = appendNeedleSpans(spans, msg, password, redactedPlaceholder)
+			}
+			if username := parsed.User.Username(); username != "" {
+				hostSpans = appendNeedleSpans(hostSpans, parsed.Host, username, redactedPlaceholder)
+				spans = appendNeedleSpans(spans, msg, username, redactedPlaceholder)
+			}
+		}
+		if reqURI := parsed.RequestURI(); len(reqURI) > 1 {
+			spans = appendNeedleSpans(spans, msg, reqURI, "/"+redactedPlaceholder)
+		}
+		if escPath := parsed.EscapedPath(); len(escPath) > 1 {
+			spans = appendNeedleSpans(spans, msg, escPath, "/"+redactedPlaceholder)
+		}
+		if len(parsed.Path) > 1 {
+			spans = appendNeedleSpans(spans, msg, parsed.Path, "/"+redactedPlaceholder)
+		}
+		if parsed.RawQuery != "" {
+			spans = appendNeedleSpans(spans, msg, parsed.RawQuery, redactedPlaceholder)
+			for _, vals := range parsed.Query() {
+				for _, v := range vals {
+					if v != "" {
+						hostSpans = appendNeedleSpans(hostSpans, parsed.Host, v, redactedPlaceholder)
+						spans = appendNeedleSpans(spans, msg, v, redactedPlaceholder)
+					}
+				}
+			}
+		}
+		if len(hostSpans) > 0 && parsed.Scheme != "" && parsed.Host != "" {
+			maskedHost := applyRedactSpans(parsed.Host, hostSpans)
+			prefix := parsed.Scheme + "://"
+			if parsed.User != nil {
+				prefix += redactedPlaceholder + "@"
+			}
+			if strings.HasPrefix(redactedURL, prefix+parsed.Host) {
+				redactedURL = prefix + maskedHost + redactedURL[len(prefix+parsed.Host):]
+			}
+		}
+	}
+	spans = appendNeedleSpans(spans, msg, raw, redactedURL)
+	return applyRedactSpans(msg, spans)
 }
 
 const redactedPlaceholder = common.RedactedPlaceholder

@@ -653,3 +653,29 @@ func TestInstallSecureStateManagerSupportsEmbeddedWrapper(t *testing.T) {
 		t.Fatal("expected error for unrelated server struct")
 	}
 }
+
+func TestNewTssManagerMalformedAddressBookFallsBackToBootstrap(t *testing.T) {
+	priv, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	pubKey := base64.StdEncoding.EncodeToString(crypto.CompressPubkey(&priv.PublicKey))
+
+	dir := filepath.Join(t.TempDir(), "tss-malformed-book")
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, addressBookFileName), []byte("not-a-valid-multiaddr\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	mgr, err := NewTssManager(oconfig.TssManagerConfig{
+		BaseDir:   dir,
+		Port:      0,
+		PublicKey: pubKey,
+	}, testPrivateKeyBase64(t))
+	if err != nil {
+		t.Fatalf("expected malformed regular address_book.seed to warn and fall back, got error: %v", err)
+	}
+	mgr.Stop()
+}

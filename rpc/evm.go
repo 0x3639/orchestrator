@@ -81,6 +81,11 @@ func isWebSocketURL(rawURL string) bool {
 	return strings.HasPrefix(lower, "ws://") || strings.HasPrefix(lower, "wss://")
 }
 
+func isHTTPURL(rawURL string) bool {
+	lower := strings.ToLower(strings.TrimSpace(rawURL))
+	return strings.HasPrefix(lower, "http://") || strings.HasPrefix(lower, "https://")
+}
+
 func isSafeLocalTransportError(err error, msg string) bool {
 	var opErr *net.OpError
 	if stderrors.As(err, &opErr) {
@@ -160,8 +165,13 @@ var errWSReconnectRequired = stderrors.New("websocket reconnect requires chainId
 // WebSocket endpoints with expectedChainId != 0, internal go-ethereum
 // auto-reconnects are rejected with errWSReconnectRequired so callers must
 // open and chainId-verify a fresh connection rather than silently resuming on
-// an unverified replacement socket.
+// an unverified replacement socket. Non-HTTP/WebSocket transports (such as IPC
+// Unix sockets) are rejected in chain-aware mode because go-ethereum's IPC
+// transport reconnects internally without a hook to re-verify eth_chainId.
 func dialVerifiedEvmClient(parent context.Context, rawURL string, expectedChainId uint32, networkName string) (*ethclient.Client, error) {
+	if expectedChainId != 0 && !isWebSocketURL(rawURL) && !isHTTPURL(rawURL) {
+		return nil, fmt.Errorf("network %s (%s): unsupported EVM RPC scheme for chain-aware mode (only http, https, ws, and wss are supported)", networkName, config.RedactURL(rawURL))
+	}
 	var (
 		client *ethclient.Client
 		err    error
@@ -236,18 +246,49 @@ func NewEvmRpcClientForChainContext(parent context.Context, networkConfig config
 	if err != nil {
 		return nil, err
 	}
-	var newRpcClient *ethclient.Client
-	var lastErr error
+	limit, burst := rateSettings(networkConfig)
+	var endpointLimiters map[string]*rate.Limiter
+	if limit > 0 {
+		endpointLimiters = make(map[string]*rate.Limiter, len(newUrls.Urls))
+	}
+	var (
+		newRpcClient *ethclient.Client
+		limiter      *rate.Limiter
+		lastErr      error
+	)
 	currentUrl := newUrls.GetCurrentUrl()
 	for {
 		if err := parent.Err(); err != nil {
 			return nil, err
 		}
-		newRpcClient, err = dialVerifiedEvmClient(parent, currentUrl, chainId, networkName)
+		var epLimiter *rate.Limiter
+		if limit > 0 {
+			epLimiter = endpointLimiters[currentUrl]
+			if epLimiter == nil {
+				epLimiter = rate.NewLimiter(limit, burst)
+				endpointLimiters[currentUrl] = epLimiter
+			}
+		}
+		dialParent := parent
+		var dialCancel context.CancelFunc
+		if chainId != 0 && epLimiter != nil {
+			// Charge the startup eth_chainId probe to the endpoint's limiter so
+			// the first subsequent read respects RpcRequestsPerSecond/RpcBurst.
+			var limitErr error
+			dialParent, dialCancel, limitErr = limitedCallContext(parent, epLimiter, evmCallTimeout)
+			if limitErr != nil {
+				return nil, limitErr
+			}
+		}
+		newRpcClient, err = dialVerifiedEvmClient(dialParent, currentUrl, chainId, networkName)
+		if dialCancel != nil {
+			dialCancel()
+		}
 		if err != nil {
 			lastErr = err
 			logger.Warnf("Error when connecting to %s: %s", config.RedactURL(currentUrl), err.Error())
 		} else {
+			limiter = epLimiter
 			break
 		}
 		currentUrl = newUrls.NextUrl()
@@ -266,10 +307,7 @@ func NewEvmRpcClientForChainContext(parent context.Context, networkConfig config
 		filterQuerySize = defaultFilterQuerySize
 		logger.Warnf("network %s: FilterQuerySize is 0, using %d", networkName, filterQuerySize)
 	}
-	limit, burst := rateSettings(networkConfig)
-	var limiter *rate.Limiter
 	if limit > 0 {
-		limiter = rate.NewLimiter(limit, burst)
 		logger.Infof("network %s: EVM RPC requests capped at %g/s per endpoint, burst %d", networkName, limit, burst)
 	} else {
 		logger.Warnf("network %s: EVM RPC requests are not rate limited; set RpcRequestsPerSecond in config.json if the provider throttles the initial sync", networkName)
@@ -365,32 +403,47 @@ func (r *EvmRpc) getPrimaryClient() *ethclient.Client {
 	return client
 }
 
-func (r *EvmRpc) reconnectPrimary(ctx context.Context, failedClient *ethclient.Client) (*ethclient.Client, error) {
+// mergeCancelContext derives a context that cancels when either primary or
+// secondary cancels while preserving primary's deadline if any.
+func mergeCancelContext(primary, secondary context.Context) (context.Context, context.CancelFunc) {
+	if primary == nil {
+		primary = context.Background()
+	}
+	if secondary == nil || primary == secondary {
+		return context.WithCancel(primary)
+	}
+	ctx, cancel := context.WithCancel(primary)
+	stop := context.AfterFunc(secondary, cancel)
+	if secondary.Err() != nil {
+		cancel()
+	}
+	return ctx, func() {
+		stop()
+		cancel()
+	}
+}
+
+func (r *EvmRpc) reconnectPrimary(callerCtx context.Context, failedClient *ethclient.Client) (*ethclient.Client, error) {
 	r.clientMu.Lock()
 	defer r.clientMu.Unlock()
 	if r.ctx.Err() != nil {
 		return nil, errors.New("evm rpc stopped")
 	}
+	if callerCtx != nil && callerCtx.Err() != nil {
+		return nil, callerCtx.Err()
+	}
 	if r.rpcClient != failedClient {
 		return r.rpcClient, nil
 	}
-	// Keep the rate-limit permit wait outside the per-call timeout while still
-	// honoring caller or EvmRpc cancellation.
-	waitParent, stopCancel := context.WithCancel(r.ctx)
-	stopAfter := context.AfterFunc(ctx, stopCancel)
-	if ctx.Err() != nil {
-		stopCancel()
-	}
-	dialCtx, dialCancel, err := limitedCallContext(waitParent, r.limiter, evmCallTimeout)
-	stopAfter()
+	// Keep both caller cancellation/deadline and EvmRpc cancellation active
+	// through permit wait, dial, and eth_chainId verification.
+	merged, stopMerged := mergeCancelContext(callerCtx, r.ctx)
+	defer stopMerged()
+	dialCtx, dialCancel, err := limitedCallContext(merged, r.limiter, evmCallTimeout)
 	if err != nil {
-		stopCancel()
 		return nil, err
 	}
-	defer func() {
-		dialCancel()
-		stopCancel()
-	}()
+	defer dialCancel()
 	currentURL := r.Urls.GetCurrentUrl()
 	newClient, err := dialVerifiedEvmClient(dialCtx, currentURL, r.chainId, r.networkName)
 	if err != nil {
@@ -405,22 +458,28 @@ func (r *EvmRpc) reconnectPrimary(ctx context.Context, failedClient *ethclient.C
 }
 
 func (r *EvmRpc) doPrimary(ctx context.Context, fn func(context.Context, *ethclient.Client) error) error {
-	return r.doPrimaryWithTimeout(ctx, evmCallTimeout, fn)
+	return r.doPrimaryWithParent(r.ctx, ctx, evmCallTimeout, fn)
 }
 
 func (r *EvmRpc) doPrimaryWithTimeout(ctx context.Context, retryTimeout time.Duration, fn func(context.Context, *ethclient.Client) error) error {
+	return r.doPrimaryWithParent(r.ctx, ctx, retryTimeout, fn)
+}
+
+func (r *EvmRpc) doPrimaryWithParent(callerCtx, attemptCtx context.Context, retryTimeout time.Duration, fn func(context.Context, *ethclient.Client) error) error {
 	client := r.getPrimaryClient()
-	err := fn(ctx, client)
+	err := fn(attemptCtx, client)
 	if err == nil || !stderrors.Is(err, errWSReconnectRequired) {
 		return err
 	}
-	newClient, reconnErr := r.reconnectPrimary(ctx, client)
+	newClient, reconnErr := r.reconnectPrimary(callerCtx, client)
 	if reconnErr != nil {
 		return reconnErr
 	}
 	// Charge a fresh permit for the retried RPC after eth_chainId verification,
-	// keeping the permit wait outside the per-call timeout.
-	retryCtx, retryCancel, limitErr := limitedCallContext(r.ctx, r.limiter, retryTimeout)
+	// keeping both caller and client cancellation/deadline active.
+	merged, stopMerged := mergeCancelContext(callerCtx, r.ctx)
+	defer stopMerged()
+	retryCtx, retryCancel, limitErr := limitedCallContext(merged, r.limiter, retryTimeout)
 	if limitErr != nil {
 		return limitErr
 	}
@@ -470,7 +529,7 @@ func (r *EvmRpc) SyncState() (bool, error) {
 		return false, err
 	}
 	defer cancel()
-	return r.syncState(ctx)
+	return r.syncState(r.ctx, ctx)
 }
 
 // SampleSyncState skips a monitoring poll when the provider budget is busy.
@@ -480,12 +539,12 @@ func (r *EvmRpc) SampleSyncState(parent context.Context) (bool, error) {
 	}
 	ctx, cancel := context.WithTimeout(parent, evmCallTimeout)
 	defer cancel()
-	return r.syncState(ctx)
+	return r.syncState(parent, ctx)
 }
 
-func (r *EvmRpc) syncState(ctx context.Context) (bool, error) {
+func (r *EvmRpc) syncState(callerCtx, attemptCtx context.Context) (bool, error) {
 	var progress *ethereum.SyncProgress
-	err := r.doPrimary(ctx, func(callCtx context.Context, client *ethclient.Client) error {
+	err := r.doPrimaryWithParent(callerCtx, attemptCtx, evmCallTimeout, func(callCtx context.Context, client *ethclient.Client) error {
 		var callErr error
 		progress, callErr = client.SyncProgress(callCtx)
 		return callErr
@@ -508,7 +567,7 @@ func (r *EvmRpc) syncState(ctx context.Context) (bool, error) {
 // a subscription that was set up lasts until it ends or is unsubscribed.
 func (r *EvmRpc) SubscribeToLogs(ctx context.Context) (ethereum.Subscription, chan etypes.Log, error) {
 	var sub ethereum.Subscription
-	err := r.doPrimary(ctx, func(callCtx context.Context, client *ethclient.Client) error {
+	err := r.doPrimaryWithParent(ctx, ctx, evmCallTimeout, func(callCtx context.Context, client *ethclient.Client) error {
 		var callErr error
 		sub, callErr = client.SubscribeFilterLogs(callCtx, r.filterQuery, r.logChan)
 		return callErr
@@ -712,12 +771,19 @@ func (r *EvmRpc) callContext(timeout time.Duration) (context.Context, context.Ca
 	return limitedCallContext(r.ctx, r.limiter, timeout)
 }
 
+// onPermitGranted is an optional test hook invoked immediately after a rate
+// limiter permit is granted in limitedCallContext; nil in production.
+var onPermitGranted func(*rate.Limiter)
+
 // Waiting for a local permit can take longer than the provider's call timeout,
 // especially with a fractional request rate. Shutdown cancels both waits.
 func limitedCallContext(parent context.Context, limiter *rate.Limiter, timeout time.Duration) (context.Context, context.CancelFunc, error) {
 	if limiter != nil {
 		if err := limiter.Wait(parent); err != nil {
 			return nil, nil, err
+		}
+		if hook := onPermitGranted; hook != nil {
+			hook(limiter)
 		}
 	}
 	ctx, cancel := context.WithTimeout(parent, timeout)
@@ -781,7 +847,7 @@ func (r *EvmRpc) FilterBlockLogsContext(parent context.Context, blockHash ecommo
 	}
 	defer cancel()
 	var logs []etypes.Log
-	err = r.doPrimary(ctx, func(callCtx context.Context, client *ethclient.Client) error {
+	err = r.doPrimaryWithParent(parent, ctx, evmCallTimeout, func(callCtx context.Context, client *ethclient.Client) error {
 		var callErr error
 		logs, callErr = client.FilterLogs(callCtx, newFilterQuery)
 		return callErr
@@ -800,7 +866,7 @@ func (r *EvmRpc) TransactionReceiptContext(parent context.Context, txHash ecommo
 	}
 	defer cancel()
 	var receipt *etypes.Receipt
-	err = r.doPrimary(ctx, func(callCtx context.Context, client *ethclient.Client) error {
+	err = r.doPrimaryWithParent(parent, ctx, evmCallTimeout, func(callCtx context.Context, client *ethclient.Client) error {
 		var callErr error
 		receipt, callErr = client.TransactionReceipt(callCtx, txHash)
 		return callErr
@@ -1037,7 +1103,7 @@ func (r *EvmRpc) callEndpoint(idx int, read func(context.Context, *ethclient.Cli
 	if stopped {
 		return errors.New("evm rpc stopped")
 	}
-	if entry.client == nil {
+	dialSecondary := func() error {
 		// Charge eth_chainId verification separately from the read RPC so
 		// dialing a secondary client respects RpcRequestsPerSecond / RpcBurst.
 		dialCtx, dialCancel, err := limitedCallContext(r.ctx, entry.limiter, evmCallTimeout)
@@ -1050,13 +1116,44 @@ func (r *EvmRpc) callEndpoint(idx int, read func(context.Context, *ethclient.Cli
 			return err
 		}
 		entry.client = client
+		return nil
+	}
+	if entry.client == nil {
+		if err := dialSecondary(); err != nil {
+			return err
+		}
 	}
 	ctx, cancel, err := limitedCallContext(r.ctx, entry.limiter, evmCallTimeout)
 	if err != nil {
 		return err
 	}
-	defer cancel()
-	if err := read(ctx, entry.client); err != nil {
+	readErr := read(ctx, entry.client)
+	cancel()
+	if readErr == nil {
+		return nil
+	}
+	entry.client.Close()
+	entry.client = nil
+	if !stderrors.Is(readErr, errWSReconnectRequired) {
+		return readErr
+	}
+	// Retry once on a freshly verified replacement socket when an idle
+	// secondary WebSocket closed and triggered the reconnect guard.
+	r.secondaryMu.Lock()
+	stopped = r.secondaryStopped
+	r.secondaryMu.Unlock()
+	if stopped {
+		return errors.New("evm rpc stopped")
+	}
+	if err := dialSecondary(); err != nil {
+		return err
+	}
+	retryCtx, retryCancel, err := limitedCallContext(r.ctx, entry.limiter, evmCallTimeout)
+	if err != nil {
+		return err
+	}
+	defer retryCancel()
+	if err := read(retryCtx, entry.client); err != nil {
 		entry.client.Close()
 		entry.client = nil
 		return err
@@ -1101,19 +1198,28 @@ func (r *EvmRpc) BlockByHash(hash ecommon.Hash) (*etypes.Block, error) {
 
 // The generated bridge binding can follow an empty eth_call result with
 // eth_getCode. Charge each request where the binding dispatches it and route
-// through EvmRpc.doPrimary so WebSocket reconnects re-verify eth_chainId.
+// through EvmRpc.doPrimaryWithParent so WebSocket reconnects re-verify
+// eth_chainId while keeping caller cancellation and deadlines active.
 type bridgeReadBackend struct {
 	rpc *EvmRpc
 }
 
+var (
+	_ bind.ContractBackend         = bridgeReadBackend{}
+	_ bind.PendingContractCaller   = bridgeReadBackend{}
+	_ bind.BlockHashContractCaller = bridgeReadBackend{}
+)
+
 func (b bridgeReadBackend) CallContract(ctx context.Context, msg ethereum.CallMsg, block *big.Int) ([]byte, error) {
-	ctx, cancel, err := limitedCallContext(ctx, b.rpc.limiter, evmCallTimeout)
+	merged, stopMerged := mergeCancelContext(ctx, b.rpc.ctx)
+	defer stopMerged()
+	attemptCtx, cancel, err := limitedCallContext(merged, b.rpc.limiter, evmCallTimeout)
 	if err != nil {
 		return nil, err
 	}
 	defer cancel()
 	var out []byte
-	err = b.rpc.doPrimary(ctx, func(callCtx context.Context, client *ethclient.Client) error {
+	err = b.rpc.doPrimaryWithParent(ctx, attemptCtx, evmCallTimeout, func(callCtx context.Context, client *ethclient.Client) error {
 		var callErr error
 		out, callErr = client.CallContract(callCtx, msg, block)
 		return callErr
@@ -1122,13 +1228,15 @@ func (b bridgeReadBackend) CallContract(ctx context.Context, msg ethereum.CallMs
 }
 
 func (b bridgeReadBackend) CodeAt(ctx context.Context, address ecommon.Address, block *big.Int) ([]byte, error) {
-	ctx, cancel, err := limitedCallContext(ctx, b.rpc.limiter, evmCallTimeout)
+	merged, stopMerged := mergeCancelContext(ctx, b.rpc.ctx)
+	defer stopMerged()
+	attemptCtx, cancel, err := limitedCallContext(merged, b.rpc.limiter, evmCallTimeout)
 	if err != nil {
 		return nil, err
 	}
 	defer cancel()
 	var code []byte
-	err = b.rpc.doPrimary(ctx, func(callCtx context.Context, client *ethclient.Client) error {
+	err = b.rpc.doPrimaryWithParent(ctx, attemptCtx, evmCallTimeout, func(callCtx context.Context, client *ethclient.Client) error {
 		var callErr error
 		code, callErr = client.CodeAt(callCtx, address, block)
 		return callErr
@@ -1136,9 +1244,60 @@ func (b bridgeReadBackend) CodeAt(ctx context.Context, address ecommon.Address, 
 	return code, err
 }
 
+func (b bridgeReadBackend) PendingCallContract(ctx context.Context, msg ethereum.CallMsg) ([]byte, error) {
+	merged, stopMerged := mergeCancelContext(ctx, b.rpc.ctx)
+	defer stopMerged()
+	attemptCtx, cancel, err := limitedCallContext(merged, b.rpc.limiter, evmCallTimeout)
+	if err != nil {
+		return nil, err
+	}
+	defer cancel()
+	var out []byte
+	err = b.rpc.doPrimaryWithParent(ctx, attemptCtx, evmCallTimeout, func(callCtx context.Context, client *ethclient.Client) error {
+		var callErr error
+		out, callErr = client.PendingCallContract(callCtx, msg)
+		return callErr
+	})
+	return out, err
+}
+
+func (b bridgeReadBackend) CallContractAtHash(ctx context.Context, msg ethereum.CallMsg, blockHash ecommon.Hash) ([]byte, error) {
+	merged, stopMerged := mergeCancelContext(ctx, b.rpc.ctx)
+	defer stopMerged()
+	attemptCtx, cancel, err := limitedCallContext(merged, b.rpc.limiter, evmCallTimeout)
+	if err != nil {
+		return nil, err
+	}
+	defer cancel()
+	var out []byte
+	err = b.rpc.doPrimaryWithParent(ctx, attemptCtx, evmCallTimeout, func(callCtx context.Context, client *ethclient.Client) error {
+		var callErr error
+		out, callErr = client.CallContractAtHash(callCtx, msg, blockHash)
+		return callErr
+	})
+	return out, err
+}
+
+func (b bridgeReadBackend) CodeAtHash(ctx context.Context, account ecommon.Address, blockHash ecommon.Hash) ([]byte, error) {
+	merged, stopMerged := mergeCancelContext(ctx, b.rpc.ctx)
+	defer stopMerged()
+	attemptCtx, cancel, err := limitedCallContext(merged, b.rpc.limiter, evmCallTimeout)
+	if err != nil {
+		return nil, err
+	}
+	defer cancel()
+	var code []byte
+	err = b.rpc.doPrimaryWithParent(ctx, attemptCtx, evmCallTimeout, func(callCtx context.Context, client *ethclient.Client) error {
+		var callErr error
+		code, callErr = client.CodeAtHash(callCtx, account, blockHash)
+		return callErr
+	})
+	return code, err
+}
+
 func (b bridgeReadBackend) HeaderByNumber(ctx context.Context, number *big.Int) (*etypes.Header, error) {
 	var h *etypes.Header
-	err := b.rpc.doPrimary(ctx, func(callCtx context.Context, client *ethclient.Client) error {
+	err := b.rpc.doPrimaryWithParent(ctx, ctx, evmCallTimeout, func(callCtx context.Context, client *ethclient.Client) error {
 		var callErr error
 		h, callErr = client.HeaderByNumber(callCtx, number)
 		return callErr
@@ -1147,8 +1306,15 @@ func (b bridgeReadBackend) HeaderByNumber(ctx context.Context, number *big.Int) 
 }
 
 func (b bridgeReadBackend) PendingCodeAt(ctx context.Context, account ecommon.Address) ([]byte, error) {
+	merged, stopMerged := mergeCancelContext(ctx, b.rpc.ctx)
+	defer stopMerged()
+	attemptCtx, cancel, err := limitedCallContext(merged, b.rpc.limiter, evmCallTimeout)
+	if err != nil {
+		return nil, err
+	}
+	defer cancel()
 	var code []byte
-	err := b.rpc.doPrimary(ctx, func(callCtx context.Context, client *ethclient.Client) error {
+	err = b.rpc.doPrimaryWithParent(ctx, attemptCtx, evmCallTimeout, func(callCtx context.Context, client *ethclient.Client) error {
 		var callErr error
 		code, callErr = client.PendingCodeAt(callCtx, account)
 		return callErr
@@ -1158,7 +1324,7 @@ func (b bridgeReadBackend) PendingCodeAt(ctx context.Context, account ecommon.Ad
 
 func (b bridgeReadBackend) PendingNonceAt(ctx context.Context, account ecommon.Address) (uint64, error) {
 	var nonce uint64
-	err := b.rpc.doPrimary(ctx, func(callCtx context.Context, client *ethclient.Client) error {
+	err := b.rpc.doPrimaryWithParent(ctx, ctx, evmCallTimeout, func(callCtx context.Context, client *ethclient.Client) error {
 		var callErr error
 		nonce, callErr = client.PendingNonceAt(callCtx, account)
 		return callErr
@@ -1168,7 +1334,7 @@ func (b bridgeReadBackend) PendingNonceAt(ctx context.Context, account ecommon.A
 
 func (b bridgeReadBackend) SuggestGasPrice(ctx context.Context) (*big.Int, error) {
 	var price *big.Int
-	err := b.rpc.doPrimary(ctx, func(callCtx context.Context, client *ethclient.Client) error {
+	err := b.rpc.doPrimaryWithParent(ctx, ctx, evmCallTimeout, func(callCtx context.Context, client *ethclient.Client) error {
 		var callErr error
 		price, callErr = client.SuggestGasPrice(callCtx)
 		return callErr
@@ -1178,7 +1344,7 @@ func (b bridgeReadBackend) SuggestGasPrice(ctx context.Context) (*big.Int, error
 
 func (b bridgeReadBackend) SuggestGasTipCap(ctx context.Context) (*big.Int, error) {
 	var tip *big.Int
-	err := b.rpc.doPrimary(ctx, func(callCtx context.Context, client *ethclient.Client) error {
+	err := b.rpc.doPrimaryWithParent(ctx, ctx, evmCallTimeout, func(callCtx context.Context, client *ethclient.Client) error {
 		var callErr error
 		tip, callErr = client.SuggestGasTipCap(callCtx)
 		return callErr
@@ -1188,7 +1354,7 @@ func (b bridgeReadBackend) SuggestGasTipCap(ctx context.Context) (*big.Int, erro
 
 func (b bridgeReadBackend) EstimateGas(ctx context.Context, call ethereum.CallMsg) (uint64, error) {
 	var gas uint64
-	err := b.rpc.doPrimary(ctx, func(callCtx context.Context, client *ethclient.Client) error {
+	err := b.rpc.doPrimaryWithParent(ctx, ctx, evmCallTimeout, func(callCtx context.Context, client *ethclient.Client) error {
 		var callErr error
 		gas, callErr = client.EstimateGas(callCtx, call)
 		return callErr
@@ -1197,14 +1363,14 @@ func (b bridgeReadBackend) EstimateGas(ctx context.Context, call ethereum.CallMs
 }
 
 func (b bridgeReadBackend) SendTransaction(ctx context.Context, tx *etypes.Transaction) error {
-	return b.rpc.doPrimary(ctx, func(callCtx context.Context, client *ethclient.Client) error {
+	return b.rpc.doPrimaryWithParent(ctx, ctx, evmCallTimeout, func(callCtx context.Context, client *ethclient.Client) error {
 		return client.SendTransaction(callCtx, tx)
 	})
 }
 
 func (b bridgeReadBackend) FilterLogs(ctx context.Context, query ethereum.FilterQuery) ([]etypes.Log, error) {
 	var logs []etypes.Log
-	err := b.rpc.doPrimary(ctx, func(callCtx context.Context, client *ethclient.Client) error {
+	err := b.rpc.doPrimaryWithParent(ctx, ctx, evmCallTimeout, func(callCtx context.Context, client *ethclient.Client) error {
 		var callErr error
 		logs, callErr = client.FilterLogs(callCtx, query)
 		return callErr
@@ -1214,7 +1380,7 @@ func (b bridgeReadBackend) FilterLogs(ctx context.Context, query ethereum.Filter
 
 func (b bridgeReadBackend) SubscribeFilterLogs(ctx context.Context, query ethereum.FilterQuery, ch chan<- etypes.Log) (ethereum.Subscription, error) {
 	var sub ethereum.Subscription
-	err := b.rpc.doPrimary(ctx, func(callCtx context.Context, client *ethclient.Client) error {
+	err := b.rpc.doPrimaryWithParent(ctx, ctx, evmCallTimeout, func(callCtx context.Context, client *ethclient.Client) error {
 		var callErr error
 		sub, callErr = client.SubscribeFilterLogs(callCtx, query, ch)
 		return callErr

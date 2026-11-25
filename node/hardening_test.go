@@ -839,8 +839,9 @@ func TestSendSignaturesWrapDoesNotMarkReplacedSignatureSent(t *testing.T) {
 	n.producerKeyPair = &wallet.KeyPair{Public: make([]byte, 32)}
 	n.config.TssConfig.LocalPubKeys = []string{"other-participant"}
 
+	replacedWrap := events.WrapRequestZnn{NetworkClass: definition.EvmClass, ChainId: 1, Id: replacedID, Amount: big.NewInt(10), Fee: big.NewInt(1), Signature: "old-sig", SentSignature: false, RedeemStatus: common.UnredeemedStatus}
 	for _, w := range []events.WrapRequestZnn{
-		{NetworkClass: definition.EvmClass, ChainId: 1, Id: replacedID, Amount: big.NewInt(10), Fee: big.NewInt(1), Signature: "old-sig", SentSignature: false, RedeemStatus: common.UnredeemedStatus},
+		replacedWrap,
 		{NetworkClass: definition.EvmClass, ChainId: 1, Id: stableID, Amount: big.NewInt(20), Fee: big.NewInt(1), Signature: "stable-sig", SentSignature: false, RedeemStatus: common.UnredeemedStatus},
 	} {
 		if err := n.dbManager.ZnnStorage().AddWrapRequest(w); err != nil {
@@ -854,8 +855,8 @@ func TestSendSignaturesWrapDoesNotMarkReplacedSignatureSent(t *testing.T) {
 	bridge.onGetID = func(id types.Hash) {
 		if id == replacedID {
 			replacedOnce.Do(func() {
-				if err := n.networksManager.SaveSignedWrapRequest(replacedID, "new-sig"); err != nil {
-					t.Errorf("SaveSignedWrapRequest failed: %v", err)
+				if saved, err := n.networksManager.SaveSignedWrapRequest(replacedWrap, "new-sig"); err != nil || !saved {
+					t.Errorf("SaveSignedWrapRequest = (%v, %v), want (true, nil)", saved, err)
 				}
 			})
 		}

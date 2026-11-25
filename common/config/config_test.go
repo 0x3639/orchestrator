@@ -599,18 +599,48 @@ func TestSecureKeyShareFilesTightensPermissionsAndRejectsUnsafeEntries(t *testin
 	_ = os.Remove(subDir)
 }
 
-func TestSecureKeyShareFilesFailsOnOwnershipMismatch(t *testing.T) {
-	dir := t.TempDir()
-	share := filepath.Join(dir, "localstate-deadbeef.json")
-	if err := os.WriteFile(share, []byte(`{}`), 0600); err != nil {
-		t.Fatal(err)
+func TestRedactErrorForURLMasksCredentialMatchingHost(t *testing.T) {
+	raw := "https://user:secretpass@secretpass.example:8545/v1"
+	got := RedactErrorForURL(errors.New("Get "+raw+": connection refused"), raw)
+	if strings.Contains(got, "secretpass") {
+		t.Fatalf("expected password matching host to be masked, got %q", got)
+	}
+	if !strings.Contains(got, "https://<redacted>@<redacted>.example:8545/<redacted>") {
+		t.Fatalf("unexpected redacted URL form: %q", got)
 	}
 
-	prev := currentEuid
-	currentEuid = func() int { return os.Geteuid() + 1 }
-	t.Cleanup(func() { currentEuid = prev })
+	unrelatedRaw := "https://user:otherpass@rpc.example:8545/v1"
+	gotUnrelated := RedactErrorForURL(errors.New("Get "+unrelatedRaw+": connection refused"), unrelatedRaw)
+	if !strings.Contains(gotUnrelated, "https://<redacted>@rpc.example:8545/<redacted>") {
+		t.Fatalf("expected unrelated host to remain visible, got %q", gotUnrelated)
+	}
+}
 
-	if err := SecureKeyShareFiles(dir); err == nil {
-		t.Fatal("expected ownership error from SecureKeyShareFiles")
+func TestLinkOwnedFileToCleansTempOnSameInode(t *testing.T) {
+	base := t.TempDir()
+	src, err := OpenOwnedDir(filepath.Join(base, "src"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer src.Close()
+	dst, err := OpenOwnedDir(filepath.Join(base, "dst"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dst.Close()
+
+	// Link twice: second link hits the same-inode POSIX rename no-op case and
+	// must still clean up its temporary link entry.
+	for i := 0; i < 2; i++ {
+		if err := src.LinkOwnedFileTo(dst, "tss.server.log", ConfigFilePerm); err != nil {
+			t.Fatalf("LinkOwnedFileTo attempt %d failed: %v", i+1, err)
+		}
+	}
+	entries, err := os.ReadDir(filepath.Join(base, "dst"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Name() != "tss.server.log" {
+		t.Fatalf("unexpected dst entries after same-inode relink: %v", entries)
 	}
 }

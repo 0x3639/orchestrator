@@ -17,6 +17,7 @@ import (
 	ecommon "github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/ethclient"
 	"github.com/gorilla/websocket"
+	"golang.org/x/time/rate"
 
 	"orchestrator/common/config"
 )
@@ -255,10 +256,8 @@ func TestWebSocketReconnectReverifiesChainID(t *testing.T) {
 	servedChain.Store(73405)
 	var blockCalls atomic.Int32
 	var (
-		connMu         sync.Mutex
-		activeCon      *websocket.Conn
-		lastChainTime  time.Time
-		lastBlockTime  time.Time
+		connMu    sync.Mutex
+		activeCon *websocket.Conn
 	)
 	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -281,15 +280,9 @@ func TestWebSocketReconnectReverifiesChainID(t *testing.T) {
 			var res string
 			switch req.Method {
 			case "eth_chainId":
-				connMu.Lock()
-				lastChainTime = time.Now()
-				connMu.Unlock()
 				res = fmt.Sprintf("0x%x", servedChain.Load())
 			case "eth_blockNumber":
 				blockCalls.Add(1)
-				connMu.Lock()
-				lastBlockTime = time.Now()
-				connMu.Unlock()
 				res = "0x10"
 			default:
 				res = "0x0"
@@ -346,15 +339,33 @@ func TestWebSocketReconnectReverifiesChainID(t *testing.T) {
 
 	// Restore correct chain: next call reconnects, verifies eth_chainId, waits
 	// for a fresh rate-limit permit, and succeeds.
+	var (
+		permitMu    sync.Mutex
+		permitTimes []time.Time
+	)
+	prevHook := onPermitGranted
+	onPermitGranted = func(l *rate.Limiter) {
+		if l == client.limiter {
+			permitMu.Lock()
+			permitTimes = append(permitTimes, time.Now())
+			permitMu.Unlock()
+		}
+	}
+	t.Cleanup(func() { onPermitGranted = prevHook })
+
 	servedChain.Store(73405)
 	if num, err := client.BlockNumber(); err != nil || num != 0x10 {
 		t.Fatalf("expected BlockNumber to recover once endpoint serves expected chain again, num=%d err=%v", num, err)
 	}
-	connMu.Lock()
-	gap := lastBlockTime.Sub(lastChainTime)
-	connMu.Unlock()
-	if gap < 180*time.Millisecond {
-		t.Fatalf("expected retried eth_blockNumber after WS reconnect to wait for fresh permit (>=180ms at 4 req/s burst 1), got %v", gap)
+	permitMu.Lock()
+	times := append([]time.Time(nil), permitTimes...)
+	permitMu.Unlock()
+	if len(times) < 3 {
+		t.Fatalf("expected >=3 permits (initial attempt, reconnect eth_chainId, retried eth_blockNumber), got %d", len(times))
+	}
+	gap := times[len(times)-1].Sub(times[len(times)-2])
+	if gap < 220*time.Millisecond {
+		t.Fatalf("expected retried eth_blockNumber after WS reconnect to wait for fresh permit (>=220ms at 4 req/s burst 1), got %v", gap)
 	}
 }
 
@@ -381,11 +392,6 @@ func TestSecondaryEndpointChargesSeparatePermitsForChainIDAndRead(t *testing.T) 
 	}))
 	defer primarySrv.Close()
 
-	var (
-		mu         sync.Mutex
-		chainTime  time.Time
-		blockTime  time.Time
-	)
 	secondarySrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var req struct {
 			ID     json.RawMessage `json:"id"`
@@ -393,13 +399,6 @@ func TestSecondaryEndpointChargesSeparatePermitsForChainIDAndRead(t *testing.T) 
 		}
 		_ = json.NewDecoder(r.Body).Decode(&req)
 		w.Header().Set("Content-Type", "application/json")
-		mu.Lock()
-		if req.Method == "eth_chainId" {
-			chainTime = time.Now()
-		} else if req.Method == "eth_getBlockByNumber" {
-			blockTime = time.Now()
-		}
-		mu.Unlock()
 		if req.Method == "eth_chainId" {
 			_ = json.NewEncoder(w).Encode(map[string]any{"jsonrpc": "2.0", "id": req.ID, "result": "0x1"})
 			return
@@ -425,6 +424,20 @@ func TestSecondaryEndpointChargesSeparatePermitsForChainIDAndRead(t *testing.T) 
 	}
 	defer client.Stop()
 
+	var (
+		permitMu       sync.Mutex
+		secondaryTimes []time.Time
+	)
+	prevHook := onPermitGranted
+	onPermitGranted = func(l *rate.Limiter) {
+		if l != client.limiter {
+			permitMu.Lock()
+			secondaryTimes = append(secondaryTimes, time.Now())
+			permitMu.Unlock()
+		}
+	}
+	t.Cleanup(func() { onPermitGranted = prevHook })
+
 	hash, err := client.CanonicalHash(5)
 	if err != nil {
 		t.Fatalf("CanonicalHash failed: %v", err)
@@ -432,10 +445,162 @@ func TestSecondaryEndpointChargesSeparatePermitsForChainIDAndRead(t *testing.T) 
 	if hash != ecommon.HexToHash("0x1234") {
 		t.Fatalf("unexpected canonical hash %s", hash.Hex())
 	}
+	permitMu.Lock()
+	times := append([]time.Time(nil), secondaryTimes...)
+	permitMu.Unlock()
+	if len(times) < 2 {
+		t.Fatalf("expected >=2 secondary permits (eth_chainId + read), got %d", len(times))
+	}
+	gap := times[1].Sub(times[0])
+	if gap < 220*time.Millisecond {
+		t.Fatalf("expected secondary eth_chainId and eth_getBlockByNumber to be rate-limited separately (>=220ms at 4 req/s burst 1), got %v", gap)
+	}
+}
+
+func TestChainAwareModeRejectsIPCAndChargesStartupLimiter(t *testing.T) {
+	if _, err := NewEvmRpcClientForChain(config.BaseNetworkConfig{
+		Urls: []string{"/tmp/geth.ipc"},
+	}, 1, "Ethereum", ecommon.HexToAddress("0x0000000000000000000000000000000000000001")); err == nil || !strings.Contains(err.Error(), "unsupported EVM RPC scheme") {
+		t.Fatalf("expected chain-aware mode to reject IPC socket path, got: %v", err)
+	}
+
+	srv := fakeChainIDServer(t, 1)
+	defer srv.Close()
+
+	var (
+		mu          sync.Mutex
+		permitTimes []time.Time
+	)
+	prevHook := onPermitGranted
+	onPermitGranted = func(*rate.Limiter) {
+		mu.Lock()
+		permitTimes = append(permitTimes, time.Now())
+		mu.Unlock()
+	}
+	t.Cleanup(func() { onPermitGranted = prevHook })
+
+	client, err := NewEvmRpcClientForChain(config.BaseNetworkConfig{
+		Urls:                 []string{srv.URL},
+		RpcRequestsPerSecond: 4, // 250ms per permit
+		RpcBurst:             1,
+	}, 1, "Ethereum", ecommon.HexToAddress("0x0000000000000000000000000000000000000001"))
+	if err != nil {
+		t.Fatalf("NewEvmRpcClientForChain failed: %v", err)
+	}
+	defer client.Stop()
+
+	if _, err := client.BlockNumber(); err != nil {
+		t.Fatalf("BlockNumber failed: %v", err)
+	}
 	mu.Lock()
-	gap := blockTime.Sub(chainTime)
+	times := append([]time.Time(nil), permitTimes...)
 	mu.Unlock()
-	if gap < 180*time.Millisecond {
-		t.Fatalf("expected secondary eth_chainId and eth_getBlockByNumber to be rate-limited separately (>=180ms at 4 req/s burst 1), got %v", gap)
+	if len(times) < 2 {
+		t.Fatalf("expected startup eth_chainId and first BlockNumber to both consume permits, got %d", len(times))
+	}
+	if gap := times[1].Sub(times[0]); gap < 220*time.Millisecond {
+		t.Fatalf("expected first read after startup eth_chainId to respect rate limit (>=220ms), got %v", gap)
+	}
+}
+
+func TestSecondaryWebSocketReconnectRetriesOnceWithVerification(t *testing.T) {
+	primarySrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			ID     json.RawMessage `json:"id"`
+			Method string          `json:"method"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		w.Header().Set("Content-Type", "application/json")
+		if req.Method == "eth_chainId" {
+			_ = json.NewEncoder(w).Encode(map[string]any{"jsonrpc": "2.0", "id": req.ID, "result": "0x1"})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"jsonrpc": "2.0",
+			"id":      req.ID,
+			"result": map[string]any{
+				"hash":   ecommon.HexToHash("0xabcd").Hex(),
+				"number": "0x5",
+			},
+		})
+	}))
+	defer primarySrv.Close()
+
+	var (
+		servedChain atomic.Uint64
+		connMu      sync.Mutex
+		activeConn  *websocket.Conn
+	)
+	servedChain.Store(1)
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	secondaryWS := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		connMu.Lock()
+		activeConn = conn
+		connMu.Unlock()
+		defer conn.Close()
+		for {
+			var req struct {
+				ID     json.RawMessage `json:"id"`
+				Method string          `json:"method"`
+			}
+			if err := conn.ReadJSON(&req); err != nil {
+				return
+			}
+			var res any
+			if req.Method == "eth_chainId" {
+				res = fmt.Sprintf("0x%x", servedChain.Load())
+			} else {
+				res = map[string]any{
+					"hash":   ecommon.HexToHash("0xabcd").Hex(),
+					"number": "0x5",
+				}
+			}
+			if err := conn.WriteJSON(map[string]any{"jsonrpc": "2.0", "id": req.ID, "result": res}); err != nil {
+				return
+			}
+		}
+	}))
+	defer secondaryWS.Close()
+
+	client, err := NewEvmRpcClientForChain(config.BaseNetworkConfig{
+		Urls: []string{primarySrv.URL, "ws" + strings.TrimPrefix(secondaryWS.URL, "http")},
+	}, 1, "Ethereum", ecommon.HexToAddress("0x0000000000000000000000000000000000000001"))
+	if err != nil {
+		t.Fatalf("NewEvmRpcClientForChain failed: %v", err)
+	}
+	defer client.Stop()
+
+	if h, err := client.CanonicalHash(5); err != nil || h != ecommon.HexToHash("0xabcd") {
+		t.Fatalf("initial CanonicalHash = (%s, %v)", h.Hex(), err)
+	}
+
+	// Drop the idle secondary WebSocket while keeping chainId valid: the next
+	// CanonicalHash must transparently reconnect, verify eth_chainId, and succeed.
+	connMu.Lock()
+	if activeConn != nil {
+		_ = activeConn.Close()
+	}
+	connMu.Unlock()
+	time.Sleep(25 * time.Millisecond)
+
+	if h, err := client.CanonicalHash(5); err != nil || h != ecommon.HexToHash("0xabcd") {
+		t.Fatalf("CanonicalHash after idle secondary WS drop = (%s, %v), want retry success", h.Hex(), err)
+	}
+
+	// Drop again and switch secondary to wrong chain: must fail agreement.
+	servedChain.Store(999)
+	connMu.Lock()
+	if activeConn != nil {
+		_ = activeConn.Close()
+	}
+	connMu.Unlock()
+	time.Sleep(25 * time.Millisecond)
+
+	if _, err := client.CanonicalHash(5); err == nil {
+		t.Fatal("expected CanonicalHash to fail when secondary replacement WS serves wrong chain")
 	}
 }

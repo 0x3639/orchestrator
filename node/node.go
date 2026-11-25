@@ -1955,8 +1955,14 @@ func (node *Node) applyWrapSignatures(response *keysign.Response, wrapRequestsId
 			continue
 		}
 
-		if err = node.networksManager.SaveSignedWrapRequest(wrapRequestsIds[reqIdx].Id, fullSignatureStr); err != nil {
+		signedWrap := common.ZnnWrapToOrchestratorWrap(wrapRequestsIds[reqIdx])
+		saved, err := node.networksManager.SaveSignedWrapRequest(signedWrap, fullSignatureStr)
+		if err != nil {
 			node.logger.Debug(err)
+			continue
+		}
+		if !saved {
+			node.logger.Debugf("wrap %s changed or settled during signing; discarding stale signature", signedWrap.Id.String())
 			continue
 		}
 		applied[sig.Msg] = true

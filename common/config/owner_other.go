@@ -3,8 +3,10 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 )
 
 // VerifyOwnedPath only checks existence on platforms without POSIX ownership.
@@ -66,6 +68,6 @@ func statAtNoFollowExists(dir *os.File, name string) (bool, error) {
 	return false, err
 }
 
-func fdDirPath(dir *os.File) string {
-	return dir.Name()
+func fdDirPath(dir *os.File) (string, error) {
+	return "", fmt.Errorf("descriptor-anchored directory paths are not supported on %s", runtime.GOOS)
 }

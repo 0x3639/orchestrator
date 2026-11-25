@@ -17,7 +17,7 @@ import (
 func TestSaveSignedWrapRequestAndMarkSentMatchExactSignature(t *testing.T) {
 	run := func(t *testing.T, store db.ZnnStorage) {
 		id := types.Hash{0x55}
-		if err := store.AddWrapRequest(events.WrapRequestZnn{
+		initial := events.WrapRequestZnn{
 			NetworkClass:  2,
 			ChainId:       1,
 			Id:            id,
@@ -26,16 +26,30 @@ func TestSaveSignedWrapRequestAndMarkSentMatchExactSignature(t *testing.T) {
 			Signature:     "old-sig",
 			SentSignature: true,
 			RedeemStatus:  common.UnredeemedStatus,
-		}); err != nil {
+		}
+		if err := store.AddWrapRequest(initial); err != nil {
 			t.Fatal(err)
 		}
 		if err := store.SetResignStatus(id, true); err != nil {
 			t.Fatal(err)
 		}
 
+		// Mismatched signing payload must not attach an old signature or clear resign.
+		stalePayload := initial
+		stalePayload.Amount = big.NewInt(999)
+		if saved, err := store.SaveSignedWrapRequest(stalePayload, "stale-sig"); err != nil || saved {
+			t.Fatalf("SaveSignedWrapRequest(stalePayload) = (%v, %v), want (false, nil)", saved, err)
+		}
+		if got, err := store.GetWrapRequestById(id); err != nil || got.Signature != "old-sig" || !got.SentSignature {
+			t.Fatalf("stale payload save modified row: got=%+v err=%v", got, err)
+		}
+		if resign, err := store.GetResignStatus(id); err != nil || !resign {
+			t.Fatalf("stale payload save cleared resign flag: resign=%v err=%v", resign, err)
+		}
+
 		// Atomically install replacement signature, clear SentSignature, and clear resign flag.
-		if err := store.SaveSignedWrapRequest(id, "new-sig"); err != nil {
-			t.Fatalf("SaveSignedWrapRequest failed: %v", err)
+		if saved, err := store.SaveSignedWrapRequest(initial, "new-sig"); err != nil || !saved {
+			t.Fatalf("SaveSignedWrapRequest failed: saved=%v err=%v", saved, err)
 		}
 
 		got, err := store.GetWrapRequestById(id)
@@ -73,6 +87,29 @@ func TestSaveSignedWrapRequestAndMarkSentMatchExactSignature(t *testing.T) {
 		}
 		if !got.SentSignature {
 			t.Fatal("matching poll did not mark signature as sent")
+		}
+
+		// Unsigned stale local row with no pending resign marker is updated to
+		// the finalized RPC payload that was signed rather than discarded forever.
+		staleUnsignedID := types.Hash{0x56}
+		if err := store.AddWrapRequest(events.WrapRequestZnn{
+			NetworkClass: 2, ChainId: 1, Id: staleUnsignedID,
+			Amount: big.NewInt(50), Fee: big.NewInt(1),
+			RedeemStatus: common.UnredeemedStatus,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		finalizedPayload := events.WrapRequestZnn{
+			NetworkClass: 2, ChainId: 1, Id: staleUnsignedID,
+			Amount: big.NewInt(75), Fee: big.NewInt(2),
+			RedeemStatus: common.UnredeemedStatus,
+		}
+		if saved, err := store.SaveSignedWrapRequest(finalizedPayload, "finalized-sig"); err != nil || !saved {
+			t.Fatalf("SaveSignedWrapRequest(unsigned stale row) = (%v, %v), want (true, nil)", saved, err)
+		}
+		gotStale, err := store.GetWrapRequestById(staleUnsignedID)
+		if err != nil || gotStale == nil || gotStale.Signature != "finalized-sig" || gotStale.Amount.Cmp(big.NewInt(75)) != 0 {
+			t.Fatalf("unsigned stale row not updated to signed payload: got=%+v err=%v", gotStale, err)
 		}
 	}
 
@@ -144,6 +181,31 @@ func TestPublishResignWrapsAtomicallyStoresMissingAndSkipsRedeemed(t *testing.T)
 		if resign, err := store.GetResignStatus(preRedeemedNoRowID); err != nil || resign {
 			t.Fatalf("wrap with pre-existing EVM redeem outcome must not be marked for resign: resign=%v err=%v", resign, err)
 		}
+
+		// Existing row pointing at chain 1 whose canonical payload targets chain 2,
+		// where chain 2 already has a redeem log, must not be migrated or marked for resign.
+		migratedRedeemedID := types.Hash{0x65}
+		if err := store.AddWrapRequest(events.WrapRequestZnn{
+			NetworkClass: 2, ChainId: 1, Id: migratedRedeemedID,
+			Amount: big.NewInt(50), Fee: big.NewInt(1), RedeemStatus: common.UnredeemedStatus,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.ApplyRedeemLog(2, migratedRedeemedID, 80, 0, common.RedeemedStatus); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.PublishResignWraps([]events.WrapRequestZnn{{
+			NetworkClass: 2, ChainId: 2, Id: migratedRedeemedID,
+			Amount: big.NewInt(50), Fee: big.NewInt(1), RedeemStatus: common.UnredeemedStatus,
+		}}); err != nil {
+			t.Fatalf("PublishResignWraps failed: %v", err)
+		}
+		if resign, err := store.GetResignStatus(migratedRedeemedID); err != nil || resign {
+			t.Fatalf("wrap already redeemed on canonical destination chain 2 must not be marked for resign: resign=%v err=%v", resign, err)
+		}
+		if got, err := store.GetWrapRequestById(migratedRedeemedID); err != nil || got.ChainId != 1 {
+			t.Fatalf("existing row should not be migrated onto already-redeemed chain 2: got=%+v err=%v", got, err)
+		}
 	}
 
 	t.Run("memdb", func(t *testing.T) {
@@ -183,14 +245,30 @@ func TestAcknowledgeWrapRequestSignaturePreservesNewerSignatureAndResignFlag(t *
 		if err := store.AddWrapRequest(baseWrap(replacedID, "old-sig")); err != nil {
 			t.Fatal(err)
 		}
-		if err := store.SaveSignedWrapRequest(replacedID, "new-sig"); err != nil {
-			t.Fatal(err)
+		if saved, err := store.SaveSignedWrapRequest(baseWrap(replacedID, "old-sig"), "new-sig"); err != nil || !saved {
+			t.Fatalf("SaveSignedWrapRequest = (%v, %v), want (true, nil)", saved, err)
 		}
 		if err := store.AcknowledgeWrapRequestSignature(baseWrap(replacedID, "old-sig"), "old-sig"); err != nil {
 			t.Fatal(err)
 		}
 		if got, err := store.GetWrapRequestById(replacedID); err != nil || got == nil || got.Signature != "new-sig" || got.SentSignature {
 			t.Fatalf("stale ack corrupted newer signature: got=%+v err=%v", got, err)
+		}
+
+		// 2b. Stale payload acknowledgement must NOT fill an empty signature on a replaced payload.
+		replacedPayloadID := types.Hash{0x74}
+		payloadB := baseWrap(replacedPayloadID, "")
+		payloadB.Amount = big.NewInt(200)
+		if err := store.AddWrapRequest(payloadB); err != nil {
+			t.Fatal(err)
+		}
+		staleAckA := baseWrap(replacedPayloadID, "sig-for-A")
+		staleAckA.Amount = big.NewInt(100)
+		if err := store.AcknowledgeWrapRequestSignature(staleAckA, "sig-for-A"); err != nil {
+			t.Fatal(err)
+		}
+		if got, err := store.GetWrapRequestById(replacedPayloadID); err != nil || got == nil || got.Signature != "" || got.SentSignature {
+			t.Fatalf("stale payload ack stamped old signature onto replaced payload: got=%+v err=%v", got, err)
 		}
 
 		// 3. Matching old-sig acknowledgement marks SentSignature=true while

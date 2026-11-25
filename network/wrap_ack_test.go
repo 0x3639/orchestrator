@@ -34,8 +34,8 @@ func TestUpdateWrapRequestReceivePreservesNewerSignatureAndPendingResign(t *test
 			if method == "embedded.bridge.getWrapTokenRequestById" {
 				// Simulate SaveSignedWrapRequest storing a newer signature
 				// right after the RPC read completes.
-				if err := stores.znn.SaveSignedWrapRequest(id, "new-sig"); err != nil {
-					t.Errorf("SaveSignedWrapRequest failed: %v", err)
+				if saved, err := stores.znn.SaveSignedWrapRequest(common.ZnnWrapToOrchestratorWrap(request), "new-sig"); err != nil || !saved {
+					t.Errorf("SaveSignedWrapRequest = (%v, %v), want (true, nil)", saved, err)
 				}
 				return request
 			}

@@ -24,6 +24,8 @@ import (
 
 const addressBookFileName = "address_book.seed"
 
+var errInvalidAddressBook = errors.New("malformed address book")
+
 // secureLocalStateManager implements go-tss's storage.LocalStateManager on top
 // of a single verified, open 0700 directory descriptor. Every key share read
 // and write is anchored via *at syscalls (no pathname reopen, no symlink
@@ -114,7 +116,7 @@ func (s *secureLocalStateManager) RetrieveP2PAddresses() (addr.AddrList, error) 
 		}
 		a, err := ma.NewMultiaddr(el)
 		if err != nil {
-			return nil, fmt.Errorf("invalid address in address book %w", err)
+			return nil, fmt.Errorf("%w: %v", errInvalidAddressBook, err)
 		}
 		peerAddresses = append(peerAddresses, a)
 	}

@@ -214,8 +214,8 @@ func TestSaveSignedWrapRequestSkipsSettledWrap(t *testing.T) {
 	if err := store.ApplyRedeemLog(settledDuringTSS.ChainId, settledDuringTSS.Id, 100, 0, common.RedeemedStatus); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.SaveSignedWrapRequest(settledDuringTSS.Id, "late-sig"); err != nil {
-		t.Fatal(err)
+	if saved, err := store.SaveSignedWrapRequest(settledDuringTSS, "late-sig"); err != nil || saved {
+		t.Fatalf("SaveSignedWrapRequest(settled) = (%v, %v), want (false, nil)", saved, err)
 	}
 	if resign, err := store.GetResignStatus(settledDuringTSS.Id); err != nil || resign {
 		t.Fatalf("expected resign flag cleared for settled wrap, resign=%v err=%v", resign, err)
