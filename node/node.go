@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	wallet2 "github.com/MoonBaZZe/znn-sdk-go/wallet"
+	"maps"
 	"math"
 	"math/big"
 	"net/http"
@@ -25,6 +26,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"slices"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -50,16 +52,27 @@ import (
 	"golang.org/x/crypto/sha3"
 )
 
+type tssParticipantUpdater interface {
+	DeleteLocalPubKey(pubKey string)
+	SetNewLocalPubKeys(newPubKeys []string)
+	GetLocalPubKeys() []string
+	AddWhitelistEntries(peerIDs ...string)
+	DeleteWhitelistEntry(peerID string)
+	ReplaceWhitelist(peerIDs ...string)
+}
+
 type Node struct {
 	config *oconfig.Config
 
 	networksManager *network.NetworksManager
 	dbManager       *manager.Manager
 	tssManager      *tss.TssManager
-	producerKeyPair *wallet.KeyPair
-	ecdsaPrivateKey *ecdsa.PrivateKey
-	evmAddress      ecommon.Address
-	state           *common.GlobalState
+	// participantUpdater overrides tssManager in unit tests.
+	participantUpdater tssParticipantUpdater
+	producerKeyPair    *wallet.KeyPair
+	ecdsaPrivateKey    *ecdsa.PrivateKey
+	evmAddress         ecommon.Address
+	state              *common.GlobalState
 
 	healthRpcServer *http.Server
 	snapshotServer  *http.Server
@@ -69,8 +82,18 @@ type Node struct {
 	// Channel to wait for termination notifications. It is never closed:
 	// some senders (e.g. evmNetwork.requestStop) do not recover from a send
 	// on a closed channel.
-	stopChan chan os.Signal
-	lock     sync.RWMutex
+	stopChan       chan os.Signal
+	lock           sync.RWMutex
+	participantsMu sync.RWMutex
+	// activeKeyPeerIDs and activeKeyPubKeys hold the currently active TSS
+	// key's participant set. bootstrapWhitelist preserves the initial seeded
+	// whitelist when no active key exists yet. Blame exclusions during a new
+	// keygen never drop activeKeyPeerIDs from the shared whitelist until
+	// rotation finishes, so the active key can still form its signing quorum
+	// (e.g. if keygen aborts or an emergency halt interrupts keygen).
+	activeKeyPeerIDs   map[string]bool
+	activeKeyPubKeys   []string
+	bootstrapWhitelist map[string]bool
 	// Signing workers launched by Start; Stop cancels and joins them.
 	workers  signingWorkers
 	stopOnce sync.Once
@@ -600,133 +623,54 @@ func (node *Node) processSignatures() {
 
 			// each round of keyGen will remove nodes that do not participate
 			// we try to keygen until we have min parties threshold
-			var keyGenResponse *keygen.Response
-
 			initialParticipantsLength := node.getParticipantsLength()
 			node.logger.Debug("node.getParticipantsLength(): ", initialParticipantsLength)
 
-			for node.networksManager.Znn().KeyGenThreshold() <= node.getParticipantsLength() {
-				// Do not start another ceremony once Stop has begun.
-				if node.workerStopping() {
-					return
-				}
-				state, err := node.state.GetState()
-				if err != nil {
-					node.logger.Debug("currentState error in processSig")
-					node.logger.Debug(err.Error())
-					time.Sleep(5 * time.Second)
-					continue
-				}
-				if state != common.KeyGenState {
-					node.logger.Info("State no longer keyGen so will exit key generation")
-					keyGenResponse = nil
-					break
-				}
-				keyGenThreshold := node.networksManager.Znn().KeyGenThreshold()
-				node.logger.Debug("keyGenThreshold: ", keyGenThreshold)
-				node.logger.Info("Started ECDSA Keygen")
-				node.logger.Debug("len(node.participatingPubKeys): ", node.getParticipantsLength())
+			keyGenResponse := node.runKeyGenLoop(
+				node.networksManager.Znn().KeyGenThreshold,
+				func() (*keygen.Response, error) {
+					node.logger.Infof("Old party timeout value: %f minutes", node.tssManager.Config().PartyTimeout.Minutes())
+					oldTimeout := node.tssManager.Config().PartyTimeout
+					node.tssManager.SetPartyTimeout(oldTimeout * 2)
+					node.logger.Infof("New party timeout value: %f minutes", node.tssManager.Config().PartyTimeout.Minutes())
 
-				node.logger.Infof("Old party timeout value: %f minutes", node.tssManager.Config().PartyTimeout.Minutes())
-				oldTimeout := node.tssManager.Config().PartyTimeout
-				node.tssManager.SetPartyTimeout(oldTimeout * 2)
-				node.logger.Infof("New party timeout value: %f minutes", node.tssManager.Config().PartyTimeout.Minutes())
-
-				// start the key gen
-				start := time.Now()
-				keyGenResponse, err = node.tssManager.KeyGen(messages.ECDSAKEYGEN)
-				elapsed := time.Since(start)
-				node.logger.Infof("keyGen took %f", elapsed.Seconds())
-				if keyGenResponse != nil {
-					node.logger.Infof("keyGen threshold %d", keyGenResponse.Threshold)
-					node.logger.Infof("KeyGen status: %d (0 NA, 1 Success, 2 Fail)", keyGenResponse.Status)
-				}
-
-				// Set the old party timeout
-				node.tssManager.SetPartyTimeout(oldTimeout)
-				node.logger.Infof("Set party timeout to old value: %f minutes", node.config.TssConfig.BaseConfig.PartyTimeout.Minutes())
-
-				if err != nil {
-					if errors.Is(err, tss.ErrKeyShareSecurity) {
-						node.logger.Errorf("fatal key share security failure after KeyGen: %v", err)
-						common.RequestStop(node.stopChan)
-						return
+					start := time.Now()
+					resp, err := node.tssManager.KeyGen(messages.ECDSAKEYGEN)
+					elapsed := time.Since(start)
+					node.logger.Infof("keyGen took %f", elapsed.Seconds())
+					if resp != nil {
+						node.logger.Infof("keyGen threshold %d", resp.Threshold)
+						node.logger.Infof("KeyGen status: %d (0 NA, 1 Success, 2 Fail)", resp.Status)
 					}
-					node.logger.Debug(err)
-					continue
-				}
 
-				node.logger.Debug("len(node.participatingPubKeys): ", node.getParticipantsLength())
-				p2pWhitelist, partyWhitelist, sigWhitelist := node.tssManager.GetWhitelists()
-				for _, blamedNode := range keyGenResponse.Blame.BlameNodes {
-					node.removeParticipant(blamedNode.Pubkey)
-					node.logger.Debugf("Blamed node pubKey: %s", blamedNode.Pubkey)
-
-					// remove peerId from whitelist
-					pubKeyBytes, err := base64.StdEncoding.DecodeString(blamedNode.Pubkey)
-					if err != nil {
-						node.logger.Debugf("PubKey from blamed node could not be decoded: %s", blamedNode.Pubkey)
-						continue
-					}
-					pub, err := ic.UnmarshalEd25519PublicKey(pubKeyBytes)
-					if err != nil {
-						node.logger.Debugf("PubKey from blamed node could not be unmarshaled: %s", blamedNode.Pubkey)
-						continue
-					}
-					id, err := peer.IDFromPublicKey(pub)
-					if err != nil {
-						node.logger.Debugf("PubKey from blamed node could not be transformed into peerId: %s", blamedNode.Pubkey)
-						continue
-					}
-					p2pWhitelist[id.String()] = false
-					partyWhitelist[id.String()] = false
-					sigWhitelist[id.String()] = false
-				}
-				node.logger.Debug("len(node.participatingPubKeys) after removing blamed nodes: ", node.getParticipantsLength())
-
-				if keyGenThreshold > node.getParticipantsLength() {
-					node.logger.Info("KeyGen threshold was not met")
-					if keyGenResponse.Status == tcommon.Success {
-						if err := node.tssManager.DeleteKeyShare(keyGenResponse.PubKey); err != nil {
-							node.logger.Error(err)
-						}
-					}
-					keyGenResponse = nil
-					break
-				}
-
-				// key gen was generated
-				if keyGenResponse.Status == tcommon.Success {
-					if err := node.tssManager.VerifyKeyShare(keyGenResponse.PubKey); err != nil {
-						node.logger.Errorf("fatal key share security failure after KeyGen: %v", err)
-						common.RequestStop(node.stopChan)
-						return
-					}
-					node.logger.Infof("Generated key: %s", keyGenResponse.PubKey)
-					break
-				} else {
-					// Sleep so we can close current connections
-					if !node.workerSleep(15 * time.Second) {
-						return
-					}
-				}
+					node.tssManager.SetPartyTimeout(oldTimeout)
+					node.logger.Infof("Set party timeout to old value: %f minutes", node.config.TssConfig.BaseConfig.PartyTimeout.Minutes())
+					return resp, err
+				},
+			)
+			if node.workerStopping() {
+				return
 			}
-			// there was en error while trying to keyGen, we retry
-			if keyGenResponse == nil {
-				continue
-			} else if keyGenResponse.Status != tcommon.Success {
+			// If this node did not succeed in generating the replacement key,
+			// do not proceed to old-key rotation signing. There is no separate
+			// on-chain or threshold attestation of keyGenResponse.PubKey:
+			// participating in keygen is what proves the replacement key is a
+			// threshold key rather than a single-party attacker key.
+			if keyGenResponse == nil || keyGenResponse.Status != tcommon.Success {
 				continue
 			}
 
 			// 33 bytes in base64 will always be 44 chars
 			if len(keyGenResponse.PubKey) != 44 {
 				node.logger.Debug("Generated pubKey base64 encoded form length is not 44 characters long")
+				node.restoreActiveKeyParticipants(true)
 				continue
 			}
 
 			decompressedKeyGenPubKey, errDecompress := common.DecompressPubKey(keyGenResponse.PubKey)
 			if errDecompress != nil {
 				node.logger.Debug(errDecompress)
+				node.restoreActiveKeyParticipants(true)
 				continue
 			}
 			// The Zenon contract drops leading zero bytes of X and Y, so such a
@@ -734,14 +678,16 @@ func (node *Node) processSignatures() {
 			// the same key and generates a new one.
 			if accepted, errZenon := common.ZenonAcceptsDecompressedPubKey(decompressedKeyGenPubKey); errZenon != nil || !accepted {
 				node.logger.Infof("Generated pubKey %s cannot be set on the Zenon bridge contract (leading zero coordinate byte), generating a new key", keyGenResponse.PubKey)
-				if err := node.tssManager.DeleteKeyShare(keyGenResponse.PubKey); err != nil {
-					node.logger.Error(err)
-				}
+				node.discardUnusedKeyGen(keyGenResponse)
+				node.restoreActiveKeyParticipants(true)
 				continue
 			}
 
 			if !node.workerSleep(5 * time.Second) {
 				return
+			}
+			if node.abortRotationIfInterrupted("State left keyGen before rotation; aborting rotation, preserving generated share, and restoring active participants") {
+				continue
 			}
 			// we save the old pubKey because we will need it
 			oldKey := node.tssManager.GetPubKey()
@@ -754,96 +700,24 @@ func (node *Node) processSignatures() {
 			// that do not hold the new key; the round does not change them.
 			var keyNotSet error
 			if len(oldKey) != 0 {
-				decompressedOldKey, errDecompress := common.DecompressPubKey(oldKey)
-				if errDecompress != nil {
-					node.logger.Debug(errDecompress)
+				plan, ok := node.prepareKeyRotation(oldKey, keyGenResponse, decompressedKeyGenPubKey, rotationPrepOps{
+					getTssNonce: node.networksManager.GetTssNonceZnn,
+					getChangePubKeyMsg: func(nonce uint64, pubKey string) ([]byte, error) {
+						return implementation.GetChangePubKeyMessage(definition.ChangeTssECDSAPubKeyMethodName, definition.NoMClass, 1, nonce, pubKey)
+					},
+					getEvmMessages:     node.networksManager.GetSetTssEcdsaPubKeysEvmMessages,
+					setActivePubKey:    node.tssManager.SetPubKey,
+					signMessages:       node.signMessages,
+					validateSignatures: node.validateSignatures,
+				})
+				if !ok {
 					continue
 				}
-				// Zenon checks the old-key signature against its own short form of
-				// such a key and rejects it, while the EVM networks would accept it.
-				if accepted, errZenon := common.ZenonAcceptsDecompressedPubKey(decompressedOldKey); errZenon != nil || !accepted {
-					node.logger.Errorf("Active pubKey %s has a leading zero coordinate byte that the Zenon bridge contract cannot verify; the administrator must set the key", oldKey)
-					if err := node.tssManager.DeleteKeyShare(keyGenResponse.PubKey); err != nil {
-						node.logger.Error(err)
-					}
-					continue
-				}
-
-				node.logger.Debug("Old key found")
-				znnTssNonce, err := node.networksManager.GetTssNonceZnn()
-				if err != nil {
-					node.logger.Error(err)
-					continue
-				}
-
-				// ZNN
-				msgsIndexes := make(map[string]int)
-				znnMessage, err := implementation.GetChangePubKeyMessage(definition.ChangeTssECDSAPubKeyMethodName, definition.NoMClass, 1, znnTssNonce, keyGenResponse.PubKey)
-				if err != nil {
-					node.logger.Debug(err)
-					continue
-				}
-				msgsIndexes[base64.StdEncoding.EncodeToString(znnMessage)] = 0
-				messagesToSign := make([][]byte, 0)
-				messagesToSign = append(messagesToSign, znnMessage)
-
-				// EVM messages
-				evmBatch, toSignMessagesEvm, err := node.networksManager.GetSetTssEcdsaPubKeysEvmMessages(keyGenResponse.PubKey)
-				if err != nil {
-					node.logger.Debug(err)
-					continue
-				}
-				for idx, msg := range toSignMessagesEvm {
-					messagesToSign = append(messagesToSign, msg)
-					msgsIndexes[base64.StdEncoding.EncodeToString(msg)] = idx + 1
-				}
-				node.logger.Debug("msg to sign after evm append: ", messagesToSign)
-				// New key sign of messages
-				// we will try to generate a signature using the new key secret shares and validate it
-				node.tssManager.SetPubKey(keyGenResponse.PubKey)
-
-				newKeySignResponse, err := node.signMessages(messagesToSign, msgsIndexes)
-				// Always restore oldKey immediately so a failed or rejected
-				// candidate signing response never leaves the uninstalled key
-				// active locally.
-				node.tssManager.SetPubKey(oldKey)
-				if err != nil {
-					node.logger.Debug(err)
-					node.logger.Debug(" Error after signing with the new generated key 1")
-					continue
-				} else if newKeySignResponse.Status != tcommon.Success {
-					node.logger.Debugf("keySignStatus: %d", newKeySignResponse.Status)
-					node.logger.Debug(" Error after signing with the new generated key 2")
-					continue
-				}
-
-				// Verify all signatures
-				znnNewKeySignature, newKeyFullSignatures, errValidate := node.validateSignatures(newKeySignResponse, decompressedKeyGenPubKey, messagesToSign)
-				if errValidate != nil {
-					node.logger.Info(errValidate.Error())
-					continue
-				}
-				node.logger.Debug("Signatures generated from the new key are valid!")
-
-				// Old key sign of messages
-				oldKeySignResponse, err := node.signMessages(messagesToSign, msgsIndexes)
-				if err != nil {
-					node.logger.Debug(err)
-					node.logger.Debug("Error when trying to sign evm msgs with the old key")
-					continue
-				} else if oldKeySignResponse.Status != tcommon.Success {
-					node.logger.Debugf("keySignStatus: %d", oldKeySignResponse.Status)
-					node.logger.Debug(" Error after signing with the old key 2")
-					continue
-				}
-
-				// Verify all signatures
-				znnOldKeySignature, oldKeyFullSignatures, errValidate := node.validateSignatures(oldKeySignResponse, decompressedOldKey, messagesToSign)
-				if errValidate != nil {
-					node.logger.Debug(errValidate)
-					continue
-				}
-				node.logger.Debug("Signatures generated from the old key are valid!")
+				evmBatch := plan.evmBatch
+				znnOldKeySignature := plan.znnOldKeySignature
+				znnNewKeySignature := plan.znnNewKeySignature
+				oldKeyFullSignatures := plan.oldKeyFullSignatures
+				newKeyFullSignatures := plan.newKeyFullSignatures
 
 				var senders sync.WaitGroup
 				senders.Add(2)
@@ -851,9 +725,9 @@ func (node *Node) processSignatures() {
 				go func() {
 					defer senders.Done()
 					// we take the first base64 char of the signature and transform it to its ascii value
-					index := uint32(int(znnOldKeySignature[0])) % node.getParticipantsLength()
+					turn := uint32(int(znnOldKeySignature[0]))
 					for {
-						index = (index + 1) % node.getParticipantsLength()
+						turn++
 						producerPubKey := base64.StdEncoding.EncodeToString(node.producerKeyPair.Public)
 						bridgeInfo, err := node.networksManager.GetBridgeInfo()
 						if err != nil {
@@ -867,7 +741,7 @@ func (node *Node) processSignatures() {
 						if bridgeInfo.CompressedTssECDSAPubKey == keyGenResponse.PubKey {
 							break
 						}
-						if producerPubKey == node.getParticipant(index) {
+						if selected, ok := node.selectParticipant(turn); ok && producerPubKey == selected {
 							node.logger.Debug("[sendZnnTx PubKey] this is me")
 							err = node.networksManager.ChangeTssEcdsaPubKeyZnn(keyGenResponse.PubKey, znnOldKeySignature, znnNewKeySignature, node.producerKeyPair)
 							if err != nil {
@@ -893,11 +767,11 @@ func (node *Node) processSignatures() {
 
 				go func() {
 					defer senders.Done()
-					index := uint32(int(znnOldKeySignature[0])) % node.getParticipantsLength()
+					turn := uint32(int(znnOldKeySignature[0]))
 					for {
-						index = (index + 1) % node.getParticipantsLength()
+						turn++
 						producerPubKey := base64.StdEncoding.EncodeToString(node.producerKeyPair.Public)
-						if producerPubKey == node.getParticipant(index) {
+						if selected, ok := node.selectParticipant(turn); ok && producerPubKey == selected {
 							node.logger.Debug("[send set tss ecdsa pub key evm tx] this is me")
 							changed, err := node.networksManager.SetTssEcdsaPubKeyEvm(evmBatch, oldKeyFullSignatures, newKeyFullSignatures, keyGenResponse.PubKey, node.ecdsaPrivateKey, node.evmAddress)
 							// Read after senders.Wait.
@@ -999,9 +873,7 @@ func (node *Node) processSignatures() {
 
 			node.logger.Infof("ECDSA KeyGen Response here: %v", keyGenResponse)
 
-			node.config.TssConfig.PublicKey = keyGenResponse.PubKey
-			node.config.TssConfig.DecompressedPublicKey = decompressedKeyGenPubKey
-			node.tssManager.SetPubKey(keyGenResponse.PubKey)
+			node.finalizeKeyRotation(keyGenResponse.PubKey, decompressedKeyGenPubKey)
 			if changed, stateErr := node.state.SetStateIf(common.KeyGenState, common.LiveState); stateErr != nil {
 				node.logger.Info("Could not set state to live after key gen")
 				node.logger.Debug(stateErr)
@@ -1174,17 +1046,17 @@ func (node *Node) processSignatures() {
 			senders.Add(2)
 			go func() {
 				defer senders.Done()
-				index := uint32(int(znnSignature[0])) % node.getParticipantsLength()
+				turn := uint32(int(znnSignature[0]))
 				// The halt flag itself decides: the wait that follows an
 				// unhalt still needs a halt, and a failed read is retried.
 				for !stopSender() {
-					index = (index + 1) % node.getParticipantsLength()
+					turn++
 					halted, ok := node.znnHaltFlag()
 					if ok && halted {
 						return
 					}
 					producerPubKey := base64.StdEncoding.EncodeToString(node.producerKeyPair.Public)
-					if ok && producerPubKey == node.getParticipant(index) {
+					if selected, hasParticipant := node.selectParticipant(turn); ok && hasParticipant && producerPubKey == selected {
 						node.logger.Debug("[send Halt Znn Tx] this is me")
 						// The emergency cannot be released while the
 						// halt is being published.
@@ -1213,11 +1085,11 @@ func (node *Node) processSignatures() {
 
 			go func() {
 				defer senders.Done()
-				index := uint32(int(znnSignature[0])) % node.getParticipantsLength()
+				turn := uint32(int(znnSignature[0]))
 				for !stopSender() {
-					index = (index + 1) % node.getParticipantsLength()
+					turn++
 					producerPubKey := base64.StdEncoding.EncodeToString(node.producerKeyPair.Public)
-					if producerPubKey == node.getParticipant(index) {
+					if selected, ok := node.selectParticipant(turn); ok && producerPubKey == selected {
 						node.logger.Debug("[send halt evm tx] this is me")
 						// todo discuss using concurrent send for different networks with different senders
 						changed, err := node.networksManager.SendHaltEvm(evmBatch, evmFullSignatures, node.ecdsaPrivateKey, node.evmAddress, node.state.WhileEmergency)
@@ -2261,12 +2133,16 @@ func (node *Node) sendSignaturesWrap(seenEventsCount map[string]uint32) {
 		//node.logger.Debugf("Rpc wrap: Id: %s, Signature: %s",
 		//	rpcRequest.Id.String(), rpcRequest.Signature)
 
-		index := uint32(req.Id.Bytes()[31]) % node.getParticipantsLength()
+		seed := uint32(req.Id.Bytes()[31])
 		if seenEventsCount[req.Id.String()] > 2 {
-			index = (index + seenEventsCount[req.Id.String()]) % node.getParticipantsLength()
+			seed += seenEventsCount[req.Id.String()]
 		}
 		seenEventsCount[req.Id.String()] += 1
-		if producerPubKey == node.getParticipant(index) {
+		selected, ok := node.selectParticipant(seed)
+		if !ok {
+			return
+		}
+		if producerPubKey == selected {
 			node.logger.Info("[sendSignaturesWrap] this is me")
 			if err := node.requireLiveTransfers(); err != nil {
 				return
@@ -2340,13 +2216,17 @@ func (node *Node) sendUnwrapRequests(seenEventsCount map[string]uint32) {
 			continue
 		}
 
-		index := uint32(req.TransactionHash.Bytes()[31]) % node.getParticipantsLength()
+		seed := uint32(req.TransactionHash.Bytes()[31])
 		if seenEventsCount[req.TransactionHash.String()] > 2 {
-			index = (index + seenEventsCount[req.TransactionHash.String()]) % node.getParticipantsLength()
+			seed += seenEventsCount[req.TransactionHash.String()]
 		}
 		seenEventsCount[req.TransactionHash.String()] += 1
 		producerPubKey := base64.StdEncoding.EncodeToString(node.producerKeyPair.Public)
-		if producerPubKey == node.getParticipant(index) {
+		selected, ok := node.selectParticipant(seed)
+		if !ok {
+			return
+		}
+		if producerPubKey == selected {
 			node.logger.Info("[sendUnwrapRequests] this is me")
 			if len(req.Signature) == 0 {
 				node.logger.Debug("signature missing")
@@ -2484,7 +2364,14 @@ func (node *Node) haltNetworksAdministrator() {
 // Getters
 
 func (node *Node) SaveConfig() error {
-	return node.state.SaveConfig(func() error { return oconfig.WriteConfig(*node.config) })
+	return node.state.SaveConfig(func() error {
+		node.participantsMu.RLock()
+		cfg := *node.config
+		cfg.TssConfig.LocalPubKeys = slices.Clone(node.config.TssConfig.LocalPubKeys)
+		cfg.TssConfig.PubKeyWhitelist = maps.Clone(node.config.TssConfig.PubKeyWhitelist)
+		node.participantsMu.RUnlock()
+		return oconfig.WriteConfig(cfg)
+	})
 }
 
 func (node *Node) GetConfig() *oconfig.Config {
@@ -2493,14 +2380,28 @@ func (node *Node) GetConfig() *oconfig.Config {
 
 func (node *Node) getParticipantsLength() uint32 {
 	// we know for sure that these pubKeys were in our keyGen, or we don't have the keyGen at all
+	node.participantsMu.RLock()
+	defer node.participantsMu.RUnlock()
 	return uint32(len(node.config.TssConfig.LocalPubKeys))
 }
 
+func (node *Node) selectParticipant(seed uint32) (string, bool) {
+	node.participantsMu.RLock()
+	defer node.participantsMu.RUnlock()
+	if len(node.config.TssConfig.LocalPubKeys) == 0 {
+		return "", false
+	}
+	return node.config.TssConfig.LocalPubKeys[int(seed%uint32(len(node.config.TssConfig.LocalPubKeys)))], true
+}
+
 func (node *Node) getParticipant(index uint32) string {
-	return node.config.TssConfig.LocalPubKeys[index]
+	selected, _ := node.selectParticipant(index)
+	return selected
 }
 
 func (node *Node) getParticipantIndex(pubKey string) int {
+	node.participantsMu.RLock()
+	defer node.participantsMu.RUnlock()
 	for idx, localPubKey := range node.config.TssConfig.LocalPubKeys {
 		if pubKey == localPubKey {
 			return idx
@@ -2705,50 +2606,518 @@ func (node *Node) validateSignatures(response *keysign.Response, pubKey string, 
 	return znnSignature, evmFullSignatures, nil
 }
 
-func (node *Node) removeParticipant(pubKey string) {
-	for idx, localPubKey := range node.config.TssConfig.LocalPubKeys {
-		if localPubKey == pubKey {
-			node.config.TssConfig.LocalPubKeys = append(node.config.TssConfig.LocalPubKeys[:idx], node.config.TssConfig.LocalPubKeys[idx+1:]...)
+func pubKeyToPeerID(pubKey string) (peer.ID, error) {
+	pubKeyBytes, err := base64.StdEncoding.DecodeString(pubKey)
+	if err != nil {
+		return "", fmt.Errorf("decode ed25519 pubkey: %w", err)
+	}
+	return ed25519BytesToPeerID(pubKeyBytes)
+}
+
+func ed25519BytesToPeerID(pubKeyBytes []byte) (peer.ID, error) {
+	pub, err := ic.UnmarshalEd25519PublicKey(pubKeyBytes)
+	if err != nil {
+		return "", fmt.Errorf("unmarshal ed25519 pubkey: %w", err)
+	}
+	id, err := peer.IDFromPublicKey(pub)
+	if err != nil {
+		return "", fmt.Errorf("derive peer id from ed25519 pubkey: %w", err)
+	}
+	return id, nil
+}
+
+func (node *Node) selfPeerID() (string, error) {
+	if node.producerKeyPair != nil && len(node.producerKeyPair.Public) > 0 {
+		id, err := ed25519BytesToPeerID(node.producerKeyPair.Public)
+		if err != nil {
+			return "", err
+		}
+		return id.String(), nil
+	}
+	if node.tssManager != nil {
+		if id := node.tssManager.GetPeerId().String(); id != "" {
+			return id, nil
 		}
 	}
-	delete(node.config.TssConfig.PubKeyWhitelist, pubKey)
-	node.tssManager.DeleteLocalPubKey(pubKey)
-	node.tssManager.DeleteWhitelistEntry(pubKey)
+	return "", errors.New("producer public key is not available")
+}
+
+func (node *Node) participantsBackend() tssParticipantUpdater {
+	if node.participantUpdater != nil {
+		return node.participantUpdater
+	}
+	if node.tssManager != nil {
+		return node.tssManager
+	}
+	return nil
+}
+
+func (node *Node) removeParticipant(pubKey string) {
+	peerID, err := pubKeyToPeerID(pubKey)
+	if err != nil {
+		node.logger.Debugf("PubKey from blamed node could not be transformed into peerId (%s): %v", pubKey, err)
+	}
+	selfPeerID, _ := node.selfPeerID()
+
+	shouldDeleteFromWhitelist := false
+	node.participantsMu.Lock()
+	node.config.TssConfig.LocalPubKeys = slices.DeleteFunc(node.config.TssConfig.LocalPubKeys, func(localPubKey string) bool {
+		return localPubKey == pubKey
+	})
+	if err == nil {
+		peerIDStr := peerID.String()
+		// Retain peers belonging to the currently active TSS key until key
+		// rotation completes so the old key can still reach quorum to sign the
+		// key-change transactions. Blame still excludes them from LocalPubKeys
+		// for the pending keygen.
+		if peerIDStr != selfPeerID && !node.activeKeyPeerIDs[peerIDStr] {
+			delete(node.config.TssConfig.PubKeyWhitelist, peerIDStr)
+			shouldDeleteFromWhitelist = true
+		}
+	}
+	if backend := node.participantsBackend(); backend != nil {
+		backend.DeleteLocalPubKey(pubKey)
+		if shouldDeleteFromWhitelist {
+			backend.DeleteWhitelistEntry(peerID.String())
+		}
+	}
+	node.participantsMu.Unlock()
+}
+
+// finalizeKeyRotation commits the newly rotated TSS public key and prunes the
+// active key participant set and TSS whitelist down to the new key's signers
+// plus self.
+func (node *Node) finalizeKeyRotation(newPubKey, decompressedNewPubKey string) {
+	selfPeerID, _ := node.selfPeerID()
+
+	node.participantsMu.Lock()
+	node.config.TssConfig.PublicKey = newPubKey
+	node.config.TssConfig.DecompressedPublicKey = decompressedNewPubKey
+
+	nextActivePeers := make(map[string]bool, len(node.config.TssConfig.LocalPubKeys))
+	nextWhitelist := make(map[string]bool, len(node.config.TssConfig.LocalPubKeys)+1)
+	if selfPeerID != "" {
+		nextWhitelist[selfPeerID] = true
+	}
+	for _, pubKey := range node.config.TssConfig.LocalPubKeys {
+		peerID, err := pubKeyToPeerID(pubKey)
+		if err != nil {
+			node.logger.Warnf("Skipping invalid participant pubkey during key rotation whitelist prune (%s): %v", pubKey, err)
+			continue
+		}
+		peerIDStr := peerID.String()
+		nextActivePeers[peerIDStr] = true
+		nextWhitelist[peerIDStr] = true
+	}
+	node.activeKeyPeerIDs = nextActivePeers
+	node.activeKeyPubKeys = slices.Clone(node.config.TssConfig.LocalPubKeys)
+	node.bootstrapWhitelist = nil
+	node.config.TssConfig.PubKeyWhitelist = nextWhitelist
+
+	localPubKeys := slices.Clone(node.config.TssConfig.LocalPubKeys)
+	peerIDs := make([]string, 0, len(nextWhitelist))
+	for id := range nextWhitelist {
+		peerIDs = append(peerIDs, id)
+	}
+	if node.tssManager != nil {
+		node.tssManager.SetPubKey(newPubKey)
+	}
+	if backend := node.participantsBackend(); backend != nil {
+		backend.SetNewLocalPubKeys(localPubKeys)
+		backend.ReplaceWhitelist(peerIDs...)
+	}
+	node.participantsMu.Unlock()
+}
+
+// restoreActiveKeyParticipants restores LocalPubKeys and (when
+// pruneNonActiveWhitelist is true) the TSS whitelist to the pre-keygen
+// baseline: the active key's participants when an active key exists, or the
+// bootstrap participant/whitelist baseline when no active key exists yet.
+func (node *Node) restoreActiveKeyParticipants(pruneNonActiveWhitelist bool) {
+	selfPeerID, _ := node.selfPeerID()
+
+	node.participantsMu.Lock()
+	var restoredPubKeys []string
+	if len(node.activeKeyPubKeys) > 0 {
+		restoredPubKeys = slices.Clone(node.activeKeyPubKeys)
+	} else {
+		restoredPubKeys = make([]string, 0)
+	}
+	node.config.TssConfig.LocalPubKeys = restoredPubKeys
+
+	var prunedPeerIDs []string
+	if pruneNonActiveWhitelist {
+		basePeers := node.activeKeyPeerIDs
+		if len(node.activeKeyPubKeys) == 0 {
+			basePeers = node.bootstrapWhitelist
+		}
+		nextWhitelist := make(map[string]bool, len(basePeers)+1)
+		if selfPeerID != "" {
+			nextWhitelist[selfPeerID] = true
+		}
+		for peerID := range basePeers {
+			if peerID != "" {
+				nextWhitelist[peerID] = true
+			}
+		}
+		node.config.TssConfig.PubKeyWhitelist = nextWhitelist
+		prunedPeerIDs = make([]string, 0, len(nextWhitelist))
+		for peerID := range nextWhitelist {
+			prunedPeerIDs = append(prunedPeerIDs, peerID)
+		}
+	}
+	if backend := node.participantsBackend(); backend != nil {
+		backend.SetNewLocalPubKeys(restoredPubKeys)
+		if pruneNonActiveWhitelist {
+			backend.ReplaceWhitelist(prunedPeerIDs...)
+		}
+	}
+	node.participantsMu.Unlock()
+}
+
+type rotationPrepOps struct {
+	getTssNonce        func() (uint64, error)
+	getChangePubKeyMsg func(nonce uint64, pubKey string) ([]byte, error)
+	getEvmMessages     func(pubKey string) (network.EvmBatch, [][]byte, error)
+	setActivePubKey    func(pubKey string)
+	signMessages       func(messagesToSign [][]byte, msgsIndexes map[string]int) (*keysign.Response, error)
+	validateSignatures func(response *keysign.Response, pubKey string, messagesToSign [][]byte) (string, [][]byte, error)
+}
+
+type rotationPlan struct {
+	evmBatch             network.EvmBatch
+	znnOldKeySignature   string
+	znnNewKeySignature   string
+	oldKeyFullSignatures [][]byte
+	newKeyFullSignatures [][]byte
+}
+
+// prepareKeyRotation prepares and signs the Zenon and EVM key-change messages
+// for a replacement key. It checks keygenInterrupted before each RPC/signing
+// boundary and before returning so an emergency halt is never delayed by
+// starting rotation senders, and uses a shared cleanup path to restore the
+// active key and pre-keygen whitelist on any pre-submission abort or error
+// while preserving the generated threshold share on disk in case peers already
+// authorized and submitted the rotation.
+func (node *Node) prepareKeyRotation(oldKey string, keyGenResponse *keygen.Response, decompressedKeyGenPubKey string, ops rotationPrepOps) (plan *rotationPlan, ready bool) {
+	defer func() {
+		if !ready {
+			if ops.setActivePubKey != nil {
+				ops.setActivePubKey(oldKey)
+			}
+			node.restoreActiveKeyParticipants(true)
+		}
+	}()
+
+	if node.keygenInterrupted() {
+		node.logger.Info("State left keyGen before rotation preparation; aborting rotation and preserving generated share")
+		return nil, false
+	}
+
+	decompressedOldKey, errDecompress := common.DecompressPubKey(oldKey)
+	if errDecompress != nil {
+		node.logger.Debug(errDecompress)
+		return nil, false
+	}
+	// Zenon checks the old-key signature against its own short form of
+	// such a key and rejects it, while the EVM networks would accept it.
+	if accepted, errZenon := common.ZenonAcceptsDecompressedPubKey(decompressedOldKey); errZenon != nil || !accepted {
+		node.logger.Errorf("Active pubKey %s has a leading zero coordinate byte that the Zenon bridge contract cannot verify; the administrator must set the key", oldKey)
+		return nil, false
+	}
+
+	node.logger.Debug("Old key found")
+	znnTssNonce, err := ops.getTssNonce()
+	if err != nil {
+		node.logger.Error(err)
+		return nil, false
+	}
+	if node.keygenInterrupted() {
+		node.logger.Info("State left keyGen after nonce lookup; aborting rotation and preserving generated share")
+		return nil, false
+	}
+
+	// ZNN
+	msgsIndexes := make(map[string]int)
+	znnMessage, err := ops.getChangePubKeyMsg(znnTssNonce, keyGenResponse.PubKey)
+	if err != nil {
+		node.logger.Debug(err)
+		return nil, false
+	}
+	msgsIndexes[base64.StdEncoding.EncodeToString(znnMessage)] = 0
+	messagesToSign := [][]byte{znnMessage}
+
+	// EVM messages
+	evmBatch, toSignMessagesEvm, err := ops.getEvmMessages(keyGenResponse.PubKey)
+	if err != nil {
+		node.logger.Debug(err)
+		return nil, false
+	}
+	for idx, msg := range toSignMessagesEvm {
+		messagesToSign = append(messagesToSign, msg)
+		msgsIndexes[base64.StdEncoding.EncodeToString(msg)] = idx + 1
+	}
+	if node.keygenInterrupted() {
+		node.logger.Info("State left keyGen before new-key rotation signing; aborting rotation and preserving generated share")
+		return nil, false
+	}
+	node.logger.Debug("msg to sign after evm append: ", messagesToSign)
+
+	// New key sign of messages
+	ops.setActivePubKey(keyGenResponse.PubKey)
+	newKeySignResponse, err := ops.signMessages(messagesToSign, msgsIndexes)
+	// Restore oldKey immediately so a failed or rejected candidate signing
+	// response never leaves the uninstalled key active locally.
+	ops.setActivePubKey(oldKey)
+	if err != nil {
+		node.logger.Debug(err)
+		node.logger.Debug(" Error after signing with the new generated key 1")
+		return nil, false
+	} else if newKeySignResponse == nil || newKeySignResponse.Status != tcommon.Success {
+		if newKeySignResponse != nil {
+			node.logger.Debugf("keySignStatus: %d", newKeySignResponse.Status)
+		}
+		node.logger.Debug(" Error after signing with the new generated key 2")
+		return nil, false
+	}
+
+	// Verify all new-key signatures
+	znnNewKeySignature, newKeyFullSignatures, errValidate := ops.validateSignatures(newKeySignResponse, decompressedKeyGenPubKey, messagesToSign)
+	if errValidate != nil {
+		node.logger.Info(errValidate.Error())
+		return nil, false
+	}
+	node.logger.Debug("Signatures generated from the new key are valid!")
+
+	// Recheck before old-key signing so an emergency started during new-key
+	// signing does not trigger an unnecessary old-key rotation ceremony.
+	if node.keygenInterrupted() {
+		node.logger.Info("State left keyGen before old-key rotation signing; aborting rotation and preserving generated share")
+		return nil, false
+	}
+
+	// Old key sign of messages
+	oldKeySignResponse, err := ops.signMessages(messagesToSign, msgsIndexes)
+	if err != nil {
+		node.logger.Debug(err)
+		node.logger.Debug("Error when trying to sign evm msgs with the old key")
+		return nil, false
+	} else if oldKeySignResponse == nil || oldKeySignResponse.Status != tcommon.Success {
+		if oldKeySignResponse != nil {
+			node.logger.Debugf("keySignStatus: %d", oldKeySignResponse.Status)
+		}
+		node.logger.Debug(" Error after signing with the old key 2")
+		return nil, false
+	}
+
+	// Verify all old-key signatures
+	znnOldKeySignature, oldKeyFullSignatures, errValidate := ops.validateSignatures(oldKeySignResponse, decompressedOldKey, messagesToSign)
+	if errValidate != nil {
+		node.logger.Debug(errValidate)
+		return nil, false
+	}
+	node.logger.Debug("Signatures generated from the old key are valid!")
+
+	// Final check before launching rotation transaction senders so an emergency
+	// raised during old-key signing is handled immediately without waiting on
+	// rotation submission. Preserve the generated share on disk because peers
+	// may already hold both rotation signatures and submit the key change.
+	if node.keygenInterrupted() {
+		node.logger.Info("State left keyGen before submitting rotation transactions; aborting submission and preserving generated share")
+		return nil, false
+	}
+
+	return &rotationPlan{
+		evmBatch:             evmBatch,
+		znnOldKeySignature:   znnOldKeySignature,
+		znnNewKeySignature:   znnNewKeySignature,
+		oldKeyFullSignatures: oldKeyFullSignatures,
+		newKeyFullSignatures: newKeyFullSignatures,
+	}, true
+}
+
+func (node *Node) keygenInterrupted() bool {
+	if node.state == nil {
+		return false
+	}
+	if node.state.RedeemHaltGeneration() != 0 {
+		return true
+	}
+	state, err := node.state.GetState()
+	return err == nil && state != common.KeyGenState
+}
+
+// abortRotationIfInterrupted checks whether the node has left KeyGenState (or
+// entered an emergency halt) after key generation completed. When interrupted,
+// it restores the active key's participants and prunes temporary keygen
+// candidates from the whitelist while preserving any generated threshold share
+// file on disk in case other peers already activate the key on-chain.
+func (node *Node) abortRotationIfInterrupted(reason string) bool {
+	if !node.keygenInterrupted() {
+		return false
+	}
+	node.logger.Info(reason)
+	node.restoreActiveKeyParticipants(true)
+	return true
+}
+
+func (node *Node) discardUnusedKeyGen(resp *keygen.Response) {
+	if resp == nil || resp.Status != tcommon.Success || resp.PubKey == "" {
+		return
+	}
+	if node.tssManager != nil {
+		if err := node.tssManager.DeleteKeyShare(resp.PubKey); err != nil && !os.IsNotExist(err) {
+			node.logger.Error(err)
+		}
+		return
+	}
+	if node.config == nil || node.config.TssConfig.BaseDir == "" {
+		return
+	}
+	if err := common.DeletePubKeyFile(node.config.TssConfig.BaseDir, resp.PubKey); err != nil && !os.IsNotExist(err) {
+		node.logger.Error(err)
+	}
+}
+
+// runKeyGenLoop runs ECDSA keygen retries until a replacement key succeeds,
+// participants fall below keyGenThreshold, or the node leaves KeyGenState
+// (including an emergency halt transition). Whenever it exits without a usable
+// replacement key, it restores the active key's participants and prunes
+// temporary non-active keygen candidates from the whitelist.
+func (node *Node) runKeyGenLoop(keyGenThresholdFn func() uint32, keyGenFn func() (*keygen.Response, error)) *keygen.Response {
+	for keyGenThresholdFn() <= node.getParticipantsLength() {
+		// Do not start another ceremony once Stop has begun.
+		if node.workerStopping() {
+			return nil
+		}
+		if node.state != nil {
+			if node.state.RedeemHaltGeneration() != 0 {
+				node.logger.Info("Emergency halt active; exiting key generation")
+				node.restoreActiveKeyParticipants(true)
+				return nil
+			}
+			state, err := node.state.GetState()
+			if err != nil {
+				node.logger.Debug("currentState error in processSig")
+				node.logger.Debug(err.Error())
+				if !node.workerSleep(5 * time.Second) {
+					return nil
+				}
+				continue
+			}
+			if state != common.KeyGenState {
+				node.logger.Info("State no longer keyGen so will exit key generation")
+				node.restoreActiveKeyParticipants(true)
+				return nil
+			}
+		}
+
+		keyGenThreshold := keyGenThresholdFn()
+		node.logger.Debug("keyGenThreshold: ", keyGenThreshold)
+		node.logger.Info("Started ECDSA Keygen")
+		node.logger.Debug("len(node.participatingPubKeys): ", node.getParticipantsLength())
+
+		keyGenResponse, err := keyGenFn()
+		if err != nil && errors.Is(err, tss.ErrKeyShareSecurity) {
+			node.logger.Errorf("fatal key share security failure after KeyGen: %v", err)
+			common.RequestStop(node.stopChan)
+			return nil
+		}
+		// Recheck state immediately after KeyGen returns so an emergency halt
+		// or AllowKeyGen cancellation that arrived during the ceremony is never
+		// bypassed by entering rotation. Preserve any generated threshold share
+		// on disk in case other committee members already activate it on-chain.
+		if node.abortRotationIfInterrupted("State left keyGen during ceremony; restoring active participants and preserving generated share") {
+			return nil
+		}
+		if err != nil {
+			node.logger.Debug(err)
+			continue
+		}
+
+		node.logger.Debug("len(node.participatingPubKeys): ", node.getParticipantsLength())
+		if keyGenResponse != nil {
+			for _, blamedNode := range keyGenResponse.Blame.BlameNodes {
+				node.logger.Debugf("Blamed node pubKey: %s", blamedNode.Pubkey)
+				node.removeParticipant(blamedNode.Pubkey)
+			}
+		}
+		node.logger.Debug("len(node.participatingPubKeys) after removing blamed nodes: ", node.getParticipantsLength())
+
+		if keyGenThreshold > node.getParticipantsLength() {
+			node.logger.Info("KeyGen threshold was not met")
+			// Preserve any completed threshold share on disk in case peers that
+			// did not record the same blame activate it on-chain.
+			node.restoreActiveKeyParticipants(true)
+			return nil
+		}
+
+		// key gen was generated
+		if keyGenResponse != nil && keyGenResponse.Status == tcommon.Success {
+			if node.tssManager != nil {
+				if secErr := node.tssManager.VerifyKeyShare(keyGenResponse.PubKey); secErr != nil {
+					node.logger.Errorf("fatal key share security failure after KeyGen: %v", secErr)
+					common.RequestStop(node.stopChan)
+					return nil
+				}
+			}
+			node.logger.Infof("Generated key: %s", keyGenResponse.PubKey)
+			return keyGenResponse
+		}
+		// Sleep so we can close current connections
+		if !node.workerSleep(15 * time.Second) {
+			return nil
+		}
+	}
+	node.restoreActiveKeyParticipants(true)
+	return nil
 }
 
 func (node *Node) allowNewParticipants(pubKeysMap map[string]string) {
-	localPubKeysMap := make(map[string]bool)
+	node.participantsMu.Lock()
+	if node.config.TssConfig.PubKeyWhitelist == nil {
+		node.config.TssConfig.PubKeyWhitelist = make(map[string]bool)
+	}
+	localPubKeysMap := make(map[string]bool, len(node.config.TssConfig.LocalPubKeys)+len(pubKeysMap))
 	for _, pubKey := range node.config.TssConfig.LocalPubKeys {
 		localPubKeysMap[pubKey] = true
 	}
 
-	// we add the new producing pub keys to the whitelist
-	p2pWhitelist, partyWhitelist, sigWhitelist := node.tssManager.GetWhitelists()
-	p2pWhitelist = make(map[string]bool)
-	partyWhitelist = make(map[string]bool)
-	sigWhitelist = make(map[string]bool)
+	// Add the new producing pub keys and peer IDs to the whitelist alongside existing ones.
+	peerIDs := make([]string, 0, len(pubKeysMap))
 	for k, v := range pubKeysMap {
-		// eddsa pubKey
-		localPubKeysMap[k] = true
-		// peer id
-		p2pWhitelist[v] = true
-		partyWhitelist[v] = true
-		sigWhitelist[v] = true
-		// peer id
-		node.config.TssConfig.PubKeyWhitelist[v] = true
+		if k != "" {
+			// eddsa pubKey
+			localPubKeysMap[k] = true
+		}
+		if v != "" {
+			// peer id
+			node.config.TssConfig.PubKeyWhitelist[v] = true
+			peerIDs = append(peerIDs, v)
+		}
 	}
 
-	// reset them
-	node.config.TssConfig.LocalPubKeys = make([]string, 0)
-	for k, _ := range localPubKeysMap {
-		node.config.TssConfig.LocalPubKeys = append(node.config.TssConfig.LocalPubKeys, k)
+	localPubKeys := make([]string, 0, len(localPubKeysMap))
+	for k := range localPubKeysMap {
+		localPubKeys = append(localPubKeys, k)
 	}
-	sort.Strings(node.config.TssConfig.LocalPubKeys)
-	node.tssManager.SetNewLocalPubKeys(node.config.TssConfig.LocalPubKeys)
-	node.logger.Info("node.config.TssConfig.LocalPubKeys: ", node.config.TssConfig.LocalPubKeys)
-	node.logger.Info("node.config.TssConfig.WhiteList: ", node.config.TssConfig.PubKeyWhitelist)
-	node.logger.Info("node.config.TssConfig.LocalPubKeys len: ", len(node.config.TssConfig.LocalPubKeys))
-	node.logger.Info("node.tssManager.GetLocalPubKeys(): ", node.tssManager.GetLocalPubKeys())
+	sort.Strings(localPubKeys)
+	node.config.TssConfig.LocalPubKeys = localPubKeys
+	whitelistSnapshot := maps.Clone(node.config.TssConfig.PubKeyWhitelist)
+	var backendPubKeys []string
+	if backend := node.participantsBackend(); backend != nil {
+		backend.AddWhitelistEntries(peerIDs...)
+		backend.SetNewLocalPubKeys(localPubKeys)
+		backendPubKeys = backend.GetLocalPubKeys()
+	}
+	node.participantsMu.Unlock()
+
+	if backendPubKeys != nil {
+		node.logger.Info("node.tssManager.GetLocalPubKeys(): ", backendPubKeys)
+	}
+	node.logger.Info("node.config.TssConfig.LocalPubKeys: ", localPubKeys)
+	node.logger.Info("node.config.TssConfig.WhiteList: ", whitelistSnapshot)
+	node.logger.Info("node.config.TssConfig.LocalPubKeys len: ", len(localPubKeys))
 }
 
 func (node *Node) openDataDir() error {
@@ -2786,11 +3155,21 @@ func (node *Node) closeDataDir() {
 }
 
 func (node *Node) configurePubKey() error {
-	node.config.TssConfig.LocalPubKeys = make([]string, 0)
-	node.config.TssConfig.PubKeyWhitelist = make(map[string]bool)
 	bridgeInfo, err := node.networksManager.GetBridgeInfo()
 	if err != nil {
 		return err
+	}
+	return node.configurePubKeyFrom(bridgeInfo, node.networksManager.GetPillarPubKeys)
+}
+
+func (node *Node) configurePubKeyFrom(bridgeInfo *definition.BridgeInfoVariable, getPillarPubKeys func() (map[string]string, error)) error {
+	localPubKeys := make([]string, 0)
+	whitelist := make(map[string]bool)
+	activePeers := make(map[string]bool)
+
+	selfPeerID, selfErr := node.selfPeerID()
+	if selfErr == nil && selfPeerID != "" {
+		whitelist[selfPeerID] = true
 	}
 
 	// just try to load the path of the pub key coming from the rpc
@@ -2803,13 +3182,31 @@ func (node *Node) configurePubKey() error {
 		return err
 	}
 	if !found {
-		// 1. we had a hard reset, in this case we can no longer sign be cause we don't have the pubKey files
+		// 1. we had a hard reset, in this case we can no longer sign because we don't have the pubKey files
 		// 2. we have not participated yet in a keyGen ceremony
 		// 3. there was no key gen (bootstrap), in this case participatingPubKeys will be empty
-		// pub key file does not exist, we can only wait for a new key gen
+		// pub key file does not exist, we can only wait for a new key gen.
+		// Seed the whitelist from known pillars plus self so go-tss never starts
+		// with an empty (accept-all) whitelist.
 		node.logger.Infof("key share file %s not found in %s", pubKeyFileName, node.config.TssConfig.BaseDir)
 		node.config.TssConfig.PublicKey = ""
 		node.config.TssConfig.DecompressedPublicKey = ""
+
+		if getPillarPubKeys != nil {
+			pillarPubKeys, pillarErr := getPillarPubKeys()
+			if pillarErr != nil {
+				node.logger.Warnf("Unable to seed initial TSS whitelist from pillar pubkeys: %v", pillarErr)
+			} else {
+				for _, peerID := range pillarPubKeys {
+					if peerID != "" {
+						whitelist[peerID] = true
+					}
+				}
+			}
+		}
+		if len(whitelist) == 0 && selfErr != nil {
+			return fmt.Errorf("cannot seed initial TSS whitelist: %w", selfErr)
+		}
 	} else {
 		participantKeys, err := parseLocalStateParticipantKeys(bytesValue, pubKeyFileName)
 		if err != nil {
@@ -2820,24 +3217,31 @@ func (node *Node) configurePubKey() error {
 
 		for _, publicKey := range participantKeys {
 			node.logger.Info(publicKey)
-			publicKeyBytes, err := base64.StdEncoding.DecodeString(publicKey)
-			if err != nil {
-				return err
-			}
-			pub, err := ic.UnmarshalEd25519PublicKey(publicKeyBytes)
-			if err != nil {
-				return err
-			}
-			peerId, err := peer.IDFromPublicKey(pub)
+			peerId, err := pubKeyToPeerID(publicKey)
 			if err != nil {
 				return err
 			}
 
-			node.config.TssConfig.PubKeyWhitelist[peerId.String()] = true
-			node.config.TssConfig.LocalPubKeys = append(node.config.TssConfig.LocalPubKeys, publicKey)
+			peerIDStr := peerId.String()
+			whitelist[peerIDStr] = true
+			activePeers[peerIDStr] = true
+			localPubKeys = append(localPubKeys, publicKey)
 		}
 	}
-	sort.Strings(node.config.TssConfig.LocalPubKeys)
+	sort.Strings(localPubKeys)
+
+	node.participantsMu.Lock()
+	node.config.TssConfig.LocalPubKeys = localPubKeys
+	node.config.TssConfig.PubKeyWhitelist = whitelist
+	node.activeKeyPeerIDs = activePeers
+	if len(activePeers) > 0 {
+		node.activeKeyPubKeys = slices.Clone(localPubKeys)
+		node.bootstrapWhitelist = nil
+	} else {
+		node.activeKeyPubKeys = nil
+		node.bootstrapWhitelist = maps.Clone(whitelist)
+	}
+	node.participantsMu.Unlock()
 
 	return nil
 }

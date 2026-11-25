@@ -31,6 +31,10 @@ The helper accepts `--data-dir PATH` for the directory that actually contains `e
 
 Save the incident logs and status first. Choose a checkpoint **from before the first missed or disputed event**. A newer one can preserve the same problem. Recover one signer at a time using its own checkpoint from the same bridge deployment.
 
+:::caution Restore only checkpoints you created on your own signer
+Never import or restore a checkpoint produced by another operator or an untrusted host. The SHA-256 manifest verifies file integrity against accidental corruption, **not** origin or authenticity; a tampered checkpoint can alter local event history or scan cursors.
+:::
+
 ```bash
 sudo systemctl stop orchestrator
 sudo -u orchestrator -H orchestrator-checkpoint restore eth-21000000

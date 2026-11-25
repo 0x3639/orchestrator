@@ -6,73 +6,734 @@ on:
       - master
       - cicd
       - dev
+  pull_request:
+    branches:
+      - master
+      - dev
   # Allows you to run this workflow manually from the Actions tab
   workflow_dispatch:
 
+permissions:
+  contents: read
+
+env:
+  GO_VERSION: '1.27.4'
+  GO_LINUX_AMD64_SHA256: '7226736c2339719cda28fbf3a54d71aa63bcefe376e98cef00034268dab24840'
+  # Pinned Ubuntu 20.04 (glibc 2.31) build & smoke-test baseline so release
+  # binaries stay compatible with existing Ubuntu 20.04+ signer hosts.
+  UBUNTU_2004_IMAGE: 'ubuntu@sha256:8feb4d8ca5354def3d8fce243717141ce31e2c428701f6682bd2fafe15388214'
+  # Pinned QEMU binfmt image (tonistiigi/binfmt:qemu-v10.2.3) used only after
+  # binaries are built so no unpinned privileged image runs on the build host.
+  QEMU_BINFMT_IMAGE: 'tonistiigi/binfmt@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0'
+
 jobs:
-  xgo:
-    permissions: write-all
+  test:
+    permissions:
+      contents: read
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v3
-      - name: Install zip utility
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - name: Setup Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - name: Vet
+        run: go vet ./...
+      - name: Test with race detector
+        run: go test -race -count=1 -ldflags '-extldflags=-Wl,--allow-multiple-definition' ./...
+      - name: Vulnerability scan (govulncheck)
         run: |
-          sudo apt update
-          sudo apt install -y zip
+          set -euo pipefail
+          rc=0
+          go run golang.org/x/vuln/cmd/govulncheck@v1.10.0 -format json ./... > /tmp/govulncheck.json || rc=$?
+          if [ "$rc" -ne 0 ] && [ "$rc" -ne 3 ]; then
+            echo "govulncheck failed with exit code $rc" >&2
+            exit "$rc"
+          fi
+          python3 - <<'PY'
+          import json, sys
+
+          # Known upstream-blocked advisories tracked separately:
+          # - go-libp2p v0.11.0 / go-libp2p-kad-dht v0.10.0 are pinned by
+          #   HyperCore-Team/go-tss and require a coordinated upstream go-tss upgrade.
+          # - go-ethereum v1.14.13 is the latest v1.14 release compatible with
+          #   go-zenon v0.0.7-alphanet (v1.15+ breaks go-zenon's metrics.Timer usage);
+          #   these three advisories are in go-ethereum's P2P layer, which the
+          #   orchestrator does not run.
+          ALLOWED_OSVS = {
+              "GO-2022-1148",
+              "GO-2023-2024",
+              "GO-2024-3218",
+              "GO-2026-4314",
+              "GO-2026-4315",
+              "GO-2026-4508",
+          }
+
+          raw = open("/tmp/govulncheck.json", "r", encoding="utf-8").read()
+          if not raw.strip():
+              print("govulncheck produced empty output", file=sys.stderr)
+              sys.exit(1)
+
+          dec = json.JSONDecoder()
+          idx = 0
+          osvs = {}
+          seen = {}
+          while idx < len(raw):
+              while idx < len(raw) and raw[idx].isspace():
+                  idx += 1
+              if idx >= len(raw):
+                  break
+              obj, idx = dec.raw_decode(raw, idx)
+              if "osv" in obj:
+                  osvs[obj["osv"]["id"]] = obj["osv"].get("summary", "")
+              if "finding" in obj:
+                  finding = obj["finding"]
+                  trace = finding.get("trace", [])
+                  # Enforce on reachable symbol-level findings (the default govulncheck mode).
+                  if trace and trace[0].get("function"):
+                      osv_id = finding["osv"]
+                      mod = trace[0].get("module", "stdlib")
+                      ver = trace[0].get("version", "")
+                      fixed = finding.get("fixed_version", "") or "n/a"
+                      seen.setdefault(osv_id, (mod, ver, fixed, osvs.get(osv_id, "")))
+
+          unexpected = []
+          for osv_id, (mod, ver, fixed, summary) in sorted(seen.items()):
+              tag = "ALLOWED" if osv_id in ALLOWED_OSVS else "FAIL"
+              print(f"[{tag}] {osv_id} ({mod}@{ver}, fixed={fixed}): {summary}")
+              if osv_id not in ALLOWED_OSVS:
+                  unexpected.append(osv_id)
+
+          if unexpected:
+              print("Unexpected reachable vulnerabilities found: " + ", ".join(unexpected), file=sys.stderr)
+              sys.exit(1)
+          print(f"\ngovulncheck passed ({len(seen)} known upstream-blocked advisories ignored, 0 unexpected).")
+          PY
+
+  build:
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    outputs:
+      orchestrator_version: ${{ steps.set_version.outputs.orchestrator_version }}
+      artifact_name: ${{ steps.set_version.outputs.artifact_name }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
       - name: Make version
         run: make version
-      - name: Build orchestrator
-        uses: crazy-max/ghaction-xgo@v3.0.0
+      - name: Set version
+        id: set_version
+        run: |
+          ORCHESTRATOR=$(grep Version metadata/version.go | awk -F '"' '{print $2}')
+          # Artifact names may not contain '/', which branch names like fix/x do.
+          # Read from $GITHUB_REF_NAME / $GITHUB_SHA env vars rather than interpolating
+          # expressions into shell source.
+          ARTIFACT_REF=$(printf '%s' "$GITHUB_REF_NAME" | tr -c 'A-Za-z0-9._-' '-')
+          ARTIFACT_NAME="orchestrator-${ORCHESTRATOR}-${ARTIFACT_REF}-${GITHUB_SHA}"
+          echo "orchestrator_version=${ORCHESTRATOR}" >> "$GITHUB_OUTPUT"
+          echo "artifact_name=${ARTIFACT_NAME}" >> "$GITHUB_OUTPUT"
+      - name: Build and verify on Ubuntu 20.04 baseline (Go 1.27.4)
+        env:
+          ORCHESTRATOR_VERSION: ${{ steps.set_version.outputs.orchestrator_version }}
+        run: |
+          set -euo pipefail
+          mkdir -p build
+          docker run --rm \
+            -v "${GITHUB_WORKSPACE}:/src" \
+            -w /src \
+            -e GO_VERSION="${GO_VERSION}" \
+            -e GO_LINUX_AMD64_SHA256="${GO_LINUX_AMD64_SHA256}" \
+            -e ORCHESTRATOR_VERSION="${ORCHESTRATOR_VERSION}" \
+            "${UBUNTU_2004_IMAGE}" \
+            bash -euo pipefail -c '
+              export DEBIAN_FRONTEND=noninteractive
+              apt-get update -qq
+              apt-get install -y -qq ca-certificates curl file binutils binutils-aarch64-linux-gnu gcc gcc-aarch64-linux-gnu >/dev/null
+
+              curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz" -o /tmp/go.tgz
+              echo "${GO_LINUX_AMD64_SHA256}  /tmp/go.tgz" | sha256sum -c -
+              tar -C /usr/local -xzf /tmp/go.tgz
+              export PATH="/usr/local/go/bin:${PATH}"
+              go version
+
+              CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build -v -trimpath -buildvcs=false \
+                -ldflags '\''-extldflags "-Wl,--allow-multiple-definition"'\'' \
+                -o build/orchestrator-linux-amd64 ./main.go
+              CGO_ENABLED=1 GOOS=linux GOARCH=arm64 CC=aarch64-linux-gnu-gcc go build -v -trimpath -buildvcs=false \
+                -ldflags '\''-extldflags "-Wl,--allow-multiple-definition"'\'' \
+                -o build/orchestrator-linux-arm64 ./main.go
+
+              chmod +x build/orchestrator-linux-amd64 build/orchestrator-linux-arm64
+
+              # Verify embedded Go version, ELF architecture, and glibc <= 2.31 ceiling.
+              for bin in build/orchestrator-linux-amd64 build/orchestrator-linux-arm64; do
+                ver=$(go version "$bin")
+                echo "$ver"
+                case "$ver" in
+                  *": go${GO_VERSION}"*) ;;
+                  *)
+                    echo "Binary $bin built with unexpected Go version: $ver (want go${GO_VERSION})" >&2
+                    exit 1
+                    ;;
+                esac
+              done
+              file build/orchestrator-linux-amd64 | tee /dev/stderr | grep -q "x86-64"
+              file build/orchestrator-linux-arm64 | tee /dev/stderr | grep -q "ARM aarch64"
+
+              check_glibc() {
+                local dump_tool="$1" bin="$2"
+                local bad
+                bad=$("$dump_tool" -T "$bin" | grep -oE "GLIBC_[0-9]+\.[0-9]+(\.[0-9]+)?" | sort -Vu | awk -F_ '\''{
+                  split($2, v, ".")
+                  if (v[1] > 2 || (v[1] == 2 && v[2] > 31)) print $0
+                }'\'')
+                if [ -n "$bad" ]; then
+                  echo "Binary $bin requires glibc > 2.31: $bad" >&2
+                  exit 1
+                fi
+              }
+              check_glibc objdump build/orchestrator-linux-amd64
+              check_glibc aarch64-linux-gnu-objdump build/orchestrator-linux-arm64
+            '
+      - name: Set up pinned QEMU for arm64 smoke test
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
         with:
-          xgo_version: latest
-          go_version: 1.22.1
-          dest: build
-          prefix: orchestrator
-          pkg: ./main.go
-          targets: linux/amd64,linux/arm64
-          v: true
-          x: true
-          ldflags: '-extldflags "-Wl,--allow-multiple-definition"'
-          buildvcs: false
-          buildmode: default
-          trimpath: true
-      - name: Add execute flag
+          image: ${{ env.QEMU_BINFMT_IMAGE }}
+          platforms: arm64
+      - name: Smoke-test both binaries on Ubuntu 20.04 (glibc 2.31)
+        env:
+          ORCHESTRATOR_VERSION: ${{ steps.set_version.outputs.orchestrator_version }}
         run: |
-          chmod +x build/*
-      - name: Archive files
+          set -euo pipefail
+          for arch in amd64 arm64; do
+            out=$(docker run --rm --platform "linux/${arch}" \
+              -v "${GITHUB_WORKSPACE}/build:/out:ro" \
+              -e HOME=/tmp/smoke \
+              "${UBUNTU_2004_IMAGE}" \
+              "/out/orchestrator-linux-${arch}" version)
+            echo "=== smoke test linux/${arch} ==="
+            echo "$out"
+            printf '%s\n' "$out" | grep -q "Version:${ORCHESTRATOR_VERSION}"
+            printf '%s\n' "$out" | grep -q "Architecture:${arch}"
+            printf '%s\n' "$out" | grep -q "Go Version:go${GO_VERSION}"
+          done
+      - name: Archive files and generate checksums
         run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq zip >/dev/null
           cd build
           zip orchestrator-linux-amd64.zip orchestrator-linux-amd64
           zip orchestrator-linux-arm64.zip orchestrator-linux-arm64
-          rm orchestrator-linux-amd64
-          rm orchestrator-linux-arm64
-      - name: Generate checksums
-        run: |
-          cd build
+          rm -f orchestrator-linux-amd64 orchestrator-linux-arm64
           sha256sum * | tee SHA256CHECKSUMS.txt
-      - name: Set version
-        run: |
-          ORCHESTRATOR=$(cat metadata/version.go | grep Version | awk -F '"' '{print $2}')
-          echo "ORCHESTRATOR_VERSION=$ORCHESTRATOR" >> $GITHUB_ENV
-          # Artifact names may not contain '/', which branch names like fix/x do.
-          echo "ARTIFACT_REF=$(echo "${{ github.ref_name }}" | tr '/' '-')" >> $GITHUB_ENV
       - name: Upload build artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: orchestrator-${{ env.ORCHESTRATOR_VERSION }}-${{ env.ARTIFACT_REF }}-${{ github.sha }}
+          name: ${{ steps.set_version.outputs.artifact_name }}
           path: build/*
           retention-days: 14
-      # Only master publishes to the versioned release. Test branches such as
-      # dev must never overwrite the released alphanet binaries.
-      - name: Upload files to a GitHub release
-        if: github.ref == 'refs/heads/master'
-        uses: svenstaro/upload-release-action@2.5.0
+
+  # Only master publishes to the versioned release, and only after tests and
+  # builds pass. Publication is serialized per tag and uses an atomic
+  # draft -> upload -> verify -> create/verify git tag -> publish flow pinned
+  # to github.sha so failed uploads never leave a half-published release and
+  # immutable tags are never overwritten or retargeted.
+  release:
+    needs: [test, build]
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/master'
+    permissions:
+      contents: write
+    concurrency:
+      group: release-${{ needs.build.outputs.orchestrator_version }}-alphanet
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    steps:
+      - name: Setup Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
-          repo_token: ${{ secrets.GITHUB_TOKEN }}
-          file: build/*
-          release_name: ${{ env.ORCHESTRATOR_VERSION }}
-          tag: ${{ env.ORCHESTRATOR_VERSION }}-alphanet
-          file_glob: true
-          overwrite: true
-          body: ""
+          go-version: ${{ env.GO_VERSION }}
+      - name: Download build artifacts
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ${{ needs.build.outputs.artifact_name }}
+          path: build
+      - name: Verify release archives, checksums, and Go toolchain
+        run: |
+          set -euo pipefail
+          cd build
+          for f in orchestrator-linux-amd64.zip orchestrator-linux-arm64.zip SHA256CHECKSUMS.txt; do
+            test -s "$f"
+          done
+          checksum_files=$(awk '{print $2}' SHA256CHECKSUMS.txt | sort)
+          expected_checksum_files=$(printf '%s\n' orchestrator-linux-amd64.zip orchestrator-linux-arm64.zip | sort)
+          if [ "$checksum_files" != "$expected_checksum_files" ]; then
+            echo "SHA256CHECKSUMS.txt entries mismatch: got '$checksum_files', want '$expected_checksum_files'" >&2
+            exit 1
+          fi
+          sha256sum -c --strict SHA256CHECKSUMS.txt
+          tmpdir=$(mktemp -d)
+          trap 'rm -rf "$tmpdir"' EXIT
+          unzip -q orchestrator-linux-amd64.zip -d "$tmpdir"
+          unzip -q orchestrator-linux-arm64.zip -d "$tmpdir"
+          for bin in "$tmpdir/orchestrator-linux-amd64" "$tmpdir/orchestrator-linux-arm64"; do
+            ver=$(go version "$bin")
+            echo "$ver"
+            case "$ver" in
+              *": go${GO_VERSION}"*) ;;
+              *)
+                echo "Binary $bin built with unexpected Go version: $ver (want go${GO_VERSION})" >&2
+                exit 1
+                ;;
+            esac
+          done
+      # Automated publication fails closed unless RELEASE_RULESET_AUDIT_TOKEN is
+      # configured with repository ruleset visibility (Administration: write on a
+      # dedicated fine-grained PAT or GitHub App token) so GitHub exposes
+      # bypass_actors and the gate can verify bypass-free tag immutability.
+      # GITHUB_TOKEN is used for all release/tag/asset writes.
+      - name: Publish immutable release (draft, verify, lock tag, publish)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RULESET_AUDIT_TOKEN: ${{ secrets.RELEASE_RULESET_AUDIT_TOKEN }}
+          REPO: ${{ github.repository }}
+          COMMIT_SHA: ${{ github.sha }}
+          RELEASE_NAME: ${{ needs.build.outputs.orchestrator_version }}
+          RELEASE_TAG: ${{ needs.build.outputs.orchestrator_version }}-alphanet
+        run: |
+          python3 - <<'PY'
+          from functools import lru_cache
+          import hashlib
+          import json
+          import os
+          import re
+          import sys
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+
+          token = os.environ["GH_TOKEN"]
+          ruleset_audit_token = os.environ.get("RULESET_AUDIT_TOKEN", "").strip()
+          repo = os.environ["REPO"]
+          commit_sha = os.environ["COMMIT_SHA"]
+          release_name = os.environ["RELEASE_NAME"]
+          release_tag = os.environ["RELEASE_TAG"]
+          expected_files = [
+              "orchestrator-linux-amd64.zip",
+              "orchestrator-linux-arm64.zip",
+              "SHA256CHECKSUMS.txt",
+          ]
+
+          api_base = f"https://api.github.com/repos/{repo}"
+          upload_base = f"https://uploads.github.com/repos/{repo}"
+
+          def api_req(method, url, body=None, content_type="application/json", auth_token=None):
+              headers = {
+                  "Authorization": f"Bearer {auth_token or token}",
+                  "Accept": "application/vnd.github+json",
+                  "X-GitHub-Api-Version": "2022-11-28",
+                  "User-Agent": "orchestrator-release-workflow",
+              }
+              data = None
+              if body is not None:
+                  headers["Content-Type"] = content_type
+                  data = json.dumps(body).encode("utf-8") if content_type == "application/json" else body
+              req = urllib.request.Request(url, data=data, headers=headers, method=method)
+              try:
+                  with urllib.request.urlopen(req) as resp:
+                      raw = resp.read()
+                      return resp.status, (json.loads(raw.decode("utf-8")) if raw else None)
+              except urllib.error.HTTPError as e:
+                  err_body = e.read().decode("utf-8", errors="replace")
+                  return e.code, err_body
+
+          def resolve_tag_commit(tag):
+              status, data = api_req("GET", f"{api_base}/git/ref/tags/{urllib.parse.quote(tag, safe='')}")
+              if status == 404:
+                  return None
+              if status != 200:
+                  raise RuntimeError(f"failed to inspect tag {tag}: HTTP {status}: {data}")
+              obj = data["object"]
+              if obj["type"] == "tag":
+                  status2, tag_obj = api_req("GET", obj["url"])
+                  if status2 != 200:
+                      raise RuntimeError(f"failed to peel annotated tag {tag}: HTTP {status2}: {tag_obj}")
+                  return tag_obj["object"]["sha"]
+              return obj["sha"]
+
+          def match_github_ref_pattern(ref, pat, conservative_on_unknown=False):
+              """Match GitHub ruleset ref_name patterns using Ruby File::FNM_PATHNAME semantics.
+
+              GitHub evaluates ruleset patterns with Ruby's File.fnmatch(..., File::FNM_PATHNAME)
+              without FNM_EXTGLOB, FNM_CASEFOLD, or FNM_DOTMATCH:
+                - '*' and '?' never cross '/' and do not match a leading '.' in a segment.
+                - '**/' (as a full non-final segment) matches zero or more non-dot segments;
+                  trailing '/**' or embedded '**' matches only within a single segment.
+                - Unverifiable syntax (escapes '\\', character classes '[...]', braces '{...}',
+                  or unknown '~' tokens) fails closed: False for include, True for exclude.
+              """
+              if not isinstance(pat, str) or not pat:
+                  return conservative_on_unknown
+              if pat == "~ALL":
+                  return True
+              if pat.startswith("~") or any(ch in pat for ch in ("\\", "[", "]", "{", "}")):
+                  return conservative_on_unknown
+
+              ref_segs = ref.split("/")
+              pat_segs = pat.split("/")
+
+              def match_seg(p_seg, r_seg):
+                  if r_seg.startswith(".") and not p_seg.startswith("."):
+                      return False
+                  regex = "^" + "".join(
+                      ".*" if ch == "*" else "." if ch == "?" else re.escape(ch)
+                      for ch in p_seg
+                  ) + "$"
+                  return re.match(regex, r_seg, flags=re.DOTALL) is not None
+
+              @lru_cache(maxsize=None)
+              def dp(pi, ri):
+                  if pi == len(pat_segs) and ri == len(ref_segs):
+                      return True
+                  if pi == len(pat_segs):
+                      return False
+                  if pat_segs[pi] == "**" and pi + 1 < len(pat_segs):
+                      if dp(pi + 1, ri):
+                          return True
+                      if ri < len(ref_segs) and not ref_segs[ri].startswith("."):
+                          return dp(pi, ri + 1)
+                      return False
+                  if ri == len(ref_segs):
+                      return False
+                  return match_seg(pat_segs[pi], ref_segs[ri]) and dp(pi + 1, ri + 1)
+
+              return dp(0, 0)
+
+          def matches_ref_patterns(ref, patterns, conservative_on_unknown=False):
+              for pat in patterns or []:
+                  if match_github_ref_pattern(ref, pat, conservative_on_unknown=conservative_on_unknown):
+                      return True
+              return False
+
+          def require_tag_protection_ruleset(tag):
+              """Require verifiable, bypass-free GitHub tag ruleset protection blocking update and deletion on refs/tags/<tag>."""
+              full_ref = f"refs/tags/{tag}"
+              if not ruleset_audit_token:
+                  raise RuntimeError(
+                      f"RELEASE_RULESET_AUDIT_TOKEN secret is not configured; cannot verify bypass_actors on {full_ref} "
+                      "(GitHub hides bypass_actors from GITHUB_TOKEN). Keeping verified draft private. Configure "
+                      "RELEASE_RULESET_AUDIT_TOKEN with repository ruleset access and an active bypass-free Tag Ruleset "
+                      "blocking update and deletion on refs/tags/*-alphanet before automated publication."
+                  )
+              protected_rules = set()
+              unverifiable_reasons = []
+              page = 1
+              while True:
+                  status, rulesets = api_req(
+                      "GET",
+                      f"{api_base}/rulesets?includes_parents=true&per_page=100&page={page}",
+                      auth_token=ruleset_audit_token,
+                  )
+                  if status != 200:
+                      raise RuntimeError(
+                          f"failed to query repository tag rulesets (HTTP {status}: {rulesets}); "
+                          "refusing to publish without verified tag immutability protection"
+                      )
+                  if not rulesets:
+                      break
+                  for summary in rulesets:
+                      if summary.get("enforcement") != "active" or summary.get("target") != "tag":
+                          continue
+                      detail_status, detail = api_req(
+                          "GET",
+                          f"{api_base}/rulesets/{summary['id']}",
+                          auth_token=ruleset_audit_token,
+                      )
+                      if detail_status != 200:
+                          raise RuntimeError(
+                              f"failed to read tag ruleset {summary['id']} (HTTP {detail_status}: {detail})"
+                          )
+                      if detail.get("enforcement") != "active" or detail.get("target") != "tag":
+                          continue
+                      ref_cond = (detail.get("conditions") or {}).get("ref_name") or {}
+                      if not matches_ref_patterns(full_ref, ref_cond.get("include"), conservative_on_unknown=False):
+                          continue
+                      if matches_ref_patterns(full_ref, ref_cond.get("exclude"), conservative_on_unknown=True):
+                          continue
+                      bypass_actors = detail.get("bypass_actors")
+                      if not isinstance(bypass_actors, list):
+                          unverifiable_reasons.append(
+                              f"ruleset {summary['id']} ({detail.get('name', 'unnamed')}) did not expose bypass_actors to this token"
+                          )
+                          continue
+                      if len(bypass_actors) > 0:
+                          unverifiable_reasons.append(
+                              f"ruleset {summary['id']} ({detail.get('name', 'unnamed')}) allows {len(bypass_actors)} bypass actor(s)"
+                          )
+                          continue
+                      for rule in detail.get("rules") or []:
+                          rtype = rule.get("type")
+                          if rtype in ("update", "deletion"):
+                              protected_rules.add(rtype)
+                  if len(rulesets) < 100:
+                      break
+                  page += 1
+
+              missing = sorted({"update", "deletion"} - protected_rules)
+              if missing:
+                  detail_msg = f" ({'; '.join(unverifiable_reasons)})" if unverifiable_reasons else ""
+                  raise RuntimeError(
+                      f"no verifiable bypass-free GitHub tag ruleset blocks {', '.join(missing)} on {full_ref}{detail_msg}; "
+                      "keeping verified draft private. Configure an active repository Tag Ruleset with no bypass actors "
+                      "blocking updates and deletions on refs/tags/*-alphanet (and ensure the workflow token can inspect "
+                      "bypass_actors) before automated publication."
+                  )
+              print(f"Verified active bypass-free tag ruleset blocks update and deletion on {full_ref}")
+
+          def require_immutable_releases_enabled():
+              """Require GitHub Immutable Releases to be enabled on the repository before publishing."""
+              if not ruleset_audit_token:
+                  raise RuntimeError(
+                      "RELEASE_RULESET_AUDIT_TOKEN secret is not configured; cannot verify repository immutable releases "
+                      "setting. Keeping verified draft private."
+                  )
+              status, data = api_req(
+                  "GET",
+                  f"{api_base}/immutable-releases",
+                  auth_token=ruleset_audit_token,
+              )
+              if status != 200 or not isinstance(data, dict) or data.get("enabled") is not True:
+                  raise RuntimeError(
+                      f"GitHub Immutable Releases are not enabled or unverifiable on {repo} "
+                      f"(HTTP {status}: {data}); keeping verified draft private. Enable Immutable Releases in "
+                      "repository settings (Settings -> General -> Releases) before automated publication."
+                  )
+              print(f"Verified GitHub Immutable Releases are enabled on {repo}")
+
+          def ensure_tag_points_to_commit(tag, expected_sha):
+              """Atomically create refs/tags/<tag> at expected_sha if absent, or verify it resolves to expected_sha."""
+              status, data = api_req(
+                  "POST",
+                  f"{api_base}/git/refs",
+                  {"ref": f"refs/tags/{tag}", "sha": expected_sha},
+              )
+              if status == 201:
+                  print(f"Created git tag {tag} at {expected_sha}")
+                  return
+              if status != 422:
+                  raise RuntimeError(f"failed to create git tag {tag}: HTTP {status}: {data}")
+              resolved = resolve_tag_commit(tag)
+              if resolved != expected_sha:
+                  raise RuntimeError(
+                      f"git tag {tag} already resolves to {resolved}, "
+                      f"refusing to publish binaries built from {expected_sha}"
+                  )
+              print(f"Verified existing git tag {tag} resolves to {expected_sha}")
+
+          # Load expected release payloads, sizes, and SHA-256 digests upfront so
+          # both same-commit published retries and draft/published verifications
+          # validate against the exact local build artifacts.
+          expected_payloads = {}
+          expected_sizes = {}
+          expected_digests = {}
+          for fname in expected_files:
+              fpath = os.path.join("build", fname)
+              payload = open(fpath, "rb").read()
+              expected_payloads[fname] = payload
+              expected_sizes[fname] = len(payload)
+              expected_digests[fname] = f"sha256:{hashlib.sha256(payload).hexdigest()}"
+
+          def verify_release_assets(release_obj, label):
+              raw_assets = release_obj.get("assets") or []
+              attached = {}
+              for asset in raw_assets:
+                  name = asset.get("name")
+                  if name in attached:
+                      raise RuntimeError(f"{label} contains duplicate asset name {name!r}")
+                  attached[name] = asset
+              if set(attached.keys()) != set(expected_files):
+                  raise RuntimeError(
+                      f"{label} asset set mismatch: got {sorted(attached.keys())}, want {sorted(expected_files)}"
+                  )
+              for fname in expected_files:
+                  asset = attached[fname]
+                  want_size = expected_sizes[fname]
+                  want_digest = expected_digests[fname]
+                  if (
+                      asset.get("state") != "uploaded"
+                      or asset.get("size") != want_size
+                      or asset.get("digest") != want_digest
+                  ):
+                      raise RuntimeError(
+                          f"{label} asset verification failed for {fname}: "
+                          f"got state={asset.get('state')!r} size={asset.get('size')!r} digest={asset.get('digest')!r}, "
+                          f"want state='uploaded' size={want_size} digest={want_digest!r}"
+                      )
+
+          # 1. If a published (non-draft) release already exists for this tag, never overwrite it,
+          #    and refuse to report success if the existing release is mutable. On a same-commit
+          #    retry (e.g. after a dropped publish PATCH response), verify tag binding and all
+          #    published asset digests against the build artifacts before succeeding.
+          status, published = api_req("GET", f"{api_base}/releases/tags/{urllib.parse.quote(release_tag, safe='')}")
+          if status == 200:
+              if published.get("immutable") is not True:
+                  raise RuntimeError(
+                      f"existing published release {release_tag} is not immutable (immutable={published.get('immutable')!r}); "
+                      "refusing to report success for a mutable release"
+                  )
+              tag_sha = resolve_tag_commit(release_tag)
+              if tag_sha == commit_sha:
+                  if published.get("tag_name") != release_tag:
+                      raise RuntimeError(
+                          f"existing published release tag_name={published.get('tag_name')!r} != {release_tag!r}"
+                      )
+                  verify_release_assets(published, f"existing immutable release {release_tag}")
+              print(
+                  f"::notice::Release {release_tag} is already published and immutable (tag SHA: {tag_sha}); "
+                  "skipping upload to preserve immutable release assets. Bump metadata/version.go to publish a new release."
+              )
+              sys.exit(0)
+          elif status != 404:
+              raise RuntimeError(f"failed to check published release {release_tag}: HTTP {status}: {published}")
+
+          # 2. If the git tag already exists without a published release, verify it points to this exact commit.
+          existing_tag_sha = resolve_tag_commit(release_tag)
+          if existing_tag_sha is not None and existing_tag_sha != commit_sha:
+              raise RuntimeError(
+                  f"git tag {release_tag} already resolves to {existing_tag_sha}, "
+                  f"refusing to publish binaries built from {commit_sha}"
+              )
+
+          # 2b. Verify repository immutability and tag-ruleset prerequisites BEFORE
+          #     creating or mutating any draft so missing configuration never leaves
+          #     an orphaned draft reserving this version. (Re-checked again right
+          #     before publication in step 6.)
+          require_immutable_releases_enabled()
+          require_tag_protection_ruleset(release_tag)
+
+          # 3. Find an existing draft for this tag (or create one tied to commit_sha).
+          drafts = []
+          page = 1
+          while True:
+              status, rels = api_req("GET", f"{api_base}/releases?per_page=100&page={page}")
+              if status != 200:
+                  raise RuntimeError(f"failed to list releases: HTTP {status}: {rels}")
+              if not rels:
+                  break
+              for rel in rels:
+                  if rel.get("draft") and rel.get("tag_name") == release_tag:
+                      drafts.append(rel)
+              if len(rels) < 100:
+                  break
+              page += 1
+
+          if len(drafts) > 1:
+              raise RuntimeError(f"found {len(drafts)} draft releases for {release_tag}; clean up duplicates before retrying")
+
+          if len(drafts) == 1:
+              draft = drafts[0]
+              if draft.get("target_commitish") != commit_sha:
+                  raise RuntimeError(
+                      f"existing draft release for {release_tag} targets {draft.get('target_commitish')}, "
+                      f"refusing to mix assets from {commit_sha}"
+                  )
+              draft_id = draft["id"]
+              print(f"Resuming existing draft release {draft_id} for {release_tag} at {commit_sha}")
+          else:
+              status, draft = api_req(
+                  "POST",
+                  f"{api_base}/releases",
+                  {
+                      "tag_name": release_tag,
+                      "target_commitish": commit_sha,
+                      "name": release_name,
+                      "body": "",
+                      "draft": True,
+                      "prerelease": False,
+                  },
+              )
+              if status != 201:
+                  raise RuntimeError(f"failed to create draft release {release_tag}: HTTP {status}: {draft}")
+              draft_id = draft["id"]
+              print(f"Created draft release {draft_id} for {release_tag} at {commit_sha}")
+
+          # 4. Remove any pre-existing assets on a resumed draft (including any
+          #    unexpected extra files), then upload the exact expected asset set.
+          for stale in draft.get("assets", []):
+              asset_id = stale["id"]
+              del_status, del_data = api_req("DELETE", f"{api_base}/releases/assets/{asset_id}")
+              if del_status != 204:
+                  raise RuntimeError(
+                      f"failed to remove stale draft asset {stale.get('name')} ({asset_id}): HTTP {del_status}: {del_data}"
+                  )
+          for fname in expected_files:
+              payload = expected_payloads[fname]
+              up_url = f"{upload_base}/releases/{draft_id}/assets?name={urllib.parse.quote(fname)}"
+              up_status, up_data = api_req("POST", up_url, body=payload, content_type="application/octet-stream")
+              if up_status != 201:
+                  raise RuntimeError(f"failed to upload {fname} to draft {draft_id}: HTTP {up_status}: {up_data}")
+              print(f"Uploaded {fname} ({len(payload)} bytes, {expected_digests[fname]}) to draft {draft_id}")
+
+          # 5. Verify draft metadata and exact asset set + SHA-256 digests before touching the git tag or publishing.
+          status, verified = api_req("GET", f"{api_base}/releases/{draft_id}")
+          if status != 200:
+              raise RuntimeError(f"failed to re-read draft {draft_id}: HTTP {status}: {verified}")
+          if not verified.get("draft"):
+              raise RuntimeError(f"release {draft_id} is unexpectedly already published")
+          if verified.get("tag_name") != release_tag:
+              raise RuntimeError(
+                  f"draft {draft_id} tag_name={verified.get('tag_name')!r} != {release_tag!r}"
+              )
+          if verified.get("target_commitish") != commit_sha:
+              raise RuntimeError(
+                  f"draft {draft_id} target_commitish={verified.get('target_commitish')} != {commit_sha}"
+              )
+          verify_release_assets(verified, f"draft {draft_id}")
+
+          # 6. Require BOTH GitHub Immutable Releases (so published release assets
+          #    and metadata cannot be modified) and an active bypass-free tag
+          #    ruleset blocking update and deletion on refs/tags/<release_tag>
+          #    BEFORE creating the tag or publishing.
+          require_immutable_releases_enabled()
+          require_tag_protection_ruleset(release_tag)
+
+          # 7. Atomically create or verify refs/tags/<release_tag> == commit_sha BEFORE publishing.
+          #    If another actor created the tag at a different commit during asset upload, this
+          #    aborts while the release is still a private draft instead of publishing against a
+          #    mismatched tag.
+          ensure_tag_points_to_commit(release_tag, commit_sha)
+
+          # 8. Atomically publish the verified draft bound explicitly to the
+          #    protected, verified release_tag and commit_sha, and verify that
+          #    GitHub marked the published release immutable with the exact
+          #    expected tag and asset digests.
+          status, pub = api_req(
+              "PATCH",
+              f"{api_base}/releases/{draft_id}",
+              {"draft": False, "tag_name": release_tag, "target_commitish": commit_sha},
+          )
+          if status != 200 or pub.get("draft"):
+              raise RuntimeError(f"failed to publish draft {draft_id}: HTTP {status}: {pub}")
+          if pub.get("tag_name") != release_tag:
+              raise RuntimeError(
+                  f"published release {draft_id} tag_name={pub.get('tag_name')!r} != {release_tag!r}"
+              )
+          if pub.get("target_commitish") != commit_sha:
+              raise RuntimeError(
+                  f"published release {draft_id} target_commitish={pub.get('target_commitish')!r} != {commit_sha!r}"
+              )
+          if pub.get("immutable") is not True:
+              raise RuntimeError(
+                  f"published release {release_tag} ({draft_id}) is not immutable (immutable={pub.get('immutable')!r}); "
+                  "enable GitHub Immutable Releases on this repository"
+              )
+          verify_release_assets(pub, f"published release {release_tag} ({draft_id})")
+
+          final_tag_sha = resolve_tag_commit(release_tag)
+          if final_tag_sha != commit_sha:
+              raise RuntimeError(f"published tag {release_tag} resolved to {final_tag_sha}, expected {commit_sha}")
+          print(f"Published immutable release {release_tag} ({draft_id}) at {final_tag_sha}")
+          PY
