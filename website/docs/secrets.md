@@ -36,11 +36,17 @@ Ownership is checked by exact user id. Running as root against a directory owned
 
 ## The signer's EVM address
 
-The producer key also derives this signer's EVM private key. Its address is written to `config.json` as `EvmAddress` and reported by the [health API](health-api.md). When this signer is selected to submit a bridge halt on an EVM network, the transaction is sent from this address, so it **must hold gas** on every bridged EVM network. A signer whose balance is empty cannot submit when selected, which delays the halt until another signer is chosen. Fund it after the first start and include its balance in monitoring; see [Security model](security-model.md).
+The producer key also derives this signer's EVM private key directly as `keccak256(keystore.Entropy)` with **no derivation path or domain separation tag**. Anyone who holds the producer keystore's mnemonic (or underlying entropy) holds this EVM private key regardless of `ProducerIndex`. Keep the producer mnemonic dedicated solely to this signer—do not reuse it for other wallets, Pillar collateral, or unrelated funds.
+
+Its address is written to `config.json` as `EvmAddress` and reported by the [health API](health-api.md). When this signer is selected to submit a bridge halt on an EVM network, the transaction is sent from this address, so it **must hold gas** on every bridged EVM network. A signer whose balance is empty cannot submit when selected, which delays the halt until another signer is chosen. Fund it after the first start and include its balance in monitoring; see [Security model](security-model.md).
 
 ## Back up the TSS share
 
 `~/.orchestrator/tss` holds this signer's share of the group key, produced during key generation. Back it up to a second secure location as soon as a key generation completes. A signer that loses its share cannot sign until the next key generation ceremony, and a group that loses too many shares cannot sign at all. Back up the producer key file with the same care. Never back up the passphrase alongside either.
+
+:::warning Rotate pre-2023-09-05 (BitForge-era) TSS keys
+Check the keygen momentum height and date of the active TSS public key. Key shares generated before **2023-09-05** (prior to the BitForge / CVE-2023-33241 fix in `HyperCore-Team/tss-lib`) must be rotated via a fresh key generation ceremony; upgrading the orchestrator binary alone does not remediate key shares produced by an unpatched build.
+:::
 
 ## What appears in logs
 

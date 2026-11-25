@@ -42,6 +42,12 @@ The administrator can halt any network unilaterally; ordinary signers halt only 
 - **The administrator** manages the bridge: networks, tokens, parameters, halting and unhalting. It cannot move funds. Its actions are subject to time challenges.
 - **Guardians** are elected community members who act only in an emergency. If the bridge enters the emergency state the administrator address becomes null, and the guardians vote a new one in; a candidate needs more than half of all guardians.
 
+## Network and TSS key hardening
+
+- **Firewall TCP port `55055` to known Pillar IPs.** The embedded `HyperCore-Team/go-tss` dependency still pins `go-libp2p v0.11.0` and `go-libp2p-kad-dht v0.10.0`, which carry upstream resource-exhaustion and DHT advisories that require a coordinated `go-tss` upgrade. Until that upgrade ships, restrict inbound TCP `55055` at your host or network firewall to known Pillar signer IP addresses rather than leaving the port open to `0.0.0.0/0`.
+- **Check keygen height and rotate pre-2023-09-05 keys.** Verify the momentum height and date at which the active TSS public key was generated. Any key generated before **2023-09-05** (before the BitForge / CVE-2023-33241 patch in `HyperCore-Team/tss-lib`) should be rotated via a fresh key generation ceremony; upgrading the orchestrator binary alone does not remediate key shares created by unpatched builds.
+- **Isolate the producer mnemonic.** The signer's EVM key is derived directly as `keccak256(keystore.Entropy)` with no derivation path or domain tag, so anyone holding the producer mnemonic controls the signer's EVM key; see [Producer key and passphrase](secrets.md#the-signers-evm-address).
+
 ## What to monitor
 
 Every operator is expected to run their own monitoring rather than rely on a shared one, because heterogeneous monitoring is more likely to catch fraud. Cover at least:

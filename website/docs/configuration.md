@@ -78,7 +78,7 @@ Network entries are read wholesale, so an entry that omits `RpcRequestsPerSecond
 
 | Field | Default | Meaning |
 | --- | --- | --- |
-| `Port` | `55055` | libp2p port for TSS peers. Must be reachable by the other signers. |
+| `Port` | `55055` | libp2p port for TSS peers. Must be reachable by the other signers; firewall inbound access to known Pillar IPs until `go-tss`/`go-libp2p` is upgraded. |
 | `Bootstrap` | empty | Multiaddr of a peer to bootstrap from. |
 | `BaseDir` | `~/.orchestrator/tss` | Where key shares are stored. Independent of `DataPath`. |
 | `PublicKey`, `DecompressedPublicKey`, `LocalPubKeys`, `PubKeyWhitelist` | managed | Written by the orchestrator after key generation. Do not edit. |
