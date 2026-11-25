@@ -1855,10 +1855,14 @@ type confirmedTokenPair struct {
 	minAmount     *big.Int
 }
 
-// resolveConfirmedTokenPairAtReceive walks backward along the confirmed,
-// PreviousHash-linked bridge account chain strictly below wrapRecv to find the
-// active TokenPair (TokenAddress, FeePercentage, Bridgeable, MinAmount) in
-// effect when wrapRecv executed WrapToken.
+// resolveConfirmedTokenPairAtReceive replays the confirmed, PreviousHash-linked
+// bridge account chain strictly below wrapRecv (heights 1..wrapRecv.Height-1)
+// to reconstruct the applied TokenPair state in effect when wrapRecv executed
+// WrapToken. Because SetTokenPair uses go-zenon's two-step TimeChallenge (first
+// accepted call starts/replaces the challenge without mutating TokenPairs; the
+// matching second accepted call completes the challenge and applies the update),
+// replaying in chronological order distinguishes uncompleted proposals from
+// applied pair updates.
 func (node *Node) resolveConfirmedTokenPairAtReceive(networkClass, chainID uint32, tokenStandard types.ZenonTokenStandard, wrapRecv *api.AccountBlock, resignGen uint64) (pair confirmedTokenPair, found, stale, stop bool) {
 	if wrapRecv == nil || wrapRecv.Height <= 1 {
 		return confirmedTokenPair{}, false, false, false
@@ -1873,7 +1877,12 @@ func (node *Node) resolveConfirmedTokenPairAtReceive(networkClass, chainID uint3
 			(len(data) >= len(setNetID) && bytes.Equal(data[:len(setNetID)], setNetID)) ||
 			(len(data) >= len(removeNetID) && bytes.Equal(data[:len(removeNetID)], removeNetID))
 	}
+	type netKey struct {
+		class uint32
+		chain uint32
+	}
 
+	targetHeight := wrapRecv.Height - 1
 	for {
 		if node.workerStopping() {
 			return confirmedTokenPair{}, false, false, true
@@ -1882,20 +1891,22 @@ func (node *Node) resolveConfirmedTokenPairAtReceive(networkClass, chainID uint3
 			return confirmedTokenPair{}, false, true, false
 		}
 
-		expectedHash := wrapRecv.PreviousHash
-		hi := wrapRecv.Height - 1
+		var prevHash types.Hash
+		var pendingSetPairHash types.Hash
+		pairsByNet := make(map[netKey][]definition.TokenPair)
 		needRetry := false
 		rolledBack := false
-		for hi >= 1 {
+
+		for lo := uint64(1); lo <= targetHeight; {
 			if node.workerStopping() {
 				return confirmedTokenPair{}, false, false, true
 			}
 			if !node.state.IsResignGenerationCurrent(resignGen) {
 				return confirmedTokenPair{}, false, true, false
 			}
-			lo := uint64(1)
-			if hi > api.RpcMaxCountSize {
-				lo = hi - api.RpcMaxCountSize + 1
+			hi := lo + api.RpcMaxCountSize - 1
+			if hi > targetHeight {
+				hi = targetHeight
 			}
 			count := hi - lo + 1
 
@@ -1915,18 +1926,24 @@ func (node *Node) resolveConfirmedTokenPairAtReceive(networkClass, chainID uint3
 				break
 			}
 
-			for i := int(count) - 1; i >= 0; i-- {
+			for i := 0; i < int(count); i++ {
 				b := page.List[i]
 				expectedHeight := lo + uint64(i)
 				if b == nil || b.Height != expectedHeight || !isConfirmedBridgeBlock(b) {
 					needRetry = true
 					break
 				}
-				if b.Hash != expectedHash {
+				if expectedHeight == 1 {
+					if b.PreviousHash != types.ZeroHash {
+						rolledBack = true
+						break
+					}
+				} else if b.PreviousHash != prevHash {
 					rolledBack = true
 					break
 				}
-				expectedHash = b.PreviousHash
+				prevHash = b.Hash
+
 				if !isAcceptedReceiveBlock(b) {
 					continue
 				}
@@ -1982,45 +1999,76 @@ func (node *Node) resolveConfirmedTokenPairAtReceive(networkClass, chainID uint3
 					if err := definition.ABIBridge.UnpackMethod(param, definition.SetTokenPairMethod, send.Data); err != nil {
 						continue
 					}
-					if param.NetworkClass == networkClass && param.ChainId == chainID && param.TokenStandard == tokenStandard {
-						return confirmedTokenPair{
-							tokenAddress:  strings.ToLower(param.TokenAddress),
-							feePercentage: param.FeePercentage,
-							bridgeable:    param.Bridgeable,
-							minAmount:     param.MinAmount,
-						}, true, false, false
+					paramsHash, err := types.BytesToHash(param.Hash())
+					if err != nil {
+						continue
 					}
+					// Mirror go-zenon TimeChallenge(context, "SetTokenPair", ...):
+					// an accepted call whose paramsHash differs from the pending
+					// challenge only starts/replaces the challenge; a matching
+					// accepted call completes it and mutates TokenPairs.
+					if paramsHash != pendingSetPairHash {
+						pendingSetPairHash = paramsHash
+						continue
+					}
+					pendingSetPairHash = types.ZeroHash
+					tp := definition.TokenPair{
+						TokenStandard: param.TokenStandard,
+						TokenAddress:  strings.ToLower(param.TokenAddress),
+						Bridgeable:    param.Bridgeable,
+						Redeemable:    param.Redeemable,
+						Owned:         param.Owned,
+						MinAmount:     param.MinAmount,
+						FeePercentage: param.FeePercentage,
+						RedeemDelay:   param.RedeemDelay,
+						Metadata:      param.Metadata,
+					}
+					key := netKey{class: param.NetworkClass, chain: param.ChainId}
+					list := pairsByNet[key]
+					replaced := false
+					for j := range list {
+						if list[j].TokenStandard == tp.TokenStandard || list[j].TokenAddress == tp.TokenAddress {
+							list[j] = tp
+							replaced = true
+							break
+						}
+					}
+					if !replaced {
+						list = append(list, tp)
+					}
+					pairsByNet[key] = list
 				case len(send.Data) >= len(removePairID) && bytes.Equal(send.Data[:len(removePairID)], removePairID):
 					param := new(definition.TokenPairParam)
 					if err := definition.ABIBridge.UnpackMethod(param, definition.RemoveTokenPairMethodName, send.Data); err != nil {
 						continue
 					}
-					if param.NetworkClass == networkClass && param.ChainId == chainID && param.TokenStandard == tokenStandard {
-						return confirmedTokenPair{}, false, false, false
+					key := netKey{class: param.NetworkClass, chain: param.ChainId}
+					list := pairsByNet[key]
+					for j := range list {
+						if list[j].TokenStandard == param.TokenStandard && list[j].TokenAddress == param.TokenAddress {
+							pairsByNet[key] = append(list[:j], list[j+1:]...)
+							break
+						}
 					}
 				case len(send.Data) >= len(setNetID) && bytes.Equal(send.Data[:len(setNetID)], setNetID):
 					param := new(definition.NetworkInfoParam)
 					if err := definition.ABIBridge.UnpackMethod(param, definition.SetNetworkMethodName, send.Data); err != nil {
 						continue
 					}
-					if param.NetworkClass == networkClass && param.ChainId == chainID {
-						return confirmedTokenPair{}, false, false, false
-					}
+					pairsByNet[netKey{class: param.NetworkClass, chain: param.ChainId}] = nil
 				case len(send.Data) >= len(removeNetID) && bytes.Equal(send.Data[:len(removeNetID)], removeNetID):
 					param := new(definition.NetworkInfoParam)
 					if err := definition.ABIBridge.UnpackMethod(param, definition.RemoveNetworkMethodName, send.Data); err != nil {
 						continue
 					}
-					if param.NetworkClass == networkClass && param.ChainId == chainID {
-						return confirmedTokenPair{}, false, false, false
-					}
+					delete(pairsByNet, netKey{class: param.NetworkClass, chain: param.ChainId})
 				}
 			}
 
-			if needRetry || rolledBack || lo == 1 {
+			if needRetry || rolledBack {
 				break
 			}
-			hi = lo - 1
+			lo = hi + 1
 		}
 
 		if rolledBack {
@@ -2031,6 +2079,19 @@ func (node *Node) resolveConfirmedTokenPairAtReceive(networkClass, chainID uint3
 				return confirmedTokenPair{}, false, false, true
 			}
 			continue
+		}
+		if prevHash != wrapRecv.PreviousHash {
+			return confirmedTokenPair{}, false, false, false
+		}
+		for _, tp := range pairsByNet[netKey{class: networkClass, chain: chainID}] {
+			if tp.TokenStandard == tokenStandard {
+				return confirmedTokenPair{
+					tokenAddress:  tp.TokenAddress,
+					feePercentage: tp.FeePercentage,
+					bridgeable:    tp.Bridgeable,
+					minAmount:     tp.MinAmount,
+				}, true, false, false
+			}
 		}
 		return confirmedTokenPair{}, false, false, false
 	}
@@ -3117,31 +3178,48 @@ func (node *Node) requireLiveTransfers() error {
 	return nil
 }
 
-// ok == true we had a signing ceremony
-// ok == false means that we had nothing to sign
-func (node *Node) processSignaturesWrap(window uint64) (error, bool) {
-	store := node.state.HealthStore()
-	store.Selected(snapshot.Wrap, window, nil)
-	wrapRequestsIds, err := node.networksManager.GetUnsignedWrapRequests()
+// buildWrapSigningBatch collects and deduplicates wrap candidates for signing.
+// Verified local re-sign rows take precedence over unsigned RPC rows for the
+// same wrap ID (both for payload selection and pool-size priority) so an
+// unverified unsigned RPC row cannot displace or overwrite a ledger-verified
+// re-sign payload.
+func (node *Node) buildWrapSigningBatch() ([]*definition.WrapTokenRequest, [][]byte, map[string]int, error) {
+	unsignedWraps, err := node.networksManager.GetUnsignedWrapRequests()
 	if err != nil {
-		return err, false
-	} else if wrapRequestsIds == nil {
-		wrapRequestsIds = make([]*definition.WrapTokenRequest, 0)
+		return nil, nil, nil, err
 	}
-	node.logger.Debugf("WrapRequests len: %d", len(wrapRequestsIds))
+	node.logger.Debugf("WrapRequests len: %d", len(unsignedWraps))
 
-	resignableWrapsRequestsIds, err := node.networksManager.GetResignableWrapRequests()
+	resignableWraps, err := node.networksManager.GetResignableWrapRequests()
 	if err != nil {
-		return err, false
-	} else if resignableWrapsRequestsIds == nil {
-		resignableWrapsRequestsIds = make([]*definition.WrapTokenRequest, 0)
+		return nil, nil, nil, err
 	}
-	node.logger.Debugf("Resignable WrapRequests len: %d", len(resignableWrapsRequestsIds))
+	node.logger.Debugf("Resignable WrapRequests len: %d", len(resignableWraps))
 
-	wrapRequestsIds = append(wrapRequestsIds, resignableWrapsRequestsIds...)
+	wrapRequestsIds := make([]*definition.WrapTokenRequest, 0, len(resignableWraps)+len(unsignedWraps))
+	seen := make(map[types.Hash]struct{}, len(resignableWraps)+len(unsignedWraps))
+	for _, req := range resignableWraps {
+		if req == nil {
+			continue
+		}
+		if _, dup := seen[req.Id]; dup {
+			continue
+		}
+		seen[req.Id] = struct{}{}
+		wrapRequestsIds = append(wrapRequestsIds, req)
+	}
+	for _, req := range unsignedWraps {
+		if req == nil {
+			continue
+		}
+		if _, dup := seen[req.Id]; dup {
+			continue
+		}
+		seen[req.Id] = struct{}{}
+		wrapRequestsIds = append(wrapRequestsIds, req)
+	}
 	if len(wrapRequestsIds) == 0 {
-		store.Selected(snapshot.Wrap, window, map[uint32]int{})
-		return nil, false
+		return nil, nil, nil, nil
 	}
 	node.logger.Debugf("Final WrapRequests len: %d", len(wrapRequestsIds))
 
@@ -3154,15 +3232,16 @@ func (node *Node) processSignaturesWrap(window uint64) (error, bool) {
 			// it again would overwrite a stored signature and redeem status.
 			node.logger.Error(err)
 			common.RequestStop(node.stopChan)
-			return err, false
+			return nil, nil, nil, err
 		}
+		resignStatus := false
 		if event == nil {
 			// if the rpc returns it but we don't have it locally there was a problem
 			// if we don't have it we just add it now
 			if errStorage := node.networksManager.Znn().AddWrapEvent(request); errStorage != nil {
 				node.logger.Error(errStorage)
 				common.RequestStop(node.stopChan)
-				return errStorage, false
+				return nil, nil, nil, errStorage
 			}
 			event, err = node.networksManager.GetWrapEventById(request.Id)
 			if err == nil && event == nil {
@@ -3171,38 +3250,49 @@ func (node *Node) processSignaturesWrap(window uint64) (error, bool) {
 			if err != nil {
 				node.logger.Error(err)
 				common.RequestStop(node.stopChan)
-				return err, false
+				return nil, nil, nil, err
 			}
 		} else {
-			resignStatus, err := node.networksManager.GetResignStatus(event.Id)
+			resignStatus, err = node.networksManager.GetResignStatus(event.Id)
 			if err != nil {
 				node.logger.Error(err)
 				common.RequestStop(node.stopChan)
-				return err, false
+				return nil, nil, nil, err
 			}
 			if !resignStatus && len(event.Signature) > 0 {
 				continue
 			}
 		}
-		node.logger.Debugf("param.Id: %s", request.Id.String())
-		node.logger.Debugf("param.ToAddress: %s", request.ToAddress)
-		node.logger.Debugf("param.TokenAddress: %s", request.TokenAddress)
-		node.logger.Debugf("param.Amount: %s", request.Amount.String())
+
+		// When the local row is marked for re-signing, always sign the verified
+		// local payload written by PublishResignWraps rather than an unsigned RPC
+		// row that may have raced ahead of it.
+		var signingEvent events.WrapRequestZnn
+		if resignStatus {
+			signingEvent = *event
+			wrapRequestsIds[idx] = common.OrchestratorWrapToZnnWrap(event)
+		} else {
+			signingEvent = common.ZnnWrapToOrchestratorWrap(request)
+		}
+
+		node.logger.Debugf("param.Id: %s", signingEvent.Id.String())
+		node.logger.Debugf("param.ToAddress: %s", signingEvent.ToAddress)
+		node.logger.Debugf("param.TokenAddress: %s", signingEvent.TokenAddress)
+		node.logger.Debugf("param.Amount: %s", signingEvent.Amount.String())
 
 		if needed, errStorage := wrapNeedsSignature(node.dbManager.ZnnStorage(), event.Id); errStorage != nil {
 			node.logger.Error(errStorage)
 			common.RequestStop(node.stopChan)
-			return errStorage, false
+			return nil, nil, nil, errStorage
 		} else if !needed {
 			continue
 		}
 
-		evmNetwork := node.networksManager.LookupEvm(request.ChainId)
+		evmNetwork := node.networksManager.LookupEvm(signingEvent.ChainId)
 		if evmNetwork == nil {
-			node.logger.Infof("EVM network %d is no longer listed by the bridge; skipping wrap %s", request.ChainId, request.Id.String())
+			node.logger.Infof("EVM network %d is no longer listed by the bridge; skipping wrap %s", signingEvent.ChainId, signingEvent.Id.String())
 			continue
 		}
-		signingEvent := common.ZnnWrapToOrchestratorWrap(request)
 		msg, err := signingEvent.GetMessage(evmNetwork.ContractAddress())
 		if err != nil {
 			node.logger.Debug(err)
@@ -3214,8 +3304,7 @@ func (node *Node) processSignaturesWrap(window uint64) (error, bool) {
 	}
 
 	if len(messagesToSign) == 0 {
-		store.Selected(snapshot.Wrap, window, map[uint32]int{})
-		return nil, false
+		return wrapRequestsIds, nil, nil, nil
 	}
 
 	poolSize := common.GetSignCeremonyPoolSize()
@@ -3229,7 +3318,23 @@ func (node *Node) processSignaturesWrap(window uint64) (error, bool) {
 		encoded := base64.StdEncoding.EncodeToString(msg)
 		selectedIndexes[encoded] = msgsIndexes[encoded]
 	}
-	msgsIndexes = selectedIndexes
+	return wrapRequestsIds, messagesToSign, selectedIndexes, nil
+}
+
+// ok == true we had a signing ceremony
+// ok == false means that we had nothing to sign
+func (node *Node) processSignaturesWrap(window uint64) (error, bool) {
+	store := node.state.HealthStore()
+	store.Selected(snapshot.Wrap, window, nil)
+
+	wrapRequestsIds, messagesToSign, msgsIndexes, err := node.buildWrapSigningBatch()
+	if err != nil {
+		return err, false
+	}
+	if len(messagesToSign) == 0 {
+		store.Selected(snapshot.Wrap, window, map[uint32]int{})
+		return nil, false
+	}
 	if store != nil {
 		counts := make(map[uint32]int)
 		for _, msg := range messagesToSign {

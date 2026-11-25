@@ -76,7 +76,7 @@ func verifyEvmChainID(parent context.Context, client *ethclient.Client, expected
 	defer cancel()
 	got, err := client.ChainID(ctx)
 	if err != nil {
-		return fmt.Errorf("network %s (%s): failed to verify eth_chainId: %w", networkName, config.RedactURL(url), err)
+		return fmt.Errorf("network %s (%s): failed to verify eth_chainId: %s", networkName, config.RedactURL(url), config.RedactErrorForURL(err, url))
 	}
 	if got == nil || !got.IsUint64() || got.Uint64() != uint64(expectedChainId) {
 		return fmt.Errorf("network %s (%s): eth_chainId mismatch: endpoint serves chain %v, expected %d", networkName, config.RedactURL(url), got, expectedChainId)
@@ -122,8 +122,9 @@ func NewEvmRpcClientForChainContext(parent context.Context, networkConfig config
 		}
 		newRpcClient, err = ethclient.DialContext(parent, currentUrl)
 		if err != nil {
-			lastErr = err
-			logger.Infof("Error when dialing %s, got: %s\n", config.RedactURL(currentUrl), config.RedactErrorForURL(err, currentUrl))
+			sanitizedErr := errors.New(config.RedactErrorForURL(err, currentUrl))
+			lastErr = sanitizedErr
+			logger.Infof("Error when dialing %s, got: %s\n", config.RedactURL(currentUrl), sanitizedErr.Error())
 		} else if err = verifyEvmChainID(parent, newRpcClient, chainId, networkName, currentUrl); err != nil {
 			lastErr = err
 			newRpcClient.Close()
@@ -778,7 +779,7 @@ func (r *EvmRpc) callEndpoint(idx int, read func(context.Context, *ethclient.Cli
 	if entry.client == nil {
 		client, err := ethclient.DialContext(ctx, url)
 		if err != nil {
-			return err
+			return errors.New(config.RedactErrorForURL(err, url))
 		}
 		if err := verifyEvmChainID(ctx, client, r.chainId, r.networkName, url); err != nil {
 			client.Close()

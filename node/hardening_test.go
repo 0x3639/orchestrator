@@ -769,7 +769,7 @@ func (l *wrapTestLedger) GetFrontierAccountBlock(ctx context.Context, _ types.Ad
 	if fn != nil {
 		return fn(ctx, call)
 	}
-	return testAccountBlock(3, types.Hash{0xaa, 0, 3}), nil
+	return testAccountBlock(4, types.Hash{0xaa, 0, 4}), nil
 }
 
 func (l *wrapTestLedger) GetAccountBlocksByHeight(ctx context.Context, _ types.Address, height, count uint64) (*api.AccountBlockList, error) {
@@ -823,7 +823,9 @@ func (l *wrapTestLedger) GetAccountBlocksByHeight(ctx context.Context, _ types.A
 				var hasPair bool
 				if pairFn != nil {
 					pairParam, hasPair = pairFn(h)
-				} else if h == 2 {
+				} else if h == 2 || h == 3 {
+					// Heights 2 and 3 model go-zenon's two-step SetTokenPair
+					// TimeChallenge (proposal at 2, completion at 3).
 					pairParam, hasPair = defaultTokenPairForWrap(lastWrap), true
 				}
 				if hasPair && pairParam != nil {
@@ -870,9 +872,10 @@ func (l *wrapTestLedger) GetAccountBlockByHash(ctx context.Context, hash types.H
 		return nil, nil
 	}
 	// Default: derive a confirmed accepted WrapToken send + paired bridge
-	// receive block consistent with the fixture's height-3 bridge block and
-	// confirming momentum (height 1 = SetOrchestratorInfo, height 2 = SetTokenPair).
-	acctList, err := l.GetAccountBlocksByHeight(ctx, types.BridgeContract, 3, 1)
+	// receive block consistent with the fixture's height-4 bridge block and
+	// confirming momentum (height 1 = SetOrchestratorInfo, heights 2..3 =
+	// SetTokenPair proposal + completion).
+	acctList, err := l.GetAccountBlocksByHeight(ctx, types.BridgeContract, 4, 1)
 	if err != nil || acctList == nil || len(acctList.List) == 0 || acctList.List[0] == nil {
 		return nil, err
 	}
@@ -883,7 +886,7 @@ func (l *wrapTestLedger) GetAccountBlockByHash(ctx context.Context, hash types.H
 		momHeight = recv.ConfirmationDetail.MomentumHeight
 		momHash = recv.ConfirmationDetail.MomentumHash
 	}
-	return testConfirmedWrapBlocks(servedWrap, 3, recv.Hash, recv.PreviousHash, momHeight, momHash, true), nil
+	return testConfirmedWrapBlocks(servedWrap, 4, recv.Hash, recv.PreviousHash, momHeight, momHash, true), nil
 }
 
 func (l *wrapTestLedger) GetFrontierMomentum(ctx context.Context) (*api.Momentum, error) {
@@ -4049,7 +4052,7 @@ func TestReSignStateBindsConfirmationThresholdToPrePublishBridgeSnapshot(t *test
 				}
 				return testConfirmedWrapBlocks(
 					makeWrap(0).WrapTokenRequest,
-					3, types.Hash{0xaa, 0, 3}, types.Hash{0xaa, 0, 2},
+					4, types.Hash{0xaa, 0, 4}, types.Hash{0xaa, 0, 3},
 					1, testMomentum(1).Hash, true,
 				), nil
 			},
@@ -4525,7 +4528,7 @@ func TestReSignStateRequiresMomentumConfirmationForBridgeSnapshot(t *testing.T) 
 				}
 				return testConfirmedWrapBlocks(
 					makeEntry(hash).WrapTokenRequest,
-					3, types.Hash{0xaa, 0, 3}, types.Hash{0xaa, 0, 2},
+					4, types.Hash{0xaa, 0, 4}, types.Hash{0xaa, 0, 3},
 					1, testMomentum(1).Hash, true,
 				), nil
 			},
@@ -4610,13 +4613,13 @@ func TestReSignStateRequiresMomentumConfirmationForBridgeSnapshot(t *testing.T) 
 					// Confirmed paired BridgeContract receive with failed execution status (2).
 					return testConfirmedWrapBlocks(
 						makeEntry(failedWrap).WrapTokenRequest,
-						3, types.Hash{0xaa, 0, 3}, types.Hash{0xaa, 0, 2},
+						4, types.Hash{0xaa, 0, 4}, types.Hash{0xaa, 0, 3},
 						1, testMomentum(1).Hash, false,
 					), nil
 				}
 				return testConfirmedWrapBlocks(
 					makeEntry(hash).WrapTokenRequest,
-					3, types.Hash{0xaa, 0, 3}, types.Hash{0xaa, 0, 2},
+					4, types.Hash{0xaa, 0, 4}, types.Hash{0xaa, 0, 3},
 					1, testMomentum(1).Hash, true,
 				), nil
 			},
@@ -4705,7 +4708,7 @@ func TestReSignStateRequiresMomentumConfirmationForBridgeSnapshot(t *testing.T) 
 				}},
 			},
 			confirmedTokenPairAtFn: func(height uint64) (*definition.TokenPairParam, bool) {
-				if height != 2 {
+				if height != 2 && height != 3 {
 					return nil, false
 				}
 				return &definition.TokenPairParam{
@@ -4738,13 +4741,13 @@ func TestReSignStateRequiresMomentumConfirmationForBridgeSnapshot(t *testing.T) 
 					badChecked.Store(true)
 					return testConfirmedWrapBlocks(
 						makeBad().WrapTokenRequest,
-						3, types.Hash{0xaa, 0, 3}, types.Hash{0xaa, 0, 2},
+						4, types.Hash{0xaa, 0, 4}, types.Hash{0xaa, 0, 3},
 						1, testMomentum(1).Hash, true,
 					), nil
 				}
 				return testConfirmedWrapBlocks(
 					makeGood().WrapTokenRequest,
-					3, types.Hash{0xaa, 0, 3}, types.Hash{0xaa, 0, 2},
+					4, types.Hash{0xaa, 0, 4}, types.Hash{0xaa, 0, 3},
 					1, testMomentum(1).Hash, true,
 				), nil
 			},
@@ -4778,17 +4781,173 @@ func TestReSignStateRequiresMomentumConfirmationForBridgeSnapshot(t *testing.T) 
 		}
 	})
 
-	t.Run("replaces stale local wrap payload on re-sign publish so signer uses confirmed digest", func(t *testing.T) {
+	t.Run("ignores uncompleted SetTokenPair proposal during time-challenge window", func(t *testing.T) {
 		evmSrv := fakeEvmRpcServer(t)
 		defer evmSrv.Close()
 
-		// Exact regression for Round 17 Finding 1 (batch write + signing path):
-		// Local LevelDB already holds a stale row for wrapID with wrong
-		// TokenAddress, wrong Fee, and a stale signature. After ReSignState
-		// validates the confirmed wrap against momentumStore + SetTokenPair,
-		// PublishResignWraps must overwrite the local payload (and clear the
-		// stale signature) so GetResignableWrapRequests and GetMessage sign the
-		// confirmed digest rather than the stale local row.
+		// Exact regression for Round 18 Finding 1:
+		// - Heights 2 & 3 complete the two-step SetTokenPair TimeChallenge for
+		//   (appliedToken, FeePercentage=1000 -> Fee=10 on Amount=100).
+		// - Height 4 submits an accepted SetTokenPair PROPOSAL for
+		//   (proposedToken, FeePercentage=5000 -> Fee=50 on Amount=100) that
+		//   starts a new TimeChallenge without modifying active TokenPairs.
+		// - Height 5 executes a valid WrapToken during the challenge window
+		//   using the still-active (appliedToken, Fee=10).
+		// resolveConfirmedTokenPairAtReceive must reconstruct the applied state,
+		// reject a spoofed row claiming the uncompleted proposal (proposedToken,
+		// Fee=50), accept the valid wrap (appliedToken, Fee=10), mark it, and
+		// return to LiveState without stalling.
+		const (
+			appliedToken  = "0x0000000000000000000000000000000000005555"
+			proposedToken = "0x0000000000000000000000000000000000006666"
+			destAddr      = "0x000000000000000000000000000000000000beef"
+		)
+		spoofedProposedID := types.Hash{0xc8}
+		validChallengeWrapID := types.Hash{0xc9}
+
+		makeSpoofed := func() *embedded.WrapTokenRequest {
+			return &embedded.WrapTokenRequest{
+				WrapTokenRequest: &definition.WrapTokenRequest{
+					NetworkClass: definition.EvmClass, ChainId: 1, Id: spoofedProposedID,
+					ToAddress:              destAddr,
+					TokenAddress:           proposedToken,
+					Amount:                 big.NewInt(100),
+					Fee:                    big.NewInt(50),
+					CreationMomentumHeight: 99,
+				},
+				ConfirmationsToFinality: 0,
+			}
+		}
+		makeValid := func() *embedded.WrapTokenRequest {
+			return &embedded.WrapTokenRequest{
+				WrapTokenRequest: &definition.WrapTokenRequest{
+					NetworkClass: definition.EvmClass, ChainId: 1, Id: validChallengeWrapID,
+					ToAddress:              destAddr,
+					TokenAddress:           appliedToken,
+					Amount:                 big.NewInt(100),
+					Fee:                    big.NewInt(10),
+					CreationMomentumHeight: 99,
+				},
+				ConfirmationsToFinality: 0,
+			}
+		}
+
+		var spoofedChecked atomic.Bool
+		bridge := &wrapTestBridge{
+			networks: &embedded.NetworkInfoList{
+				Count: 1,
+				List: []*definition.NetworkInfo{{
+					NetworkClass: definition.EvmClass, Id: 1, Name: "Ethereum",
+					ContractAddress: "0x0000000000000000000000000000000000000001",
+				}},
+			},
+			confirmedTokenPairAtFn: func(height uint64) (*definition.TokenPairParam, bool) {
+				switch height {
+				case 2, 3:
+					// Completed two-step TimeChallenge -> applied pair.
+					return &definition.TokenPairParam{
+						NetworkClass:  definition.EvmClass,
+						ChainId:       1,
+						TokenStandard: types.ZeroTokenStandard,
+						TokenAddress:  appliedToken,
+						Bridgeable:    true,
+						Redeemable:    true,
+						MinAmount:     big.NewInt(1),
+						FeePercentage: 1000,
+						RedeemDelay:   1,
+						Metadata:      "{}",
+					}, true
+				case 4:
+					// Uncompleted single-call proposal -> starts TimeChallenge only!
+					return &definition.TokenPairParam{
+						NetworkClass:  definition.EvmClass,
+						ChainId:       1,
+						TokenStandard: types.ZeroTokenStandard,
+						TokenAddress:  proposedToken,
+						Bridgeable:    true,
+						Redeemable:    true,
+						MinAmount:     big.NewInt(1),
+						FeePercentage: 5000,
+						RedeemDelay:   1,
+						Metadata:      "{}",
+					}, true
+				default:
+					return nil, false
+				}
+			},
+			frontierMomFn: func(_ context.Context, _ int32) (*api.Momentum, error) {
+				return testMomentum(105), nil
+			},
+			frontierFn: func(_ context.Context, _ int32) (*api.AccountBlock, error) {
+				return testAccountBlock(10, types.Hash{0xaa, 0, 10}), nil
+			},
+			pageHandler: func(pageIndex, pageSize uint32, call int32) *embedded.WrapTokenRequestList {
+				if call == 1 {
+					return paginateZenonWraps([]*embedded.WrapTokenRequest{makeSpoofed()}, pageIndex, pageSize)
+				}
+				return paginateZenonWraps([]*embedded.WrapTokenRequest{makeValid()}, pageIndex, pageSize)
+			},
+			blockByHashFn: func(_ context.Context, hash types.Hash) (*api.AccountBlock, error) {
+				if hash == spoofedProposedID {
+					spoofedChecked.Store(true)
+					return testConfirmedWrapBlocks(
+						makeSpoofed().WrapTokenRequest,
+						5, types.Hash{0xaa, 0, 5}, types.Hash{0xaa, 0, 4},
+						1, testMomentum(1).Hash, true,
+					), nil
+				}
+				return testConfirmedWrapBlocks(
+					makeValid().WrapTokenRequest,
+					5, types.Hash{0xaa, 0, 5}, types.Hash{0xaa, 0, 4},
+					1, testMomentum(1).Hash, true,
+				), nil
+			},
+		}
+
+		n := wrapTestNodeWithEvm(t, common.LiveState, bridge, map[string]string{"Ethereum": evmSrv.URL})
+		if activated, err := n.state.ActivateResign(definition.EvmClass, 1); err != nil || !activated {
+			t.Fatalf("ActivateResign failed: activated=%v err=%v", activated, err)
+		}
+		n.state.CompleteStartup()
+
+		n.workers.start(n.processSignatures)
+		t.Cleanup(func() {
+			done := n.workers.shutdown()
+			<-done
+		})
+
+		eventually(t, "ReSignState to reject uncompleted proposal payload and accept wrap created during challenge window", func() bool {
+			st, _ := n.state.GetState()
+			r, err := n.dbManager.ZnnStorage().GetResignStatus(validChallengeWrapID)
+			return err == nil && r && st == common.LiveState
+		})
+		if !spoofedChecked.Load() {
+			t.Fatal("expected pre-publish verification to inspect spoofedProposedID")
+		}
+		if resign, err := n.dbManager.ZnnStorage().GetResignStatus(spoofedProposedID); err != nil || resign {
+			t.Fatalf("wrap claiming uncompleted proposal must not be marked: resign=%v err=%v", resign, err)
+		}
+	})
+
+	t.Run("replaces stale local wrap payload on re-sign publish and prioritizes verified digest over unsigned RPC", func(t *testing.T) {
+		prevPool := common.GetSignCeremonyPoolSize()
+		common.SetSignCeremonyPoolSize(1)
+		t.Cleanup(func() { common.SetSignCeremonyPoolSize(prevPool) })
+
+		evmSrv := fakeEvmRpcServer(t)
+		defer evmSrv.Close()
+
+		// Exact regression for Round 17 Finding 1 + Round 18 Finding 2:
+		// 1. Local LevelDB already holds a stale row for wrapID with wrong
+		//    TokenAddress, wrong Fee, and a stale signature.
+		// 2. ReSignState validates the confirmed wrap against momentumStore +
+		//    applied SetTokenPair and refreshes the local row via PublishResignWraps.
+		// 3. GetAllUnsignedWrapTokenRequests ALSO returns the same wrapID with
+		//    a conflicting/unverified payload while SignCeremonyPoolSize == 1.
+		// 4. buildWrapSigningBatch (the exact candidate-selection and digest
+		//    path of processSignaturesWrap) must deduplicate by ID, prioritize
+		//    the verified local re-sign row over the unsigned RPC row, and emit
+		//    ONLY the confirmed digest (never the unsigned RPC digest).
 		const (
 			canonicalToken = "0x0000000000000000000000000000000000003333"
 			staleToken     = "0x0000000000000000000000000000000000004444"
@@ -4808,6 +4967,19 @@ func TestReSignStateRequiresMomentumConfirmationForBridgeSnapshot(t *testing.T) 
 			},
 			ConfirmationsToFinality: 0,
 		}
+		conflictingUnsigned := &embedded.WrapTokenRequest{
+			WrapTokenRequest: &definition.WrapTokenRequest{
+				NetworkClass:           definition.EvmClass,
+				ChainId:                1,
+				Id:                     wrapID,
+				ToAddress:              "0x000000000000000000000000000000000000dead",
+				TokenAddress:           staleToken,
+				Amount:                 big.NewInt(100),
+				Fee:                    big.NewInt(99),
+				CreationMomentumHeight: 99,
+			},
+			ConfirmationsToFinality: 0,
+		}
 
 		bridge := &wrapTestBridge{
 			networks: &embedded.NetworkInfoList{
@@ -4818,7 +4990,7 @@ func TestReSignStateRequiresMomentumConfirmationForBridgeSnapshot(t *testing.T) 
 				}},
 			},
 			confirmedTokenPairAtFn: func(height uint64) (*definition.TokenPairParam, bool) {
-				if height != 2 {
+				if height != 2 && height != 3 {
 					return nil, false
 				}
 				return &definition.TokenPairParam{
@@ -4843,6 +5015,10 @@ func TestReSignStateRequiresMomentumConfirmationForBridgeSnapshot(t *testing.T) 
 			allWraps: &embedded.WrapTokenRequestList{
 				Count: 1,
 				List:  []*embedded.WrapTokenRequest{canonical},
+			},
+			unsigned: &embedded.WrapTokenRequestList{
+				Count: 1,
+				List:  []*embedded.WrapTokenRequest{conflictingUnsigned},
 			},
 		}
 
@@ -4883,18 +5059,26 @@ func TestReSignStateRequiresMomentumConfirmationForBridgeSnapshot(t *testing.T) 
 			t.Fatalf("stale signature was not cleared after payload refresh: sig=%q sent=%v", stored.Signature, stored.SentSignature)
 		}
 
-		contractAddr := n.networksManager.LookupEvm(1).ContractAddress()
-		gotDigest, err := stored.GetMessage(contractAddr)
+		// Exercise the real signing batch builder with conflicting unsigned RPC
+		// row and SignCeremonyPoolSize == 1.
+		reqs, msgs, msgsIndexes, err := n.buildWrapSigningBatch()
 		if err != nil {
-			t.Fatal(err)
+			t.Fatalf("buildWrapSigningBatch failed: %v", err)
 		}
+		if len(reqs) != 1 || len(msgs) != 1 {
+			t.Fatalf("expected deduplicated single candidate/message, got reqs=%d msgs=%d", len(reqs), len(msgs))
+		}
+		contractAddr := n.networksManager.LookupEvm(1).ContractAddress()
 		wantEvent := common.ZnnWrapToOrchestratorWrap(canonical.WrapTokenRequest)
 		wantDigest, err := wantEvent.GetMessage(contractAddr)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if !bytes.Equal(gotDigest, wantDigest) {
-			t.Fatalf("signing digest mismatch after resign publish: got %x, want %x", gotDigest, wantDigest)
+		if !bytes.Equal(msgs[0], wantDigest) {
+			t.Fatalf("buildWrapSigningBatch selected wrong digest (unsigned RPC bypassed verified resign row): got %x, want %x", msgs[0], wantDigest)
+		}
+		if idx, ok := msgsIndexes[base64.StdEncoding.EncodeToString(wantDigest)]; !ok || reqs[idx].Id != wrapID {
+			t.Fatalf("msgsIndexes missing verified digest mapping: ok=%v idx=%d", ok, idx)
 		}
 	})
 }

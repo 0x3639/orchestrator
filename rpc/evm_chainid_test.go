@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"testing"
 
 	ecommon "github.com/ethereum/go-ethereum/common"
@@ -71,5 +72,38 @@ func TestAddEvmClientVerifiesChainIDAndRejectsWrongChain(t *testing.T) {
 	client := mgr.Evm(73405)
 	if err := client.callEndpoint(0, func(_ context.Context, _ *ethclient.Client) error { return nil }); err == nil {
 		t.Fatal("expected secondary endpoint serving wrong eth_chainId to be rejected")
+	}
+}
+
+func TestEvmDialAndChainIDErrorsRedactCredentials(t *testing.T) {
+	// 1. Dial failure on a credential-bearing URL must redact userinfo, path,
+	// and query parameters from the returned error.
+	dialURL := "ws://alice:supersecretpass@127.0.0.1:1/v2/secret-path-key?apikey=secretquery"
+	_, err := NewEvmRpcClientForChain(config.BaseNetworkConfig{Urls: []string{dialURL}}, 1, "Ethereum", ecommon.Address{})
+	if err == nil {
+		t.Fatal("expected dial failure on unreachable port")
+	}
+	for _, secret := range []string{"supersecretpass", "secret-path-key", "secretquery"} {
+		if strings.Contains(err.Error(), secret) {
+			t.Fatalf("dial error leaked credential %q: %v", secret, err)
+		}
+	}
+
+	// 2. HTTP error during eth_chainId on a credential-bearing URL must also
+	// scrub userinfo, path, and query parameters from the returned error.
+	failingSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+	}))
+	defer failingSrv.Close()
+	host := strings.TrimPrefix(failingSrv.URL, "http://")
+	chainURL := fmt.Sprintf("http://bob:chainsecret@%s/v2/chain-api-key?token=chaintoken", host)
+	_, err = NewEvmRpcClientForChain(config.BaseNetworkConfig{Urls: []string{chainURL}}, 73405, "Supernova", ecommon.Address{})
+	if err == nil {
+		t.Fatal("expected eth_chainId failure on HTTP 401 server")
+	}
+	for _, secret := range []string{"chainsecret", "chain-api-key", "chaintoken"} {
+		if strings.Contains(err.Error(), secret) {
+			t.Fatalf("eth_chainId error leaked credential %q: %v", secret, err)
+		}
 	}
 }

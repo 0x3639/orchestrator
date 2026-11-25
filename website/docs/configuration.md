@@ -61,7 +61,7 @@ Everything lives in `~/.orchestrator/config.json`. On first start the orchestrat
 
 `Networks` is a map from network name to settings. `Zenon` is required. At startup the orchestrator reads the networks registered on the Zenon bridge contract and requires an entry here **for each of them**, by name; startup fails if one is missing. Entries for names the bridge does not register are ignored.
 
-The file is loaded on top of the built-in defaults, which already contain `BSC`, `Ethereum`, and `Supernova` entries pointing at `ws://127.0.0.1:8545`. Leaving a network out of your file therefore does not remove it; the default entry remains and is rewritten into the file. The example above shows only the entries you should edit.
+The file is loaded on top of the built-in defaults, which contain `BSC` and `Ethereum` entries pointing at `ws://127.0.0.1:8545`, plus a `Supernova` entry with an empty `Urls` list (`[]`). Leaving a network out of your file therefore does not remove it; the default entry remains and is rewritten into the file. When `Supernova` is registered on the bridge, you must supply an explicit `Supernova` RPC URL in `config.json`. The example above shows only the entries you should edit.
 
 | Field | Default | Meaning |
 | --- | --- | --- |
