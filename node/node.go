@@ -24,6 +24,7 @@ import (
 	"path"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -82,6 +83,9 @@ type Node struct {
 	pendingKeyGenPubKey string
 	// signMessagesHook is optional and used by tests to substitute BulkSign.
 	signMessagesHook func(pubKey string, messagesToSign [][]byte, msgsIndexes map[string]int) (*keysign.Response, error)
+	// lastSignedKeyParties records the participant_keys selected per groupKey
+	// during signEmergencyHaltMessages for unit test verification.
+	lastSignedKeyParties map[string][]string
 }
 
 func NewNode(config *oconfig.Config, logger *zap.Logger) (_ *Node, initErr error) {
@@ -804,139 +808,41 @@ func (node *Node) processSignatures() {
 			if state, err := node.state.GetState(); err == nil && state != common.EmergencyState {
 				continue
 			}
-			znnTssNonce, err := node.networksManager.GetTssNonceZnn()
+			bridgeInfo, err := node.networksManager.GetBridgeInfo()
 			if err != nil {
 				node.logger.Debug(err)
 				continue
 			}
-			znnMessage, err := implementation.GetBasicMethodMessage("Halt", znnTssNonce, definition.NoMClass, 1)
+			if bridgeInfo == nil {
+				node.logger.Debug("missing bridge info in emergency state")
+				continue
+			}
+			signedZnnNonce := bridgeInfo.TssNonce
+			signedZnnKey := bridgeInfo.CompressedTssECDSAPubKey
+			znnMessage, err := implementation.GetBasicMethodMessage("Halt", signedZnnNonce, definition.NoMClass, 1)
 			if err != nil {
 				node.logger.Debug(err)
 				continue
 			}
 
-			evmBatch, evmMessages, err := node.networksManager.GetHaltMessages()
+			evmBatch, evmMessages, signedEvmNonces, signedEvmTss, err := node.networksManager.GetHaltMessagesWithState()
 			if err != nil {
 				node.logger.Debug(err)
 				continue
 			}
 
-			znnSignature, evmFullSignatures, err := node.signEmergencyHaltMessages(znnMessage, evmBatch, evmMessages)
+			znnSignature, evmFullSignatures, err := node.signEmergencyHaltMessages(znnMessage, signedZnnKey, evmBatch, evmMessages, signedEvmTss)
 			if err != nil {
 				node.logger.Debug(err)
 				continue
 			}
 
 			node.logger.Debug("Halt signatures are valid!")
-			// The redeem worker can release the last incident while the group
-			// signs. A halt is sent only while the emergency still stands.
-			emergency := func() bool {
-				state, err := node.state.GetState()
-				return err == nil && state == common.EmergencyState
-			}
-			if !emergency() {
-				continue
-			}
-			// Set when the bridge lists an EVM network the round did not sign
-			// for, or when the emergency ended. Both senders then stop, and
-			// the round ends without recording a halt. If the emergency still
-			// stands, the next round signs again, for every network.
-			var aborted atomic.Bool
-			// Each sender ends once its bridge shows the halt, when the round
-			// is aborted, or when the node stops. Whether the halt is recorded
-			// is decided after both, from one read of every flag.
-			stopSender := func() bool {
-				if node.workerStopping() || aborted.Load() {
-					return true
-				}
-				if !emergency() {
-					aborted.Store(true)
-					return true
-				}
-				return false
-			}
-			var senders sync.WaitGroup
-			senders.Add(2)
-			go func() {
-				defer senders.Done()
-				index := uint32(int(znnSignature[0])) % node.getParticipantsLength()
-				// The halt flag itself decides: the wait that follows an
-				// unhalt still needs a halt, and a failed read is retried.
-				for !stopSender() {
-					index = (index + 1) % node.getParticipantsLength()
-					halted, ok := node.znnHaltFlag()
-					if ok && halted {
-						return
-					}
-					producerPubKey := base64.StdEncoding.EncodeToString(node.producerKeyPair.Public)
-					if ok && producerPubKey == node.getParticipant(index) {
-						node.logger.Debug("[send Halt Znn Tx] this is me")
-						// The emergency cannot be released while the
-						// halt is being published.
-						sent, err := node.networksManager.HaltZnn(znnSignature, node.producerKeyPair, node.state.WhileEmergency)
-						if err != nil {
-							node.logger.Info(err.Error())
-						} else if !sent {
-							aborted.Store(true)
-							return
-						} else {
-							node.logger.Debug("[send Halt Znn Tx] sent request")
-							// we wait 2 momentums so that the send and receive block are inserted and the pubKey changes
-							// todo wait use constant
-							if !node.workerSleep(20 * time.Second) {
-								return
-							}
-							continue
-						}
-					}
-					// Paces the turns, and the retry after a failed send.
-					if !node.workerSleep(time.Second) {
-						return
-					}
-				}
-			}()
-
-			go func() {
-				defer senders.Done()
-				index := uint32(int(znnSignature[0])) % node.getParticipantsLength()
-				for !stopSender() {
-					index = (index + 1) % node.getParticipantsLength()
-					producerPubKey := base64.StdEncoding.EncodeToString(node.producerKeyPair.Public)
-					if producerPubKey == node.getParticipant(index) {
-						node.logger.Debug("[send halt evm tx] this is me")
-						// todo discuss using concurrent send for different networks with different senders
-						changed, err := node.networksManager.SendHaltEvm(evmBatch, evmFullSignatures, node.ecdsaPrivateKey, node.evmAddress, node.state.WhileEmergency)
-						switch {
-						case errors.Is(err, network.ErrNetworksChanged):
-							node.logger.Info("the bridge lists an EVM network the halt was not signed for; signing the halt again")
-							aborted.Store(true)
-							return
-						case errors.Is(err, network.ErrEmergencyEnded):
-							aborted.Store(true)
-							return
-						case err != nil:
-							node.logger.Debug(err)
-						case changed:
-							return
-						default:
-							// todo use estimatedBlockTime / TimeToFinality
-							if !node.workerSleep(15 * time.Second) {
-								return
-							}
-							continue
-						}
-					}
-					// Paces the turns, and the retry after an error.
-					if !node.workerSleep(time.Second) {
-						return
-					}
-				}
-			}()
-			senders.Wait()
+			aborted := node.publishEmergencyHalt(evmBatch, znnSignature, evmFullSignatures, signedZnnKey, signedZnnNonce, signedEvmTss, signedEvmNonces)
 			if node.workerStopping() {
 				return
 			}
-			if aborted.Load() {
+			if aborted {
 				continue // The next iteration decides from the state as it is now.
 			}
 
@@ -1676,21 +1582,26 @@ func (node *Node) sleepWhileKeyGenCtx(ctx context.Context, d time.Duration) bool
 }
 
 func (node *Node) finishKeyGenRound(keyGenResponse *keygen.Response, decompressedKeyGenPubKey string) bool {
-	if !node.workerSleep(5 * time.Second) {
-		return false
-	}
-	// Coordinate with the bridge listener before any peer submits
-	// ChangeTssECDSAPubKey so Zenon accepting keyGenResponse.PubKey does not
-	// leave KeyGenState while EVM rotation and local key installation finish.
+	// Coordinate with the bridge listener and establish a state-bound context
+	// BEFORE the initial wait, nonce reads, signing ceremonies, and final
+	// verification so an EmergencyState or RestartRequired transition preempts
+	// the round immediately at every phase.
 	node.state.SetActiveKeyGenPubKey(keyGenResponse.PubKey)
 	defer node.state.ClearActiveKeyGenPubKey(keyGenResponse.PubKey)
+
+	ctx, cancel := node.keyGenContext()
+	defer cancel()
+
+	if !node.sleepWhileKeyGenCtx(ctx, 5*time.Second) {
+		return false
+	}
 
 	// Retain the newly generated key across a preempted round so EmergencyState
 	// can sign halt messages for any chain that already rotated to it.
 	node.setPendingKeyGenPubKey(keyGenResponse.PubKey)
 
 	// we save the old pubKey because we will need it
-	oldKey := node.tssManager.GetPubKey()
+	oldKey := node.activeSigningPubKey()
 	node.logger.Debugf("Old pubKey: %s", oldKey)
 
 	// if len is 0, it means that we have not generated a key before and the administrator needs to set it manually
@@ -1715,8 +1626,11 @@ func (node *Node) finishKeyGenRound(keyGenResponse *keygen.Response, decompresse
 			return false
 		}
 
+		if !node.keyGenActive() {
+			return false
+		}
 		node.logger.Debug("Old key found")
-		znnTssNonce, err := node.networksManager.GetTssNonceZnn()
+		znnTssNonce, err := node.networksManager.GetTssNonceZnnContext(ctx)
 		if err != nil {
 			node.logger.Error(err)
 			return false
@@ -1734,7 +1648,7 @@ func (node *Node) finishKeyGenRound(keyGenResponse *keygen.Response, decompresse
 		messagesToSign = append(messagesToSign, znnMessage)
 
 		// EVM messages
-		evmBatch, toSignMessagesEvm, err := node.networksManager.GetSetTssEcdsaPubKeysEvmMessages(keyGenResponse.PubKey)
+		evmBatch, toSignMessagesEvm, err := node.networksManager.GetSetTssEcdsaPubKeysEvmMessagesContext(ctx, keyGenResponse.PubKey)
 		if err != nil {
 			node.logger.Debug(err)
 			return false
@@ -1744,18 +1658,32 @@ func (node *Node) finishKeyGenRound(keyGenResponse *keygen.Response, decompresse
 			msgsIndexes[base64.StdEncoding.EncodeToString(msg)] = idx + 1
 		}
 		node.logger.Debug("msg to sign after evm append: ", messagesToSign)
+		if !node.keyGenActive() {
+			return false
+		}
 		// New key sign of messages
 		// we will try to generate a signature using the new key secret shares and validate it
-		node.tssManager.SetPubKey(keyGenResponse.PubKey)
+		if node.tssManager != nil {
+			node.tssManager.SetPubKey(keyGenResponse.PubKey)
+		}
 
-		newKeySignResponse, err := node.signMessages(messagesToSign, msgsIndexes)
+		var newKeySignResponse *keysign.Response
+		if node.signMessagesHook != nil {
+			newKeySignResponse, err = node.signMessagesHook(keyGenResponse.PubKey, messagesToSign, msgsIndexes)
+		} else {
+			newKeySignResponse, err = node.signMessages(messagesToSign, msgsIndexes)
+		}
 		if err != nil {
-			node.tssManager.SetPubKey(oldKey)
+			if node.tssManager != nil {
+				node.tssManager.SetPubKey(oldKey)
+			}
 			node.logger.Debug(err)
 			node.logger.Debug(" Error after signing with the new generated key 1")
 			return false
 		} else if newKeySignResponse.Status != tcommon.Success {
-			node.tssManager.SetPubKey(oldKey)
+			if node.tssManager != nil {
+				node.tssManager.SetPubKey(oldKey)
+			}
 			node.logger.Debugf("keySignStatus: %d", newKeySignResponse.Status)
 			node.logger.Debug(" Error after signing with the new generated key 2")
 			return false
@@ -1764,16 +1692,28 @@ func (node *Node) finishKeyGenRound(keyGenResponse *keygen.Response, decompresse
 		// Verify all signatures
 		znnNewKeySignature, newKeyFullSignatures, errValidate := node.validateSignatures(newKeySignResponse, decompressedKeyGenPubKey, messagesToSign)
 		if errValidate != nil {
-			node.tssManager.SetPubKey(oldKey)
+			if node.tssManager != nil {
+				node.tssManager.SetPubKey(oldKey)
+			}
 			node.logger.Info(errValidate.Error())
 			return false
 		}
 		node.logger.Debug("Signatures generated from the new key are valid!")
 
 		// Old key sign of messages
-		node.tssManager.SetPubKey(oldKey)
+		if node.tssManager != nil {
+			node.tssManager.SetPubKey(oldKey)
+		}
+		if !node.keyGenActive() {
+			return false
+		}
 
-		oldKeySignResponse, err := node.signMessages(messagesToSign, msgsIndexes)
+		var oldKeySignResponse *keysign.Response
+		if node.signMessagesHook != nil {
+			oldKeySignResponse, err = node.signMessagesHook(oldKey, messagesToSign, msgsIndexes)
+		} else {
+			oldKeySignResponse, err = node.signMessages(messagesToSign, msgsIndexes)
+		}
 		if err != nil {
 			node.logger.Debug(err)
 			node.logger.Debug("Error when trying to sign evm msgs with the old key")
@@ -1791,14 +1731,17 @@ func (node *Node) finishKeyGenRound(keyGenResponse *keygen.Response, decompresse
 			return false
 		}
 		node.logger.Debug("Signatures generated from the old key are valid!")
+		if !node.keyGenActive() {
+			return false
+		}
 
 		var aborted bool
-		keyNotSet, aborted = node.publishKeyGenTss(evmBatch, keyGenResponse.PubKey, znnOldKeySignature, znnNewKeySignature, oldKeyFullSignatures, newKeyFullSignatures)
+		keyNotSet, aborted = node.publishKeyGenTssContext(ctx, evmBatch, keyGenResponse.PubKey, znnOldKeySignature, znnNewKeySignature, oldKeyFullSignatures, newKeyFullSignatures)
 		if node.workerStopping() || aborted {
 			return false
 		}
 	} else {
-		if aborted := node.waitForKeyGenActivation(keyGenResponse.PubKey); node.workerStopping() || aborted {
+		if aborted := node.waitForKeyGenActivationContext(ctx, keyGenResponse.PubKey); node.workerStopping() || aborted {
 			return false
 		}
 	}
@@ -1806,7 +1749,10 @@ func (node *Node) finishKeyGenRound(keyGenResponse *keygen.Response, decompresse
 	// The EVM sender or waiter can finish while the Zenon one still
 	// waits, and the bridge can add a network in between that it never
 	// looked at. Name every listed network not seen to hold the key.
-	if missing, err := node.networksManager.NetworksWithoutKey(keyGenResponse.PubKey); err != nil {
+	if missing, err := node.networksManager.NetworksWithoutKeyContext(ctx, keyGenResponse.PubKey); err != nil {
+		if ctx.Err() != nil || !node.keyGenActive() {
+			return false
+		}
 		node.logger.Error(err)
 	} else if len(missing) != 0 {
 		notSeen := fmt.Errorf("EVM networks %v are not seen to hold the new key", missing)
@@ -1814,6 +1760,9 @@ func (node *Node) finishKeyGenRound(keyGenResponse *keygen.Response, decompresse
 			notSeen = fmt.Errorf("%v; %w", keyNotSet, notSeen)
 		}
 		keyNotSet = notSeen
+	}
+	if !node.keyGenActive() {
+		return false
 	}
 	if keyNotSet != nil {
 		node.logger.Errorf("Set pubKey on the networks of the key change round; not on every EVM network: %v", keyNotSet)
@@ -1826,7 +1775,9 @@ func (node *Node) finishKeyGenRound(keyGenResponse *keygen.Response, decompresse
 
 	node.config.TssConfig.PublicKey = keyGenResponse.PubKey
 	node.config.TssConfig.DecompressedPublicKey = decompressedKeyGenPubKey
-	node.tssManager.SetPubKey(keyGenResponse.PubKey)
+	if node.tssManager != nil {
+		node.tssManager.SetPubKey(keyGenResponse.PubKey)
+	}
 	if keyNotSet != nil && oldKey != "" {
 		// Retain oldKey as fallback if an added EVM network did not rotate yet.
 		node.setPendingKeyGenPubKey(oldKey)
@@ -1850,7 +1801,10 @@ func (node *Node) waitForKeyGenActivation(newPubKey string) bool {
 	node.state.SetActiveKeyGenPubKey(newPubKey)
 	ctx, cancel := node.keyGenContext()
 	defer cancel()
+	return node.waitForKeyGenActivationContext(ctx, newPubKey)
+}
 
+func (node *Node) waitForKeyGenActivationContext(ctx context.Context, newPubKey string) bool {
 	var waiters sync.WaitGroup
 	waiters.Add(2)
 
@@ -1913,6 +1867,10 @@ func (node *Node) publishKeyGenTss(evmBatch network.EvmBatch, newPubKey, znnOldK
 	node.state.SetActiveKeyGenPubKey(newPubKey)
 	ctx, cancel := node.keyGenContext()
 	defer cancel()
+	return node.publishKeyGenTssContext(ctx, evmBatch, newPubKey, znnOldKeySignature, znnNewKeySignature, oldKeyFullSignatures, newKeyFullSignatures)
+}
+
+func (node *Node) publishKeyGenTssContext(ctx context.Context, evmBatch network.EvmBatch, newPubKey, znnOldKeySignature, znnNewKeySignature string, oldKeyFullSignatures, newKeyFullSignatures [][]byte) (keyNotSet error, aborted bool) {
 	node.networksManager.ClearObsoleteHaltTxContext(ctx, node.evmAddress)
 
 	var senders sync.WaitGroup
@@ -2021,47 +1979,304 @@ func compressedPubKeyToEvmAddress(compressedB64 string) (ecommon.Address, error)
 	return crypto.PubkeyToAddress(*pub), nil
 }
 
+type localTssKeyInfo struct {
+	compressedPubKey string
+	evmAddress       ecommon.Address
+	participantKeys  []string
+	peerIDs          []string
+}
+
+func parseLocalTssKeyFile(filePath, compressedPubKey string) (localTssKeyInfo, error) {
+	evmAddr, err := compressedPubKeyToEvmAddress(compressedPubKey)
+	if err != nil {
+		return localTssKeyInfo{}, err
+	}
+	raw, err := os.ReadFile(filePath)
+	if err != nil {
+		return localTssKeyInfo{}, err
+	}
+	var result map[string]interface{}
+	if err := json.Unmarshal(raw, &result); err != nil {
+		return localTssKeyInfo{}, err
+	}
+	rawParties, _ := result["participant_keys"].([]interface{})
+	parties := make([]string, 0, len(rawParties))
+	peerIDs := make([]string, 0, len(rawParties))
+	for _, entry := range rawParties {
+		pkStr, ok := entry.(string)
+		if !ok || pkStr == "" {
+			continue
+		}
+		pkBytes, err := base64.StdEncoding.DecodeString(pkStr)
+		if err != nil {
+			return localTssKeyInfo{}, err
+		}
+		pub, err := ic.UnmarshalEd25519PublicKey(pkBytes)
+		if err != nil {
+			return localTssKeyInfo{}, err
+		}
+		peerID, err := peer.IDFromPublicKey(pub)
+		if err != nil {
+			return localTssKeyInfo{}, err
+		}
+		parties = append(parties, pkStr)
+		peerIDs = append(peerIDs, peerID.String())
+	}
+	sort.Strings(parties)
+	return localTssKeyInfo{
+		compressedPubKey: compressedPubKey,
+		evmAddress:       evmAddr,
+		participantKeys:  parties,
+		peerIDs:          peerIDs,
+	}, nil
+}
+
+// scanLocalTssKeys discovers all local TSS key share files in baseDir so a
+// node restarted mid-rotation can still locate both the old and new keys and
+// their participant sets when signing emergency halts.
+func scanLocalTssKeys(baseDir string) map[string]localTssKeyInfo {
+	keys := make(map[string]localTssKeyInfo)
+	if baseDir == "" {
+		return keys
+	}
+	entries, err := os.ReadDir(baseDir)
+	if err != nil {
+		return keys
+	}
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		if !strings.HasPrefix(name, "localstate-") || !strings.HasSuffix(name, ".json") {
+			continue
+		}
+		hexKey := strings.TrimSuffix(strings.TrimPrefix(name, "localstate-"), ".json")
+		rawBytes, err := hex.DecodeString(hexKey)
+		if err != nil || len(rawBytes) != 33 {
+			continue
+		}
+		compressedB64 := base64.StdEncoding.EncodeToString(rawBytes)
+		info, err := parseLocalTssKeyFile(filepath.Join(baseDir, name), compressedB64)
+		if err != nil {
+			continue
+		}
+		keys[compressedB64] = info
+	}
+	return keys
+}
+
+// publishEmergencyHalt submits the signed Zenon and EVM halt transactions
+// until every bridge is halted, the emergency ends, a network is added, or an
+// in-flight key rotation changes the active TSS key or nonce on Zenon or any
+// EVM chain (in which case aborted=true so processSignatures immediately
+// re-reads state and re-signs fresh halt messages).
+func (node *Node) publishEmergencyHalt(evmBatch network.EvmBatch, znnSignature string, evmFullSignatures [][]byte, signedZnnKey string, signedZnnNonce uint64, signedEvmTss []ecommon.Address, signedEvmNonces []*big.Int) bool {
+	// The redeem worker can release the last incident while the group signs.
+	// A halt is sent only while the emergency still stands.
+	emergency := func() bool {
+		state, err := node.state.GetState()
+		return err == nil && state == common.EmergencyState
+	}
+	if !emergency() {
+		return true
+	}
+	var aborted atomic.Bool
+	roundCtx, cancelRound := context.WithCancel(node.workers.context())
+	defer cancelRound()
+	abortRound := func() {
+		aborted.Store(true)
+		cancelRound()
+	}
+	stopSender := func() bool {
+		if node.workerStopping() || aborted.Load() {
+			return true
+		}
+		if !emergency() {
+			abortRound()
+			return true
+		}
+		return false
+	}
+	sleepRound := func(d time.Duration) bool {
+		timer := time.NewTimer(d)
+		defer timer.Stop()
+		select {
+		case <-roundCtx.Done():
+			return false
+		case <-timer.C:
+			return !stopSender()
+		}
+	}
+	var senders sync.WaitGroup
+	senders.Add(2)
+	go func() {
+		defer senders.Done()
+		index := uint32(int(znnSignature[0])) % node.getParticipantsLength()
+		// The halt flag itself decides: the wait that follows an unhalt still
+		// needs a halt, and a failed read is retried. If a rotation changed
+		// Zenon's active key or tssNonce, abort so the round re-signs.
+		for !stopSender() {
+			index = (index + 1) % node.getParticipantsLength()
+			bridgeInfo, err := node.networksManager.GetBridgeInfo()
+			ok := err == nil && bridgeInfo != nil
+			if ok && bridgeInfo.Halted {
+				return
+			}
+			if ok && (bridgeInfo.TssNonce != signedZnnNonce || (signedZnnKey != "" && bridgeInfo.CompressedTssECDSAPubKey != signedZnnKey)) {
+				node.logger.Infof("Zenon bridge TSS key or nonce changed during halt publishing (nonce %d -> %d); re-signing halt", signedZnnNonce, bridgeInfo.TssNonce)
+				abortRound()
+				return
+			}
+			producerPubKey := base64.StdEncoding.EncodeToString(node.producerKeyPair.Public)
+			if ok && producerPubKey == node.getParticipant(index) {
+				node.logger.Debug("[send Halt Znn Tx] this is me")
+				sent, err := node.networksManager.HaltZnn(znnSignature, node.producerKeyPair, node.state.WhileEmergency)
+				if err != nil {
+					node.logger.Info(err.Error())
+				} else if !sent {
+					abortRound()
+					return
+				} else {
+					node.logger.Debug("[send Halt Znn Tx] sent request")
+					if !sleepRound(20 * time.Second) {
+						return
+					}
+					continue
+				}
+			}
+			if !sleepRound(time.Second) {
+				return
+			}
+		}
+	}()
+
+	go func() {
+		defer senders.Done()
+		index := uint32(int(znnSignature[0])) % node.getParticipantsLength()
+		for !stopSender() {
+			index = (index + 1) % node.getParticipantsLength()
+			producerPubKey := base64.StdEncoding.EncodeToString(node.producerKeyPair.Public)
+			if producerPubKey == node.getParticipant(index) {
+				node.logger.Debug("[send halt evm tx] this is me")
+				changed, err := node.networksManager.SendHaltEvmWithExpected(evmBatch, evmFullSignatures, signedEvmTss, signedEvmNonces, node.ecdsaPrivateKey, node.evmAddress, node.state.WhileEmergency)
+				switch {
+				case errors.Is(err, network.ErrNetworksChanged):
+					node.logger.Info("the bridge lists an EVM network the halt was not signed for; signing the halt again")
+					abortRound()
+					return
+				case errors.Is(err, network.ErrHaltSignaturesStale):
+					node.logger.Infof("%v; signing the halt again", err)
+					abortRound()
+					return
+				case errors.Is(err, network.ErrEmergencyEnded):
+					abortRound()
+					return
+				case err != nil:
+					node.logger.Debug(err)
+				case changed:
+					return
+				default:
+					if !sleepRound(15 * time.Second) {
+						return
+					}
+					continue
+				}
+			}
+			if !sleepRound(time.Second) {
+				return
+			}
+		}
+	}()
+	senders.Wait()
+	return aborted.Load()
+}
+
 // signEmergencyHaltMessages signs the Zenon and EVM halt messages using each
 // chain's observed active TSS key. When a key rotation was partially applied
-// before EmergencyState preempted it, Zenon and each EVM chain are grouped by
-// their observed on-chain key (old vs new) so every chain receives a valid
-// halt signature.
-func (node *Node) signEmergencyHaltMessages(znnMessage []byte, evmBatch network.EvmBatch, evmMessages [][]byte) (string, [][]byte, error) {
+// (either in-memory or recovered from localstate-*.json files on disk after a
+// restart), Zenon and each EVM chain are grouped by their observed on-chain
+// key (old vs new) and signed with that key's participant set so every chain
+// receives a valid halt signature.
+func (node *Node) signEmergencyHaltMessages(znnMessage []byte, observedZnnKey string, evmBatch network.EvmBatch, evmMessages [][]byte, observedEvmTss []ecommon.Address) (string, [][]byte, error) {
 	primaryKey := node.activeSigningPubKey()
+	var baseDir string
+	if node.config != nil {
+		baseDir = node.config.TssConfig.BaseDir
+	}
+	diskKeys := scanLocalTssKeys(baseDir)
+
+	// Build lookup maps across all locally available TSS keys (active key,
+	// in-memory candidate key, and any localstate-*.json keyfiles on disk).
+	byCompressed := make(map[string]localTssKeyInfo, len(diskKeys)+2)
+	byEvmAddr := make(map[ecommon.Address]localTssKeyInfo, len(diskKeys)+2)
+	registerKey := func(compressed string) {
+		if compressed == "" {
+			return
+		}
+		if info, ok := diskKeys[compressed]; ok {
+			byCompressed[compressed] = info
+			byEvmAddr[info.evmAddress] = info
+			return
+		}
+		if addr, err := compressedPubKeyToEvmAddress(compressed); err == nil {
+			info := localTssKeyInfo{compressedPubKey: compressed, evmAddress: addr}
+			byCompressed[compressed] = info
+			byEvmAddr[addr] = info
+		}
+	}
+	for k := range diskKeys {
+		registerKey(k)
+	}
+	registerKey(node.getPendingKeyGenPubKey())
+	registerKey(primaryKey)
+
+	if primaryKey == "" {
+		// Fallback if Zenon's key is not locally held but an alternate disk key is.
+		if info, ok := byCompressed[observedZnnKey]; ok {
+			primaryKey = info.compressedPubKey
+		} else if len(observedEvmTss) > 0 {
+			for _, addr := range observedEvmTss {
+				if info, ok := byEvmAddr[addr]; ok {
+					primaryKey = info.compressedPubKey
+					break
+				}
+			}
+		}
+	}
 	if primaryKey == "" {
 		return "", nil, errors.New("missing active TSS public key for emergency halt")
 	}
-	secondaryKey := node.getPendingKeyGenPubKey()
-	if secondaryKey == primaryKey {
-		secondaryKey = ""
-	}
 
-	// Slot 0 is Zenon; slots 1..len(evmMessages) correspond to evmMessages[0..].
-	slotKeys := make([]string, 1+len(evmMessages))
-	for i := range slotKeys {
-		slotKeys[i] = primaryKey
-	}
-	if secondaryKey != "" {
-		secondaryEvmAddr, err := compressedPubKeyToEvmAddress(secondaryKey)
-		if err != nil {
-			return "", nil, fmt.Errorf("decode candidate TSS pubkey for emergency halt: %w", err)
-		}
+	// If caller did not pass observed keys, read them when multiple local keys exist.
+	if observedZnnKey == "" && len(byCompressed) > 1 {
 		bridgeInfo, err := node.networksManager.GetBridgeInfo()
 		if err != nil {
 			return "", nil, fmt.Errorf("read Zenon active TSS pubkey for emergency halt: %w", err)
 		}
-		if bridgeInfo != nil && bridgeInfo.CompressedTssECDSAPubKey == secondaryKey {
-			slotKeys[0] = secondaryKey
+		if bridgeInfo != nil {
+			observedZnnKey = bridgeInfo.CompressedTssECDSAPubKey
 		}
-		if len(evmMessages) > 0 {
-			evmAddrs, err := node.networksManager.GetBatchCurrentTss(evmBatch)
-			if err != nil {
-				return "", nil, fmt.Errorf("read EVM active TSS addresses for emergency halt: %w", err)
-			}
-			for i, addr := range evmAddrs {
-				if i < len(evmMessages) && addr == secondaryEvmAddr {
-					slotKeys[i+1] = secondaryKey
-				}
+	}
+	if len(observedEvmTss) == 0 && len(evmMessages) > 0 && len(byCompressed) > 1 {
+		addrs, err := node.networksManager.GetBatchCurrentTss(evmBatch)
+		if err != nil {
+			return "", nil, fmt.Errorf("read EVM active TSS addresses for emergency halt: %w", err)
+		}
+		observedEvmTss = addrs
+	}
+
+	// Slot 0 is Zenon; slots 1..len(evmMessages) correspond to evmMessages[0..].
+	slotKeys := make([]string, 1+len(evmMessages))
+	slotKeys[0] = primaryKey
+	if info, ok := byCompressed[observedZnnKey]; ok {
+		slotKeys[0] = info.compressedPubKey
+	}
+	for i := range evmMessages {
+		slotKeys[i+1] = primaryKey
+		if i < len(observedEvmTss) {
+			if info, ok := byEvmAddr[observedEvmTss[i]]; ok {
+				slotKeys[i+1] = info.compressedPubKey
 			}
 		}
 	}
@@ -2071,7 +2286,7 @@ func (node *Node) signEmergencyHaltMessages(znnMessage []byte, evmBatch network.
 		msg  []byte
 	}
 	groups := make(map[string][]haltMsgItem)
-	keyOrder := make([]string, 0, 2)
+	keyOrder := make([]string, 0, len(byCompressed))
 	addItem := func(k string, slot int, msg []byte) {
 		if _, exists := groups[k]; !exists {
 			keyOrder = append(keyOrder, k)
@@ -2086,15 +2301,37 @@ func (node *Node) signEmergencyHaltMessages(znnMessage []byte, evmBatch network.
 	var znnSignature string
 	evmFullSignatures := make([][]byte, len(evmMessages))
 
+	var origLocalPubKeys []string
 	if node.tssManager != nil {
-		defer node.tssManager.SetPubKey(primaryKey)
+		origLocalPubKeys = append([]string(nil), node.tssManager.GetLocalPubKeys()...)
+		defer func() {
+			node.tssManager.SetPubKey(primaryKey)
+			if len(origLocalPubKeys) > 0 {
+				node.tssManager.SetNewLocalPubKeys(origLocalPubKeys)
+			}
+		}()
 	}
 
+	signedParties := make(map[string][]string, len(keyOrder))
 	for _, groupKey := range keyOrder {
 		items := groups[groupKey]
 		decompressed, err := common.DecompressPubKey(groupKey)
 		if err != nil {
 			return "", nil, err
+		}
+		if info, ok := byCompressed[groupKey]; ok && len(info.participantKeys) > 0 {
+			signedParties[groupKey] = append([]string(nil), info.participantKeys...)
+			if node.tssManager != nil {
+				p2pWL, partyWL, sigWL := node.tssManager.GetWhitelists()
+				for _, pid := range info.peerIDs {
+					p2pWL[pid] = true
+					partyWL[pid] = true
+					sigWL[pid] = true
+				}
+				node.tssManager.SetNewLocalPubKeys(info.participantKeys)
+			}
+		} else if node.tssManager != nil && len(origLocalPubKeys) > 0 {
+			node.tssManager.SetNewLocalPubKeys(origLocalPubKeys)
 		}
 		msgs := make([][]byte, len(items))
 		idxMap := make(map[string]int, len(items))
@@ -2147,6 +2384,9 @@ func (node *Node) signEmergencyHaltMessages(znnMessage []byte, evmBatch network.
 			}
 		}
 	}
+	node.lock.Lock()
+	node.lastSignedKeyParties = signedParties
+	node.lock.Unlock()
 	return znnSignature, evmFullSignatures, nil
 }
 
@@ -2577,6 +2817,30 @@ func (node *Node) configurePubKey() error {
 		}
 	}
 	sort.Strings(node.config.TssConfig.LocalPubKeys)
+
+	// Rediscover any alternate local TSS key still active on an EVM chain
+	// (e.g. after a restart during a split key rotation) and whitelist its
+	// signing parties so restored emergency halts can sign for every chain.
+	diskKeys := scanLocalTssKeys(node.config.TssConfig.BaseDir)
+	if len(diskKeys) > 0 && node.networksManager != nil {
+		byAddr := make(map[ecommon.Address]localTssKeyInfo, len(diskKeys))
+		for _, info := range diskKeys {
+			byAddr[info.evmAddress] = info
+		}
+		evmBatch := node.networksManager.EvmBatch()
+		if evmAddrs, err := node.networksManager.GetBatchCurrentTss(evmBatch); err == nil {
+			for _, addr := range evmAddrs {
+				info, ok := byAddr[addr]
+				if !ok || info.compressedPubKey == node.config.TssConfig.PublicKey {
+					continue
+				}
+				node.setPendingKeyGenPubKey(info.compressedPubKey)
+				for _, pid := range info.peerIDs {
+					node.config.TssConfig.PubKeyWhitelist[pid] = true
+				}
+			}
+		}
+	}
 
 	return nil
 }

@@ -790,6 +790,14 @@ func (m *NetworksManager) GetTssNonceZnn() (uint64, error) {
 	return bridgeInfo.TssNonce, nil
 }
 
+func (m *NetworksManager) GetTssNonceZnnContext(ctx context.Context) (uint64, error) {
+	bridgeInfo, err := m.Znn().GetBridgeInfoContext(ctx)
+	if err != nil {
+		return 0, err
+	}
+	return bridgeInfo.TssNonce, nil
+}
+
 func (m *NetworksManager) GetEvmUnwrapRequestByHashAndLogFromRPC(txHash types.Hash, logIndex uint32) (*definition.UnwrapTokenRequest, error) {
 	return m.Znn().GetUnwrapTokenRequestByHashAndLog(txHash, logIndex)
 }
@@ -1071,6 +1079,16 @@ func (m *NetworksManager) CheckNewTssEcdsaPubKeyEvmContext(ctx context.Context, 
 // lists now that are not seen to hold the key: their TSS address is another,
 // or it cannot be read.
 func (m *NetworksManager) NetworksWithoutKey(newCompressedPubKey string) ([]uint32, error) {
+	return m.NetworksWithoutKeyContext(context.Background(), newCompressedPubKey)
+}
+
+func (m *NetworksManager) NetworksWithoutKeyContext(ctx context.Context, newCompressedPubKey string) ([]uint32, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	newCompressedPubKeyBytes, err := base64.StdEncoding.DecodeString(newCompressedPubKey)
 	if err != nil {
 		return nil, err
@@ -1082,12 +1100,25 @@ func (m *NetworksManager) NetworksWithoutKey(newCompressedPubKey string) ([]uint
 	newTss := crypto.PubkeyToAddress(*newPubKey)
 	var missing []uint32
 	for _, network := range m.networks() {
-		if tss, err := network.GetCurrentTss(); err != nil || tss != newTss {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if tss, err := network.GetCurrentTssContext(ctx); err != nil {
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			missing = append(missing, network.ChainId())
+		} else if tss != newTss {
 			missing = append(missing, network.ChainId())
 		}
 	}
 	return missing, nil
 }
+
+// ErrHaltSignaturesStale is returned when an EVM network's active TSS address
+// or action nonce changed after the halt batch was signed, requiring a fresh
+// halt signing round.
+var ErrHaltSignaturesStale = errors.New("bridge TSS key or action nonce changed; halt signatures are stale")
 
 // SendHaltEvm sends the halt, signed for the networks in batch, to the first
 // of them that the bridge still lists and whose halt flag is not set yet. It
@@ -1097,6 +1128,15 @@ func (m *NetworksManager) NetworksWithoutKey(newCompressedPubKey string) ([]uint
 // The transaction is submitted through while; ErrEmergencyEnded is returned
 // when while did not run it.
 func (m *NetworksManager) SendHaltEvm(batch EvmBatch, signatures [][]byte, ecdsaPrivateKey *ecdsa.PrivateKey, evmAddress ecommon.Address, while WhileEmergency) (bool, error) {
+	return m.SendHaltEvmWithExpected(batch, signatures, nil, nil, ecdsaPrivateKey, evmAddress, while)
+}
+
+// SendHaltEvmWithExpected behaves like SendHaltEvm and additionally verifies
+// that each unhalted network still holds the TSS address and action nonce that
+// its halt signature was built for, returning ErrHaltSignaturesStale if either
+// changed (e.g. an in-flight key rotation confirmed after halt messages were
+// built).
+func (m *NetworksManager) SendHaltEvmWithExpected(batch EvmBatch, signatures [][]byte, expectedTss []ecommon.Address, expectedNonces []*big.Int, ecdsaPrivateKey *ecdsa.PrivateKey, evmAddress ecommon.Address, while WhileEmergency) (bool, error) {
 	targets, err := m.targets(batch, signatures)
 	if err != nil {
 		return false, err
@@ -1117,6 +1157,28 @@ func (m *NetworksManager) SendHaltEvm(batch EvmBatch, signatures [][]byte, ecdsa
 				m.logger.Debugf("clear obsolete halt tx on chainId %d: %v", network.ChainId(), clrErr)
 			}
 			continue
+		}
+		if idx < len(expectedTss) && expectedTss[idx] != (ecommon.Address{}) {
+			curTss, err := network.GetCurrentTss()
+			if err != nil {
+				m.logger.Errorf("cannot read current TSS of EVM network %d: %v", network.ChainId(), err)
+				ok = false
+				continue
+			}
+			if curTss != expectedTss[idx] {
+				return false, fmt.Errorf("%w: EVM network %d TSS changed from %s to %s", ErrHaltSignaturesStale, network.ChainId(), expectedTss[idx].Hex(), curTss.Hex())
+			}
+		}
+		if idx < len(expectedNonces) && expectedNonces[idx] != nil {
+			curNonce, err := network.EvmRpc().GetActionNonce()
+			if err != nil {
+				m.logger.Errorf("cannot read action nonce of EVM network %d: %v", network.ChainId(), err)
+				ok = false
+				continue
+			}
+			if curNonce.Cmp(expectedNonces[idx]) != 0 {
+				return false, fmt.Errorf("%w: EVM network %d action nonce changed from %s to %s", ErrHaltSignaturesStale, network.ChainId(), expectedNonces[idx].String(), curNonce.String())
+			}
 		}
 		ok = false
 		tx, err := network.GetHaltEvmTx(signatures[idx], evmAddress)
@@ -1206,16 +1268,32 @@ func (m *NetworksManager) ClearObsoleteHaltTxContext(ctx context.Context, sender
 // GetHaltMessages returns the halt message of every EVM network the bridge
 // lists, and the batch of those networks, in the same order.
 func (m *NetworksManager) GetHaltMessages() (EvmBatch, [][]byte, error) {
+	batch, msgs, _, _, err := m.GetHaltMessagesWithState()
+	return batch, msgs, err
+}
+
+// GetHaltMessagesWithState returns the halt message, action nonce, and current
+// TSS address of every EVM network in batch order so halt signing and sending
+// can match each chain's active key and detect mid-emergency key/nonce changes.
+func (m *NetworksManager) GetHaltMessagesWithState() (EvmBatch, [][]byte, []*big.Int, []ecommon.Address, error) {
 	batch := m.EvmBatch()
-	ans := make([][]byte, 0)
+	msgs := make([][]byte, 0, len(batch.networks))
+	nonces := make([]*big.Int, 0, len(batch.networks))
+	tssAddrs := make([]ecommon.Address, 0, len(batch.networks))
 	for _, network := range batch.networks {
-		msg, err := network.GetHaltEvmMessage()
+		tssAddr, err := network.GetCurrentTss()
 		if err != nil {
-			return EvmBatch{}, nil, err
+			return EvmBatch{}, nil, nil, nil, err
 		}
-		ans = append(ans, msg)
+		msg, nonce, err := network.GetHaltEvmMessageWithNonce()
+		if err != nil {
+			return EvmBatch{}, nil, nil, nil, err
+		}
+		msgs = append(msgs, msg)
+		nonces = append(nonces, nonce)
+		tssAddrs = append(tssAddrs, tssAddr)
 	}
-	return batch, ans, nil
+	return batch, msgs, nonces, tssAddrs, nil
 }
 
 // GetBatchCurrentTss reads the current on-chain TSS address for each EVM
@@ -1344,6 +1422,16 @@ func (m *NetworksManager) GetChangeTssEcdsaPubKeysEvmTxs(batch EvmBatch, oldPubl
 // EVM network the bridge lists, and the batch of those networks, in the same
 // order.
 func (m *NetworksManager) GetSetTssEcdsaPubKeysEvmMessages(newCompressedPubKey string) (EvmBatch, [][]byte, error) {
+	return m.GetSetTssEcdsaPubKeysEvmMessagesContext(context.Background(), newCompressedPubKey)
+}
+
+func (m *NetworksManager) GetSetTssEcdsaPubKeysEvmMessagesContext(ctx context.Context, newCompressedPubKey string) (EvmBatch, [][]byte, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return EvmBatch{}, nil, err
+	}
 	newCompressedPubKeyBytes, err := base64.StdEncoding.DecodeString(newCompressedPubKey)
 	if err != nil {
 		m.logger.Debug(err)
@@ -1359,7 +1447,10 @@ func (m *NetworksManager) GetSetTssEcdsaPubKeysEvmMessages(newCompressedPubKey s
 	batch := m.EvmBatch()
 	ans := make([][]byte, 0)
 	for _, network := range batch.networks {
-		msg, err := network.GetSetTssEcdsaPubKeyEvmMessage(newTss)
+		if err := ctx.Err(); err != nil {
+			return EvmBatch{}, nil, err
+		}
+		msg, err := network.GetSetTssEcdsaPubKeyEvmMessageContext(ctx, newTss)
 		if err != nil {
 			return EvmBatch{}, nil, err
 		}

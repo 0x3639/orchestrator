@@ -63,8 +63,10 @@ type EvmRpc struct {
 	secondaryStopped bool
 
 	// pendingMu serializes durable pendingTxStore read/modify/write batches
-	// with in-memory pendingTx updates (never held across network RPCs).
-	pendingMu sync.Mutex
+	// with in-memory pendingTx and pendingStack updates (never held across
+	// network RPCs).
+	pendingMu    sync.Mutex
+	pendingStack map[evmTxKey][]*pendingAttempt
 	// txMu guards storageName, chainID, pendingTx, pendingTxStore, and
 	// sendTimeout, which track the latest unconfirmed halt or key-change
 	// transaction per (sender, contract, action) so retries reuse the same
@@ -93,10 +95,19 @@ type pendingEvmTx struct {
 	isDynamic bool
 }
 
+type pendingAttempt struct {
+	txHash     ecommon.Hash
+	nonce      uint64
+	entry      *pendingEvmTx
+	superseded *supersededTx
+	rejected   bool
+}
+
 type secondaryClient struct {
-	sem     chan struct{}
-	client  *ethclient.Client
-	limiter *rate.Limiter
+	sem          chan struct{}
+	client       *ethclient.Client
+	limiter      *rate.Limiter
+	verifiedHead uint64
 }
 
 func (s *secondaryClient) acquire(ctx context.Context) error {
@@ -449,13 +460,13 @@ func (r *EvmRpc) SendTransactionContext(parent context.Context, tx *etypes.Trans
 	if allowSend != nil && !allowSend() {
 		return context.Canceled
 	}
-	prevSnapshot, superseded, tracked, err := r.recordPendingTxAttempt(tx)
+	attempt, tracked, err := r.recordPendingTxAttempt(tx)
 	if err != nil {
 		return err
 	}
 	sendErr := r.rpcClient.SendTransaction(ctx, tx)
 	if tracked {
-		r.reconcileSentTx(tx, prevSnapshot, superseded, sendErr)
+		r.reconcileSentTx(tx, attempt, sendErr)
 	}
 	return sendErr
 }
@@ -586,20 +597,20 @@ type supersededTx struct {
 // cannot erase the watermark. When an emergency halt supersedes an unconfirmed
 // setTss at the same nonce, ownership is explicitly transferred in one atomic
 // fsynced batch (saving halt and deleting setTss together).
-func (r *EvmRpc) recordPendingTxAttempt(tx *etypes.Transaction) (*pendingEvmTx, *supersededTx, bool, error) {
+func (r *EvmRpc) recordPendingTxAttempt(tx *etypes.Transaction) (*pendingAttempt, bool, error) {
 	key, ok := evmTxKeyFromTx(tx)
 	if !ok {
-		return nil, nil, false, nil
+		return nil, false, nil
 	}
 	r.pendingMu.Lock()
 	defer r.pendingMu.Unlock()
 
 	if _, err := r.loadPendingTxLocked(key); err != nil {
-		return nil, nil, false, fmt.Errorf("load pending EVM tx record before broadcast: %w", err)
+		return nil, false, fmt.Errorf("load pending EVM tx record before broadcast: %w", err)
 	}
 	if key.kind == evmTxKindHalt {
 		if _, err := r.loadPendingTxLocked(evmTxKey{sender: key.sender, contract: key.contract, kind: evmTxKindSetTss}); err != nil {
-			return nil, nil, false, fmt.Errorf("load superseded setTss record before broadcast: %w", err)
+			return nil, false, fmt.Errorf("load superseded setTss record before broadcast: %w", err)
 		}
 	}
 	r.txMu.Lock()
@@ -632,7 +643,7 @@ func (r *EvmRpc) recordPendingTxAttempt(tx *etypes.Transaction) (*pendingEvmTx, 
 	if prev != nil {
 		if prev.nonce > entry.nonce {
 			r.txMu.Unlock()
-			return prevSnapshot, nil, false, nil
+			return nil, false, nil
 		}
 		if prev.nonce == entry.nonce {
 			entry.gasPrice = maxBigInt(prev.gasPrice, entry.gasPrice)
@@ -659,9 +670,27 @@ func (r *EvmRpc) recordPendingTxAttempt(tx *etypes.Transaction) (*pendingEvmTx, 
 	if store != nil {
 		if err := store.ApplyPendingEvmTxBatch(ops); err != nil {
 			r.logger.Errorf("failed to persist pending EVM tx record before broadcast: %v", err)
-			return nil, nil, false, fmt.Errorf("persist pending EVM tx before broadcast: %w", err)
+			return nil, false, fmt.Errorf("persist pending EVM tx before broadcast: %w", err)
 		}
 	}
+
+	if r.pendingStack == nil {
+		r.pendingStack = make(map[evmTxKey][]*pendingAttempt)
+	}
+	if len(r.pendingStack[key]) == 0 && prevSnapshot != nil {
+		r.pendingStack[key] = append(r.pendingStack[key], &pendingAttempt{
+			txHash: prevSnapshot.txHash,
+			nonce:  prevSnapshot.nonce,
+			entry:  prevSnapshot,
+		})
+	}
+	attempt := &pendingAttempt{
+		txHash:     tx.Hash(),
+		nonce:      tx.Nonce(),
+		entry:      clonePendingEvmTx(entry),
+		superseded: superseded,
+	}
+	r.pendingStack[key] = append(r.pendingStack[key], attempt)
 
 	r.txMu.Lock()
 	r.pendingTx[key] = entry
@@ -669,17 +698,18 @@ func (r *EvmRpc) recordPendingTxAttempt(tx *etypes.Transaction) (*pendingEvmTx, 
 		delete(r.pendingTx, superseded.key)
 	}
 	r.txMu.Unlock()
-	return prevSnapshot, superseded, true, nil
+	return attempt, true, nil
 }
 
 // reconcileSentTx updates or rolls back the pre-broadcast watermark based on
-// the broadcast outcome. Ambiguous failures (EOF, timeouts, connection resets)
-// and mempool pricing/duplicate errors keep the persisted watermark. Rollback
-// and cleanup are serialized with pendingMu and run only while the current
-// record still belongs to tx (matching nonce and txHash), so a late rejection
-// from an older attempt can never erase a newer accepted transaction.
-func (r *EvmRpc) reconcileSentTx(tx *etypes.Transaction, prevSnapshot *pendingEvmTx, superseded *supersededTx, sendErr error) {
-	if sendErr == nil {
+// the broadcast outcome. Attempt lineage is tracked under pendingMu so:
+//   - An accepted attempt collapses older attempts/superseded records below it.
+//   - Ambiguous failures (EOF, timeouts, underpriced) stay viable.
+//   - Overlapping definitive rejections unwind through ALL trailing rejected
+//     attempts in one atomic batch, restoring the last viable owner (e.g. the
+//     original setTss) and never restoring a definitively rejected halt.
+func (r *EvmRpc) reconcileSentTx(tx *etypes.Transaction, attempt *pendingAttempt, sendErr error) {
+	if attempt == nil {
 		return
 	}
 	key, ok := evmTxKeyFromTx(tx)
@@ -689,7 +719,23 @@ func (r *EvmRpc) reconcileSentTx(tx *etypes.Transaction, prevSnapshot *pendingEv
 	r.pendingMu.Lock()
 	defer r.pendingMu.Unlock()
 
+	stack := r.pendingStack[key]
+	if sendErr == nil {
+		// This attempt was accepted by the EVM node. Collapse any older
+		// attempts below it so later rejections from superseded attempts can
+		// never unwind past an accepted transaction.
+		for i, a := range stack {
+			if a == attempt {
+				a.superseded = nil
+				r.pendingStack[key] = stack[i:]
+				break
+			}
+		}
+		return
+	}
+
 	if isNonceTooLowErr(sendErr) {
+		attempt.rejected = true
 		r.txMu.Lock()
 		store := r.pendingTxStore
 		cur := r.pendingTx[key]
@@ -704,6 +750,7 @@ func (r *EvmRpc) reconcileSentTx(tx *etypes.Transaction, prevSnapshot *pendingEv
 				return
 			}
 		}
+		delete(r.pendingStack, key)
 		r.txMu.Lock()
 		if cur := r.pendingTx[key]; cur != nil && (cur.nonce < tx.Nonce() || (cur.nonce == tx.Nonce() && cur.txHash == tx.Hash())) {
 			delete(r.pendingTx, key)
@@ -714,27 +761,47 @@ func (r *EvmRpc) reconcileSentTx(tx *etypes.Transaction, prevSnapshot *pendingEv
 	if !isDefinitivePreMempoolRejection(sendErr) {
 		return
 	}
-	r.txMu.Lock()
-	store := r.pendingTxStore
-	cur := r.pendingTx[key]
-	matchesAttempt := cur != nil && cur.nonce == tx.Nonce() && cur.txHash == tx.Hash()
-	r.txMu.Unlock()
-	if !matchesAttempt {
+
+	attempt.rejected = true
+	if len(stack) == 0 || stack[len(stack)-1] != attempt {
+		// A newer viable attempt owns the top of the stack; leave attempt
+		// marked rejected so if the top attempt is later rejected too, unwind
+		// skips straight past this rejected attempt to the last viable owner.
 		return
 	}
+
+	// Unwind all trailing definitively rejected attempts and collect the
+	// earliest superseded record among them.
+	cut := len(stack)
+	var restoredSuperseded *supersededTx
+	for cut > 0 && stack[cut-1].rejected {
+		if stack[cut-1].superseded != nil {
+			restoredSuperseded = stack[cut-1].superseded
+		}
+		cut--
+	}
+	remaining := stack[:cut]
+	var surviving *pendingEvmTx
+	if len(remaining) > 0 {
+		surviving = clonePendingEvmTx(remaining[len(remaining)-1].entry)
+	}
+
+	r.txMu.Lock()
+	store := r.pendingTxStore
+	r.txMu.Unlock()
 
 	ops := []common.PendingEvmTxOp{{
 		Sender:   key.sender,
 		Contract: key.contract,
 		Kind:     key.kind,
-		Record:   toCommonPendingEvmTx(prevSnapshot),
+		Record:   toCommonPendingEvmTx(surviving),
 	}}
-	if superseded != nil {
+	if surviving == nil && restoredSuperseded != nil {
 		ops = append(ops, common.PendingEvmTxOp{
-			Sender:   superseded.key.sender,
-			Contract: superseded.key.contract,
-			Kind:     superseded.key.kind,
-			Record:   toCommonPendingEvmTx(superseded.entry),
+			Sender:   restoredSuperseded.key.sender,
+			Contract: restoredSuperseded.key.contract,
+			Kind:     restoredSuperseded.key.kind,
+			Record:   toCommonPendingEvmTx(restoredSuperseded.entry),
 		})
 	}
 	if store != nil {
@@ -743,14 +810,19 @@ func (r *EvmRpc) reconcileSentTx(tx *etypes.Transaction, prevSnapshot *pendingEv
 			return
 		}
 	}
+	if len(remaining) == 0 {
+		delete(r.pendingStack, key)
+	} else {
+		r.pendingStack[key] = remaining
+	}
 	r.txMu.Lock()
-	if prevSnapshot != nil {
-		r.pendingTx[key] = clonePendingEvmTx(prevSnapshot)
+	if surviving != nil {
+		r.pendingTx[key] = surviving
 	} else {
 		delete(r.pendingTx, key)
-	}
-	if superseded != nil {
-		r.pendingTx[superseded.key] = clonePendingEvmTx(superseded.entry)
+		if restoredSuperseded != nil {
+			r.pendingTx[restoredSuperseded.key] = clonePendingEvmTx(restoredSuperseded.entry)
+		}
 	}
 	r.txMu.Unlock()
 }
@@ -821,6 +893,7 @@ func (r *EvmRpc) clearPendingTxIfMatchesLocked(key evmTxKey, expected *pendingEv
 	cur = r.pendingTx[key]
 	if expected == nil || (cur != nil && cur.nonce == expected.nonce && cur.txHash == expected.txHash) {
 		delete(r.pendingTx, key)
+		delete(r.pendingStack, key)
 	}
 	r.txMu.Unlock()
 }
@@ -1164,7 +1237,11 @@ func (r *EvmRpc) buildContractTxContext(parent context.Context, sender ecommon.A
 }
 
 func (r *EvmRpc) GetSetTssEcdsaPubKeyEvmMessage(newAddress ecommon.Address, networkClass, chainId uint32, contractAddress *ecommon.Address) ([]byte, error) {
-	actionsNonce, err := r.GetActionNonce()
+	return r.GetSetTssEcdsaPubKeyEvmMessageContext(r.ctx, newAddress, networkClass, chainId, contractAddress)
+}
+
+func (r *EvmRpc) GetSetTssEcdsaPubKeyEvmMessageContext(ctx context.Context, newAddress ecommon.Address, networkClass, chainId uint32, contractAddress *ecommon.Address) ([]byte, error) {
+	actionsNonce, err := r.GetActionNonceContext(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -1202,9 +1279,14 @@ func (r *EvmRpc) GetSetTssEcdsaPubKeyEvmTxContext(ctx context.Context, newTss, s
 }
 
 func (r *EvmRpc) GetHaltEvmMessage(networkClass, chainId uint32, contractAddress *ecommon.Address) ([]byte, error) {
+	msg, _, err := r.GetHaltEvmMessageWithNonce(networkClass, chainId, contractAddress)
+	return msg, err
+}
+
+func (r *EvmRpc) GetHaltEvmMessageWithNonce(networkClass, chainId uint32, contractAddress *ecommon.Address) ([]byte, *big.Int, error) {
 	actionsNonce, err := r.GetActionNonce()
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	args := abi.Arguments{{Type: definition.StringTy}, {Type: definition.Uint256Ty}, {Type: definition.Uint256Ty}, {Type: definition.AddressTy}, {Type: definition.Uint256Ty}}
@@ -1213,13 +1295,17 @@ func (r *EvmRpc) GetHaltEvmMessage(networkClass, chainId uint32, contractAddress
 
 	packedData, err := args.PackValues(values)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	hasher := sha3.NewLegacyKeccak256()
 	hasher.Write(packedData)
 	data := hasher.Sum(nil)
-	return implementation.GetMessageToSignEvm(data)
+	msg, err := implementation.GetMessageToSignEvm(data)
+	if err != nil {
+		return nil, nil, err
+	}
+	return msg, new(big.Int).Set(actionsNonce), nil
 }
 
 func (r *EvmRpc) GetHaltTxEvm(sender ecommon.Address, signature []byte, contractAddress *ecommon.Address) (*etypes.Transaction, error) {
@@ -1586,6 +1672,9 @@ func (r *EvmRpc) EndpointHeads() (uint64, uint64, error) {
 					return errors.New("endpoint is still syncing")
 				}
 				head, err = client.BlockNumber(ctx)
+				if err == nil && uint32(idx) != r.Urls.CurrentUrlIndex {
+					r.recordSecondaryVerifiedHead(urls[idx], head)
+				}
 				return err
 			})
 			if err != nil {
@@ -1757,18 +1846,24 @@ func (r *EvmRpc) AnySecondaryHasUnwrapLogChunked(parent context.Context, fromBlo
 			var lowestVerified uint64
 			var scanErr error
 			// Verify the secondary's head covers targetHead so it cannot clip logs.
-			if err := r.callEndpointContext(attemptCtx, idx, func(ctx context.Context, client *ethclient.Client) error {
-				head, err := client.BlockNumber(ctx)
-				if err != nil {
-					return err
+			// Reuse a previously verified head >= targetHead (from EndpointHeads or
+			// an earlier corroboration attempt) so low-rate-limit endpoints spend
+			// their permit budget advancing log chunks instead of repeating BlockNumber.
+			if r.getSecondaryVerifiedHead(urls[idx]) < targetHead {
+				if err := r.callEndpointContext(attemptCtx, idx, func(ctx context.Context, client *ethclient.Client) error {
+					head, err := client.BlockNumber(ctx)
+					if err != nil {
+						return err
+					}
+					if head < targetHead {
+						return fmt.Errorf("secondary head %d lags target %d", head, targetHead)
+					}
+					r.recordSecondaryVerifiedHead(urls[idx], head)
+					return nil
+				}); err != nil {
+					results[idx] = logAnswer{checked: true, err: errors.New(config.RedactErrorForURL(err, urls[idx]))}
+					return
 				}
-				if head < targetHead {
-					return fmt.Errorf("secondary head %d lags target %d", head, targetHead)
-				}
-				return nil
-			}); err != nil {
-				results[idx] = logAnswer{checked: true, err: errors.New(config.RedactErrorForURL(err, urls[idx]))}
-				return
 			}
 			for end := resumeEnd; ; {
 				if attemptCtx.Err() != nil {
@@ -2034,8 +2129,44 @@ func (r *EvmRpc) IsHalted() (bool, error) {
 	return r.bridgeContract.IsHalted(&bind.CallOpts{Context: r.ctx})
 }
 
+func (r *EvmRpc) getSecondaryVerifiedHead(url string) uint64 {
+	r.secondaryMu.Lock()
+	defer r.secondaryMu.Unlock()
+	if entry := r.secondary[url]; entry != nil {
+		return entry.verifiedHead
+	}
+	return 0
+}
+
+func (r *EvmRpc) recordSecondaryVerifiedHead(url string, head uint64) {
+	r.secondaryMu.Lock()
+	defer r.secondaryMu.Unlock()
+	if r.secondary == nil {
+		r.secondary = make(map[string]*secondaryClient)
+	}
+	entry := r.secondary[url]
+	if entry == nil {
+		entry = &secondaryClient{sem: make(chan struct{}, 1)}
+		if url == r.Urls.GetCurrentUrl() {
+			entry.limiter = r.limiter
+		} else if r.limit > 0 {
+			entry.limiter = rate.NewLimiter(r.limit, r.burst)
+		}
+		r.secondary[url] = entry
+	}
+	if head > entry.verifiedHead {
+		entry.verifiedHead = head
+	}
+}
+
 func (r *EvmRpc) GetActionNonce() (*big.Int, error) {
-	return r.bridgeContract.ActionsNonce(&bind.CallOpts{Context: r.ctx})
+	return r.GetActionNonceContext(r.ctx)
+}
+
+func (r *EvmRpc) GetActionNonceContext(parent context.Context) (*big.Int, error) {
+	ctx, cancel := combineContexts(r.ctx, parent, 0)
+	defer cancel()
+	return r.bridgeContract.ActionsNonce(&bind.CallOpts{Context: ctx})
 }
 
 func (r *EvmRpc) EstimatedBlockTime() (uint64, error) {

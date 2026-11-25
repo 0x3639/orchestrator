@@ -1614,6 +1614,10 @@ func (eN *evmNetwork) GetSetTssEcdsaPubKeyEvmMessage(newAddress ecommon.Address)
 	return eN.EvmRpc().GetSetTssEcdsaPubKeyEvmMessage(newAddress, eN.NetworkClass(), eN.ChainId(), eN.ContractAddress())
 }
 
+func (eN *evmNetwork) GetSetTssEcdsaPubKeyEvmMessageContext(ctx context.Context, newAddress ecommon.Address) ([]byte, error) {
+	return eN.EvmRpc().GetSetTssEcdsaPubKeyEvmMessageContext(ctx, newAddress, eN.NetworkClass(), eN.ChainId(), eN.ContractAddress())
+}
+
 func (eN *evmNetwork) GetSetTssEcdsaPubKeyEvmTx(newTss, sender ecommon.Address, oldFullSignature, newFullSignature []byte) (*etypes.Transaction, error) {
 	return eN.EvmRpc().GetSetTssEcdsaPubKeyEvmTx(newTss, sender, oldFullSignature, newFullSignature, eN.ContractAddress())
 }
@@ -1628,6 +1632,10 @@ func (eN *evmNetwork) SendTransactionContext(ctx context.Context, tx *etypes.Tra
 
 func (eN *evmNetwork) GetHaltEvmMessage() ([]byte, error) {
 	return eN.EvmRpc().GetHaltEvmMessage(definition.EvmClass, eN.ChainId(), eN.ContractAddress())
+}
+
+func (eN *evmNetwork) GetHaltEvmMessageWithNonce() ([]byte, *big.Int, error) {
+	return eN.EvmRpc().GetHaltEvmMessageWithNonce(definition.EvmClass, eN.ChainId(), eN.ContractAddress())
 }
 
 func (eN *evmNetwork) GetHaltEvmTx(signature []byte, sender ecommon.Address) (*etypes.Transaction, error) {
