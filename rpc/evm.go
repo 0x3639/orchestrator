@@ -660,7 +660,22 @@ func (r *EvmRpc) recordPendingTxAttempt(tx *etypes.Transaction) (*pendingAttempt
 	if prev != nil {
 		if prev.nonce > entry.nonce {
 			r.txMu.Unlock()
-			return nil, false, nil
+			// Leave the higher-nonce durable owner intact, while still tracking
+			// this lower-nonce attempt in nonceStack through reconciliation so
+			// in-flight cleanup guards and hash checks observe it.
+			nk := evmNonceKey{sender: key.sender, contract: key.contract, nonce: entry.nonce}
+			if r.nonceStack == nil {
+				r.nonceStack = make(map[evmNonceKey][]*pendingAttempt)
+			}
+			attempt := &pendingAttempt{
+				kind:     key.kind,
+				txHash:   tx.Hash(),
+				nonce:    tx.Nonce(),
+				entry:    clonePendingEvmTx(entry),
+				inFlight: true,
+			}
+			r.nonceStack[nk] = append(r.nonceStack[nk], attempt)
+			return attempt, true, nil
 		}
 		if prev.nonce == entry.nonce {
 			entry.gasPrice = maxBigInt(prev.gasPrice, entry.gasPrice)
@@ -1350,6 +1365,32 @@ func (r *EvmRpc) ClearObsoleteHaltTxContext(parent context.Context, sender ecomm
 		return nil
 	}
 	obsGen := r.sendGen[key]
+	// Collect all viable halt tx hashes across nonces [confirmedNonce..rec.nonce]
+	// (including earlier accepted halts queued behind a nonce gap underneath an
+	// ambiguous replacement) so cleanup never discards a live queued halt.
+	seenHashes := make(map[ecommon.Hash]struct{})
+	var hashesToCheck []ecommon.Hash
+	addHash := func(h ecommon.Hash) {
+		if h == (ecommon.Hash{}) {
+			return
+		}
+		if _, ok := seenHashes[h]; ok {
+			return
+		}
+		seenHashes[h] = struct{}{}
+		hashesToCheck = append(hashesToCheck, h)
+	}
+	addHash(rec.txHash)
+	for nk, st := range r.nonceStack {
+		if nk.sender != sender || nk.contract != r.bridgeAddress || nk.nonce < confirmedNonce || nk.nonce > rec.nonce {
+			continue
+		}
+		for _, a := range st {
+			if !a.rejected && a.kind == evmTxKindHalt {
+				addHash(a.txHash)
+			}
+		}
+	}
 	r.pendingMu.Unlock()
 
 	pendingNonce, err := r.PendingNonceAtContext(parent, sender)
@@ -1361,8 +1402,8 @@ func (r *EvmRpc) ClearObsoleteHaltTxContext(parent context.Context, sender ecomm
 		// A transaction from this sender is still pending in the mempool; keep ownership.
 		return nil
 	}
-	if rec.txHash != (ecommon.Hash{}) {
-		tx, _, txErr := r.TransactionByHashContext(parent, rec.txHash)
+	for _, h := range hashesToCheck {
+		tx, _, txErr := r.TransactionByHashContext(parent, h)
 		if txErr == nil && tx != nil {
 			// Still known to the node; keep ownership.
 			return nil
