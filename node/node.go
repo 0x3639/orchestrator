@@ -26,7 +26,6 @@ import (
 	"sort"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"time"
 
 	tcommon "github.com/HyperCore-Team/go-tss/common"
@@ -987,7 +986,7 @@ func (node *Node) processSignatures() {
 			if stateErr := node.state.SetState(common.LiveState); stateErr != nil {
 				node.logger.Info("Could not set state to live after key gen")
 				node.logger.Debug(stateErr)
-				node.stopChan <- syscall.SIGINT
+				common.RequestStop(node.stopChan)
 				return
 			}
 			// todo delete it?
@@ -1342,6 +1341,9 @@ func (node *Node) processSignatures() {
 }
 
 func (node *Node) requireLiveTransfers() error {
+	if node.state.RestartRequired() {
+		return errors.New("bridge requires restart; transfers are halted")
+	}
 	state, err := node.state.GetState()
 	if err != nil {
 		return err

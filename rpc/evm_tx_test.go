@@ -17,6 +17,7 @@ import (
 	etypes "github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
 
+	"orchestrator/common"
 	"orchestrator/common/config"
 )
 
@@ -448,5 +449,273 @@ func TestLookupEvmConcurrentAddRemoveDoesNotStopOrPanic(t *testing.T) {
 	case sig := <-stop:
 		t.Fatalf("unexpected stop signal %v", sig)
 	default:
+	}
+}
+
+type memPendingTxStore struct {
+	mu   sync.Mutex
+	rows map[string]*common.PendingEvmTx
+}
+
+func newMemPendingTxStore() *memPendingTxStore {
+	return &memPendingTxStore{rows: make(map[string]*common.PendingEvmTx)}
+}
+
+func (s *memPendingTxStore) key(sender, target ecommon.Address, action string) string {
+	return sender.Hex() + ":" + target.Hex() + ":" + action
+}
+
+func (s *memPendingTxStore) LoadPendingEvmTx(sender, target ecommon.Address, action string) (*common.PendingEvmTx, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	row, ok := s.rows[s.key(sender, target, action)]
+	if !ok || row == nil {
+		return nil, nil
+	}
+	cp := *row
+	if row.GasPrice != nil {
+		cp.GasPrice = new(big.Int).Set(row.GasPrice)
+	}
+	if row.TipCap != nil {
+		cp.TipCap = new(big.Int).Set(row.TipCap)
+	}
+	if row.FeeCap != nil {
+		cp.FeeCap = new(big.Int).Set(row.FeeCap)
+	}
+	return &cp, nil
+}
+
+func (s *memPendingTxStore) SavePendingEvmTx(sender, target ecommon.Address, action string, tx *common.PendingEvmTx) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cp := *tx
+	if tx.GasPrice != nil {
+		cp.GasPrice = new(big.Int).Set(tx.GasPrice)
+	}
+	if tx.TipCap != nil {
+		cp.TipCap = new(big.Int).Set(tx.TipCap)
+	}
+	if tx.FeeCap != nil {
+		cp.FeeCap = new(big.Int).Set(tx.FeeCap)
+	}
+	s.rows[s.key(sender, target, action)] = &cp
+	return nil
+}
+
+func (s *memPendingTxStore) DeletePendingEvmTx(sender, target ecommon.Address, action string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.rows, s.key(sender, target, action))
+	return nil
+}
+
+func TestHaltAndSetTssRecoverStrandedNonceGap(t *testing.T) {
+	contract := ecommon.HexToAddress("0x6666666666666666666666666666666666666666")
+	newTss := ecommon.HexToAddress("0x7777777777777777777777777777777777777777")
+
+	for _, action := range []string{"halt", "setTss"} {
+		t.Run(action, func(t *testing.T) {
+			mock, url := newEvmTxMockServer(t)
+			mock.baseFee = big.NewInt(20_000_000_000)
+			mock.tipCap = big.NewInt(2_000_000_000)
+			// Predecessor tx occupies nonce 5, so our first tx lands on nonce 6.
+			mock.confirmedNonce = 5
+			mock.pendingNonce = 6
+
+			store := newMemPendingTxStore()
+			client, err := NewEvmRpcClient(config.BaseNetworkConfig{Urls: []string{url}}, "gap-"+action, contract)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer client.Stop()
+			client.SetChainID(1)
+			client.SetPendingTxStore(store)
+
+			key, err := crypto.GenerateKey()
+			if err != nil {
+				t.Fatal(err)
+			}
+			sender := crypto.PubkeyToAddress(key.PublicKey)
+			signer := etypes.LatestSignerForChainID(big.NewInt(1))
+
+			// Pre-seed a distinct in-process pending action at nonce 5 so build uses pendingNonce 6.
+			buildTx := func() (*etypes.Transaction, error) {
+				if action == "halt" {
+					return client.GetHaltTxEvm(sender, []byte{1, 2, 3}, &contract)
+				}
+				return client.GetSetTssEcdsaPubKeyEvmTx(newTss, sender, []byte{4}, []byte{5}, &contract)
+			}
+			// Occupy nonce 5 with the opposite action first.
+			if action == "halt" {
+				mock.pendingNonce = 5
+				other, err := client.GetSetTssEcdsaPubKeyEvmTx(newTss, sender, []byte{4}, []byte{5}, &contract)
+				if err != nil {
+					t.Fatal(err)
+				}
+				signedOther, err := etypes.SignTx(other, signer, key)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := client.SendTransaction(signedOther); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				mock.pendingNonce = 5
+				other, err := client.GetHaltTxEvm(sender, []byte{1, 2, 3}, &contract)
+				if err != nil {
+					t.Fatal(err)
+				}
+				signedOther, err := etypes.SignTx(other, signer, key)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := client.SendTransaction(signedOther); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			// Now pendingNonce == 6; build and send target action at nonce 6.
+			tx1, err := buildTx()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tx1.Nonce() != 6 {
+				t.Fatalf("tx1 nonce = %d, want 6", tx1.Nonce())
+			}
+			signed1, err := etypes.SignTx(tx1, signer, key)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := client.SendTransaction(signed1); err != nil {
+				t.Fatal(err)
+			}
+
+			// Simulate predecessor at nonce 5 being evicted from mempool: pendingNonce drops to 5
+			// leaving nonce 6 stranded behind a nonce gap.
+			mock.mu.Lock()
+			mock.confirmedNonce = 5
+			mock.pendingNonce = 5
+			mock.mu.Unlock()
+
+			tx2, err := buildTx()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tx2.Nonce() != 5 {
+				t.Fatalf("after predecessor eviction, tx2 nonce = %d, want 5 (must not keep stranded nonce 6)", tx2.Nonce())
+			}
+		})
+	}
+}
+
+func TestHaltAndSetTssRestartRecoveryWithAndWithoutStore(t *testing.T) {
+	contract := ecommon.HexToAddress("0x8888888888888888888888888888888888888888")
+	newTss := ecommon.HexToAddress("0x9999999999999999999999999999999999999999")
+
+	for _, action := range []string{"halt", "setTss"} {
+		for _, withStore := range []bool{true, false} {
+			name := action + "/without_store"
+			if withStore {
+				name = action + "/with_store"
+			}
+			t.Run(name, func(t *testing.T) {
+				mock, url := newEvmTxMockServer(t)
+				mock.baseFee = big.NewInt(20_000_000_000)
+				mock.tipCap = big.NewInt(2_000_000_000)
+				mock.confirmedNonce = 5
+				mock.pendingNonce = 5
+
+				var store *memPendingTxStore
+				if withStore {
+					store = newMemPendingTxStore()
+				}
+
+				makeClient := func() *EvmRpc {
+					c, err := NewEvmRpcClient(config.BaseNetworkConfig{Urls: []string{url}}, "restart-"+action, contract)
+					if err != nil {
+						t.Fatal(err)
+					}
+					c.SetChainID(1)
+					if store != nil {
+						c.SetPendingTxStore(store)
+					}
+					return c
+				}
+
+				key, err := crypto.GenerateKey()
+				if err != nil {
+					t.Fatal(err)
+				}
+				sender := crypto.PubkeyToAddress(key.PublicKey)
+				signer := etypes.LatestSignerForChainID(big.NewInt(1))
+
+				buildTx := func(c *EvmRpc) (*etypes.Transaction, error) {
+					if action == "halt" {
+						return c.GetHaltTxEvm(sender, []byte{1, 2, 3}, &contract)
+					}
+					return c.GetSetTssEcdsaPubKeyEvmTx(newTss, sender, []byte{4}, []byte{5}, &contract)
+				}
+
+				// Process 1 sends tx at nonce 5, then crashes/restarts while tx is still pending.
+				c1 := makeClient()
+				tx1, err := buildTx(c1)
+				if err != nil {
+					t.Fatal(err)
+				}
+				signed1, err := etypes.SignTx(tx1, signer, key)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := c1.SendTransaction(signed1); err != nil {
+					t.Fatal(err)
+				}
+				c1.Stop()
+
+				// Process 2 starts fresh while confirmed=5, pending=6.
+				c2 := makeClient()
+				defer c2.Stop()
+
+				tx2, err := buildTx(c2)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if tx2.Nonce() != 5 {
+					t.Fatalf("after restart, tx2 nonce = %d, want 5 (must replace stuck nonce instead of queueing at 6)", tx2.Nonce())
+				}
+				if withStore {
+					if tx2.GasTipCap().Cmp(bumpFee(tx1.GasTipCap())) < 0 || tx2.GasFeeCap().Cmp(bumpFee(tx1.GasFeeCap())) < 0 {
+						t.Fatalf("with store after restart, tx2 did not immediately bump >=20%%: tx1=(%s,%s) tx2=(%s,%s)",
+							tx1.GasTipCap(), tx1.GasFeeCap(), tx2.GasTipCap(), tx2.GasFeeCap())
+					}
+				} else {
+					// Without persistent store, an underpriced rejection on first replacement
+					// records the watermark so the next attempt bumps >=20% at nonce 5.
+					mock.mu.Lock()
+					mock.sendErr = "replacement transaction underpriced"
+					mock.mu.Unlock()
+					signed2, err := etypes.SignTx(tx2, signer, key)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if err := c2.SendTransaction(signed2); err == nil {
+						t.Fatal("expected replacement underpriced error")
+					}
+					mock.mu.Lock()
+					mock.sendErr = ""
+					mock.mu.Unlock()
+					tx3, err := buildTx(c2)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if tx3.Nonce() != 5 {
+						t.Fatalf("tx3 nonce = %d, want 5", tx3.Nonce())
+					}
+					if tx3.GasTipCap().Cmp(bumpFee(tx2.GasTipCap())) < 0 || tx3.GasFeeCap().Cmp(bumpFee(tx2.GasFeeCap())) < 0 {
+						t.Fatalf("without store after underpriced, tx3 did not bump >=20%%: tx2=(%s,%s) tx3=(%s,%s)",
+							tx2.GasTipCap(), tx2.GasFeeCap(), tx3.GasTipCap(), tx3.GasFeeCap())
+					}
+				}
+			})
+		}
 	}
 }

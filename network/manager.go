@@ -168,6 +168,9 @@ func (m *NetworksManager) Init(networksInfo map[string]config.BaseNetworkConfig,
 			// scanning, its calls fail on the stopped client instead of
 			// finding none.
 			newEvmNetwork.client = newRpcManager.Evm(network.Id)
+			if txStore, ok := dbManager.EvmStorage(network.Id).(common.PendingEvmTxStore); ok {
+				newEvmNetwork.client.SetPendingTxStore(txStore)
+			}
 
 			newEvmNetworks = append(newEvmNetworks, newEvmNetwork)
 		default:
@@ -500,10 +503,8 @@ func (m *NetworksManager) RemoveEvmNetwork(chainId uint32) {
 			// A worker waiting on the queue returns, and the queue is free for
 			// a network added again under the same name. With done closed, a
 			// worker that finds the queue closed does not stop the node.
-			if network.unconfirmedQueue != nil {
-				if err := network.unconfirmedQueue.Close(); err != nil {
-					m.logger.Debugf("queue of removed EVM network %d: %v", chainId, err)
-				}
+			if err := network.closeQueue(); err != nil {
+				m.logger.Debugf("queue of removed EVM network %d: %v", chainId, err)
 			}
 			m.evmNetworks = append(m.evmNetworks[:idx], m.evmNetworks[idx+1:]...)
 			return

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"math/big"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -13,6 +14,7 @@ import (
 	ecommon "github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/hexutil"
 	etypes "github.com/ethereum/go-ethereum/core/types"
+	zdb "github.com/zenon-network/go-zenon/common/db"
 	"github.com/zenon-network/go-zenon/chain/nom"
 	"github.com/zenon-network/go-zenon/common/types"
 	"github.com/zenon-network/go-zenon/rpc/api"
@@ -23,6 +25,9 @@ import (
 	"orchestrator/common/config"
 	"orchestrator/common/events"
 	"orchestrator/common/storage"
+	"orchestrator/db/manager"
+	"orchestrator/db/unwrap"
+	"orchestrator/health/snapshot"
 	"orchestrator/rpc"
 )
 
@@ -386,6 +391,8 @@ func TestLateUnknownUnwrapInsideRedeemDelayEscalatesOnlyWhenCanonicalScanCoversW
 				return nil, nil
 			case "embedded.bridge.getUnwrapTokenRequestByHashAndLog":
 				return withRedeemDelay(b.request, l.redeemableIn.Load()), nil
+			case "eth_syncing":
+				return false, nil
 			case "eth_blockNumber":
 				return hexutil.EncodeUint64(200), nil
 			case "eth_getBlockByNumber":
@@ -509,4 +516,684 @@ func TestLateUnknownUnwrapInsideRedeemDelayEscalatesOnlyWhenCanonicalScanCoversW
 		}
 		l.expect("past delay", common.LiveState, 1)
 	})
+}
+
+func TestAdminCatchUpAcrossTwoTransitionsStillRotatesContractAndHoldsUnreadableOutcome(t *testing.T) {
+	adminA := types.ParseAddressPanic("z1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqsggv2f")
+	adminB := types.ParseAddressPanic("z1qpp8g8v4hrd5ernfrgsn86jmv09ra6zrvhvmr7")
+	adminC := types.ParseAddressPanic("z1qzal6c5s9rjnnxd2z7dvdhjxpmmj4fmw56a0mz")
+	oldContract := ecommon.HexToAddress("0x1111111111111111111111111111111111111111")
+	newContract := ecommon.HexToAddress("0x2222222222222222222222222222222222222222")
+
+	// Bridge tip is already at adminC and newContract while the listener is catching up
+	// from adminA -> ProposeAdministrator(adminB) -> adminB SetNetwork(newContract) -> ChangeAdministrator(adminC).
+	url := replayServerWithErrors(t, func(method string, params []json.RawMessage) (interface{}, *replayRPCError) {
+		switch method {
+		case "embedded.bridge.getBridgeInfo":
+			return &definition.BridgeInfoVariable{Administrator: adminC}, nil
+		case "embedded.bridge.getNetworkInfo":
+			return &definition.NetworkInfo{
+				NetworkClass:    definition.EvmClass,
+				Id:              1,
+				Name:            "eth",
+				ContractAddress: newContract.Hex(),
+			}, nil
+		default:
+			t.Errorf("unexpected method %s", method)
+			return nil, nil
+		}
+	})
+
+	b := newReplayBridge(t)
+	b.contract = oldContract
+	n, stores := replayNetwork(t, b, url, map[uint32]string{1: url})
+	n.setAdministrator(adminA.String())
+	stopChan := make(chan os.Signal, 1)
+	n.stopChan = stopChan
+
+	params, err := config.NewEvmParams(&definition.NetworkInfo{
+		NetworkClass:    definition.EvmClass,
+		Id:              1,
+		Name:            "eth",
+		ContractAddress: oldContract.Hex(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	evmNet := &evmNetwork{
+		EvmParams: params,
+		client:    n.rpcManager.Evm(1),
+		done:      make(chan struct{}),
+		state:     n.state,
+		logger:    zap.NewNop().Sugar(),
+	}
+	n.networkManager = &NetworksManager{znnNetwork: n, evmNetworks: []*evmNetwork{evmNet}, logger: zap.NewNop().Sugar()}
+
+	// 1. ProposeAdministrator(adminB) refreshes cached administrator to tip (adminC).
+	proposeData := packBridgeCall(t, definition.ProposeAdministratorMethodName, adminB)
+	if err := n.interpretSendBlockData(context.Background(), makeSendBlock(adminA, proposeData), listenerHistory, true, receiveAccepted, 2, n.refreshSettings); err != nil {
+		t.Fatal(err)
+	}
+	if got := n.getAdministrator(); got != adminC.String() {
+		t.Fatalf("administrator = %s, want tip %s", got, adminC.String())
+	}
+
+	// 2. Unreadable outcome on SetNetwork holds the checkpoint instead of skipping.
+	setNetData := packBridgeCall(t, definition.SetNetworkMethodName, definition.EvmClass, uint32(1), "eth", newContract.Hex(), "{}")
+	if err := n.interpretSendBlockData(context.Background(), makeSendBlock(adminB, setNetData), listenerHistory, true, receiveOutcomeUnknown, 3, n.refreshSettings); err == nil || !strings.Contains(err.Error(), "no readable execution status") {
+		t.Fatalf("expected unreadable execution status hold, got %v", err)
+	}
+	if height, err := stores.znn.GetLastUpdateHeight(); err != nil || height != 2 {
+		t.Fatalf("checkpoint advanced past unreadable SetNetwork: height=%d err=%v", height, err)
+	}
+
+	// 3. Accepted SetNetwork from intervening adminB still rotates the contract even though
+	// cached administrator is already adminC.
+	err = n.interpretSendBlockData(context.Background(), makeSendBlock(adminB, setNetData), listenerHistory, true, receiveAccepted, 3, n.refreshSettings)
+	if err == nil || !strings.Contains(err.Error(), "contract address changed") {
+		t.Fatalf("expected contract rotation error, got %v", err)
+	}
+	if !n.state.RestartRequired() {
+		t.Fatal("expected RestartRequired to be latched")
+	}
+	if height, err := stores.znn.GetLastUpdateHeight(); err != nil || height != 2 {
+		t.Fatalf("checkpoint = %d (err %v), want 2", height, err)
+	}
+	select {
+	case <-evmNet.done:
+	default:
+		t.Fatal("old EVM watcher was not stopped")
+	}
+	select {
+	case <-stopChan:
+	default:
+		t.Fatal("restart stop signal was not sent")
+	}
+}
+
+func TestSameNameContractRotationIsolatesStorageCursorAndQueueOnRestart(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	stopChan := make(chan os.Signal, 1)
+	dbMgr, err := manager.NewDbManager(stopChan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := common.NewGlobalState(new(uint8))
+
+	oldContract := ecommon.HexToAddress("0x1111111111111111111111111111111111111111")
+	newContract := ecommon.HexToAddress("0x2222222222222222222222222222222222222222")
+
+	// Start with original contract deployed at height 1000.
+	oldInfo := &definition.NetworkInfo{
+		NetworkClass:    definition.EvmClass,
+		Id:              1,
+		Name:            "eth",
+		ContractAddress: oldContract.Hex(),
+		Metadata:        `{"contractDeploymentHeight":1000}`,
+	}
+	oldNet, err := NewEvmNetwork(oldInfo, dbMgr, nil, state, stopChan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := dbMgr.EvmStorage(1).SetLastUpdateHeight(2000); err != nil {
+		t.Fatal(err)
+	}
+	oldTxHash := ecommon.HexToHash("0xabc1")
+	if err := dbMgr.EvmStorage(1).AddUnwrapRequest(events.UnwrapRequestEvm{
+		ChainId:         1,
+		TransactionHash: oldTxHash,
+		LogIndex:        0,
+		Amount:          big.NewInt(500),
+		Signature:       "old-contract-sig",
+		RedeemStatus:    common.UnredeemedStatus,
+		BlockNumber:     1800,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := oldNet.enqueueUnconfirmed(&events.UnwrapRequestEvm{
+		ChainId:         1,
+		TransactionHash: ecommon.HexToHash("0xabc2"),
+		LogIndex:        1,
+		Amount:          big.NewInt(100),
+		BlockNumber:     1999,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate clean shutdown after contract rotation: halt, close queue, close LevelDB handle.
+	oldNet.halt()
+	if err := oldNet.closeQueue(); err != nil {
+		t.Fatal(err)
+	}
+	oldNet.rollbackStore()
+
+	// Restart with the SAME network name "eth" but a NEW contract deployed at height 1500
+	// (below the old cursor 2000).
+	newInfo := &definition.NetworkInfo{
+		NetworkClass:    definition.EvmClass,
+		Id:              1,
+		Name:            "eth",
+		ContractAddress: newContract.Hex(),
+		Metadata:        `{"contractDeploymentHeight":1500}`,
+	}
+	newNet, err := NewEvmNetwork(newInfo, dbMgr, nil, state, stopChan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		newNet.halt()
+		_ = newNet.closeQueue()
+		newNet.rollbackStore()
+	})
+
+	// New store must start fresh at height 0 (NOT old cursor 2000), so Start()
+	// initializes scanning from the replacement contract's deployment height (1500)
+	// instead of skipping events in [1500, 2000].
+	if got, err := dbMgr.EvmStorage(1).GetLastUpdateHeight(); err != nil || got != 0 {
+		t.Fatalf("rotated store cursor = %d (err %v), want 0 (fresh store)", got, err)
+	}
+	// Old signed rows must NOT be eligible for submission under the rotated contract.
+	if unsent, err := dbMgr.EvmStorage(1).GetUnsentSignedUnwrapRequests(); err != nil || len(unsent) != 0 {
+		t.Fatalf("rotated store unsent signed rows = %d (err %v), want 0", len(unsent), err)
+	}
+	// Old unconfirmed queue must NOT be reopened/replayed.
+	if depth, ok := newNet.queueDepth(); !ok || depth != 0 {
+		t.Fatalf("rotated network queue depth = (%d, %v), want (0, true)", depth, ok)
+	}
+
+	// Old contract LevelDB directory must remain intact on disk with its historical evidence.
+	oldDBPath := filepath.Join(common.DefaultDataDir(), common.DefaultEventsDir, "eth")
+	if _, err := os.Stat(oldDBPath); err != nil {
+		t.Fatalf("expected old contract DB %s to be retained: %v", oldDBPath, err)
+	}
+	oldLdb, err := storage.CreateOrOpenLevelDb("eth")
+	if err != nil {
+		t.Fatalf("reopening retained old contract DB: %v", err)
+	}
+	defer oldLdb.Close()
+	retained := unwrap.NewEvmStorage(zdb.NewLevelDBWrapper(oldLdb), stopChan, 1000)
+	if got, err := retained.GetLastUpdateHeight(); err != nil || got != 2000 {
+		t.Fatalf("retained old cursor = %d (err %v), want 2000", got, err)
+	}
+	if row, err := retained.GetUnwrapRequestByHashAndLog(oldTxHash, 0); err != nil || row == nil || row.Signature != "old-contract-sig" {
+		t.Fatalf("retained old unwrap row = %+v (err %v), want old-contract-sig", row, err)
+	}
+}
+
+func TestLateUnknownUnwrapRealSyncWithTwoEndpointsLaggingPrimary(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	b := newReplayBridge(t)
+	l := &lateNode{t: t, bridge: b}
+	l.ledger.Store(newReplayLedger(t, b, 5000))
+	l.redeemableIn.Store(30)
+
+	var primaryHead, secondaryHead atomic.Uint64
+	var secondaryHasReceipt atomic.Bool
+	primaryHead.Store(190)
+	secondaryHead.Store(205)
+	secondaryHasReceipt.Store(true)
+
+	headerHash := func(n uint64) ecommon.Hash {
+		return ecommon.BigToHash(new(big.Int).SetUint64(n + 1000))
+	}
+
+	genuineLog := b.sourceLog(t, testRecipient)
+	genuineLog.BlockNumber = 196
+	genuineLog.BlockHash = headerHash(196)
+	genuineReceipt := b.receipt(genuineLog)
+	genuineReceipt.BlockNumber = big.NewInt(196)
+	genuineReceipt.BlockHash = headerHash(196)
+
+	primaryURL := replayServerWithErrors(t, func(method string, params []json.RawMessage) (interface{}, *replayRPCError) {
+		switch method {
+		case "eth_syncing":
+			return false, nil
+		case "eth_blockNumber":
+			return hexutil.EncodeUint64(primaryHead.Load()), nil
+		case "eth_getBlockByNumber":
+			var number hexutil.Uint64
+			_ = json.Unmarshal(params[0], &number)
+			if uint64(number) > primaryHead.Load() {
+				return nil, nil
+			}
+			return map[string]interface{}{"number": number, "hash": headerHash(uint64(number))}, nil
+		case "eth_getTransactionReceipt":
+			return nil, nil
+		case "eth_getLogs":
+			return []etypes.Log{}, nil
+		default:
+			t.Errorf("unexpected primary EVM method %s", method)
+			return nil, nil
+		}
+	})
+
+	secondaryURL := replayServerWithErrors(t, func(method string, params []json.RawMessage) (interface{}, *replayRPCError) {
+		switch method {
+		case "eth_syncing":
+			return false, nil
+		case "eth_blockNumber":
+			return hexutil.EncodeUint64(secondaryHead.Load()), nil
+		case "eth_getBlockByNumber":
+			var number hexutil.Uint64
+			_ = json.Unmarshal(params[0], &number)
+			if uint64(number) > secondaryHead.Load() {
+				return nil, nil
+			}
+			return map[string]interface{}{"number": number, "hash": headerHash(uint64(number))}, nil
+		case "eth_getTransactionReceipt":
+			if secondaryHasReceipt.Load() {
+				return genuineReceipt, nil
+			}
+			return nil, nil
+		case "eth_getLogs":
+			return []etypes.Log{}, nil
+		default:
+			t.Errorf("unexpected secondary EVM method %s", method)
+			return nil, nil
+		}
+	})
+
+	znnURL := replayServerWithErrors(t, func(method string, params []json.RawMessage) (interface{}, *replayRPCError) {
+		switch method {
+		case "stats.syncInfo":
+			return nil, nil
+		case "embedded.bridge.getUnwrapTokenRequestByHashAndLog":
+			return withRedeemDelay(b.request, l.redeemableIn.Load()), nil
+		}
+		if result, ok := l.ledger.Load().answer(t, method, params); ok {
+			return result, nil
+		}
+		t.Errorf("unexpected Zenon method %s", method)
+		return nil, nil
+	})
+
+	l.n, l.stores = replayNetwork(t, b, znnURL, map[uint32]string{1: primaryURL})
+	evmClient, err := rpc.NewEvmRpcClient(config.BaseNetworkConfig{Urls: []string{primaryURL, secondaryURL}}, "eth", b.contract)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(evmClient.Stop)
+	l.n.rpcManager.RegisterEvmClient(1, evmClient)
+	l.n.SetConfirmationsToFinality(5)
+	l.at(5000, acceptedReceive)
+
+	params, err := config.NewEvmParams(&definition.NetworkInfo{
+		NetworkClass:    definition.EvmClass,
+		Id:              1,
+		Name:            "eth",
+		ContractAddress: b.contract.Hex(),
+		Metadata:        `{"contractDeploymentHeight":1}`,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	params.SetConfirmationsToFinality(5)
+	q, err := storage.CreateOrOpenQueue(definition.EvmClass, "two-endpoint-lag-queue")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = q.Close() })
+	eN := &evmNetwork{
+		EvmParams:        params,
+		client:           evmClient,
+		dbManager:        l.stores,
+		rpcManager:       l.n.rpcManager,
+		unconfirmedQueue: q,
+		queuedBlockCounts: make(map[uint64]int),
+		done:             make(chan struct{}),
+		syncTrigger:      make(chan struct{}, 1),
+		state:            l.n.state,
+		health:           snapshot.New("test", ""),
+		logger:           zap.NewNop().Sugar(),
+	}
+	t.Cleanup(eN.health.Close)
+	l.n.networkManager = &NetworksManager{znnNetwork: l.n, evmNetworks: []*evmNetwork{eN}, logger: zap.NewNop().Sugar()}
+
+	// Case 1: Primary lags at 190 while secondary is at 205 (source at 196).
+	// Real eN.Sync() scans through 190; listener MUST NOT trigger a false emergency halt.
+	if err := eN.Sync(); err != nil {
+		t.Fatalf("real Sync (lagging primary) failed: %v", err)
+	}
+	if err := l.listen(); err == nil {
+		t.Fatal("expected hold when primary lags behind secondary")
+	}
+	l.expect("primary lagging behind secondary", common.LiveState, 1)
+
+	// Case 2: Primary lags only within finality depth (193 vs secondary 196), but secondary
+	// has the genuine receipt at 196. Real eN.Sync() scans through 193; MUST still hold.
+	primaryHead.Store(193)
+	secondaryHead.Store(196)
+	if err := eN.Sync(); err != nil {
+		t.Fatalf("real Sync (small lag) failed: %v", err)
+	}
+	if err := l.listen(); err == nil {
+		t.Fatal("expected hold when secondary endpoint serves the receipt")
+	}
+	l.expect("secondary has receipt", common.LiveState, 1)
+
+	// Case 3: Both endpoints caught up at 205 and neither has a receipt for a forged txHash.
+	// Real eN.Sync() scans through 205; listener MUST escalate to EmergencyState.
+	primaryHead.Store(205)
+	secondaryHead.Store(205)
+	secondaryHasReceipt.Store(false)
+	if err := eN.Sync(); err != nil {
+		t.Fatalf("real Sync (caught up) failed: %v", err)
+	}
+	if err := l.listen(); err != nil {
+		t.Fatalf("expected escalation to EmergencyState when both endpoints cover window, got err: %v", err)
+	}
+	l.expect("forged unwrap escalated", common.EmergencyState, 2)
+}
+
+func TestLateUnknownUnwrapIgnoresNewerUnrelatedQueuedEvents(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	setup := func(t *testing.T, queueName string) (*lateNode, *evmNetwork) {
+		t.Helper()
+		b := newReplayBridge(t)
+		l := &lateNode{t: t, bridge: b}
+		l.ledger.Store(newReplayLedger(t, b, 5000))
+		l.redeemableIn.Store(30)
+
+		url := replayServerWithErrors(t, func(method string, params []json.RawMessage) (interface{}, *replayRPCError) {
+			switch method {
+			case "stats.syncInfo":
+				return nil, nil
+			case "embedded.bridge.getUnwrapTokenRequestByHashAndLog":
+				return withRedeemDelay(b.request, l.redeemableIn.Load()), nil
+			case "eth_syncing":
+				return false, nil
+			case "eth_blockNumber":
+				return hexutil.EncodeUint64(200), nil
+			case "eth_getBlockByNumber":
+				var number hexutil.Uint64
+				_ = json.Unmarshal(params[0], &number)
+				return map[string]interface{}{"number": number, "hash": ecommon.BigToHash(new(big.Int).SetUint64(uint64(number) + 10))}, nil
+			case "eth_getTransactionReceipt":
+				return nil, nil
+			case "eth_getLogs":
+				return []etypes.Log{}, nil
+			}
+			if result, ok := l.ledger.Load().answer(t, method, params); ok {
+				return result, nil
+			}
+			t.Errorf("unexpected method %s", method)
+			return nil, nil
+		})
+		l.n, l.stores = replayNetwork(t, b, url, map[uint32]string{1: url})
+		l.n.SetConfirmationsToFinality(5)
+		l.at(5000, acceptedReceive)
+
+		params, err := config.NewEvmParams(&definition.NetworkInfo{
+			NetworkClass:    definition.EvmClass,
+			Id:              1,
+			Name:            "eth",
+			ContractAddress: b.contract.Hex(),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		params.SetConfirmationsToFinality(5)
+		q, err := storage.CreateOrOpenQueue(definition.EvmClass, queueName)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = q.Close() })
+		eN := &evmNetwork{
+			EvmParams:         params,
+			client:            l.n.rpcManager.Evm(1),
+			unconfirmedQueue:  q,
+			queuedBlockCounts: make(map[uint64]int),
+			done:              make(chan struct{}),
+			syncTrigger:       make(chan struct{}, 1),
+			state:             l.n.state,
+			logger:            zap.NewNop().Sugar(),
+		}
+		eN.lastScannedThrough.Store(200)
+		eN.scanned.Store(true)
+		l.n.networkManager = &NetworksManager{znnNetwork: l.n, evmNetworks: []*evmNetwork{eN}, logger: zap.NewNop().Sugar()}
+		return l, eN
+	}
+
+	t.Run("newer queued events above requiredHeight do not block escalation", func(t *testing.T) {
+		l, eN := setup(t, "newer-queue-escalation")
+		if err := eN.enqueueUnconfirmed(&events.UnwrapRequestEvm{ChainId: 1, BlockNumber: 198}); err != nil {
+			t.Fatal(err)
+		}
+		if err := l.listen(); err != nil {
+			t.Fatalf("expected escalation despite newer queued event at block 198 (> requiredHeight 195), got %v", err)
+		}
+		l.expect("escalated with newer queued event", common.EmergencyState, 2)
+	})
+
+	t.Run("queued event at or below requiredHeight still holds", func(t *testing.T) {
+		l, eN := setup(t, "older-queue-hold")
+		if err := eN.enqueueUnconfirmed(&events.UnwrapRequestEvm{ChainId: 1, BlockNumber: 195}); err != nil {
+			t.Fatal(err)
+		}
+		if err := l.listen(); err == nil {
+			t.Fatal("expected hold when queued event is at requiredHeight 195")
+		}
+		l.expect("held with queued event in window", common.LiveState, 1)
+	})
+}
+
+func TestRuntimeSetNetworkInstallsTokenMappingsBeforeInitialScanAndRollsBackOnError(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	admin := types.ParseAddressPanic("z1qpp8g8v4hrd5ernfrgsn86jmv09ra6zrvhvmr7")
+	contract := ecommon.HexToAddress("0x3333333333333333333333333333333333333333")
+	wznn := ecommon.HexToAddress("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+
+	b := newReplayBridge(t)
+	b.contract = contract
+	b.token = wznn
+	affiliateTo := testRecipient + common.AffiliateProgramAddressSeparator + testRecipient
+	unwrapLog := b.sourceLog(t, affiliateTo)
+	unwrapLog.BlockNumber = 5
+	block5Hash := ecommon.BigToHash(big.NewInt(505))
+	unwrapLog.BlockHash = block5Hash
+
+	net2 := &definition.NetworkInfo{
+		NetworkClass:    definition.EvmClass,
+		Id:              2,
+		Name:            "arb",
+		ContractAddress: contract.Hex(),
+		Metadata:        `{"contractDeploymentHeight":1,"confirmationsToFinality":5}`,
+		TokenPairs: []definition.TokenPair{
+			{TokenStandard: types.ZnnTokenStandard, TokenAddress: wznn.Hex()},
+		},
+	}
+	net3 := &definition.NetworkInfo{
+		NetworkClass:    definition.EvmClass,
+		Id:              3,
+		Name:            "failing-chain",
+		ContractAddress: contract.Hex(),
+		Metadata:        `{"contractDeploymentHeight":1,"confirmationsToFinality":5}`,
+		TokenPairs: []definition.TokenPair{
+			{TokenStandard: types.ZnnTokenStandard, TokenAddress: wznn.Hex()},
+		},
+	}
+
+	var ethCallCount atomic.Int32
+	evmOK := replayServerWithErrors(t, func(method string, params []json.RawMessage) (interface{}, *replayRPCError) {
+		switch method {
+		case "eth_syncing":
+			return false, nil
+		case "eth_call":
+			// FillEvmParamsRpc calls: 1) confirmationsToFinality, 2) contractDeploymentHeight, 3) estimatedBlockTime.
+			val := big.NewInt(1)
+			if ethCallCount.Add(1) == 1 {
+				val = big.NewInt(5)
+			}
+			return hexutil.Bytes(ecommon.LeftPadBytes(val.Bytes(), 32)), nil
+		case "eth_chainId":
+			return hexutil.EncodeUint64(2), nil
+		case "eth_blockNumber":
+			return hexutil.EncodeUint64(20), nil
+		case "eth_getBlockByNumber":
+			var number hexutil.Uint64
+			_ = json.Unmarshal(params[0], &number)
+			hash := ecommon.BigToHash(new(big.Int).SetUint64(uint64(number) + 500))
+			return map[string]interface{}{"number": number, "hash": hash}, nil
+		case "eth_getLogs":
+			return []etypes.Log{unwrapLog}, nil
+		default:
+			return nil, &replayRPCError{-32601, "unsupported " + method}
+		}
+	})
+	evmFail := replayServerWithErrors(t, func(method string, params []json.RawMessage) (interface{}, *replayRPCError) {
+		if method == "eth_syncing" {
+			return false, nil
+		}
+		return nil, &replayRPCError{-32000, "endpoint down"}
+	})
+	znnURL := replayServerWithErrors(t, func(method string, params []json.RawMessage) (interface{}, *replayRPCError) {
+		switch method {
+		case "embedded.bridge.getNetworkInfo":
+			var class, id uint32
+			_ = json.Unmarshal(params[0], &class)
+			_ = json.Unmarshal(params[1], &id)
+			if id == 2 {
+				return net2, nil
+			}
+			return net3, nil
+		default:
+			t.Errorf("unexpected Zenon method %s", method)
+			return nil, nil
+		}
+	})
+
+	stopChan := make(chan os.Signal, 1)
+	dbMgr, err := manager.NewDbManager(stopChan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rpcs, err := rpc.NewRpcManager(config.BaseNetworkConfig{Urls: []string{znnURL}}, stopChan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = rpcs.Znn().Stop() })
+
+	state := common.NewGlobalState(new(uint8))
+	state.Health = snapshot.New("test", "")
+	t.Cleanup(state.Health.Close)
+	state.SetIsAffiliateProgram(common.AffiliateProgram{
+		Networks: map[uint32]common.AffiliateNetwork{
+			2: {StartingHeight: 1, ZNN: true, WZNN: true},
+		},
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	n := &znnNetwork{
+		listenerCtx:    ctx,
+		cancelListener: cancel,
+		rpcManager:     rpcs,
+		dbManager:      dbMgr,
+		state:          state,
+		stopChan:       stopChan,
+		startupRead:    make(chan struct{}),
+		networksInfo: map[string]config.BaseNetworkConfig{
+			"arb":           {Urls: []string{evmOK}},
+			"failing-chain": {Urls: []string{evmFail}},
+		},
+		logger: zap.NewNop().Sugar(),
+	}
+	close(n.startupRead)
+	n.setAdministrator(admin.String())
+	mgr := &NetworksManager{znnNetwork: n, health: state.Health, logger: n.logger}
+	n.networkManager = mgr
+
+	// 1. Runtime SetNetwork installs token mappings BEFORE net.Start() scans, so the first
+	// unwrap event is split (101% + 2%) and pinned as SplitAffiliate|VerifyAffiliate.
+	setNet2 := packBridgeCall(t, definition.SetNetworkMethodName, definition.EvmClass, uint32(2), "arb", contract.Hex(), net2.Metadata)
+	if err := n.interpretSendBlockData(ctx, makeSendBlock(admin, setNet2), liveReceive, true, receiveAccepted, 2, n.refreshSettings); err != nil {
+		t.Fatalf("runtime SetNetwork failed: %v", err)
+	}
+	t.Cleanup(func() {
+		mgr.RemoveEvmNetwork(2)
+		rpcs.RemoveEvmClient(2)
+	})
+
+	mainRow, err := dbMgr.EvmStorage(2).GetUnwrapRequestByHashAndLog(unwrapLog.TxHash, uint32(unwrapLog.Index))
+	if err != nil || mainRow == nil {
+		t.Fatalf("main unwrap row = %+v (err %v), want split 101%% row", mainRow, err)
+	}
+	if mainRow.Amount.Cmp(big.NewInt(101)) != 0 {
+		t.Fatalf("main unwrap amount = %s, want 101 (affiliate split applied during initial scan)", mainRow.Amount)
+	}
+	affRow, err := dbMgr.EvmStorage(2).GetUnwrapRequestByHashAndLog(unwrapLog.TxHash, uint32(unwrapLog.Index)+common.AffiliateLogIndexAddition)
+	if err != nil || affRow == nil || affRow.Amount.Cmp(big.NewInt(2)) != 0 {
+		t.Fatalf("affiliate unwrap row = %+v (err %v), want 2", affRow, err)
+	}
+	policy, exists, err := dbMgr.EvmStorage(2).UnwrapAffiliatePolicy(affiliateEvidenceKey(unwrapLog))
+	if err != nil || !exists || policy != (common.SplitAffiliate|common.VerifyAffiliate) {
+		t.Fatalf("pinned affiliate policy = (%d, exists=%v, err=%v), want Split|Verify", policy, exists, err)
+	}
+
+	// 2. If runtime start fails, provisionally installed token mappings are rolled back.
+	setNet3 := packBridgeCall(t, definition.SetNetworkMethodName, definition.EvmClass, uint32(3), "failing-chain", contract.Hex(), net3.Metadata)
+	if err := n.interpretSendBlockData(ctx, makeSendBlock(admin, setNet3), liveReceive, true, receiveAccepted, 3, n.refreshSettings); err == nil {
+		t.Fatal("expected failing-chain SetNetwork to fail")
+	}
+	if got := state.GetTokensMap(3, types.ZnnTokenStandard.String()); got != "" {
+		t.Fatalf("failed runtime SetNetwork leaked tokensMap entry %q", got)
+	}
+}
+
+func TestQueueDepthAndCloseQueueRaceFree(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	q, err := storage.CreateOrOpenQueue(definition.EvmClass, "queue-close-race")
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := snapshot.New("test", "")
+	t.Cleanup(store.Close)
+	params, err := config.NewEvmParams(&definition.NetworkInfo{
+		Id:              1,
+		NetworkClass:    definition.EvmClass,
+		Name:            "eth",
+		ContractAddress: testContract.Hex(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	eN := &evmNetwork{
+		EvmParams:         params,
+		unconfirmedQueue:  q,
+		queuedBlockCounts: make(map[uint64]int),
+		health:            store,
+		done:              make(chan struct{}),
+		logger:            zap.NewNop().Sugar(),
+	}
+	store.AddNetwork(definition.EvmClass, 1)
+	if err := eN.enqueueUnconfirmed(&events.UnwrapRequestEvm{ChainId: 1, BlockNumber: 10}); err != nil {
+		t.Fatal(err)
+	}
+
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+					eN.observeQueueDepth()
+					_, _ = eN.queueDepth()
+					_ = eN.hasQueuedAtOrBelow(10)
+				}
+			}
+		}()
+	}
+
+	_ = eN.closeQueue()
+	_ = eN.closeQueue() // idempotent
+	close(stop)
+	wg.Wait()
+	if got, ok := eN.queueDepth(); ok || got != 0 {
+		t.Fatalf("queueDepth after close = (%d, %v), want (0, false)", got, ok)
+	}
 }

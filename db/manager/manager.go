@@ -1,6 +1,8 @@
 package manager
 
 import (
+	"fmt"
+	ecommon "github.com/ethereum/go-ethereum/common"
 	zdb "github.com/zenon-network/go-zenon/common/db"
 	"go.uber.org/zap"
 	"orchestrator/common"
@@ -9,6 +11,7 @@ import (
 	"orchestrator/db/unwrap"
 	"orchestrator/db/wrap"
 	"os"
+	"strings"
 	"sync"
 )
 
@@ -54,16 +57,56 @@ func NewDbManager(stop chan os.Signal) (*Manager, error) {
 // AddEvmEventStore returns a rollback for a network that fails to start.
 // Closing a provisional handle leaves previously checkpointed events on disk.
 func (m *Manager) AddEvmEventStore(chainId uint32, name string, contractDeploymentHeight uint64) (func(), error) {
-	ldb, err := storage.CreateOrOpenLevelDb(name)
+	_, rollback, err := m.AddEvmEventStoreForContract(chainId, name, contractDeploymentHeight, ecommon.Address{})
+	return rollback, err
+}
+
+// AddEvmEventStoreForContract opens an EVM event store bound to contractAddress.
+// Existing deployments whose contract has not changed keep using events/<name>
+// and queues/<name>. When a same-name network rotates to a new contract address,
+// the previous LevelDB directory is left untouched on disk to retain historical
+// evidence and a fresh contract-scoped directory (<name>-<contractHex>) is opened
+// for both LevelDB and the unconfirmed queue.
+func (m *Manager) AddEvmEventStoreForContract(chainId uint32, name string, contractDeploymentHeight uint64, contractAddress ecommon.Address) (string, func(), error) {
+	storageName := name
+	ldb, err := storage.CreateOrOpenLevelDb(storageName)
 	if err != nil {
-		return nil, err
+		return "", nil, err
+	}
+	matches, err := unwrap.BindContractAddress(ldb, contractAddress)
+	if err != nil {
+		_ = ldb.Close()
+		return "", nil, err
+	}
+	if !matches {
+		// Retain the old contract's LevelDB intact on disk and isolate the new
+		// contract's scan cursor, unwrap rows, and queue under a scoped name.
+		if err := ldb.Close(); err != nil {
+			return "", nil, err
+		}
+		storageName = fmt.Sprintf("%s-%s", name, strings.ToLower(strings.TrimPrefix(contractAddress.Hex(), "0x")))
+		ldb, err = storage.CreateOrOpenLevelDb(storageName)
+		if err != nil {
+			return "", nil, err
+		}
+		scopedMatches, err := unwrap.BindContractAddress(ldb, contractAddress)
+		if err != nil {
+			_ = ldb.Close()
+			return "", nil, err
+		}
+		if !scopedMatches {
+			_ = ldb.Close()
+			return "", nil, fmt.Errorf("contract-scoped store %s bound to a different contract address", storageName)
+		}
+		m.logger.Infof("EVM network %s (%d) rotated to bridge contract %s; retaining previous store %s and opening contract-scoped store %s",
+			name, chainId, contractAddress.Hex(), name, storageName)
 	}
 	store := unwrap.NewEvmStorage(zdb.NewLevelDBWrapper(ldb), m.stopChan, contractDeploymentHeight)
 	m.evmMu.Lock()
 	previous := m.evmStorage[chainId]
 	m.evmStorage[chainId] = store
 	m.evmMu.Unlock()
-	return func() {
+	return storageName, func() {
 		m.evmMu.Lock()
 		if m.evmStorage[chainId] == store {
 			if previous != nil {

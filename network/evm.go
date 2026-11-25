@@ -45,8 +45,16 @@ type evmNetwork struct {
 	stopHealth func()
 	health     *snapshot.Store
 	config.EvmParams
-	unconfirmedQueue *dque.DQue
-	dbManager        networkEventStores
+	// queueMu serializes unconfirmedQueue non-blocking operations (Size,
+	// Enqueue, Dequeue, Close) and tracks queued event block heights so
+	// dque.Size never races with dque.Close and coverage checks only wait on
+	// queued events at or below the finalized target height.
+	queueMu           sync.Mutex
+	queueClosed       bool
+	queuedBlockCounts map[uint64]int
+	unknownQueued     int
+	unconfirmedQueue  *dque.DQue
+	dbManager         networkEventStores
 	rpcManager       *rpc.Manager
 	UrlsInfo         config.UrlsInfo
 	state            *common.GlobalState
@@ -133,40 +141,55 @@ func (eN *evmNetwork) resetCanonicalCache() {
 	eN.canonicalMu.Unlock()
 }
 
+type contractEventStores interface {
+	AddEvmEventStoreForContract(chainId uint32, name string, contractDeploymentHeight uint64, contractAddress ecommon.Address) (string, func(), error)
+}
+
 func NewEvmNetwork(network *definition.NetworkInfo, dbManager networkEventStores, rpcManager *rpc.Manager, state *common.GlobalState, stop chan os.Signal) (*evmNetwork, error) {
 	newConfig, err := config.NewEvmParams(network)
 	if err != nil {
 		return nil, err
 	}
 
-	newQueue, err := storage.CreateOrOpenQueue(network.NetworkClass, network.Name)
+	newLogger, errLog := common.CreateSugarLogger()
+	if errLog != nil {
+		return nil, errLog
+	}
+	var (
+		storageName = network.Name
+		rollback    func()
+	)
+	if scoped, ok := dbManager.(contractEventStores); ok {
+		storageName, rollback, err = scoped.AddEvmEventStoreForContract(network.Id, network.Name, newConfig.ContractDeploymentHeight(), *newConfig.ContractAddress())
+	} else {
+		rollback, err = dbManager.AddEvmEventStore(network.Id, network.Name, newConfig.ContractDeploymentHeight())
+	}
 	if err != nil {
 		return nil, err
 	}
 
-	newLogger, errLog := common.CreateSugarLogger()
-	if errLog != nil {
-		_ = newQueue.Close()
-		return nil, errLog
-	}
-	rollback, err := dbManager.AddEvmEventStore(network.Id, network.Name, newConfig.ContractDeploymentHeight())
+	newQueue, err := storage.CreateOrOpenQueue(network.NetworkClass, storageName)
 	if err != nil {
-		_ = newQueue.Close()
+		if rollback != nil {
+			rollback()
+		}
 		return nil, err
 	}
 
 	newEvmNetwork := &evmNetwork{
-		rollbackStore:    rollback,
-		EvmParams:        newConfig,
-		health:           state.HealthStore(),
-		dbManager:        dbManager,
-		rpcManager:       rpcManager,
-		unconfirmedQueue: newQueue,
-		state:            state,
-		stopChan:         stop,
-		logger:           newLogger,
-		done:             make(chan struct{}),
-		syncTrigger:      make(chan struct{}, 1),
+		rollbackStore:     rollback,
+		EvmParams:         newConfig,
+		health:            state.HealthStore(),
+		dbManager:         dbManager,
+		rpcManager:        rpcManager,
+		unconfirmedQueue:  newQueue,
+		queuedBlockCounts: make(map[uint64]int),
+		unknownQueued:     newQueue.Size(),
+		state:             state,
+		stopChan:          stop,
+		logger:            newLogger,
+		done:              make(chan struct{}),
+		syncTrigger:       make(chan struct{}, 1),
 	}
 
 	return newEvmNetwork, nil
@@ -367,17 +390,73 @@ const (
 )
 
 // canonicalScanCoverage reports whether this network has completed a full
-// canonical Sync pass, the block height that pass reached, and whether its
-// unconfirmed event queue is empty.
-func (eN *evmNetwork) canonicalScanCoverage() (bool, uint64, bool) {
+// canonical Sync pass and the block height that pass reached.
+func (eN *evmNetwork) canonicalScanCoverage() (bool, uint64) {
 	if !eN.scanned.Load() {
-		return false, 0, false
+		return false, 0
 	}
-	queueEmpty := true
-	if eN.unconfirmedQueue != nil && eN.unconfirmedQueue.Size() > 0 {
-		queueEmpty = false
+	return true, eN.lastScannedThrough.Load()
+}
+
+// hasQueuedAtOrBelow reports whether any unconfirmed unwrap event at or below
+// height (or any pre-restart queued event whose block number is not yet known)
+// is still pending confirmation in the unconfirmed queue.
+func (eN *evmNetwork) hasQueuedAtOrBelow(height uint64) bool {
+	eN.queueMu.Lock()
+	defer eN.queueMu.Unlock()
+	if eN.unconfirmedQueue == nil || eN.queueClosed {
+		return false
 	}
-	return true, eN.lastScannedThrough.Load(), queueEmpty
+	if eN.unknownQueued > 0 {
+		return true
+	}
+	for blk, count := range eN.queuedBlockCounts {
+		if count > 0 && blk <= height {
+			return true
+		}
+	}
+	// Fallback for tests that enqueue directly into unconfirmedQueue without
+	// calling enqueueUnconfirmed: if the queue is non-empty and our tracking
+	// counters account for nothing, treat it conservatively as having work.
+	if len(eN.queuedBlockCounts) == 0 && eN.unconfirmedQueue.Size() > 0 {
+		return true
+	}
+	return false
+}
+
+func (eN *evmNetwork) enqueueUnconfirmed(ev *events.UnwrapRequestEvm) error {
+	eN.queueMu.Lock()
+	defer eN.queueMu.Unlock()
+	if eN.unconfirmedQueue == nil || eN.queueClosed {
+		return dque.ErrQueueClosed
+	}
+	if err := eN.unconfirmedQueue.Enqueue(ev); err != nil {
+		return err
+	}
+	if eN.queuedBlockCounts == nil {
+		eN.queuedBlockCounts = make(map[uint64]int)
+	}
+	eN.queuedBlockCounts[ev.BlockNumber]++
+	return nil
+}
+
+func (eN *evmNetwork) closeQueue() error {
+	eN.queueMu.Lock()
+	defer eN.queueMu.Unlock()
+	if eN.unconfirmedQueue == nil || eN.queueClosed {
+		return nil
+	}
+	eN.queueClosed = true
+	return eN.unconfirmedQueue.Close()
+}
+
+func (eN *evmNetwork) queueDepth() (int, bool) {
+	eN.queueMu.Lock()
+	defer eN.queueMu.Unlock()
+	if eN.unconfirmedQueue == nil || eN.queueClosed {
+		return 0, false
+	}
+	return eN.unconfirmedQueue.Size(), true
 }
 
 // requestCatchUpSync nudges subscribeToEvents to run a catch-up Sync promptly.
@@ -698,7 +777,7 @@ func (eN *evmNetwork) InterpretLog(log etypes.Log, live bool) error {
 				eN.logger.Infof("Trying to enqueue event - chainId: %d, txHash: %s, logIndex: %d, To: %s, From: %s, Token: %s, Amount: %d",
 					ev.ChainId, ev.TransactionHash.String(), ev.LogIndex, ev.To, ev.From.String(), ev.Token.String(), ev.Amount.Uint64())
 
-				err := eN.unconfirmedQueue.Enqueue(ev)
+				err := eN.enqueueUnconfirmed(ev)
 				if err != nil {
 					eN.logger.Error(err)
 					return err
@@ -1217,7 +1296,24 @@ func (eN *evmNetwork) recordConfirmedBlock(confirmed *events.UnwrapRequestEvm) e
 // dropQueuedEvent removes the head of the unconfirmed queue. It returns
 // false when the queue is unusable and the node has been told to stop.
 func (eN *evmNetwork) dropQueuedEvent() bool {
-	if _, err := eN.unconfirmedQueue.DequeueBlock(); err != nil {
+	eN.queueMu.Lock()
+	if eN.unconfirmedQueue == nil || eN.queueClosed {
+		eN.queueMu.Unlock()
+		return false
+	}
+	dequeued, err := eN.unconfirmedQueue.Dequeue()
+	if err == nil {
+		if ev, ok := dequeued.(*events.UnwrapRequestEvm); ok && eN.queuedBlockCounts[ev.BlockNumber] > 0 {
+			eN.queuedBlockCounts[ev.BlockNumber]--
+			if eN.queuedBlockCounts[ev.BlockNumber] == 0 {
+				delete(eN.queuedBlockCounts, ev.BlockNumber)
+			}
+		} else if eN.unknownQueued > 0 {
+			eN.unknownQueued--
+		}
+	}
+	eN.queueMu.Unlock()
+	if err != nil {
 		eN.logger.Error(err)
 		eN.requestStop()
 		return false
@@ -1229,7 +1325,10 @@ func (eN *evmNetwork) observeQueueDepth() {
 	if eN.health == nil {
 		return
 	}
-	depth := eN.unconfirmedQueue.Size()
+	depth, ok := eN.queueDepth()
+	if !ok {
+		return
+	}
 	eN.health.UpdateNetwork(eN.ChainId(), func(n *snapshot.Network) { n.Unwrap.AwaitingFinality = snapshot.Measure(depth) })
 }
 
@@ -1262,7 +1361,7 @@ func (eN *evmNetwork) halt() {
 func (eN *evmNetwork) Stop() {
 	eN.halt()
 	eN.EvmRpc().Stop()
-	_ = eN.unconfirmedQueue.Close()
+	_ = eN.closeQueue()
 }
 
 func (eN *evmNetwork) SignTx(tx *etypes.Transaction, ecdsaPrivateKey *ecdsa.PrivateKey, chainId uint32) (*etypes.Transaction, error) {

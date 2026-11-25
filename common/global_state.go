@@ -59,10 +59,11 @@ type GlobalState struct {
 	nodeReadyOnce sync.Once
 	// Set when the node goes on running although it has read, as history, a
 	// change to what it took from the bridge when it started.
-	settingsMu    sync.RWMutex
-	settingsStale bool
-	receiveHoldMu sync.RWMutex
-	receiveHold   *snapshot.ReceiveHold
+	settingsMu      sync.RWMutex
+	settingsStale   bool
+	restartRequired atomic.Bool
+	receiveHoldMu   sync.RWMutex
+	receiveHold     *snapshot.ReceiveHold
 	frontierMomentumHeight uint64
 	frontierMomSemaphore   *semaphore.Weighted
 	lastCeremony           CeremonyWindow
@@ -139,6 +140,9 @@ func (gs *GlobalState) SetStateIf(expected, newState uint8) (bool, error) {
 func (gs *GlobalState) setStateLocked(newState uint8) error {
 	oldEffective := gs.effectiveStateLocked()
 	previous := *gs.state
+	if gs.restartRequired.Load() && newState != EmergencyState && newState != HaltedState {
+		return errors.New("restart required before resuming live operations")
+	}
 	if previous == EmergencyState && newState != EmergencyState && newState != HaltedState {
 		return errors.New("emergency halt is still pending")
 	}
@@ -186,6 +190,32 @@ func (gs *GlobalState) HaltSigning() (bool, error) {
 	return false, nil
 }
 
+// RequireRestart permanently latches that this process must restart before
+// signing or publishing any further transfers. It waits for any in-flight
+// WhileLive publication under transferSendMu, moves signing states to
+// HaltedState (preserving EmergencyState if active), and blocks any later
+// transition back to LiveState, KeyGenState, or ReSignState.
+func (gs *GlobalState) RequireRestart() error {
+	gs.transferSendMu.Lock()
+	defer gs.transferSendMu.Unlock()
+	gs.stateMu.Lock()
+	defer gs.stateMu.Unlock()
+	gs.restartRequired.Store(true)
+	switch gs.effectiveStateLocked() {
+	case LiveState, KeyGenState, ReSignState:
+		return gs.setStateLocked(HaltedState)
+	}
+	return nil
+}
+
+// RestartRequired reports whether RequireRestart has been latched.
+func (gs *GlobalState) RestartRequired() bool {
+	if gs == nil {
+		return false
+	}
+	return gs.restartRequired.Load()
+}
+
 // A receive retried after a storage error may by then be historical. Even
 // if it no longer triggers a live transition, its checkpoint must wait.
 func (gs *GlobalState) FlushPendingEmergency() error {
@@ -215,6 +245,9 @@ func (gs *GlobalState) SaveConfig(save func() error) error {
 func (gs *GlobalState) WhileSigningTransfers(do func()) bool {
 	gs.stateMu.Lock()
 	defer gs.stateMu.Unlock()
+	if gs.restartRequired.Load() {
+		return false
+	}
 	if state := gs.effectiveStateLocked(); state == EmergencyState || state == HaltedState {
 		return false
 	}
@@ -315,6 +348,9 @@ func (gs *GlobalState) lockTransfersFor(newState uint8) func() {
 func (gs *GlobalState) WhileLive(send func() error) (bool, error) {
 	gs.transferSendMu.RLock()
 	defer gs.transferSendMu.RUnlock()
+	if gs.restartRequired.Load() {
+		return false, nil
+	}
 	if state, err := gs.GetState(); err != nil || state != LiveState {
 		return false, err
 	}
@@ -390,8 +426,36 @@ func (gs *GlobalState) SetTokensMap(chainId uint32, zts, token string) {
 // recomputes cached affiliate flags for that chain, and bumps
 // affiliateGeneration if any mapping or flag changed.
 func (gs *GlobalState) ReplaceTokensMap(chainId uint32, pairs map[string]string) {
+	_ = gs.ReplaceTokensMapWithRollback(chainId, pairs)
+}
+
+// ReplaceTokensMapWithRollback replaces all token pair mappings for chainId
+// and returns a rollback closure that restores the previous mappings and
+// cached affiliate flags (for example if runtime network startup fails).
+func (gs *GlobalState) ReplaceTokensMapWithRollback(chainId uint32, pairs map[string]string) func() {
 	gs.affiliateMu.Lock()
-	defer gs.affiliateMu.Unlock()
+	prev := maps.Clone(gs.tokensMap[chainId])
+	gs.replaceTokensMapLocked(chainId, pairs)
+	gs.affiliateMu.Unlock()
+	return func() {
+		gs.affiliateMu.Lock()
+		defer gs.affiliateMu.Unlock()
+		changed := !maps.Equal(gs.tokensMap[chainId], prev)
+		if len(prev) == 0 {
+			delete(gs.tokensMap, chainId)
+		} else {
+			gs.tokensMap[chainId] = maps.Clone(prev)
+		}
+		if gs.recomputeAffiliateFlagsLocked(chainId) {
+			changed = true
+		}
+		if changed {
+			gs.affiliateGeneration++
+		}
+	}
+}
+
+func (gs *GlobalState) replaceTokensMapLocked(chainId uint32, pairs map[string]string) {
 	next := make(map[string]string, len(pairs)*2)
 	for zts, token := range pairs {
 		zts = strings.ToLower(zts)

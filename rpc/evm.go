@@ -61,12 +61,14 @@ type EvmRpc struct {
 	secondary        map[string]*secondaryClient
 	secondaryStopped bool
 
-	// txMu guards chainID and pendingTx, which track the latest unconfirmed
-	// halt or key-change transaction per (sender, contract, action) so retries
-	// reuse the same nonce with bumped fees instead of stalling behind stuck txs.
-	txMu      sync.Mutex
-	chainID   *big.Int
-	pendingTx map[evmTxKey]*pendingEvmTx
+	// txMu guards chainID, pendingTx, and pendingTxStore, which track the latest
+	// unconfirmed halt or key-change transaction per (sender, contract, action)
+	// so retries reuse the same nonce with bumped fees and recover ownership
+	// across restarts and evicted predecessors.
+	txMu           sync.Mutex
+	chainID        *big.Int
+	pendingTx      map[evmTxKey]*pendingEvmTx
+	pendingTxStore common.PendingEvmTxStore
 }
 
 type evmTxKey struct {
@@ -272,7 +274,11 @@ func (r *EvmRpc) SampleSyncState(parent context.Context) (bool, error) {
 }
 
 func (r *EvmRpc) syncState(ctx context.Context) (bool, error) {
-	progress, err := r.rpcClient.SyncProgress(ctx)
+	return syncStateForClient(ctx, r.rpcClient)
+}
+
+func syncStateForClient(ctx context.Context, client *ethclient.Client) (bool, error) {
+	progress, err := client.SyncProgress(ctx)
 	if err != nil {
 		return false, err
 	}
@@ -315,6 +321,15 @@ func (r *EvmRpc) SetChainID(chainId uint32) {
 	r.txMu.Lock()
 	defer r.txMu.Unlock()
 	r.chainID = new(big.Int).SetUint64(uint64(chainId))
+}
+
+// SetPendingTxStore attaches a persistent store for unconfirmed halt and
+// key-change transaction metadata so nonce ownership and fee watermarks
+// survive process restarts.
+func (r *EvmRpc) SetPendingTxStore(store common.PendingEvmTxStore) {
+	r.txMu.Lock()
+	defer r.txMu.Unlock()
+	r.pendingTxStore = store
 }
 
 func (r *EvmRpc) ChainID() (*big.Int, error) {
@@ -441,15 +456,27 @@ func (r *EvmRpc) observeSentTx(tx *etypes.Transaction, sendErr error) {
 	if !ok {
 		return
 	}
+	var store common.PendingEvmTxStore
+	var toSave *common.PendingEvmTx
+	var shouldDelete bool
+
 	r.txMu.Lock()
-	defer r.txMu.Unlock()
+	store = r.pendingTxStore
 	if isNonceTooLowErr(sendErr) {
 		if prev := r.pendingTx[key]; prev != nil && prev.nonce <= tx.Nonce() {
 			delete(r.pendingTx, key)
 		}
+		shouldDelete = true
+		r.txMu.Unlock()
+		if store != nil && shouldDelete {
+			if err := store.DeletePendingEvmTx(key.sender, key.contract, key.kind); err != nil {
+				r.logger.Debugf("failed to delete pending EVM tx record: %v", err)
+			}
+		}
 		return
 	}
 	if !shouldTrackPendingTxErr(sendErr) {
+		r.txMu.Unlock()
 		return
 	}
 	if r.pendingTx == nil {
@@ -467,6 +494,7 @@ func (r *EvmRpc) observeSentTx(tx *etypes.Transaction, sendErr error) {
 	}
 	if prev := r.pendingTx[key]; prev != nil {
 		if prev.nonce > entry.nonce {
+			r.txMu.Unlock()
 			return
 		}
 		if prev.nonce == entry.nonce {
@@ -476,26 +504,98 @@ func (r *EvmRpc) observeSentTx(tx *etypes.Transaction, sendErr error) {
 		}
 	}
 	r.pendingTx[key] = entry
+	if store != nil {
+		toSave = &common.PendingEvmTx{
+			Nonce:     entry.nonce,
+			GasPrice:  cloneBigInt(entry.gasPrice),
+			TipCap:    cloneBigInt(entry.tipCap),
+			FeeCap:    cloneBigInt(entry.feeCap),
+			IsDynamic: entry.isDynamic,
+		}
+	}
+	r.txMu.Unlock()
+
+	if store != nil && toSave != nil {
+		if err := store.SavePendingEvmTx(key.sender, key.contract, key.kind, toSave); err != nil {
+			r.logger.Debugf("failed to persist pending EVM tx record: %v", err)
+		}
+	}
 }
 
-func (r *EvmRpc) lookupPendingTx(key evmTxKey, confirmedNonce uint64) *pendingEvmTx {
+func (r *EvmRpc) lookupPendingTx(key evmTxKey, confirmedNonce, pendingNonce uint64, havePending bool) *pendingEvmTx {
 	r.txMu.Lock()
-	defer r.txMu.Unlock()
 	prev := r.pendingTx[key]
+	store := r.pendingTxStore
+	r.txMu.Unlock()
+
+	if prev == nil && store != nil {
+		rec, err := store.LoadPendingEvmTx(key.sender, key.contract, key.kind)
+		if err != nil {
+			r.logger.Debugf("failed to load persisted pending EVM tx record: %v", err)
+		} else if rec != nil {
+			loaded := &pendingEvmTx{
+				nonce:     rec.Nonce,
+				gasPrice:  cloneBigInt(rec.GasPrice),
+				tipCap:    cloneBigInt(rec.TipCap),
+				feeCap:    cloneBigInt(rec.FeeCap),
+				isDynamic: rec.IsDynamic,
+			}
+			r.txMu.Lock()
+			if r.pendingTx == nil {
+				r.pendingTx = make(map[evmTxKey]*pendingEvmTx)
+			}
+			if r.pendingTx[key] == nil {
+				r.pendingTx[key] = loaded
+			}
+			prev = r.pendingTx[key]
+			r.txMu.Unlock()
+		}
+	}
+
+	r.txMu.Lock()
+	prev = r.pendingTx[key]
 	if prev == nil {
+		r.txMu.Unlock()
 		return nil
 	}
-	if prev.nonce < confirmedNonce {
+	// Clear when already mined OR when a preceding pending transaction was
+	// evicted leaving a nonce gap (pendingNonce < prev.nonce) that would strand
+	// fee bumps on an unexecutable future nonce.
+	if prev.nonce < confirmedNonce || (havePending && pendingNonce < prev.nonce) {
 		delete(r.pendingTx, key)
+		r.txMu.Unlock()
+		if store != nil {
+			if err := store.DeletePendingEvmTx(key.sender, key.contract, key.kind); err != nil {
+				r.logger.Debugf("failed to clear stale pending EVM tx record: %v", err)
+			}
+		}
 		return nil
 	}
-	return &pendingEvmTx{
+	cloned := &pendingEvmTx{
 		nonce:     prev.nonce,
 		gasPrice:  cloneBigInt(prev.gasPrice),
 		tipCap:    cloneBigInt(prev.tipCap),
 		feeCap:    cloneBigInt(prev.feeCap),
 		isDynamic: prev.isDynamic,
 	}
+	r.txMu.Unlock()
+	return cloned
+}
+
+// hasOtherTrackedNonceInRange reports whether another tracked action for the
+// same sender currently owns a pending nonce in [low, high).
+func (r *EvmRpc) hasOtherTrackedNonceInRange(key evmTxKey, low, high uint64) bool {
+	r.txMu.Lock()
+	defer r.txMu.Unlock()
+	for k, entry := range r.pendingTx {
+		if k == key || k.sender != key.sender || entry == nil {
+			continue
+		}
+		if entry.nonce >= low && entry.nonce < high {
+			return true
+		}
+	}
+	return false
 }
 
 func (r *EvmRpc) buildContractTx(sender ecommon.Address, contractAddress *ecommon.Address, kind string, encodedData []byte, label string) (*etypes.Transaction, error) {
@@ -519,14 +619,23 @@ func (r *EvmRpc) buildContractTx(sender ecommon.Address, contractAddress *ecommo
 	if err != nil {
 		return nil, err
 	}
+	pendingNonce, pendErr := r.PendingNonceAt(sender)
+	havePending := pendErr == nil
 
 	key := evmTxKey{sender: sender, contract: *contractAddress, kind: kind}
-	prev := r.lookupPendingTx(key, confirmedNonce)
+	prev := r.lookupPendingTx(key, confirmedNonce, pendingNonce, havePending)
 	nonce := confirmedNonce
 	if prev != nil {
 		nonce = prev.nonce
-	} else if pendingNonce, err := r.PendingNonceAt(sender); err == nil && pendingNonce > nonce {
-		nonce = pendingNonce
+	} else if havePending && pendingNonce > confirmedNonce {
+		// Only advance to pendingNonce when another in-process action for this
+		// sender owns an active nonce in [confirmedNonce, pendingNonce).
+		// Otherwise (e.g. after a restart without a persisted record), recover
+		// ownership of confirmedNonce so we replace rather than queue behind
+		// our own stuck transaction.
+		if r.hasOtherTrackedNonceInRange(key, confirmedNonce, pendingNonce) {
+			nonce = pendingNonce
+		}
 	}
 
 	// Prefer EIP-1559 dynamic fees when the latest block carries a baseFeePerGas
@@ -965,6 +1074,110 @@ func (r *EvmRpc) CanonicalHash(number uint64) (ecommon.Hash, error) {
 	}
 	wg.Wait()
 	return agreeCanonicalHash(number, results)
+}
+
+// EndpointHeads queries every configured endpoint for sync status and chain
+// head. It returns (minHead, maxHead, nil) only when every endpoint responds
+// and reports itself synced.
+func (r *EvmRpc) EndpointHeads() (uint64, uint64, error) {
+	urls := r.Urls.Urls
+	if len(urls) == 0 {
+		return 0, 0, errors.New("no EVM endpoints configured")
+	}
+	type headAnswer struct {
+		head uint64
+		err  error
+	}
+	results := make([]headAnswer, len(urls))
+	var wg sync.WaitGroup
+	for idx := range urls {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			var head uint64
+			err := r.callEndpoint(idx, func(ctx context.Context, client *ethclient.Client) error {
+				synced, err := syncStateForClient(ctx, client)
+				if err != nil {
+					return err
+				}
+				if !synced {
+					return errors.New("endpoint is still syncing")
+				}
+				head, err = client.BlockNumber(ctx)
+				return err
+			})
+			if err != nil {
+				err = errors.New(config.RedactErrorForURL(err, urls[idx]))
+			}
+			results[idx] = headAnswer{head: head, err: err}
+		}(idx)
+	}
+	wg.Wait()
+	var minHead, maxHead uint64
+	for idx, res := range results {
+		if res.err != nil {
+			return 0, 0, fmt.Errorf("endpoint #%d head unavailable: %w", idx, res.err)
+		}
+		if idx == 0 || res.head < minHead {
+			minHead = res.head
+		}
+		if idx == 0 || res.head > maxHead {
+			maxHead = res.head
+		}
+	}
+	return minHead, maxHead, nil
+}
+
+// AnySecondaryHasReceipt checks every secondary endpoint (all configured URLs
+// other than the primary) for a transaction receipt. It returns true if any
+// secondary serves a receipt, and an error if any secondary fails to answer
+// definitively.
+func (r *EvmRpc) AnySecondaryHasReceipt(txHash ecommon.Hash) (bool, error) {
+	urls := r.Urls.Urls
+	type receiptAnswer struct {
+		found bool
+		err   error
+	}
+	results := make([]receiptAnswer, len(urls))
+	var wg sync.WaitGroup
+	for idx := range urls {
+		if uint32(idx) == r.Urls.CurrentUrlIndex {
+			continue
+		}
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			var found bool
+			err := r.callEndpoint(idx, func(ctx context.Context, client *ethclient.Client) error {
+				receipt, err := client.TransactionReceipt(ctx, txHash)
+				if errors.Is(err, ethereum.NotFound) {
+					return nil
+				}
+				if err != nil {
+					return err
+				}
+				found = receipt != nil
+				return nil
+			})
+			if err != nil {
+				err = errors.New(config.RedactErrorForURL(err, urls[idx]))
+			}
+			results[idx] = receiptAnswer{found: found, err: err}
+		}(idx)
+	}
+	wg.Wait()
+	for idx, res := range results {
+		if uint32(idx) == r.Urls.CurrentUrlIndex {
+			continue
+		}
+		if res.err != nil {
+			return false, fmt.Errorf("endpoint #%d receipt check failed: %w", idx, res.err)
+		}
+		if res.found {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // agreeCanonicalHash reduces per-endpoint answers to one hash, or an error

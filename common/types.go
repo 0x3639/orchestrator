@@ -1,5 +1,11 @@
 package common
 
+import (
+	"math/big"
+
+	ecommon "github.com/ethereum/go-ethereum/common"
+)
+
 type BridgeMetadata struct {
 	PartyTimeout         uint64           `json:"partyTimeout"`
 	KeyGenTimeout        uint64           `json:"keyGenTimeout"`
@@ -31,4 +37,22 @@ type AffiliateNetwork struct {
 	// Used when splitting an unwrap on evm
 	WZNN bool `json:"wZNN"`
 	WQSR bool `json:"wQSR"`
+}
+
+// PendingEvmTx stores the last submitted unconfirmed halt or key-change
+// transaction for a (sender, contract, kind) tuple so retries recover nonce
+// ownership and fee watermarks across process restarts.
+type PendingEvmTx struct {
+	Nonce     uint64   `json:"nonce"`
+	GasPrice  *big.Int `json:"gasPrice,omitempty"`
+	TipCap    *big.Int `json:"tipCap,omitempty"`
+	FeeCap    *big.Int `json:"feeCap,omitempty"`
+	IsDynamic bool     `json:"isDynamic"`
+}
+
+// PendingEvmTxStore persists PendingEvmTx records across restarts.
+type PendingEvmTxStore interface {
+	LoadPendingEvmTx(sender, contract ecommon.Address, kind string) (*PendingEvmTx, error)
+	SavePendingEvmTx(sender, contract ecommon.Address, kind string, rec *PendingEvmTx) error
+	DeletePendingEvmTx(sender, contract ecommon.Address, kind string) error
 }

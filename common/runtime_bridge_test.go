@@ -177,3 +177,44 @@ func TestReceiveHoldAndPendingRedeemIncidentStatus(t *testing.T) {
 		t.Fatal("clearing ReceiveHold left state or snapshot populated")
 	}
 }
+
+func TestRequireRestartLatchesHaltAgainstInFlightKeyGenCompletion(t *testing.T) {
+	gs := NewGlobalState(new(uint8))
+	if err := gs.SetState(KeyGenState); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := gs.RequireRestart(); err != nil {
+		t.Fatalf("RequireRestart failed: %v", err)
+	}
+	if !gs.RestartRequired() {
+		t.Fatal("expected RestartRequired() to be true")
+	}
+	if got, err := gs.GetState(); err != nil || got != HaltedState {
+		t.Fatalf("state after RequireRestart = %s (err %v), want HaltedState", StateToText(got), err)
+	}
+
+	// Simulate an in-flight key generation finishing and trying to restore LiveState.
+	if err := gs.SetState(LiveState); err == nil {
+		t.Fatal("SetState(LiveState) succeeded after RequireRestart")
+	}
+	if changed, err := gs.SetStateIf(KeyGenState, LiveState); err != nil || changed {
+		t.Fatalf("SetStateIf(KeyGenState, LiveState) = (%v, %v), want (false, nil)", changed, err)
+	}
+	if changed, err := gs.SetStateIf(HaltedState, LiveState); err == nil || changed {
+		t.Fatalf("SetStateIf(HaltedState, LiveState) = (%v, %v), want (false, error)", changed, err)
+	}
+	if got, err := gs.GetState(); err != nil || got != HaltedState {
+		t.Fatalf("state after rejected LiveState transitions = %s (err %v), want HaltedState", StateToText(got), err)
+	}
+
+	// Both transfer publication and transfer signing gates must refuse to run.
+	published := false
+	if ran, err := gs.WhileLive(func() error { published = true; return nil }); err != nil || ran || published {
+		t.Fatalf("WhileLive ran after RequireRestart: ran=%v published=%v err=%v", ran, published, err)
+	}
+	signed := false
+	if ran := gs.WhileSigningTransfers(func() { signed = true }); ran || signed {
+		t.Fatalf("WhileSigningTransfers ran after RequireRestart: ran=%v signed=%v", ran, signed)
+	}
+}
