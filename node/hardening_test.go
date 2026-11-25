@@ -5087,6 +5087,7 @@ func TestReSignStateRequiresMomentumConfirmationForBridgeSnapshot(t *testing.T) 
 		)
 		legacyOK := types.Hash{0xca}
 		legacyInvalid := types.Hash{0xcb}
+		legacyUnfinalized := types.Hash{0xcc}
 
 		canonicalOK := &embedded.WrapTokenRequest{
 			WrapTokenRequest: &definition.WrapTokenRequest{
@@ -5098,6 +5099,21 @@ func TestReSignStateRequiresMomentumConfirmationForBridgeSnapshot(t *testing.T) 
 				Amount:                 big.NewInt(100),
 				Fee:                    big.NewInt(10),
 				CreationMomentumHeight: 99,
+			},
+			ConfirmationsToFinality: 0,
+		}
+		// Confirmed in momentumStore with valid SetTokenPair, and even reports
+		// ConfirmationsToFinality=0, but 125 - 115 = 10 < confirmed threshold 20!
+		unfinalizedConfirmed := &embedded.WrapTokenRequest{
+			WrapTokenRequest: &definition.WrapTokenRequest{
+				NetworkClass:           definition.EvmClass,
+				ChainId:                1,
+				Id:                     legacyUnfinalized,
+				ToAddress:              destAddr,
+				TokenAddress:           canonicalToken,
+				Amount:                 big.NewInt(100),
+				Fee:                    big.NewInt(10),
+				CreationMomentumHeight: 115,
 			},
 			ConfirmationsToFinality: 0,
 		}
@@ -5136,6 +5152,12 @@ func TestReSignStateRequiresMomentumConfirmationForBridgeSnapshot(t *testing.T) 
 					ContractAddress: "0x0000000000000000000000000000000000000001",
 				}},
 			},
+			confirmedThresholdAtFn: func(height uint64) (uint32, bool) {
+				if height == 1 {
+					return 20, true
+				}
+				return 0, false
+			},
 			confirmedTokenPairAtFn: func(height uint64) (*definition.TokenPairParam, bool) {
 				if height != 2 && height != 3 {
 					return nil, false
@@ -5154,34 +5176,43 @@ func TestReSignStateRequiresMomentumConfirmationForBridgeSnapshot(t *testing.T) 
 				}, true
 			},
 			frontierMomFn: func(_ context.Context, _ int32) (*api.Momentum, error) {
-				return testMomentum(105), nil
+				return testMomentum(125), nil
 			},
 			frontierFn: func(_ context.Context, _ int32) (*api.AccountBlock, error) {
 				return testAccountBlock(10, types.Hash{0xaa, 0, 10}), nil
 			},
 			byID: map[types.Hash]*embedded.WrapTokenRequest{
-				legacyOK:      canonicalOK,
-				legacyInvalid: spoofedInvalid,
+				legacyOK:          canonicalOK,
+				legacyInvalid:     spoofedInvalid,
+				legacyUnfinalized: unfinalizedConfirmed,
 			},
 			blockByHashFn: func(_ context.Context, hash types.Hash) (*api.AccountBlock, error) {
-				if hash == legacyOK {
+				switch hash {
+				case legacyOK:
 					return testConfirmedWrapBlocks(
 						canonicalOK.WrapTokenRequest,
 						4, types.Hash{0xaa, 0, 4}, types.Hash{0xaa, 0, 3},
 						1, testMomentum(1).Hash, true,
 					), nil
+				case legacyUnfinalized:
+					return testConfirmedWrapBlocks(
+						unfinalizedConfirmed.WrapTokenRequest,
+						5, types.Hash{0xaa, 0, 5}, types.Hash{0xaa, 0, 4},
+						1, testMomentum(1).Hash, true,
+					), nil
+				default:
+					// legacyInvalid is absent from momentumStore.
+					return nil, nil
 				}
-				// legacyInvalid is absent from momentumStore.
-				return nil, nil
 			},
 			unsigned: &embedded.WrapTokenRequestList{
-				Count: 2,
-				List:  []*embedded.WrapTokenRequest{spoofedInvalid, spoofedOK},
+				Count: 3,
+				List:  []*embedded.WrapTokenRequest{spoofedInvalid, unfinalizedConfirmed, spoofedOK},
 			},
 		}
 
 		n := wrapTestNodeWithEvm(t, common.LiveState, bridge, map[string]string{"Ethereum": evmSrv.URL})
-		for _, id := range []types.Hash{legacyOK, legacyInvalid} {
+		for _, id := range []types.Hash{legacyOK, legacyInvalid, legacyUnfinalized} {
 			staleRow := events.WrapRequestZnn{
 				NetworkClass:  definition.EvmClass,
 				ChainId:       1,
@@ -5208,7 +5239,7 @@ func TestReSignStateRequiresMomentumConfirmationForBridgeSnapshot(t *testing.T) 
 			t.Fatalf("buildWrapSigningBatch failed: %v", err)
 		}
 		if len(reqs) != 1 || len(msgs) != 1 || reqs[0].Id != legacyOK {
-			t.Fatalf("expected only revalidated legacyOK in batch, got reqs=%+v msgs=%d", reqs, len(msgs))
+			t.Fatalf("expected only revalidated finalized legacyOK in batch, got reqs=%+v msgs=%d", reqs, len(msgs))
 		}
 		contractAddr := n.networksManager.LookupEvm(1).ContractAddress()
 		wantEvent := common.ZnnWrapToOrchestratorWrap(canonicalOK.WrapTokenRequest)
@@ -5224,6 +5255,9 @@ func TestReSignStateRequiresMomentumConfirmationForBridgeSnapshot(t *testing.T) 
 		}
 		if verified, err := n.dbManager.ZnnStorage().IsVerifiedResignWrap(legacyInvalid); err != nil || verified {
 			t.Fatalf("unverified legacyInvalid must not be marked verified: verified=%v err=%v", verified, err)
+		}
+		if verified, err := n.dbManager.ZnnStorage().IsVerifiedResignWrap(legacyUnfinalized); err != nil || verified {
+			t.Fatalf("unfinalized legacy wrap must not be promoted to verified marker before finality: verified=%v err=%v", verified, err)
 		}
 	})
 
@@ -5338,6 +5372,249 @@ func TestReSignStateRequiresMomentumConfirmationForBridgeSnapshot(t *testing.T) 
 		if got := height1Reads.Load(); got > 2 {
 			t.Fatalf("token-pair history replayed per wrap instead of once per scan: height-1 reads = %d, want <= 2", got)
 		}
+	})
+
+	t.Run("rejects wrap receipt from transient fork mismatched with cached token-pair history", func(t *testing.T) {
+		evmSrv := fakeEvmRpcServer(t)
+		defer evmSrv.Close()
+
+		// Exact regression for Round 20 Finding 2:
+		// Canonical bridge chain has B4_canon (Hash {0xaa, 0, 4}) at height 4.
+		// During pre-publish, ensureConfirmedTokenPairHistory replays the
+		// canonical chain and records B4_canon at height 4. Then, during
+		// verifyWrapConfirmedInLedger for forkWrap, a transient fork serves
+		// receipt B4_fork (Hash {0xee, 0, 4}) from GetAccountBlockByHash AND
+		// on the standalone GetAccountBlocksByHeight(4, 1) lookup before the
+		// node reverts to canonical B10. history.matchesBlock(recv) must catch
+		// B4_fork != B4_canon, reject forkWrap, restart on canonicalWrap, and
+		// NEVER mark or store forkWrap.
+		const canonicalToken = "0x000000000000000000000000000000000000aaaa"
+		forkWrap := types.Hash{0xd8}
+		canonicalWrap := types.Hash{0xd9}
+		makeEntry := func(id types.Hash) *embedded.WrapTokenRequest {
+			return &embedded.WrapTokenRequest{
+				WrapTokenRequest: &definition.WrapTokenRequest{
+					NetworkClass:           definition.EvmClass,
+					ChainId:                1,
+					Id:                     id,
+					ToAddress:              "0x000000000000000000000000000000000000beef",
+					TokenAddress:           canonicalToken,
+					Amount:                 big.NewInt(100),
+					Fee:                    big.NewInt(10),
+					CreationMomentumHeight: 99,
+				},
+				ConfirmationsToFinality: 0,
+			}
+		}
+
+		var transientForkActive atomic.Bool
+		var forkChecked atomic.Bool
+		bridge := &wrapTestBridge{
+			networks: &embedded.NetworkInfoList{
+				Count: 1,
+				List: []*definition.NetworkInfo{{
+					NetworkClass: definition.EvmClass, Id: 1, Name: "Ethereum",
+					ContractAddress: "0x0000000000000000000000000000000000000001",
+				}},
+			},
+			confirmedTokenPairAtFn: func(height uint64) (*definition.TokenPairParam, bool) {
+				if height != 2 && height != 3 {
+					return nil, false
+				}
+				return &definition.TokenPairParam{
+					NetworkClass:  definition.EvmClass,
+					ChainId:       1,
+					TokenStandard: types.ZeroTokenStandard,
+					TokenAddress:  canonicalToken,
+					Bridgeable:    true,
+					Redeemable:    true,
+					MinAmount:     big.NewInt(1),
+					FeePercentage: 1000,
+					RedeemDelay:   1,
+					Metadata:      "{}",
+				}, true
+			},
+			frontierMomFn: func(_ context.Context, _ int32) (*api.Momentum, error) {
+				return testMomentum(105), nil
+			},
+			frontierFn: func(_ context.Context, _ int32) (*api.AccountBlock, error) {
+				return testAccountBlock(10, types.Hash{0xaa, 0, 10}), nil
+			},
+			acctByHeightFn: func(_ context.Context, height uint64) (*api.AccountBlockList, error) {
+				if height == 4 && transientForkActive.CompareAndSwap(true, false) {
+					// Transient fork serves B4_fork on the standalone height-4
+					// receipt lookup, then immediately reverts to canonical.
+					b := testAccountBlock(4, types.Hash{0xee, 0, 4})
+					b.PreviousHash = types.Hash{0xaa, 0, 3}
+					return &api.AccountBlockList{Count: 4, List: []*api.AccountBlock{b}}, nil
+				}
+				return &api.AccountBlockList{
+					Count: int(height),
+					List:  []*api.AccountBlock{testAccountBlock(height, types.Hash{0xaa, byte(height >> 8), byte(height)})},
+				}, nil
+			},
+			pageHandler: func(pageIndex, pageSize uint32, call int32) *embedded.WrapTokenRequestList {
+				if call == 1 {
+					return paginateZenonWraps([]*embedded.WrapTokenRequest{makeEntry(forkWrap)}, pageIndex, pageSize)
+				}
+				return paginateZenonWraps([]*embedded.WrapTokenRequest{makeEntry(canonicalWrap)}, pageIndex, pageSize)
+			},
+			blockByHashFn: func(_ context.Context, hash types.Hash) (*api.AccountBlock, error) {
+				if hash == forkWrap {
+					forkChecked.Store(true)
+					transientForkActive.Store(true)
+					return testConfirmedWrapBlocks(
+						makeEntry(forkWrap).WrapTokenRequest,
+						4, types.Hash{0xee, 0, 4}, types.Hash{0xaa, 0, 3},
+						1, testMomentum(1).Hash, true,
+					), nil
+				}
+				return testConfirmedWrapBlocks(
+					makeEntry(canonicalWrap).WrapTokenRequest,
+					4, types.Hash{0xaa, 0, 4}, types.Hash{0xaa, 0, 3},
+					1, testMomentum(1).Hash, true,
+				), nil
+			},
+		}
+
+		n := wrapTestNodeWithEvm(t, common.LiveState, bridge, map[string]string{"Ethereum": evmSrv.URL})
+		if activated, err := n.state.ActivateResign(definition.EvmClass, 1); err != nil || !activated {
+			t.Fatalf("ActivateResign failed: activated=%v err=%v", activated, err)
+		}
+		n.state.CompleteStartup()
+
+		n.workers.start(n.processSignatures)
+		t.Cleanup(func() {
+			done := n.workers.shutdown()
+			<-done
+		})
+
+		eventually(t, "ReSignState to reject fork receipt mismatched with cached token-pair history and mark canonicalWrap", func() bool {
+			st, _ := n.state.GetState()
+			r, err := n.dbManager.ZnnStorage().GetResignStatus(canonicalWrap)
+			return err == nil && r && st == common.LiveState
+		})
+		if !forkChecked.Load() {
+			t.Fatal("expected verifyWrapConfirmedInLedger to inspect forkWrap")
+		}
+		if resign, err := n.dbManager.ZnnStorage().GetResignStatus(forkWrap); err != nil || resign {
+			t.Fatalf("forkWrap mismatched with cached history must not be marked: resign=%v err=%v", resign, err)
+		}
+		if ev, err := n.dbManager.ZnnStorage().GetWrapRequestById(forkWrap); err != nil || ev != nil {
+			t.Fatalf("forkWrap mismatched with cached history must not be stored: ev=%+v err=%v", ev, err)
+		}
+	})
+
+	t.Run("aborts token-pair replay immediately when bridge rolls back below target height", func(t *testing.T) {
+		evmSrv := fakeEvmRpcServer(t)
+		defer evmSrv.Close()
+
+		// Exact regression for Round 20 Finding 3:
+		// Initial anchor captures bridge frontier B10. Right as
+		// ensureConfirmedTokenPairHistory reads heights 1..10, Zenon rolls back
+		// to frontier B6 so GetAccountBlocksByHeight returns only 6 blocks (a
+		// short page) and height 10 no longer exists. Replay must immediately
+		// detect the rollback instead of retrying B10 forever, restart on B6,
+		// mark wrapID, and enter LiveState.
+		const canonicalToken = "0x000000000000000000000000000000000000bbbb"
+		wrapID := types.Hash{0xda}
+		entry := &embedded.WrapTokenRequest{
+			WrapTokenRequest: &definition.WrapTokenRequest{
+				NetworkClass:           definition.EvmClass,
+				ChainId:                1,
+				Id:                     wrapID,
+				ToAddress:              "0x000000000000000000000000000000000000beef",
+				TokenAddress:           canonicalToken,
+				Amount:                 big.NewInt(100),
+				Fee:                    big.NewInt(10),
+				CreationMomentumHeight: 99,
+			},
+			ConfirmationsToFinality: 0,
+		}
+
+		var bridgeTip atomic.Uint64
+		bridgeTip.Store(10)
+		var height1Reads atomic.Int32
+
+		bridge := &wrapTestBridge{
+			networks: &embedded.NetworkInfoList{
+				Count: 1,
+				List: []*definition.NetworkInfo{{
+					NetworkClass: definition.EvmClass, Id: 1, Name: "Ethereum",
+					ContractAddress: "0x0000000000000000000000000000000000000001",
+				}},
+			},
+			confirmedTokenPairAtFn: func(height uint64) (*definition.TokenPairParam, bool) {
+				if height != 2 && height != 3 {
+					return nil, false
+				}
+				return &definition.TokenPairParam{
+					NetworkClass:  definition.EvmClass,
+					ChainId:       1,
+					TokenStandard: types.ZeroTokenStandard,
+					TokenAddress:  canonicalToken,
+					Bridgeable:    true,
+					Redeemable:    true,
+					MinAmount:     big.NewInt(1),
+					FeePercentage: 1000,
+					RedeemDelay:   1,
+					Metadata:      "{}",
+				}, true
+			},
+			frontierMomFn: func(_ context.Context, _ int32) (*api.Momentum, error) {
+				return testMomentum(105), nil
+			},
+			frontierFn: func(_ context.Context, _ int32) (*api.AccountBlock, error) {
+				h := bridgeTip.Load()
+				return testAccountBlock(h, types.Hash{0xaa, byte(h >> 8), byte(h)}), nil
+			},
+			acctByHeightFn: func(_ context.Context, height uint64) (*api.AccountBlockList, error) {
+				if height == 1 && height1Reads.Add(1) == 2 {
+					// Second height-1 read is the start of ensureConfirmedTokenPairHistory
+					// for B10: roll back bridge tip 10 -> 6 mid-replay!
+					bridgeTip.Store(6)
+				}
+				if height > bridgeTip.Load() {
+					return &api.AccountBlockList{Count: int(bridgeTip.Load()), List: []*api.AccountBlock{}}, nil
+				}
+				return &api.AccountBlockList{
+					Count: int(bridgeTip.Load()),
+					List:  []*api.AccountBlock{testAccountBlock(height, types.Hash{0xaa, byte(height >> 8), byte(height)})},
+				}, nil
+			},
+			blockByHashFn: func(_ context.Context, hash types.Hash) (*api.AccountBlock, error) {
+				if hash != wrapID {
+					return nil, nil
+				}
+				return testConfirmedWrapBlocks(
+					entry.WrapTokenRequest,
+					4, types.Hash{0xaa, 0, 4}, types.Hash{0xaa, 0, 3},
+					1, testMomentum(1).Hash, true,
+				), nil
+			},
+			allWraps: &embedded.WrapTokenRequestList{
+				Count: 1,
+				List:  []*embedded.WrapTokenRequest{entry},
+			},
+		}
+
+		n := wrapTestNodeWithEvm(t, common.LiveState, bridge, map[string]string{"Ethereum": evmSrv.URL})
+		if activated, err := n.state.ActivateResign(definition.EvmClass, 1); err != nil || !activated {
+			t.Fatalf("ActivateResign failed: activated=%v err=%v", activated, err)
+		}
+		n.state.CompleteStartup()
+
+		n.workers.start(n.processSignatures)
+		t.Cleanup(func() {
+			done := n.workers.shutdown()
+			<-done
+		})
+
+		eventually(t, "ReSignState to abort short-page replay on rollback to B6 and complete cleanly", func() bool {
+			st, _ := n.state.GetState()
+			r, err := n.dbManager.ZnnStorage().GetResignStatus(wrapID)
+			return err == nil && r && st == common.LiveState
+		})
 	})
 }
 

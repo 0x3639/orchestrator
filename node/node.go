@@ -1621,7 +1621,7 @@ func (node *Node) readConfirmedWrapConfirmations(anchor reSignChainAnchor, advan
 		if node.workerStopping() {
 			return 0, reSignChainAnchor{}, false, false, true
 		}
-		if !node.state.IsResignGenerationCurrent(resignGen) {
+		if resignGen != 0 && !node.state.IsResignGenerationCurrent(resignGen) {
 			return 0, reSignChainAnchor{}, false, true, false
 		}
 		curAnchor, ok, retryCheck, stopCheck := node.checkZenonAnchorConsistent(cur, advanceFinality)
@@ -1629,6 +1629,9 @@ func (node *Node) readConfirmedWrapConfirmations(anchor reSignChainAnchor, advan
 			return 0, reSignChainAnchor{}, false, false, true
 		}
 		if retryCheck {
+			if resignGen == 0 {
+				return 0, reSignChainAnchor{}, false, false, false
+			}
 			if !node.workerSleep(resignRetryDelay) {
 				return 0, reSignChainAnchor{}, false, false, true
 			}
@@ -1638,6 +1641,9 @@ func (node *Node) readConfirmedWrapConfirmations(anchor reSignChainAnchor, advan
 			return 0, reSignChainAnchor{}, false, false, false
 		}
 		if curAnchor.bridgeBlock == nil || curAnchor.bridgeBlock.Height == 0 {
+			if resignGen == 0 {
+				return 0, reSignChainAnchor{}, false, false, false
+			}
 			if !node.workerSleep(resignRetryDelay) {
 				return 0, reSignChainAnchor{}, false, false, true
 			}
@@ -1659,6 +1665,9 @@ func (node *Node) readConfirmedWrapConfirmations(anchor reSignChainAnchor, advan
 			}
 			if err != nil {
 				node.logger.Debugf("failed to verify cached threshold anchor %d: %v", cache.atBlock.Height, err)
+				if resignGen == 0 {
+					return 0, reSignChainAnchor{}, false, false, false
+				}
 				if !node.workerSleep(resignRetryDelay) {
 					return 0, reSignChainAnchor{}, false, false, true
 				}
@@ -1682,7 +1691,7 @@ func (node *Node) readConfirmedWrapConfirmations(anchor reSignChainAnchor, advan
 			if node.workerStopping() {
 				return 0, reSignChainAnchor{}, false, false, true
 			}
-			if !node.state.IsResignGenerationCurrent(resignGen) {
+			if resignGen != 0 && !node.state.IsResignGenerationCurrent(resignGen) {
 				return 0, reSignChainAnchor{}, false, true, false
 			}
 			lo := minHeight
@@ -1703,7 +1712,15 @@ func (node *Node) readConfirmedWrapConfirmations(anchor reSignChainAnchor, advan
 				break
 			}
 			if page == nil || len(page.List) < int(count) {
-				needRetry = true
+				stillCanonical, _, stopCheck := node.isBridgeBlockStillCanonical(curAnchor.bridgeBlock)
+				if stopCheck {
+					return 0, reSignChainAnchor{}, false, false, true
+				}
+				if !stillCanonical {
+					rolledBack = true
+				} else {
+					needRetry = true
+				}
 				break
 			}
 
@@ -1711,7 +1728,15 @@ func (node *Node) readConfirmedWrapConfirmations(anchor reSignChainAnchor, advan
 				b := page.List[i]
 				expectedHeight := lo + uint64(i)
 				if b == nil || b.Height != expectedHeight || !isConfirmedBridgeBlock(b) {
-					needRetry = true
+					stillCanonical, _, stopCheck := node.isBridgeBlockStillCanonical(curAnchor.bridgeBlock)
+					if stopCheck {
+						return 0, reSignChainAnchor{}, false, false, true
+					}
+					if !stillCanonical {
+						rolledBack = true
+					} else {
+						needRetry = true
+					}
 					break
 				}
 				if b.Hash != expectedHash {
@@ -1800,6 +1825,9 @@ func (node *Node) readConfirmedWrapConfirmations(anchor reSignChainAnchor, advan
 			return 0, reSignChainAnchor{}, false, false, false
 		}
 		if needRetry {
+			if resignGen == 0 {
+				return 0, reSignChainAnchor{}, false, false, false
+			}
 			if !node.workerSleep(resignRetryDelay) {
 				return 0, reSignChainAnchor{}, false, false, true
 			}
@@ -1814,6 +1842,9 @@ func (node *Node) readConfirmedWrapConfirmations(anchor reSignChainAnchor, advan
 				found = true
 			} else {
 				node.logger.Debugf("no confirmed SetOrchestratorInfo block found on bridge chain up to height %d; retrying", curAnchor.bridgeBlock.Height)
+				if resignGen == 0 {
+					return 0, reSignChainAnchor{}, false, false, false
+				}
 				if !node.workerSleep(resignRetryDelay) {
 					return 0, reSignChainAnchor{}, false, false, true
 				}
@@ -1828,6 +1859,9 @@ func (node *Node) readConfirmedWrapConfirmations(anchor reSignChainAnchor, advan
 			return 0, reSignChainAnchor{}, false, false, true
 		}
 		if retryCheck {
+			if resignGen == 0 {
+				return 0, reSignChainAnchor{}, false, false, false
+			}
 			if !node.workerSleep(resignRetryDelay) {
 				return 0, reSignChainAnchor{}, false, false, true
 			}
@@ -1869,13 +1903,21 @@ type confirmedTokenPairEvent struct {
 	netParam  *definition.NetworkInfoParam
 }
 
+type confirmedBlockIdentity struct {
+	hash      types.Hash
+	momHeight uint64
+	momHash   types.Hash
+}
+
 // confirmedTokenPairHistory caches the compact stream of confirmed, accepted
-// TokenPair/Network admin events replayed along the PreviousHash-linked bridge
-// account chain up to tipBlock. Replaying once per scan avoids O(N * H) block
-// reads across multi-wrap pre-publish batches while allowing exact per-height
-// state reconstruction at each wrap receive height.
+// TokenPair/Network admin events AND the verified confirmed block identity at
+// every height 1..tipBlock.Height replayed along the PreviousHash-linked bridge
+// account chain. Replaying once per scan avoids O(N * H) block reads across
+// multi-wrap pre-publish batches while binding every wrap receipt to the exact
+// same canonical chain that produced the cached token-pair events.
 type confirmedTokenPairHistory struct {
 	tipBlock *api.AccountBlock
+	blocks   []confirmedBlockIdentity
 	events   []confirmedTokenPairEvent
 }
 
@@ -1884,7 +1926,44 @@ func (h *confirmedTokenPairHistory) reset() {
 		return
 	}
 	h.tipBlock = nil
+	h.blocks = nil
 	h.events = nil
+}
+
+// matchesBlock reports whether b matches the confirmed bridge block identity
+// recorded at b.Height during the PreviousHash-linked replay.
+func (h *confirmedTokenPairHistory) matchesBlock(b *api.AccountBlock) bool {
+	if h == nil || b == nil || !isConfirmedBridgeBlock(b) || b.Height == 0 || b.Height > uint64(len(h.blocks)) {
+		return false
+	}
+	id := h.blocks[b.Height-1]
+	return b.Hash == id.hash &&
+		b.ConfirmationDetail.MomentumHeight == id.momHeight &&
+		b.ConfirmationDetail.MomentumHash == id.momHash
+}
+
+// isBridgeBlockStillCanonical checks whether targetBlock is still present and
+// confirmed at targetBlock.Height on the bridge account chain. Used when a
+// range read returns a short page or unconfirmed block to distinguish a
+// rollback below targetBlock.Height from a transient RPC error.
+func (node *Node) isBridgeBlockStillCanonical(targetBlock *api.AccountBlock) (stillCanonical, transientErr, stop bool) {
+	if targetBlock == nil || targetBlock.Height == 0 {
+		return false, false, false
+	}
+	ctx, cancel := context.WithTimeout(node.workers.context(), resignRPCTimeout)
+	blocks, err := node.networksManager.Znn().GetAccountBlocksByHeightContext(ctx, types.BridgeContract, targetBlock.Height, 1)
+	cancel()
+	if node.workerStopping() {
+		return false, false, true
+	}
+	if err != nil {
+		return false, true, false
+	}
+	if blocks == nil || len(blocks.List) == 0 || blocks.List[0] == nil ||
+		!isConfirmedBridgeBlock(blocks.List[0]) || !sameAccountBlockFrontier(targetBlock, blocks.List[0]) {
+		return false, false, false
+	}
+	return true, false, false
 }
 
 // tokenPairBeforeHeight replays the cached admin events strictly before
@@ -2029,6 +2108,9 @@ func (node *Node) ensureConfirmedTokenPairHistory(targetBlock *api.AccountBlock,
 			}
 			if err != nil {
 				node.logger.Debugf("failed to verify cached token pair tip %d: %v", cache.tipBlock.Height, err)
+				if resignGen == 0 {
+					return false, false, false
+				}
 				if !node.workerSleep(resignRetryDelay) {
 					return false, false, true
 				}
@@ -2043,6 +2125,7 @@ func (node *Node) ensureConfirmedTokenPairHistory(targetBlock *api.AccountBlock,
 			prevHash = cache.tipBlock.Hash
 		}
 
+		deltaBlocks := make([]confirmedBlockIdentity, 0, targetBlock.Height-startHeight+1)
 		deltaEvents := make([]confirmedTokenPairEvent, 0)
 		needRetry := false
 		rolledBack := false
@@ -2072,7 +2155,15 @@ func (node *Node) ensureConfirmedTokenPairHistory(targetBlock *api.AccountBlock,
 				break
 			}
 			if page == nil || len(page.List) < int(count) {
-				needRetry = true
+				stillCanonical, _, stopCheck := node.isBridgeBlockStillCanonical(targetBlock)
+				if stopCheck {
+					return false, false, true
+				}
+				if !stillCanonical {
+					rolledBack = true
+				} else {
+					needRetry = true
+				}
 				break
 			}
 
@@ -2080,7 +2171,15 @@ func (node *Node) ensureConfirmedTokenPairHistory(targetBlock *api.AccountBlock,
 				b := page.List[i]
 				expectedHeight := lo + uint64(i)
 				if b == nil || b.Height != expectedHeight || !isConfirmedBridgeBlock(b) {
-					needRetry = true
+					stillCanonical, _, stopCheck := node.isBridgeBlockStillCanonical(targetBlock)
+					if stopCheck {
+						return false, false, true
+					}
+					if !stillCanonical {
+						rolledBack = true
+					} else {
+						needRetry = true
+					}
 					break
 				}
 				if expectedHeight == 1 {
@@ -2097,6 +2196,11 @@ func (node *Node) ensureConfirmedTokenPairHistory(targetBlock *api.AccountBlock,
 					break
 				}
 				prevHash = b.Hash
+				deltaBlocks = append(deltaBlocks, confirmedBlockIdentity{
+					hash:      b.Hash,
+					momHeight: b.ConfirmationDetail.MomentumHeight,
+					momHash:   b.ConfirmationDetail.MomentumHash,
+				})
 
 				if !isAcceptedReceiveBlock(b) {
 					continue
@@ -2202,6 +2306,9 @@ func (node *Node) ensureConfirmedTokenPairHistory(targetBlock *api.AccountBlock,
 			return false, false, false
 		}
 		if needRetry {
+			if resignGen == 0 {
+				return false, false, false
+			}
 			if !node.workerSleep(resignRetryDelay) {
 				return false, false, true
 			}
@@ -2211,6 +2318,7 @@ func (node *Node) ensureConfirmedTokenPairHistory(targetBlock *api.AccountBlock,
 			cache.reset()
 			return false, false, false
 		}
+		cache.blocks = append(cache.blocks, deltaBlocks...)
 		cache.events = append(cache.events, deltaEvents...)
 		cache.tipBlock = targetBlock
 		return true, false, false
@@ -2248,6 +2356,9 @@ func (node *Node) verifyWrapConfirmedInLedger(wrap *definition.WrapTokenRequest,
 		}
 		if err != nil {
 			node.logger.Debugf("failed to verify wrap %s in confirmed ledger store: %v", wrapID, err)
+			if resignGen == 0 {
+				return false, false, false
+			}
 			if !node.workerSleep(resignRetryDelay) {
 				return false, false, true
 			}
@@ -2300,6 +2411,9 @@ func (node *Node) verifyWrapConfirmedInLedger(wrap *definition.WrapTokenRequest,
 		}
 		if err != nil {
 			node.logger.Debugf("failed to verify receive momentum %d for wrap %s: %v", recvMom, wrapID, err)
+			if resignGen == 0 {
+				return false, false, false
+			}
 			if !node.workerSleep(resignRetryDelay) {
 				return false, false, true
 			}
@@ -2329,6 +2443,9 @@ func (node *Node) verifyWrapConfirmedInLedger(wrap *definition.WrapTokenRequest,
 				}
 				if err != nil {
 					node.logger.Debugf("failed to verify bridge receive block %d for wrap %s: %v", recv.Height, wrapID, err)
+					if resignGen == 0 {
+						return false, false, false
+					}
 					if !node.workerSleep(resignRetryDelay) {
 						return false, false, true
 					}
@@ -2342,7 +2459,10 @@ func (node *Node) verifyWrapConfirmedInLedger(wrap *definition.WrapTokenRequest,
 		}
 
 		// Bind TokenAddress and Fee (both inputs to the wrap signing digest) to
-		// the confirmed TokenPair execution state active when recv executed.
+		// the confirmed TokenPair execution state active when recv executed,
+		// requiring recv itself to match the exact confirmed block recorded at
+		// recv.Height during the PreviousHash-linked replay (ruling out a
+		// receipt served from a different fork than the cached history).
 		history := pairHistory
 		if history == nil {
 			history = &confirmedTokenPairHistory{}
@@ -2358,7 +2478,7 @@ func (node *Node) verifyWrapConfirmedInLedger(wrap *definition.WrapTokenRequest,
 		if histStale {
 			return false, true, false
 		}
-		if !histConsistent {
+		if !histConsistent || !history.matchesBlock(recv) {
 			return false, false, false
 		}
 		pair, pairFound := history.tokenPairBeforeHeight(wrap.NetworkClass, wrap.ChainId, send.TokenStandard, recv.Height)
@@ -3331,9 +3451,11 @@ func (node *Node) requireLiveTransfers() error {
 
 // revalidateLegacyResignWrap verifies a pre-upgrade local resign row (flag == 1,
 // persisted before PublishResignWraps wrote versioned verified markers) against
-// Zenon's confirmed momentumStore and applied SetTokenPair state, refreshes the
-// local row and upgrades its resign marker to verified via PublishResignWraps.
-func (node *Node) revalidateLegacyResignWrap(id types.Hash, pairHistory *confirmedTokenPairHistory) (*definition.WrapTokenRequest, bool, error) {
+// Zenon's confirmed finality threshold, momentumStore, and applied SetTokenPair
+// state, refreshes the local row and upgrades its resign marker to verified via
+// PublishResignWraps. Uses bounded non-blocking checks (resignGen == 0) so
+// transient RPC errors never stall unrelated live signing ceremonies.
+func (node *Node) revalidateLegacyResignWrap(id types.Hash, thresholdCache *confirmedThresholdCache, pairHistory *confirmedTokenPairHistory) (*definition.WrapTokenRequest, bool, error) {
 	momCtx, momCancel := context.WithTimeout(node.workers.context(), resignRPCTimeout)
 	mom, err := node.networksManager.Znn().GetFrontierMomentumContext(momCtx)
 	momCancel()
@@ -3354,15 +3476,19 @@ func (node *Node) revalidateLegacyResignWrap(id types.Hash, pairHistory *confirm
 	ctx, cancel := context.WithTimeout(node.workers.context(), resignRPCTimeout)
 	wrap, err := node.networksManager.Znn().GetWrapTokenRequestByIdContext(ctx, id)
 	cancel()
-	if err != nil || wrap == nil || wrap.WrapTokenRequest == nil || wrap.Id != id {
+	if err != nil || wrap == nil || wrap.WrapTokenRequest == nil || wrap.Id != id || wrap.ConfirmationsToFinality != 0 {
 		return nil, false, nil
 	}
-	confirmed, _, stop := node.verifyWrapConfirmedInLedger(wrap.WrapTokenRequest, anchor, pairHistory, 0)
+	reqConf, confirmedAnchor, confConsistent, _, confStop := node.readConfirmedWrapConfirmations(anchor, false, thresholdCache, 0)
+	if confStop || !confConsistent || !wrapFinalizedAtMomentum(wrap, confirmedAnchor.finalityMom, reqConf) {
+		return nil, false, nil
+	}
+	confirmed, _, stop := node.verifyWrapConfirmedInLedger(wrap.WrapTokenRequest, confirmedAnchor, pairHistory, 0)
 	if stop || !confirmed {
 		return nil, false, nil
 	}
-	_, postConsistent, postRetry, postStop := node.checkZenonAnchorConsistent(anchor, false)
-	if postStop || postRetry || !postConsistent {
+	postReqConf, postAnchor, postConsistent, _, postStop := node.readConfirmedWrapConfirmations(confirmedAnchor, false, thresholdCache, 0)
+	if postStop || !postConsistent || !wrapDefFinalizedAtMomentum(wrap.WrapTokenRequest, postAnchor.finalityMom, postReqConf) {
 		return nil, false, nil
 	}
 	if err := node.networksManager.PublishResignWraps([]*definition.WrapTokenRequest{wrap.WrapTokenRequest}); err != nil {
@@ -3393,6 +3519,7 @@ func (node *Node) buildWrapSigningBatch() ([]*definition.WrapTokenRequest, [][]b
 	wrapRequestsIds := make([]*definition.WrapTokenRequest, 0, len(resignableWraps)+len(unsignedWraps))
 	seen := make(map[types.Hash]struct{}, len(resignableWraps)+len(unsignedWraps))
 	blockedLegacy := make(map[types.Hash]struct{})
+	var legacyThresholdCache *confirmedThresholdCache
 	var legacyPairHistory *confirmedTokenPairHistory
 	for _, req := range resignableWraps {
 		if req == nil {
@@ -3408,10 +3535,13 @@ func (node *Node) buildWrapSigningBatch() ([]*definition.WrapTokenRequest, [][]b
 			return nil, nil, nil, err
 		}
 		if !verified {
+			if legacyThresholdCache == nil {
+				legacyThresholdCache = &confirmedThresholdCache{}
+			}
 			if legacyPairHistory == nil {
 				legacyPairHistory = &confirmedTokenPairHistory{}
 			}
-			refreshed, ok, err := node.revalidateLegacyResignWrap(req.Id, legacyPairHistory)
+			refreshed, ok, err := node.revalidateLegacyResignWrap(req.Id, legacyThresholdCache, legacyPairHistory)
 			if err != nil {
 				node.logger.Error(err)
 				common.RequestStop(node.stopChan)

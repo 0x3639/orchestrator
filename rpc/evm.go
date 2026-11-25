@@ -78,11 +78,15 @@ func verifyEvmChainID(parent context.Context, client *ethclient.Client, expected
 	defer cancel()
 	got, err := client.ChainID(ctx)
 	if err != nil {
-		// Never surface raw HTTP error bodies (which can echo credential-bearing
-		// path or query components); report only the status code for HTTP errors.
+		// Never surface provider-supplied HTTP bodies or JSON-RPC error text,
+		// which can echo credential-bearing path segments or query values.
 		var httpErr gethrpc.HTTPError
 		if stderrors.As(err, &httpErr) {
 			return fmt.Errorf("network %s (%s): failed to verify eth_chainId: HTTP %d", networkName, config.RedactURL(url), httpErr.StatusCode)
+		}
+		var rpcErr gethrpc.Error
+		if stderrors.As(err, &rpcErr) {
+			return fmt.Errorf("network %s (%s): failed to verify eth_chainId: JSON-RPC error %d", networkName, config.RedactURL(url), rpcErr.ErrorCode())
 		}
 		return fmt.Errorf("network %s (%s): failed to verify eth_chainId: %s", networkName, config.RedactURL(url), config.RedactErrorForURL(err, url))
 	}

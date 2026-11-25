@@ -139,6 +139,13 @@ func RedactErrorForURL(err error, raw string) string {
 		}
 		if parsed.RawQuery != "" {
 			msg = strings.ReplaceAll(msg, parsed.RawQuery, redactedPlaceholder)
+			for _, vals := range parsed.Query() {
+				for _, v := range vals {
+					if v != "" {
+						msg = strings.ReplaceAll(msg, v, redactedPlaceholder)
+					}
+				}
+			}
 		}
 		if reqURI := parsed.RequestURI(); len(reqURI) > 1 {
 			msg = strings.ReplaceAll(msg, reqURI, "/"+redactedPlaceholder)

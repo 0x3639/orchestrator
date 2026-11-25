@@ -111,10 +111,37 @@ func TestEvmDialAndChainIDErrorsRedactCredentials(t *testing.T) {
 		}
 	}
 
-	// 3. RedactErrorForURL must also scrub partial path/query echoes directly.
-	partialErr := fmt.Errorf("upstream rejected %s and %s", "/v2/chain-api-key", "token=chaintoken")
+	// 3. HTTP 200 JSON-RPC error whose provider message echoes an API key path
+	// segment or query value must report only the JSON-RPC error code without
+	// provider-supplied text.
+	jsonRpcErrSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			ID json.RawMessage `json:"id"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(fmt.Sprintf(`{"jsonrpc":"2.0","id":%s,"error":{"code":-32001,"message":"invalid key chain-api-key for chaintoken"}}`, string(req.ID))))
+	}))
+	defer jsonRpcErrSrv.Close()
+	jsonHost := strings.TrimPrefix(jsonRpcErrSrv.URL, "http://")
+	jsonChainURL := fmt.Sprintf("http://bob:chainsecret@%s/v2/chain-api-key?token=chaintoken", jsonHost)
+	_, err = NewEvmRpcClientForChain(config.BaseNetworkConfig{Urls: []string{jsonChainURL}}, 73405, "Supernova", ecommon.Address{})
+	if err == nil {
+		t.Fatal("expected eth_chainId failure on JSON-RPC error response")
+	}
+	if !strings.Contains(err.Error(), "JSON-RPC error -32001") {
+		t.Fatalf("expected JSON-RPC error -32001 in error, got: %v", err)
+	}
+	for _, leaked := range []string{"bob", "chainsecret", "chain-api-key", "chaintoken", "invalid key"} {
+		if strings.Contains(err.Error(), leaked) {
+			t.Fatalf("JSON-RPC eth_chainId error leaked provider text %q: %v", leaked, err)
+		}
+	}
+
+	// 4. RedactErrorForURL must also scrub partial path/query echoes directly.
+	partialErr := fmt.Errorf("upstream rejected %s and %s", "/v2/chain-api-key", "chaintoken")
 	redacted := config.RedactErrorForURL(partialErr, chainURL)
-	for _, secret := range []string{"chain-api-key", "chaintoken", "token="} {
+	for _, secret := range []string{"chain-api-key", "chaintoken"} {
 		if strings.Contains(redacted, secret) {
 			t.Fatalf("RedactErrorForURL leaked credential %q: %s", secret, redacted)
 		}
