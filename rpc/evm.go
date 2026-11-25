@@ -36,11 +36,12 @@ import (
 )
 
 type EvmRpc struct {
-	clientMu    sync.RWMutex
-	rpcClient   *ethclient.Client
-	Urls        config.UrlsInfo
-	networkName string
-	chainId     uint32
+	clientMu     sync.RWMutex
+	rpcClient    *ethclient.Client
+	reconnecting *primaryReconnect
+	Urls         config.UrlsInfo
+	networkName  string
+	chainId      uint32
 
 	bridgeContract  *bridge.Bridge
 	bridgeAddress   ecommon.Address
@@ -423,38 +424,110 @@ func mergeCancelContext(primary, secondary context.Context) (context.Context, co
 	}
 }
 
+type primaryReconnect struct {
+	done   chan struct{}
+	client *ethclient.Client
+	err    error
+}
+
 func (r *EvmRpc) reconnectPrimary(callerCtx context.Context, failedClient *ethclient.Client) (*ethclient.Client, error) {
-	r.clientMu.Lock()
-	defer r.clientMu.Unlock()
-	if r.ctx.Err() != nil {
-		return nil, errors.New("evm rpc stopped")
+	for {
+		r.clientMu.Lock()
+		if r.ctx.Err() != nil {
+			r.clientMu.Unlock()
+			return nil, errors.New("evm rpc stopped")
+		}
+		if callerCtx != nil && callerCtx.Err() != nil {
+			r.clientMu.Unlock()
+			return nil, callerCtx.Err()
+		}
+		if r.rpcClient != failedClient {
+			current := r.rpcClient
+			r.clientMu.Unlock()
+			return current, nil
+		}
+		if inFlight := r.reconnecting; inFlight != nil {
+			r.clientMu.Unlock()
+			var callerDone <-chan struct{}
+			if callerCtx != nil {
+				callerDone = callerCtx.Done()
+			}
+			select {
+			case <-inFlight.done:
+				if inFlight.client != nil {
+					return inFlight.client, nil
+				}
+				if r.ctx.Err() != nil {
+					return nil, errors.New("evm rpc stopped")
+				}
+				if callerCtx != nil && callerCtx.Err() != nil {
+					return nil, callerCtx.Err()
+				}
+				// If the leader aborted only because its own caller context
+				// ended, loop so this waiter can lead a fresh reconnect.
+				if stderrors.Is(inFlight.err, context.Canceled) || stderrors.Is(inFlight.err, context.DeadlineExceeded) {
+					continue
+				}
+				return nil, inFlight.err
+			case <-r.ctx.Done():
+				return nil, errors.New("evm rpc stopped")
+			case <-callerDone:
+				return nil, callerCtx.Err()
+			}
+		}
+		attempt := &primaryReconnect{done: make(chan struct{})}
+		r.reconnecting = attempt
+		currentURL := r.Urls.GetCurrentUrl()
+		r.clientMu.Unlock()
+
+		// Perform permit wait, dial, and eth_chainId verification outside
+		// clientMu so getPrimaryClient and concurrent waiters never block
+		// past their caller cancellation or deadline.
+		merged, stopMerged := mergeCancelContext(callerCtx, r.ctx)
+		dialCtx, dialCancel, err := limitedCallContext(merged, r.limiter, evmCallTimeout)
+		var newClient *ethclient.Client
+		if err == nil {
+			newClient, err = dialVerifiedEvmClient(dialCtx, currentURL, r.chainId, r.networkName)
+			dialCancel()
+			if err != nil {
+				r.logger.Warnf("WebSocket reconnect verification failed for %s: %s", config.RedactURL(currentURL), err.Error())
+			}
+		}
+		stopMerged()
+
+		r.clientMu.Lock()
+		if err == nil && r.ctx.Err() == nil && r.rpcClient == failedClient {
+			r.rpcClient = newClient
+			attempt.client = newClient
+			r.reconnecting = nil
+			close(attempt.done)
+			r.clientMu.Unlock()
+			if failedClient != nil {
+				failedClient.Close()
+			}
+			return newClient, nil
+		}
+		stopped := r.ctx.Err() != nil
+		current := r.rpcClient
+		if stopped {
+			attempt.err = errors.New("evm rpc stopped")
+		} else if err != nil {
+			attempt.err = err
+		} else {
+			attempt.client = current
+		}
+		r.reconnecting = nil
+		close(attempt.done)
+		r.clientMu.Unlock()
+
+		if newClient != nil {
+			newClient.Close()
+		}
+		if attempt.client != nil {
+			return attempt.client, nil
+		}
+		return nil, attempt.err
 	}
-	if callerCtx != nil && callerCtx.Err() != nil {
-		return nil, callerCtx.Err()
-	}
-	if r.rpcClient != failedClient {
-		return r.rpcClient, nil
-	}
-	// Keep both caller cancellation/deadline and EvmRpc cancellation active
-	// through permit wait, dial, and eth_chainId verification.
-	merged, stopMerged := mergeCancelContext(callerCtx, r.ctx)
-	defer stopMerged()
-	dialCtx, dialCancel, err := limitedCallContext(merged, r.limiter, evmCallTimeout)
-	if err != nil {
-		return nil, err
-	}
-	defer dialCancel()
-	currentURL := r.Urls.GetCurrentUrl()
-	newClient, err := dialVerifiedEvmClient(dialCtx, currentURL, r.chainId, r.networkName)
-	if err != nil {
-		r.logger.Warnf("WebSocket reconnect verification failed for %s: %s", config.RedactURL(currentURL), err.Error())
-		return nil, err
-	}
-	r.rpcClient = newClient
-	if failedClient != nil {
-		failedClient.Close()
-	}
-	return newClient, nil
 }
 
 func (r *EvmRpc) doPrimary(ctx context.Context, fn func(context.Context, *ethclient.Client) error) error {
