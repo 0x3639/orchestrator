@@ -1392,18 +1392,28 @@ type reSignChainAnchor struct {
 	bridgeBlock    *api.AccountBlock
 }
 
+func (node *Node) resignRPCContext(parent context.Context) (context.Context, context.CancelFunc) {
+	if parent == nil {
+		parent = node.workers.context()
+	}
+	return context.WithTimeout(parent, resignRPCTimeout)
+}
+
 // checkZenonAnchorConsistent verifies that Zenon has NOT rolled back past
 // anchor.cutoffMomentum/cutoffHash, past anchor.finalityMom/finalityHash (the
 // highest momentum view that established finality for any accepted wrap), or
 // past anchor.bridgeBlock, while permitting arbitrary forward chain/account
 // growth. When advanceFinality is true, next raises finalityMom/finalityHash to
 // the verified live frontier momentum.
-func (node *Node) checkZenonAnchorConsistent(anchor reSignChainAnchor, advanceFinality bool) (next reSignChainAnchor, consistent, retry, stop bool) {
+func (node *Node) checkZenonAnchorConsistent(ctx context.Context, anchor reSignChainAnchor, advanceFinality bool) (next reSignChainAnchor, consistent, retry, stop bool) {
 	if node.workerStopping() {
 		return reSignChainAnchor{}, false, false, true
 	}
+	if ctx != nil && ctx.Err() != nil {
+		return reSignChainAnchor{}, false, true, false
+	}
 
-	momFrontCtx, momFrontCancel := context.WithTimeout(node.workers.context(), resignRPCTimeout)
+	momFrontCtx, momFrontCancel := node.resignRPCContext(ctx)
 	curMom, err := node.networksManager.Znn().GetFrontierMomentumContext(momFrontCtx)
 	momFrontCancel()
 	if node.workerStopping() {
@@ -1414,7 +1424,7 @@ func (node *Node) checkZenonAnchorConsistent(anchor reSignChainAnchor, advanceFi
 		return reSignChainAnchor{}, false, true, false
 	}
 
-	acctCtx, acctCancel := context.WithTimeout(node.workers.context(), resignRPCTimeout)
+	acctCtx, acctCancel := node.resignRPCContext(ctx)
 	curAcct, err := node.networksManager.Znn().GetFrontierAccountBlockContext(acctCtx, types.BridgeContract)
 	acctCancel()
 	if node.workerStopping() {
@@ -1442,7 +1452,7 @@ func (node *Node) checkZenonAnchorConsistent(anchor reSignChainAnchor, advanceFi
 	}
 
 	if curMom.Height > anchor.cutoffMomentum {
-		momCtx, momCancel := context.WithTimeout(node.workers.context(), resignRPCTimeout)
+		momCtx, momCancel := node.resignRPCContext(ctx)
 		momList, err := node.networksManager.Znn().GetMomentumsByHeightContext(momCtx, anchor.cutoffMomentum, 1)
 		momCancel()
 		if node.workerStopping() {
@@ -1459,7 +1469,7 @@ func (node *Node) checkZenonAnchorConsistent(anchor reSignChainAnchor, advanceFi
 	}
 
 	if highMom > anchor.cutoffMomentum && curMom.Height > highMom {
-		finCtx, finCancel := context.WithTimeout(node.workers.context(), resignRPCTimeout)
+		finCtx, finCancel := node.resignRPCContext(ctx)
 		finList, err := node.networksManager.Znn().GetMomentumsByHeightContext(finCtx, highMom, 1)
 		finCancel()
 		if node.workerStopping() {
@@ -1487,7 +1497,7 @@ func (node *Node) checkZenonAnchorConsistent(anchor reSignChainAnchor, advanceFi
 			// Bridge account grew forward: verify anchor.bridgeBlock is still
 			// the confirmed canonical ancestor at its height (rules out rollback
 			// + forward re-extension).
-			ancCtx, ancCancel := context.WithTimeout(node.workers.context(), resignRPCTimeout)
+			ancCtx, ancCancel := node.resignRPCContext(ctx)
 			blocks, err := node.networksManager.Znn().GetAccountBlocksByHeightContext(ancCtx, types.BridgeContract, anchor.bridgeBlock.Height, 1)
 			ancCancel()
 			if node.workerStopping() {
@@ -1523,7 +1533,7 @@ func (node *Node) checkZenonAnchorConsistent(anchor reSignChainAnchor, advanceFi
 				return reSignChainAnchor{}, false, false, false
 			}
 		} else {
-			confCtx, confCancel := context.WithTimeout(node.workers.context(), resignRPCTimeout)
+			confCtx, confCancel := node.resignRPCContext(ctx)
 			confList, err := node.networksManager.Znn().GetMomentumsByHeightContext(confCtx, confMom, 1)
 			confCancel()
 			if node.workerStopping() {
@@ -1613,7 +1623,7 @@ type confirmedThresholdCache struct {
 // GetOrchestratorInfo RPC). When cache is non-nil and its block remains a
 // confirmed canonical ancestor, only newly confirmed bridge blocks above
 // cache.atBlock are scanned.
-func (node *Node) readConfirmedWrapConfirmations(anchor reSignChainAnchor, advanceFinality bool, cache *confirmedThresholdCache, resignGen uint64) (required uint32, nextAnchor reSignChainAnchor, consistent, stale, stop bool) {
+func (node *Node) readConfirmedWrapConfirmations(ctx context.Context, anchor reSignChainAnchor, advanceFinality bool, cache *confirmedThresholdCache, resignGen uint64) (required uint32, nextAnchor reSignChainAnchor, consistent, stale, stop bool) {
 	setOrchID := definition.ABIBridge.Methods[definition.SetOrchestratorInfoMethodName].Id()
 	cur := anchor
 
@@ -1621,10 +1631,13 @@ func (node *Node) readConfirmedWrapConfirmations(anchor reSignChainAnchor, advan
 		if node.workerStopping() {
 			return 0, reSignChainAnchor{}, false, false, true
 		}
+		if ctx != nil && ctx.Err() != nil {
+			return 0, reSignChainAnchor{}, false, false, false
+		}
 		if resignGen != 0 && !node.state.IsResignGenerationCurrent(resignGen) {
 			return 0, reSignChainAnchor{}, false, true, false
 		}
-		curAnchor, ok, retryCheck, stopCheck := node.checkZenonAnchorConsistent(cur, advanceFinality)
+		curAnchor, ok, retryCheck, stopCheck := node.checkZenonAnchorConsistent(ctx, cur, advanceFinality)
 		if stopCheck {
 			return 0, reSignChainAnchor{}, false, false, true
 		}
@@ -1657,7 +1670,7 @@ func (node *Node) readConfirmedWrapConfirmations(anchor reSignChainAnchor, advan
 		minHeight := uint64(1)
 		haveCached := false
 		if cache != nil && cache.atBlock != nil && curAnchor.bridgeBlock.Height > cache.atBlock.Height {
-			ancCtx, ancCancel := context.WithTimeout(node.workers.context(), resignRPCTimeout)
+			ancCtx, ancCancel := node.resignRPCContext(ctx)
 			blocks, err := node.networksManager.Znn().GetAccountBlocksByHeightContext(ancCtx, types.BridgeContract, cache.atBlock.Height, 1)
 			ancCancel()
 			if node.workerStopping() {
@@ -1691,16 +1704,19 @@ func (node *Node) readConfirmedWrapConfirmations(anchor reSignChainAnchor, advan
 			if node.workerStopping() {
 				return 0, reSignChainAnchor{}, false, false, true
 			}
+			if ctx != nil && ctx.Err() != nil {
+				return 0, reSignChainAnchor{}, false, false, false
+			}
 			if resignGen != 0 && !node.state.IsResignGenerationCurrent(resignGen) {
 				return 0, reSignChainAnchor{}, false, true, false
 			}
 			lo := minHeight
-			if hi-minHeight+1 > api.RpcMaxCountSize {
-				lo = hi - api.RpcMaxCountSize + 1
+			if hi-minHeight >= api.RpcMaxCountSize {
+				lo = hi - (api.RpcMaxCountSize - 1)
 			}
-			count := hi - lo + 1
+			count := (hi - lo) + 1
 
-			pageCtx, pageCancel := context.WithTimeout(node.workers.context(), resignRPCTimeout)
+			pageCtx, pageCancel := node.resignRPCContext(ctx)
 			page, err := node.networksManager.Znn().GetAccountBlocksByHeightContext(pageCtx, types.BridgeContract, lo, count)
 			pageCancel()
 			if node.workerStopping() {
@@ -1712,7 +1728,7 @@ func (node *Node) readConfirmedWrapConfirmations(anchor reSignChainAnchor, advan
 				break
 			}
 			if page == nil || len(page.List) < int(count) {
-				stillCanonical, _, stopCheck := node.isBridgeBlockStillCanonical(curAnchor.bridgeBlock)
+				stillCanonical, _, stopCheck := node.isBridgeBlockStillCanonical(ctx, curAnchor.bridgeBlock)
 				if stopCheck {
 					return 0, reSignChainAnchor{}, false, false, true
 				}
@@ -1728,7 +1744,7 @@ func (node *Node) readConfirmedWrapConfirmations(anchor reSignChainAnchor, advan
 				b := page.List[i]
 				expectedHeight := lo + uint64(i)
 				if b == nil || b.Height != expectedHeight || !isConfirmedBridgeBlock(b) {
-					stillCanonical, _, stopCheck := node.isBridgeBlockStillCanonical(curAnchor.bridgeBlock)
+					stillCanonical, _, stopCheck := node.isBridgeBlockStillCanonical(ctx, curAnchor.bridgeBlock)
 					if stopCheck {
 						return 0, reSignChainAnchor{}, false, false, true
 					}
@@ -1763,7 +1779,7 @@ func (node *Node) readConfirmedWrapConfirmations(anchor reSignChainAnchor, advan
 
 				// Verify the SetOrchestratorInfo send + receive directly in
 				// momentumStore (GetAccountBlockByHash never reads accountPool).
-				sendCtx, sendCancel := context.WithTimeout(node.workers.context(), resignRPCTimeout)
+				sendCtx, sendCancel := node.resignRPCContext(ctx)
 				send, err := node.networksManager.Znn().GetAccountBlockByHashContext(sendCtx, b.FromBlockHash)
 				sendCancel()
 				if node.workerStopping() {
@@ -1795,7 +1811,7 @@ func (node *Node) readConfirmedWrapConfirmations(anchor reSignChainAnchor, advan
 
 				// Verify the confirming momentum of this SetOrchestratorInfo
 				// receive block is canonical.
-				momCtx, momCancel := context.WithTimeout(node.workers.context(), resignRPCTimeout)
+				momCtx, momCancel := node.resignRPCContext(ctx)
 				momList, err := node.networksManager.Znn().GetMomentumsByHeightContext(momCtx, b.ConfirmationDetail.MomentumHeight, 1)
 				momCancel()
 				if node.workerStopping() {
@@ -1854,7 +1870,7 @@ func (node *Node) readConfirmedWrapConfirmations(anchor reSignChainAnchor, advan
 
 		// Verify curAnchor survived the backward scan and check whether any
 		// newer confirmed bridge block landed in the meantime.
-		postAnchor, ok, retryCheck, stopCheck := node.checkZenonAnchorConsistent(curAnchor, advanceFinality)
+		postAnchor, ok, retryCheck, stopCheck := node.checkZenonAnchorConsistent(ctx, curAnchor, advanceFinality)
 		if stopCheck {
 			return 0, reSignChainAnchor{}, false, false, true
 		}
@@ -1875,6 +1891,11 @@ func (node *Node) readConfirmedWrapConfirmations(anchor reSignChainAnchor, advan
 			cache.threshold = foundThreshold
 		}
 		if !sameAccountBlockFrontier(curAnchor.bridgeBlock, postAnchor.bridgeBlock) {
+			if resignGen == 0 {
+				// Bound live-signing legacy revalidation: do not loop on
+				// continuously advancing frontiers inside a signing ceremony.
+				return 0, reSignChainAnchor{}, false, false, false
+			}
 			cur = postAnchor
 			continue
 		}
@@ -1946,12 +1967,18 @@ func (h *confirmedTokenPairHistory) matchesBlock(b *api.AccountBlock) bool {
 // confirmed at targetBlock.Height on the bridge account chain. Used when a
 // range read returns a short page or unconfirmed block to distinguish a
 // rollback below targetBlock.Height from a transient RPC error.
-func (node *Node) isBridgeBlockStillCanonical(targetBlock *api.AccountBlock) (stillCanonical, transientErr, stop bool) {
+func (node *Node) isBridgeBlockStillCanonical(ctx context.Context, targetBlock *api.AccountBlock) (stillCanonical, transientErr, stop bool) {
 	if targetBlock == nil || targetBlock.Height == 0 {
 		return false, false, false
 	}
-	ctx, cancel := context.WithTimeout(node.workers.context(), resignRPCTimeout)
-	blocks, err := node.networksManager.Znn().GetAccountBlocksByHeightContext(ctx, types.BridgeContract, targetBlock.Height, 1)
+	if ctx != nil && ctx.Err() != nil {
+		if node.workerStopping() {
+			return false, false, true
+		}
+		return false, true, false
+	}
+	callCtx, cancel := node.resignRPCContext(ctx)
+	blocks, err := node.networksManager.Znn().GetAccountBlocksByHeightContext(callCtx, types.BridgeContract, targetBlock.Height, 1)
 	cancel()
 	if node.workerStopping() {
 		return false, false, true
@@ -2061,7 +2088,7 @@ func (h *confirmedTokenPairHistory) tokenPairBeforeHeight(networkClass, chainID 
 // extends cache.tipBlock canonically, only the new delta is scanned; if the
 // verified chain rolled back, cache is invalidated and consistent=false is
 // returned. Passing resignGen == 0 skips resign-generation staleness checks.
-func (node *Node) ensureConfirmedTokenPairHistory(targetBlock *api.AccountBlock, cache *confirmedTokenPairHistory, resignGen uint64) (consistent, stale, stop bool) {
+func (node *Node) ensureConfirmedTokenPairHistory(ctx context.Context, targetBlock *api.AccountBlock, cache *confirmedTokenPairHistory, resignGen uint64) (consistent, stale, stop bool) {
 	if targetBlock == nil || targetBlock.Height == 0 || !isConfirmedBridgeBlock(targetBlock) {
 		cache.reset()
 		return false, false, false
@@ -2088,6 +2115,9 @@ func (node *Node) ensureConfirmedTokenPairHistory(targetBlock *api.AccountBlock,
 		if node.workerStopping() {
 			return false, false, true
 		}
+		if ctx != nil && ctx.Err() != nil {
+			return false, false, false
+		}
 		if resignGen != 0 && !node.state.IsResignGenerationCurrent(resignGen) {
 			return false, true, false
 		}
@@ -2100,7 +2130,7 @@ func (node *Node) ensureConfirmedTokenPairHistory(targetBlock *api.AccountBlock,
 				cache.reset()
 				return false, false, false
 			}
-			ancCtx, ancCancel := context.WithTimeout(node.workers.context(), resignRPCTimeout)
+			ancCtx, ancCancel := node.resignRPCContext(ctx)
 			blocks, err := node.networksManager.Znn().GetAccountBlocksByHeightContext(ancCtx, types.BridgeContract, cache.tipBlock.Height, 1)
 			ancCancel()
 			if node.workerStopping() {
@@ -2124,9 +2154,15 @@ func (node *Node) ensureConfirmedTokenPairHistory(targetBlock *api.AccountBlock,
 			startHeight = cache.tipBlock.Height + 1
 			prevHash = cache.tipBlock.Hash
 		}
+		if targetBlock.Height < startHeight {
+			cache.reset()
+			return false, false, false
+		}
 
-		deltaBlocks := make([]confirmedBlockIdentity, 0, targetBlock.Height-startHeight+1)
-		deltaEvents := make([]confirmedTokenPairEvent, 0)
+		// Grow incrementally from validated pages rather than preallocating
+		// from an untrusted RPC-reported frontier height.
+		var deltaBlocks []confirmedBlockIdentity
+		var deltaEvents []confirmedTokenPairEvent
 		needRetry := false
 		rolledBack := false
 
@@ -2134,16 +2170,19 @@ func (node *Node) ensureConfirmedTokenPairHistory(targetBlock *api.AccountBlock,
 			if node.workerStopping() {
 				return false, false, true
 			}
+			if ctx != nil && ctx.Err() != nil {
+				return false, false, false
+			}
 			if resignGen != 0 && !node.state.IsResignGenerationCurrent(resignGen) {
 				return false, true, false
 			}
-			hi := lo + api.RpcMaxCountSize - 1
-			if hi > targetBlock.Height {
-				hi = targetBlock.Height
+			hi := targetBlock.Height
+			if targetBlock.Height-lo >= api.RpcMaxCountSize {
+				hi = lo + (api.RpcMaxCountSize - 1)
 			}
-			count := hi - lo + 1
+			count := (hi - lo) + 1
 
-			pageCtx, pageCancel := context.WithTimeout(node.workers.context(), resignRPCTimeout)
+			pageCtx, pageCancel := node.resignRPCContext(ctx)
 			page, err := node.networksManager.Znn().GetAccountBlocksByHeightContext(pageCtx, types.BridgeContract, lo, count)
 			pageCancel()
 			if node.workerStopping() {
@@ -2155,7 +2194,7 @@ func (node *Node) ensureConfirmedTokenPairHistory(targetBlock *api.AccountBlock,
 				break
 			}
 			if page == nil || len(page.List) < int(count) {
-				stillCanonical, _, stopCheck := node.isBridgeBlockStillCanonical(targetBlock)
+				stillCanonical, _, stopCheck := node.isBridgeBlockStillCanonical(ctx, targetBlock)
 				if stopCheck {
 					return false, false, true
 				}
@@ -2171,7 +2210,7 @@ func (node *Node) ensureConfirmedTokenPairHistory(targetBlock *api.AccountBlock,
 				b := page.List[i]
 				expectedHeight := lo + uint64(i)
 				if b == nil || b.Height != expectedHeight || !isConfirmedBridgeBlock(b) {
-					stillCanonical, _, stopCheck := node.isBridgeBlockStillCanonical(targetBlock)
+					stillCanonical, _, stopCheck := node.isBridgeBlockStillCanonical(ctx, targetBlock)
 					if stopCheck {
 						return false, false, true
 					}
@@ -2211,7 +2250,7 @@ func (node *Node) ensureConfirmedTokenPairHistory(targetBlock *api.AccountBlock,
 					}
 				}
 
-				sendCtx, sendCancel := context.WithTimeout(node.workers.context(), resignRPCTimeout)
+				sendCtx, sendCancel := node.resignRPCContext(ctx)
 				send, err := node.networksManager.Znn().GetAccountBlockByHashContext(sendCtx, b.FromBlockHash)
 				sendCancel()
 				if node.workerStopping() {
@@ -2235,7 +2274,7 @@ func (node *Node) ensureConfirmedTokenPairHistory(targetBlock *api.AccountBlock,
 					continue
 				}
 
-				momCtx, momCancel := context.WithTimeout(node.workers.context(), resignRPCTimeout)
+				momCtx, momCancel := node.resignRPCContext(ctx)
 				momList, err := node.networksManager.Znn().GetMomentumsByHeightContext(momCtx, b.ConfirmationDetail.MomentumHeight, 1)
 				momCancel()
 				if node.workerStopping() {
@@ -2295,7 +2334,7 @@ func (node *Node) ensureConfirmedTokenPairHistory(targetBlock *api.AccountBlock,
 				}
 			}
 
-			if needRetry || rolledBack {
+			if needRetry || rolledBack || hi == targetBlock.Height {
 				break
 			}
 			lo = hi + 1
@@ -2334,7 +2373,7 @@ func (node *Node) ensureConfirmedTokenPairHistory(targetBlock *api.AccountBlock,
 // recv.Height via pairHistory) and CreationMomentumHeight, and is anchored in
 // the canonical momentum chain and canonical bridge account chain at or below
 // anchor. Passing resignGen == 0 skips resign-generation staleness checks.
-func (node *Node) verifyWrapConfirmedInLedger(wrap *definition.WrapTokenRequest, anchor reSignChainAnchor, pairHistory *confirmedTokenPairHistory, resignGen uint64) (confirmed, stale, stop bool) {
+func (node *Node) verifyWrapConfirmedInLedger(ctx context.Context, wrap *definition.WrapTokenRequest, anchor reSignChainAnchor, pairHistory *confirmedTokenPairHistory, resignGen uint64) (confirmed, stale, stop bool) {
 	if wrap == nil || wrap.Amount == nil || wrap.Fee == nil {
 		return false, false, false
 	}
@@ -2345,11 +2384,14 @@ func (node *Node) verifyWrapConfirmedInLedger(wrap *definition.WrapTokenRequest,
 		if node.workerStopping() {
 			return false, false, true
 		}
+		if ctx != nil && ctx.Err() != nil {
+			return false, false, false
+		}
 		if resignGen != 0 && !node.state.IsResignGenerationCurrent(resignGen) {
 			return false, true, false
 		}
-		ctx, cancel := context.WithTimeout(node.workers.context(), resignRPCTimeout)
-		send, err := node.networksManager.Znn().GetAccountBlockByHashContext(ctx, wrapID)
+		callCtx, cancel := node.resignRPCContext(ctx)
+		send, err := node.networksManager.Znn().GetAccountBlockByHashContext(callCtx, wrapID)
 		cancel()
 		if node.workerStopping() {
 			return false, false, true
@@ -2403,7 +2445,7 @@ func (node *Node) verifyWrapConfirmedInLedger(wrap *definition.WrapTokenRequest,
 		if maxMom > 0 && recvMom > maxMom {
 			return false, false, false
 		}
-		momCtx, momCancel := context.WithTimeout(node.workers.context(), resignRPCTimeout)
+		momCtx, momCancel := node.resignRPCContext(ctx)
 		momList, err := node.networksManager.Znn().GetMomentumsByHeightContext(momCtx, recvMom, 1)
 		momCancel()
 		if node.workerStopping() {
@@ -2435,7 +2477,7 @@ func (node *Node) verifyWrapConfirmedInLedger(wrap *definition.WrapTokenRequest,
 					return false, false, false
 				}
 			} else {
-				ancCtx, ancCancel := context.WithTimeout(node.workers.context(), resignRPCTimeout)
+				ancCtx, ancCancel := node.resignRPCContext(ctx)
 				blocks, err := node.networksManager.Znn().GetAccountBlocksByHeightContext(ancCtx, types.BridgeContract, recv.Height, 1)
 				ancCancel()
 				if node.workerStopping() {
@@ -2471,7 +2513,7 @@ func (node *Node) verifyWrapConfirmedInLedger(wrap *definition.WrapTokenRequest,
 		if historyTarget == nil || historyTarget.Height < recv.Height {
 			historyTarget = recv
 		}
-		histConsistent, histStale, histStop := node.ensureConfirmedTokenPairHistory(historyTarget, history, resignGen)
+		histConsistent, histStale, histStop := node.ensureConfirmedTokenPairHistory(ctx, historyTarget, history, resignGen)
 		if histStop {
 			return false, false, true
 		}
@@ -2527,7 +2569,7 @@ func (node *Node) fetchAnchoredWrapPage(pageIndex, pageSize uint32, anchor reSig
 			return nil, reSignChainAnchor{}, false, false, true, false
 		}
 
-		preAnchor, consistent, retryCheck, stopCheck := node.checkZenonAnchorConsistent(curAnchor, true)
+		preAnchor, consistent, retryCheck, stopCheck := node.checkZenonAnchorConsistent(nil, curAnchor, true)
 		if stopCheck {
 			return nil, reSignChainAnchor{}, false, false, false, true
 		}
@@ -2546,7 +2588,7 @@ func (node *Node) fetchAnchoredWrapPage(pageIndex, pageSize uint32, anchor reSig
 			return nil, reSignChainAnchor{}, false, false, stale, stop
 		}
 
-		postAnchor, consistent, retryCheck, stopCheck := node.checkZenonAnchorConsistent(preAnchor, true)
+		postAnchor, consistent, retryCheck, stopCheck := node.checkZenonAnchorConsistent(nil, preAnchor, true)
 		if stopCheck {
 			return nil, reSignChainAnchor{}, false, false, false, true
 		}
@@ -2588,7 +2630,7 @@ func (node *Node) verifyStraddledWraps(wraps []*embedded.WrapTokenRequest, strad
 				return reSignChainAnchor{}, false, true, false
 			}
 
-			preAnchor, consistent, retryCheck, stopCheck := node.checkZenonAnchorConsistent(cur, true)
+			preAnchor, consistent, retryCheck, stopCheck := node.checkZenonAnchorConsistent(nil, cur, true)
 			if stopCheck {
 				return reSignChainAnchor{}, false, false, true
 			}
@@ -2624,7 +2666,7 @@ func (node *Node) verifyStraddledWraps(wraps []*embedded.WrapTokenRequest, strad
 				return reSignChainAnchor{}, false, false, false
 			}
 
-			postAnchor, consistent, retryCheck, stopCheck := node.checkZenonAnchorConsistent(preAnchor, true)
+			postAnchor, consistent, retryCheck, stopCheck := node.checkZenonAnchorConsistent(nil, preAnchor, true)
 			if stopCheck {
 				return reSignChainAnchor{}, false, false, true
 			}
@@ -2644,7 +2686,7 @@ func (node *Node) verifyStraddledWraps(wraps []*embedded.WrapTokenRequest, strad
 				cur.bridgeBlock = postAnchor.bridgeBlock
 				continue
 			}
-			ledgerConfirmed, staleLedger, stopLedger := node.verifyWrapConfirmedInLedger(got.WrapTokenRequest, postAnchor, pairHistory, resignGen)
+			ledgerConfirmed, staleLedger, stopLedger := node.verifyWrapConfirmedInLedger(nil, got.WrapTokenRequest, postAnchor, pairHistory, resignGen)
 			if staleLedger || stopLedger {
 				return reSignChainAnchor{}, false, staleLedger, stopLedger
 			}
@@ -3063,7 +3105,7 @@ func (node *Node) runReSignScan() bool {
 		if len(snapshot) > 0 {
 			var nextAnchor reSignChainAnchor
 			var consistentInfo, staleInfo, stopInfo bool
-			requiredConfirmations, nextAnchor, consistentInfo, staleInfo, stopInfo = node.readConfirmedWrapConfirmations(anchor, false, thresholdCache, resignGen)
+			requiredConfirmations, nextAnchor, consistentInfo, staleInfo, stopInfo = node.readConfirmedWrapConfirmations(nil, anchor, false, thresholdCache, resignGen)
 			if stopInfo {
 				return false
 			}
@@ -3153,7 +3195,7 @@ func (node *Node) runReSignScan() bool {
 					staleResign = true
 					break
 				}
-				preAnchor, consistent, retryCheck, stopCheck := node.checkZenonAnchorConsistent(anchor, true)
+				preAnchor, consistent, retryCheck, stopCheck := node.checkZenonAnchorConsistent(nil, anchor, true)
 				if stopCheck {
 					return false
 				}
@@ -3176,7 +3218,7 @@ func (node *Node) runReSignScan() bool {
 					// Before dropping a vanished wrap, verify Zenon did not roll
 					// back our snapshot anchor; a rollback requires restarting
 					// the scan so any replacement wrap is captured.
-					postAnchor, consistent, retryCheck, stopCheck := node.checkZenonAnchorConsistent(anchor, false)
+					postAnchor, consistent, retryCheck, stopCheck := node.checkZenonAnchorConsistent(nil, anchor, false)
 					if stopCheck {
 						return false
 					}
@@ -3207,7 +3249,7 @@ func (node *Node) runReSignScan() bool {
 				// by-ID read AND read ConfirmationsToFinality from momentum-
 				// confirmed bridge state so neither a transient finality spike
 				// nor a pending account-pool threshold change can be accepted.
-				reqConf, postAnchor, consistent, staleConf, stopConf := node.readConfirmedWrapConfirmations(preAnchor, true, thresholdCache, resignGen)
+				reqConf, postAnchor, consistent, staleConf, stopConf := node.readConfirmedWrapConfirmations(nil, preAnchor, true, thresholdCache, resignGen)
 				if stopConf {
 					return false
 				}
@@ -3268,7 +3310,7 @@ func (node *Node) runReSignScan() bool {
 					staleResign = true
 					break
 				}
-				_, postConsistent, retryCheck, stopCheck := node.checkZenonAnchorConsistent(anchor, false)
+				_, postConsistent, retryCheck, stopCheck := node.checkZenonAnchorConsistent(nil, anchor, false)
 				if stopCheck {
 					return false
 				}
@@ -3285,7 +3327,7 @@ func (node *Node) runReSignScan() bool {
 				break
 			}
 		} else {
-			reqConf, finalAnchor, consistent, staleConf, stopConf := node.readConfirmedWrapConfirmations(anchor, false, thresholdCache, resignGen)
+			reqConf, finalAnchor, consistent, staleConf, stopConf := node.readConfirmedWrapConfirmations(nil, anchor, false, thresholdCache, resignGen)
 			if stopConf {
 				return false
 			}
@@ -3299,7 +3341,7 @@ func (node *Node) runReSignScan() bool {
 				// finalAnchor.bridgeBlock (delta-extending any prior verified
 				// replay, or invalidating on rollback) and reuse it for every
 				// staged wrap in this batch.
-				histConsistent, histStale, histStop := node.ensureConfirmedTokenPairHistory(finalAnchor.bridgeBlock, pairHistory, resignGen)
+				histConsistent, histStale, histStop := node.ensureConfirmedTokenPairHistory(nil, finalAnchor.bridgeBlock, pairHistory, resignGen)
 				if histStop {
 					return false
 				}
@@ -3318,7 +3360,7 @@ func (node *Node) runReSignScan() bool {
 						rolledBack = true
 						break
 					}
-					ledgerConfirmed, staleLedger, stopLedger := node.verifyWrapConfirmedInLedger(w, finalAnchor, pairHistory, resignGen)
+					ledgerConfirmed, staleLedger, stopLedger := node.verifyWrapConfirmedInLedger(nil, w, finalAnchor, pairHistory, resignGen)
 					if stopLedger {
 						return false
 					}
@@ -3336,7 +3378,7 @@ func (node *Node) runReSignScan() bool {
 					// Revalidate anchor consistency AND the current confirmed
 					// threshold after all per-wrap ledger RPCs so a confirmed
 					// threshold increase during ledger verification cannot slip past.
-					postReqConf, postAnchor, postConsistent, postStale, postStop := node.readConfirmedWrapConfirmations(finalAnchor, false, thresholdCache, resignGen)
+					postReqConf, postAnchor, postConsistent, postStale, postStop := node.readConfirmedWrapConfirmations(nil, finalAnchor, false, thresholdCache, resignGen)
 					if postStop {
 						return false
 					}
@@ -3449,14 +3491,24 @@ func (node *Node) requireLiveTransfers() error {
 	return nil
 }
 
+// legacyRevalidateBudget caps the total wall-clock time spent revalidating
+// pre-upgrade legacy resign rows inside a single live signing batch so legacy
+// rows can never starve unrelated wraps or the unwrap signing fallback.
+var legacyRevalidateBudget = 2 * time.Second
+
 // revalidateLegacyResignWrap verifies a pre-upgrade local resign row (flag == 1,
 // persisted before PublishResignWraps wrote versioned verified markers) against
 // Zenon's confirmed finality threshold, momentumStore, and applied SetTokenPair
 // state, refreshes the local row and upgrades its resign marker to verified via
-// PublishResignWraps. Uses bounded non-blocking checks (resignGen == 0) so
-// transient RPC errors never stall unrelated live signing ceremonies.
-func (node *Node) revalidateLegacyResignWrap(id types.Hash, thresholdCache *confirmedThresholdCache, pairHistory *confirmedTokenPairHistory) (*definition.WrapTokenRequest, bool, error) {
-	momCtx, momCancel := context.WithTimeout(node.workers.context(), resignRPCTimeout)
+// PublishResignWraps. Uses bounded non-blocking checks (resignGen == 0) and a
+// batch-wide deadline context (ctx) propagated into every internal RPC and page
+// loop so slow or continuously advancing chains never stall unrelated live
+// signing ceremonies.
+func (node *Node) revalidateLegacyResignWrap(ctx context.Context, id types.Hash, thresholdCache *confirmedThresholdCache, pairHistory *confirmedTokenPairHistory) (*definition.WrapTokenRequest, bool, error) {
+	if ctx != nil && ctx.Err() != nil {
+		return nil, false, nil
+	}
+	momCtx, momCancel := node.resignRPCContext(ctx)
 	mom, err := node.networksManager.Znn().GetFrontierMomentumContext(momCtx)
 	momCancel()
 	if err != nil || mom == nil || mom.Momentum == nil || mom.Height == 0 {
@@ -3469,25 +3521,25 @@ func (node *Node) revalidateLegacyResignWrap(id types.Hash, thresholdCache *conf
 		finalityHash:   mom.Hash,
 		observedMom:    mom.Height,
 	}
-	anchor, consistent, retryCheck, stopCheck := node.checkZenonAnchorConsistent(initAnchor, false)
+	anchor, consistent, retryCheck, stopCheck := node.checkZenonAnchorConsistent(ctx, initAnchor, false)
 	if stopCheck || retryCheck || !consistent || anchor.bridgeBlock == nil || anchor.bridgeBlock.Height == 0 {
 		return nil, false, nil
 	}
-	ctx, cancel := context.WithTimeout(node.workers.context(), resignRPCTimeout)
-	wrap, err := node.networksManager.Znn().GetWrapTokenRequestByIdContext(ctx, id)
-	cancel()
+	wrapCtx, wrapCancel := node.resignRPCContext(ctx)
+	wrap, err := node.networksManager.Znn().GetWrapTokenRequestByIdContext(wrapCtx, id)
+	wrapCancel()
 	if err != nil || wrap == nil || wrap.WrapTokenRequest == nil || wrap.Id != id || wrap.ConfirmationsToFinality != 0 {
 		return nil, false, nil
 	}
-	reqConf, confirmedAnchor, confConsistent, _, confStop := node.readConfirmedWrapConfirmations(anchor, false, thresholdCache, 0)
+	reqConf, confirmedAnchor, confConsistent, _, confStop := node.readConfirmedWrapConfirmations(ctx, anchor, false, thresholdCache, 0)
 	if confStop || !confConsistent || !wrapFinalizedAtMomentum(wrap, confirmedAnchor.finalityMom, reqConf) {
 		return nil, false, nil
 	}
-	confirmed, _, stop := node.verifyWrapConfirmedInLedger(wrap.WrapTokenRequest, confirmedAnchor, pairHistory, 0)
+	confirmed, _, stop := node.verifyWrapConfirmedInLedger(ctx, wrap.WrapTokenRequest, confirmedAnchor, pairHistory, 0)
 	if stop || !confirmed {
 		return nil, false, nil
 	}
-	postReqConf, postAnchor, postConsistent, _, postStop := node.readConfirmedWrapConfirmations(confirmedAnchor, false, thresholdCache, 0)
+	postReqConf, postAnchor, postConsistent, _, postStop := node.readConfirmedWrapConfirmations(ctx, confirmedAnchor, false, thresholdCache, 0)
 	if postStop || !postConsistent || !wrapDefFinalizedAtMomentum(wrap.WrapTokenRequest, postAnchor.finalityMom, postReqConf) {
 		return nil, false, nil
 	}
@@ -3502,7 +3554,8 @@ func (node *Node) revalidateLegacyResignWrap(id types.Hash, thresholdCache *conf
 // precedence over unsigned RPC rows for the same wrap ID (both for payload
 // selection and pool-size priority). Legacy pre-upgrade re-sign rows (written
 // by SetResignStatus without payload verification) are revalidated against
-// confirmed ledger state before signing and never gain unverified precedence.
+// confirmed ledger state before signing (bounded by legacyRevalidateBudget)
+// and never gain unverified precedence.
 func (node *Node) buildWrapSigningBatch() ([]*definition.WrapTokenRequest, [][]byte, map[string]int, error) {
 	unsignedWraps, err := node.networksManager.GetUnsignedWrapRequests()
 	if err != nil {
@@ -3519,6 +3572,7 @@ func (node *Node) buildWrapSigningBatch() ([]*definition.WrapTokenRequest, [][]b
 	wrapRequestsIds := make([]*definition.WrapTokenRequest, 0, len(resignableWraps)+len(unsignedWraps))
 	seen := make(map[types.Hash]struct{}, len(resignableWraps)+len(unsignedWraps))
 	blockedLegacy := make(map[types.Hash]struct{})
+	var legacyCtx context.Context
 	var legacyThresholdCache *confirmedThresholdCache
 	var legacyPairHistory *confirmedTokenPairHistory
 	for _, req := range resignableWraps {
@@ -3535,13 +3589,22 @@ func (node *Node) buildWrapSigningBatch() ([]*definition.WrapTokenRequest, [][]b
 			return nil, nil, nil, err
 		}
 		if !verified {
+			if legacyCtx == nil {
+				var cancel context.CancelFunc
+				legacyCtx, cancel = context.WithTimeout(node.workers.context(), legacyRevalidateBudget)
+				defer cancel()
+			}
+			if legacyCtx.Err() != nil {
+				blockedLegacy[req.Id] = struct{}{}
+				continue
+			}
 			if legacyThresholdCache == nil {
 				legacyThresholdCache = &confirmedThresholdCache{}
 			}
 			if legacyPairHistory == nil {
 				legacyPairHistory = &confirmedTokenPairHistory{}
 			}
-			refreshed, ok, err := node.revalidateLegacyResignWrap(req.Id, legacyThresholdCache, legacyPairHistory)
+			refreshed, ok, err := node.revalidateLegacyResignWrap(legacyCtx, req.Id, legacyThresholdCache, legacyPairHistory)
 			if err != nil {
 				node.logger.Error(err)
 				common.RequestStop(node.stopChan)

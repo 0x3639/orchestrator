@@ -117,9 +117,11 @@ func RedactURLs(raw []string) []string {
 	return out
 }
 
-// RedactErrorForURL renders err for logging with the raw URL, credentials,
-// non-root path, and query string replaced. Client libraries and HTTP error
-// responses can echo the full URL or only its path/query components.
+// RedactErrorForURL renders err for logging with the raw URL, complete
+// request URI / path / query components, credentials, and individual query
+// values replaced (complete components before substrings, and overlapping
+// tokens longest first). Client libraries and HTTP error responses can echo
+// the full URL or only its path/query components.
 func RedactErrorForURL(err error, raw string) string {
 	if err == nil {
 		return ""
@@ -129,24 +131,9 @@ func RedactErrorForURL(err error, raw string) string {
 		msg = strings.ReplaceAll(msg, raw, RedactURL(raw))
 	}
 	if parsed, perr := url.Parse(raw); perr == nil {
-		if parsed.User != nil {
-			if password, ok := parsed.User.Password(); ok && password != "" {
-				msg = strings.ReplaceAll(msg, password, redactedPlaceholder)
-			}
-			if username := parsed.User.Username(); username != "" {
-				msg = strings.ReplaceAll(msg, username, redactedPlaceholder)
-			}
-		}
-		if parsed.RawQuery != "" {
-			msg = strings.ReplaceAll(msg, parsed.RawQuery, redactedPlaceholder)
-			for _, vals := range parsed.Query() {
-				for _, v := range vals {
-					if v != "" {
-						msg = strings.ReplaceAll(msg, v, redactedPlaceholder)
-					}
-				}
-			}
-		}
+		// Replace complete URI, path, and raw query components BEFORE
+		// individual credentials or query values so a matching prefix cannot
+		// disrupt a longer component match.
 		if reqURI := parsed.RequestURI(); len(reqURI) > 1 {
 			msg = strings.ReplaceAll(msg, reqURI, "/"+redactedPlaceholder)
 		}
@@ -155,6 +142,33 @@ func RedactErrorForURL(err error, raw string) string {
 		}
 		if len(parsed.Path) > 1 {
 			msg = strings.ReplaceAll(msg, parsed.Path, "/"+redactedPlaceholder)
+		}
+		if parsed.RawQuery != "" {
+			msg = strings.ReplaceAll(msg, parsed.RawQuery, redactedPlaceholder)
+		}
+		tokens := make([]string, 0, 4)
+		if parsed.User != nil {
+			if password, ok := parsed.User.Password(); ok && password != "" {
+				tokens = append(tokens, password)
+			}
+			if username := parsed.User.Username(); username != "" {
+				tokens = append(tokens, username)
+			}
+		}
+		if parsed.RawQuery != "" {
+			for _, vals := range parsed.Query() {
+				for _, v := range vals {
+					if v != "" {
+						tokens = append(tokens, v)
+					}
+				}
+			}
+		}
+		sort.Slice(tokens, func(i, j int) bool {
+			return len(tokens[i]) > len(tokens[j])
+		})
+		for _, tok := range tokens {
+			msg = strings.ReplaceAll(msg, tok, redactedPlaceholder)
 		}
 	}
 	return msg

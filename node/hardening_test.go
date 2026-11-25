@@ -5616,6 +5616,173 @@ func TestReSignStateRequiresMomentumConfirmationForBridgeSnapshot(t *testing.T) 
 			return err == nil && r && st == common.LiveState
 		})
 	})
+
+	t.Run("bounds legacy revalidation under continuous bridge growth so unrelated wraps still sign", func(t *testing.T) {
+		prevBudget := legacyRevalidateBudget
+		legacyRevalidateBudget = 150 * time.Millisecond
+		t.Cleanup(func() { legacyRevalidateBudget = prevBudget })
+
+		evmSrv := fakeEvmRpcServer(t)
+		defer evmSrv.Close()
+
+		// Exact regression for Round 21 Finding 1:
+		// 1) A legacy resign row is present while the confirmed bridge frontier
+		//    advances on every GetFrontierAccountBlock call.
+		//    readConfirmedWrapConfirmations must NOT loop on resignGen == 0.
+		// 2) A second legacy resign row encounters a slow internal RPC inside
+		//    readConfirmedWrapConfirmations; the batch-wide legacyRevalidateBudget
+		//    context must cut off internal RPCs promptly instead of waiting for
+		//    the full resignRPCTimeout (15s), skipping both unverified legacy
+		//    wraps while still selecting unrelatedWrap.
+		legacyID1 := types.Hash{0xdb}
+		legacyID2 := types.Hash{0xdd}
+		unrelatedID := types.Hash{0xdc}
+		var bridgeHeight atomic.Uint64
+		bridgeHeight.Store(10)
+		var modeSlow atomic.Bool
+		var slowCalled atomic.Bool
+
+		unrelatedWrap := &embedded.WrapTokenRequest{
+			WrapTokenRequest: &definition.WrapTokenRequest{
+				NetworkClass:           definition.EvmClass,
+				ChainId:                1,
+				Id:                     unrelatedID,
+				ToAddress:              "0x000000000000000000000000000000000000beef",
+				TokenAddress:           "0x0000000000000000000000000000000000001111",
+				Amount:                 big.NewInt(100),
+				Fee:                    big.NewInt(10),
+				CreationMomentumHeight: 99,
+			},
+			ConfirmationsToFinality: 0,
+		}
+		makeLegacyWrap := func(id types.Hash) *embedded.WrapTokenRequest {
+			return &embedded.WrapTokenRequest{
+				WrapTokenRequest: &definition.WrapTokenRequest{
+					NetworkClass:           definition.EvmClass,
+					ChainId:                1,
+					Id:                     id,
+					ToAddress:              "0x000000000000000000000000000000000000beef",
+					TokenAddress:           "0x0000000000000000000000000000000000001111",
+					Amount:                 big.NewInt(100),
+					Fee:                    big.NewInt(10),
+					CreationMomentumHeight: 99,
+				},
+				ConfirmationsToFinality: 0,
+			}
+		}
+		legacyWrap1 := makeLegacyWrap(legacyID1)
+		legacyWrap2 := makeLegacyWrap(legacyID2)
+
+		bridge := &wrapTestBridge{
+			networks: &embedded.NetworkInfoList{
+				Count: 1,
+				List: []*definition.NetworkInfo{{
+					NetworkClass: definition.EvmClass, Id: 1, Name: "Ethereum",
+					ContractAddress: "0x0000000000000000000000000000000000000001",
+				}},
+			},
+			frontierMomFn: func(_ context.Context, _ int32) (*api.Momentum, error) {
+				return testMomentum(105), nil
+			},
+			frontierFn: func(_ context.Context, _ int32) (*api.AccountBlock, error) {
+				if modeSlow.Load() {
+					return testAccountBlock(10, types.Hash{0xaa, 0x00, 0x0a}), nil
+				}
+				h := bridgeHeight.Add(1)
+				return testAccountBlock(h, types.Hash{0xaa, byte(h >> 8), byte(h)}), nil
+			},
+			byID: map[types.Hash]*embedded.WrapTokenRequest{
+				legacyID1: legacyWrap1,
+				legacyID2: legacyWrap2,
+			},
+			unsigned: &embedded.WrapTokenRequestList{
+				Count: 1,
+				List:  []*embedded.WrapTokenRequest{unrelatedWrap},
+			},
+		}
+
+		n := wrapTestNodeWithEvm(t, common.LiveState, bridge, map[string]string{"Ethereum": evmSrv.URL})
+		for _, w := range []*embedded.WrapTokenRequest{legacyWrap1, legacyWrap2} {
+			if err := n.dbManager.ZnnStorage().AddWrapRequest(common.ZnnWrapToOrchestratorWrap(w.WrapTokenRequest)); err != nil {
+				t.Fatal(err)
+			}
+			if err := n.dbManager.ZnnStorage().SetResignStatus(w.Id, true); err != nil {
+				t.Fatal(err)
+			}
+		}
+
+		// Case A: continuously advancing bridge frontier.
+		start := time.Now()
+		reqs, msgs, _, err := n.buildWrapSigningBatch()
+		elapsed := time.Since(start)
+		if err != nil {
+			t.Fatalf("buildWrapSigningBatch (advancing frontier) failed: %v", err)
+		}
+		if elapsed > time.Second {
+			t.Fatalf("legacy revalidation blocked live signing batch too long on advancing frontier: %v", elapsed)
+		}
+		if bridge.frontierCalls.Load() < 4 {
+			t.Fatalf("expected advancing-frontier case to reach readConfirmedWrapConfirmations post-scan check, got %d frontier calls", bridge.frontierCalls.Load())
+		}
+		if len(reqs) != 1 || len(msgs) != 1 || reqs[0].Id != unrelatedID {
+			t.Fatalf("expected unrelatedWrap to proceed while advancing-frontier legacy wraps were skipped, got reqs=%+v msgs=%d", reqs, len(msgs))
+		}
+
+		// Case B: stalled internal page RPC inside readConfirmedWrapConfirmations
+		// must be cancelled at legacyRevalidateBudget (150ms), not resignRPCTimeout (15s).
+		modeSlow.Store(true)
+		bridge.mu.Lock()
+		bridge.acctByHeightFn = func(ctx context.Context, _ uint64) (*api.AccountBlockList, error) {
+			slowCalled.Store(true)
+			<-ctx.Done()
+			return nil, ctx.Err()
+		}
+		bridge.mu.Unlock()
+		start = time.Now()
+		reqs, msgs, _, err = n.buildWrapSigningBatch()
+		elapsed = time.Since(start)
+		if err != nil {
+			t.Fatalf("buildWrapSigningBatch (slow RPC) failed: %v", err)
+		}
+		if !slowCalled.Load() {
+			t.Fatal("expected slow internal page RPC to be invoked during legacy revalidation")
+		}
+		if elapsed > time.Second {
+			t.Fatalf("legacy revalidation did not propagate batch deadline into internal RPCs: %v", elapsed)
+		}
+		if len(reqs) != 1 || len(msgs) != 1 || reqs[0].Id != unrelatedID {
+			t.Fatalf("expected unrelatedWrap to proceed while stalled legacy wraps timed out, got reqs=%+v msgs=%d", reqs, len(msgs))
+		}
+	})
+
+	t.Run("does not preallocate or panic on erroneous huge bridge height during token-pair replay", func(t *testing.T) {
+		evmSrv := fakeEvmRpcServer(t)
+		defer evmSrv.Close()
+
+		// Exact regression for Round 21 Finding 2:
+		// Passing an erroneous MaxUint64 target height to
+		// ensureConfirmedTokenPairHistory must grow incrementally from validated
+		// pages and return consistent=false without panicking or exhausting memory.
+		bridge := &wrapTestBridge{
+			networks: &embedded.NetworkInfoList{
+				Count: 1,
+				List: []*definition.NetworkInfo{{
+					NetworkClass: definition.EvmClass, Id: 1, Name: "Ethereum",
+					ContractAddress: "0x0000000000000000000000000000000000000001",
+				}},
+			},
+			acctByHeightFn: func(_ context.Context, _ uint64) (*api.AccountBlockList, error) {
+				return &api.AccountBlockList{Count: 0, List: []*api.AccountBlock{}}, nil
+			},
+		}
+		n := wrapTestNodeWithEvm(t, common.LiveState, bridge, map[string]string{"Ethereum": evmSrv.URL})
+		bogusTarget := testAccountBlock(math.MaxUint64, types.Hash{0xff})
+		history := &confirmedTokenPairHistory{}
+		consistent, stale, stop := n.ensureConfirmedTokenPairHistory(nil, bogusTarget, history, 0)
+		if consistent || stale || stop {
+			t.Fatalf("expected (false, false, false) for erroneous MaxUint64 height, got (%v, %v, %v)", consistent, stale, stop)
+		}
+	})
 }
 
 func TestReSignStateBoundsAndCancelsStalledDeferredWrapRPC(t *testing.T) {

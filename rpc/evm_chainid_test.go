@@ -138,10 +138,12 @@ func TestEvmDialAndChainIDErrorsRedactCredentials(t *testing.T) {
 		}
 	}
 
-	// 4. RedactErrorForURL must also scrub partial path/query echoes directly.
-	partialErr := fmt.Errorf("upstream rejected %s and %s", "/v2/chain-api-key", "chaintoken")
-	redacted := config.RedactErrorForURL(partialErr, chainURL)
-	for _, secret := range []string{"chain-api-key", "chaintoken"} {
+	// 4. RedactErrorForURL must scrub complete paths before individual query
+	// values and scrub overlapping query values longest first.
+	overlapURL := "http://127.0.0.1:8545/v2/abc123secret?env=abc&a=foo&b=foobarbaz"
+	overlapErr := fmt.Errorf("upstream rejected /v2/abc123secret and foobarbaz")
+	redacted := config.RedactErrorForURL(overlapErr, overlapURL)
+	for _, secret := range []string{"abc123secret", "123secret", "foobarbaz", "barbaz"} {
 		if strings.Contains(redacted, secret) {
 			t.Fatalf("RedactErrorForURL leaked credential %q: %s", secret, redacted)
 		}
