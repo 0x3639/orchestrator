@@ -95,6 +95,7 @@ type znnNetwork struct {
 	unknownUnwrapHeadsOK        bool
 	unknownUnwrapReceiptOK      bool
 	unknownUnwrapCanonicalOK    bool
+	unknownUnwrapCanonicalHash  ecommon.Hash
 	unknownUnwrapCorrobTarget   uint64
 	unknownUnwrapCorrobCursor   uint64
 	unknownUnwrapCorrobStarted  bool
@@ -2738,6 +2739,7 @@ func (rC *znnNetwork) observeUnknownUnwrapHead(chainId uint32, txHash types.Hash
 		rC.unknownUnwrapHeadsOK = false
 		rC.unknownUnwrapReceiptOK = false
 		rC.unknownUnwrapCanonicalOK = false
+		rC.unknownUnwrapCanonicalHash = ecommon.Hash{}
 		rC.unknownUnwrapCorrobTarget = head
 		rC.unknownUnwrapCorrobCursor = 0
 		rC.unknownUnwrapCorrobStarted = false
@@ -2746,17 +2748,17 @@ func (rC *znnNetwork) observeUnknownUnwrapHead(chainId uint32, txHash types.Hash
 	return rC.unknownUnwrapHead
 }
 
-func (rC *znnNetwork) unknownUnwrapPrecheckState(chainId uint32, txHash types.Hash, logIndex uint32) (obsHead uint64, headsOK, receiptOK, canonicalOK bool) {
+func (rC *znnNetwork) unknownUnwrapPrecheckState(chainId uint32, txHash types.Hash, logIndex uint32) (obsHead uint64, headsOK, receiptOK, canonicalOK bool, canonicalHash ecommon.Hash) {
 	key := fmt.Sprintf("%d:%s:%d", chainId, txHash.String(), logIndex)
 	rC.unknownUnwrapMu.Lock()
 	defer rC.unknownUnwrapMu.Unlock()
 	if rC.unknownUnwrapKey != key {
-		return 0, false, false, false
+		return 0, false, false, false, ecommon.Hash{}
 	}
-	return rC.unknownUnwrapHead, rC.unknownUnwrapHeadsOK, rC.unknownUnwrapReceiptOK, rC.unknownUnwrapCanonicalOK
+	return rC.unknownUnwrapHead, rC.unknownUnwrapHeadsOK, rC.unknownUnwrapReceiptOK, rC.unknownUnwrapCanonicalOK, rC.unknownUnwrapCanonicalHash
 }
 
-func (rC *znnNetwork) markUnknownUnwrapPrecheck(chainId uint32, txHash types.Hash, logIndex uint32, obsHead uint64, headsOK, receiptOK, canonicalOK bool) {
+func (rC *znnNetwork) markUnknownUnwrapPrecheck(chainId uint32, txHash types.Hash, logIndex uint32, obsHead uint64, headsOK, receiptOK, canonicalOK bool, canonicalHash ecommon.Hash) {
 	key := fmt.Sprintf("%d:%s:%d", chainId, txHash.String(), logIndex)
 	rC.unknownUnwrapMu.Lock()
 	defer rC.unknownUnwrapMu.Unlock()
@@ -2771,6 +2773,7 @@ func (rC *znnNetwork) markUnknownUnwrapPrecheck(chainId uint32, txHash types.Has
 	}
 	if canonicalOK {
 		rC.unknownUnwrapCanonicalOK = true
+		rC.unknownUnwrapCanonicalHash = canonicalHash
 	}
 }
 
@@ -2781,6 +2784,7 @@ func (rC *znnNetwork) clearUnknownUnwrapObs() {
 	rC.unknownUnwrapHeadsOK = false
 	rC.unknownUnwrapReceiptOK = false
 	rC.unknownUnwrapCanonicalOK = false
+	rC.unknownUnwrapCanonicalHash = ecommon.Hash{}
 	rC.unknownUnwrapCorrobTarget = 0
 	rC.unknownUnwrapCorrobCursor = 0
 	rC.unknownUnwrapCorrobStarted = false
@@ -2848,7 +2852,8 @@ func (rC *znnNetwork) lateUnknownUnwrapCovered(ctx context.Context, evm *rpc.Evm
 		return false
 	}
 	depth := eN.ConfirmationsToFinality()
-	obsHead, headsOK, receiptOK, canonicalOK := rC.unknownUnwrapPrecheckState(rpcZnnEvent.ChainId, rpcZnnEvent.TransactionHash, rpcZnnEvent.LogIndex)
+	obsHead, headsOK, receiptOK, canonicalOK, canonicalHash := rC.unknownUnwrapPrecheckState(rpcZnnEvent.ChainId, rpcZnnEvent.TransactionHash, rpcZnnEvent.LogIndex)
+	usedCachedPrechecks := headsOK || receiptOK || canonicalOK
 	if !headsOK {
 		minHead, maxHead, err := evm.EndpointHeads()
 		if err != nil {
@@ -2865,7 +2870,7 @@ func (rC *znnNetwork) lateUnknownUnwrapCovered(ctx context.Context, evm *rpc.Evm
 			eN.requestCatchUpSync()
 			return false
 		}
-		rC.markUnknownUnwrapPrecheck(rpcZnnEvent.ChainId, rpcZnnEvent.TransactionHash, rpcZnnEvent.LogIndex, obsHead, true, false, false)
+		rC.markUnknownUnwrapPrecheck(rpcZnnEvent.ChainId, rpcZnnEvent.TransactionHash, rpcZnnEvent.LogIndex, obsHead, true, false, false, ecommon.Hash{})
 	}
 	if !receiptOK {
 		hasReceipt, err := evm.AnySecondaryHasReceipt(ecommon.Hash(rpcZnnEvent.TransactionHash))
@@ -2875,7 +2880,7 @@ func (rC *znnNetwork) lateUnknownUnwrapCovered(ctx context.Context, evm *rpc.Evm
 			}
 			return false
 		}
-		rC.markUnknownUnwrapPrecheck(rpcZnnEvent.ChainId, rpcZnnEvent.TransactionHash, rpcZnnEvent.LogIndex, obsHead, false, true, false)
+		rC.markUnknownUnwrapPrecheck(rpcZnnEvent.ChainId, rpcZnnEvent.TransactionHash, rpcZnnEvent.LogIndex, obsHead, false, true, false, ecommon.Hash{})
 	}
 	requiredHeight := obsHead - min(obsHead, depth)
 
@@ -2885,10 +2890,12 @@ func (rC *znnNetwork) lateUnknownUnwrapCovered(ctx context.Context, evm *rpc.Evm
 		return false
 	}
 	if !canonicalOK {
-		if _, err := evm.CanonicalHash(requiredHeight); err != nil {
+		hash, err := evm.CanonicalHash(requiredHeight)
+		if err != nil {
 			return false
 		}
-		rC.markUnknownUnwrapPrecheck(rpcZnnEvent.ChainId, rpcZnnEvent.TransactionHash, rpcZnnEvent.LogIndex, obsHead, false, false, true)
+		canonicalHash = hash
+		rC.markUnknownUnwrapPrecheck(rpcZnnEvent.ChainId, rpcZnnEvent.TransactionHash, rpcZnnEvent.LogIndex, obsHead, false, false, true, hash)
 	}
 	// Corroborate absence of the source log across independent secondary
 	// endpoints in bounded batches, retaining verified progress across retries
@@ -2907,6 +2914,35 @@ func (rC *znnNetwork) lateUnknownUnwrapCovered(ctx context.Context, evm *rpc.Evm
 		}
 		rC.recordSecondaryCorrobProgress(rpcZnnEvent.ChainId, rpcZnnEvent.TransactionHash, rpcZnnEvent.LogIndex, obsHead, lowestVerified, complete)
 		if !complete {
+			return false
+		}
+	}
+	// Whenever any cached precheck was reused across retries (so low-rate
+	// endpoints never starve log chunks), revalidate canonical hash agreement,
+	// endpoint heads, and receipt absence before escalating. If the canonical
+	// hash changed (reorg), reset corroboration and re-verify.
+	if usedCachedPrechecks {
+		minHead, maxHead, err := evm.EndpointHeads()
+		if err != nil || minHead < obsHead || maxHead-minHead > depth {
+			if err == nil {
+				eN.requestCatchUpSync()
+			}
+			return false
+		}
+		currentHash, err := evm.CanonicalHash(requiredHeight)
+		if err != nil {
+			return false
+		}
+		if canonicalHash != (ecommon.Hash{}) && currentHash != canonicalHash {
+			rC.clearUnknownUnwrapObs()
+			eN.requestCatchUpSync()
+			return false
+		}
+		hasReceipt, err := evm.AnySecondaryHasReceipt(ecommon.Hash(rpcZnnEvent.TransactionHash))
+		if err != nil || hasReceipt {
+			if hasReceipt {
+				eN.requestCatchUpSync()
+			}
 			return false
 		}
 	}

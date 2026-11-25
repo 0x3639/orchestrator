@@ -744,10 +744,13 @@ const submitTimeout = 30 * time.Second
 // submit runs send through while, and waits for it at most submitTimeout. A
 // nil while always runs send.
 func submit(while func(send func() error) (bool, error), send func() error) (bool, error) {
-	return submitContext(context.Background(), while, send)
+	return submitContext(context.Background(), while, func(context.Context) error { return send() })
 }
 
-func submitContext(ctx context.Context, while func(send func() error) (bool, error), send func() error) (bool, error) {
+// submitContext runs send through while with a deadline-bound publication
+// context derived from ctx and submitTimeout so cancellation or timeout
+// aborts the underlying publish RPC directly.
+func submitContext(ctx context.Context, while func(send func() error) (bool, error), send func(context.Context) error) (bool, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -755,17 +758,15 @@ func submitContext(ctx context.Context, while func(send func() error) (bool, err
 		return false, err
 	}
 	bounded := func() error {
+		pubCtx, cancel := context.WithTimeout(ctx, submitTimeout)
+		defer cancel()
 		done := make(chan error, 1)
-		go func() { done <- send() }()
-		timer := time.NewTimer(submitTimeout)
-		defer timer.Stop()
+		go func() { done <- send(pubCtx) }()
 		select {
 		case err := <-done:
 			return err
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-timer.C:
-			return errors.New("the submission did not answer in time")
+		case <-pubCtx.Done():
+			return pubCtx.Err()
 		}
 	}
 	if while == nil {
@@ -785,7 +786,9 @@ func (m *NetworksManager) HaltZnnContext(ctx context.Context, signature string, 
 	if err != nil {
 		return false, err
 	}
-	return submitContext(ctx, while, func() error { return m.Znn().ZnnRpc().PublishTransactionContext(ctx, tx) })
+	return submitContext(ctx, while, func(pubCtx context.Context) error {
+		return m.Znn().ZnnRpc().PublishTransactionContext(pubCtx, tx)
+	})
 }
 
 //// RPC Calls
@@ -1242,7 +1245,9 @@ func (m *NetworksManager) SendHaltEvmWithExpectedContext(ctx context.Context, ba
 			m.logger.Error(err)
 			continue
 		}
-		sent, err := submitContext(ctx, while, func() error { return network.SendTransactionContext(ctx, tx, nil) })
+		sent, err := submitContext(ctx, while, func(pubCtx context.Context) error {
+			return network.SendTransactionContext(pubCtx, tx, nil)
+		})
 		if err != nil {
 			if ctx.Err() != nil {
 				return false, ctx.Err()
@@ -1256,6 +1261,19 @@ func (m *NetworksManager) SendHaltEvmWithExpectedContext(ctx context.Context, ba
 		break
 	}
 	return ok, nil
+}
+
+// IsBatchNetworkHaltedContext reports whether the EVM network at idx in batch
+// has its halt flag set (or has been removed by the bridge).
+func (m *NetworksManager) IsBatchNetworkHaltedContext(ctx context.Context, batch EvmBatch, idx int) (bool, error) {
+	if idx < 0 || idx >= len(batch.networks) {
+		return true, nil
+	}
+	network := batch.networks[idx]
+	if !m.hasNetwork(network) {
+		return true, nil
+	}
+	return network.EvmRpc().HaltFlagSetContext(ctx)
 }
 
 // ErrHaltFlagsUnreadable is returned by RecordConfirmedHalt when a halt flag

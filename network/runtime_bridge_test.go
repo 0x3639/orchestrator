@@ -3187,14 +3187,162 @@ func TestLateUnknownUnwrapLowRateLimitCachesPrechecksAndAdvancesLogCorroboration
 			secBlockNumCalls.Load(), secReceiptCalls.Load(), secHeaderCalls.Load(), secLogCalls.Load())
 	}
 
-	// Attempt 2 MUST reuse cached prechecks (zero extra blockNum/receipt/header permits)
-	// and complete chunks 3..4 to escalate cleanly.
+	// Attempt 2 reuses cached prechecks to advance chunks 3..4 without
+	// pre-chunk starvation, then revalidates agreement/receipt once before
+	// escalating cleanly.
 	if err := l.listen(); err != nil {
 		t.Fatalf("attempt 2 failed to complete corroboration: %v", err)
 	}
-	if secBlockNumCalls.Load() != 1 || secReceiptCalls.Load() != 1 || secHeaderCalls.Load() != 1 || secLogCalls.Load() != 4 {
-		t.Fatalf("after attempt 2: blockNum=%d receipt=%d header=%d logs=%d, want (1, 1, 1, 4)",
+	if secBlockNumCalls.Load() != 2 || secReceiptCalls.Load() != 2 || secHeaderCalls.Load() != 2 || secLogCalls.Load() != 4 {
+		t.Fatalf("after attempt 2: blockNum=%d receipt=%d header=%d logs=%d, want (2, 2, 2, 4)",
 			secBlockNumCalls.Load(), secReceiptCalls.Load(), secHeaderCalls.Load(), secLogCalls.Load())
 	}
 	l.expect("low-rate cached prechecks escalated", common.EmergencyState, 2)
+}
+
+func TestLateUnknownUnwrapRevalidatesCanonicalAgreementAndHashAfterMultiBatchCorroboration(t *testing.T) {
+	for _, tc := range []struct {
+		name           string
+		disagreeBatch2 bool
+		reorgHash      bool
+		gainReceipt    bool
+	}{
+		{"endpoints disagree at requiredHeight before second batch", true, false, false},
+		{"reorg changes canonical hash at requiredHeight before second batch", false, true, false},
+		{"secondary gains receipt before second batch finishes", false, false, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("HOME", t.TempDir())
+			b := newReplayBridge(t)
+			l := &lateNode{t: t, bridge: b}
+			l.ledger.Store(newReplayLedger(t, b, 5000))
+			l.redeemableIn.Store(30)
+
+			var batch2 atomic.Bool
+			primaryURL := replayServerWithErrors(t, func(method string, params []json.RawMessage) (interface{}, *replayRPCError) {
+				switch method {
+				case "stats.syncInfo":
+					return nil, nil
+				case "embedded.bridge.getUnwrapTokenRequestByHashAndLog":
+					return withRedeemDelay(b.request, l.redeemableIn.Load()), nil
+				case "eth_syncing":
+					return false, nil
+				case "eth_blockNumber":
+					return hexutil.EncodeUint64(20), nil
+				case "eth_getBlockByNumber":
+					var number hexutil.Uint64
+					_ = json.Unmarshal(params[0], &number)
+					offset := uint64(10)
+					if tc.reorgHash && batch2.Load() {
+						offset = 999
+					}
+					return map[string]interface{}{"number": number, "hash": ecommon.BigToHash(new(big.Int).SetUint64(uint64(number) + offset))}, nil
+				case "eth_getTransactionReceipt":
+					return nil, nil
+				case "eth_getLogs":
+					return []etypes.Log{}, nil
+				}
+				if result, ok := l.ledger.Load().answer(t, method, params); ok {
+					return result, nil
+				}
+				return nil, nil
+			})
+			secondaryURL := replayServerWithErrors(t, func(method string, params []json.RawMessage) (interface{}, *replayRPCError) {
+				switch method {
+				case "eth_syncing":
+					return false, nil
+				case "eth_blockNumber":
+					return hexutil.EncodeUint64(20), nil
+				case "eth_getBlockByNumber":
+					var number hexutil.Uint64
+					_ = json.Unmarshal(params[0], &number)
+					offset := uint64(10)
+					if batch2.Load() {
+						if tc.disagreeBatch2 {
+							offset = 555
+						} else if tc.reorgHash {
+							offset = 999
+						}
+					}
+					return map[string]interface{}{"number": number, "hash": ecommon.BigToHash(new(big.Int).SetUint64(uint64(number) + offset))}, nil
+				case "eth_getTransactionReceipt":
+					if tc.gainReceipt && batch2.Load() {
+						return map[string]interface{}{
+							"transactionHash": ecommon.Hash(b.request.TransactionHash),
+							"blockNumber":     hexutil.EncodeUint64(14),
+							"blockHash":       ecommon.BigToHash(big.NewInt(24)),
+							"status":          hexutil.EncodeUint64(1),
+							"logs":            []etypes.Log{},
+						}, nil
+					}
+					return nil, nil
+				case "eth_getLogs":
+					return []etypes.Log{}, nil
+				default:
+					return nil, nil
+				}
+			})
+
+			l.n, l.stores = replayNetwork(t, b, primaryURL, map[uint32]string{1: primaryURL})
+			evmClient, err := rpc.NewEvmRpcClient(config.BaseNetworkConfig{
+				Urls:            []string{primaryURL, secondaryURL},
+				FilterQuerySize: 5,
+			}, "eth", b.contract)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(evmClient.Stop)
+			l.n.rpcManager.RegisterEvmClient(1, evmClient)
+			l.n.SetConfirmationsToFinality(5)
+			l.n.secondaryLogMaxChunks = 2
+			l.at(5000, acceptedReceive)
+
+			params, err := config.NewEvmParams(&definition.NetworkInfo{NetworkClass: definition.EvmClass, Id: 1, Name: "eth", ContractAddress: b.contract.Hex()})
+			if err != nil {
+				t.Fatal(err)
+			}
+			params.SetConfirmationsToFinality(5)
+			params.SetContractDeploymentHeight(1)
+			eN := &evmNetwork{
+				EvmParams: params,
+				client:    evmClient,
+				done:      make(chan struct{}),
+				state:     l.n.state,
+				logger:    zap.NewNop().Sugar(),
+			}
+			eN.lastScannedThrough.Store(20)
+			eN.scanned.Store(true)
+			l.n.networkManager = &NetworksManager{znnNetwork: l.n, evmNetworks: []*evmNetwork{eN}, logger: zap.NewNop().Sugar()}
+
+			// Batch 1: endpoints agree at block 15 and complete chunks 1..2.
+			if err := l.listen(); err == nil {
+				t.Fatal("expected batch 1 hold after first 2 chunks")
+			}
+			l.expect("after batch 1", common.LiveState, 1)
+
+			// Mutate endpoint agreement / canonical hash / receipt before batch 2.
+			batch2.Store(true)
+
+			// Batch 2 MUST revalidate and hold in LiveState instead of falsely
+			// entering EmergencyState on stale batch-1 agreement.
+			if err := l.listen(); err == nil {
+				t.Fatal("expected batch 2 to hold instead of escalating on stale corroboration")
+			}
+			l.expect("after stale batch 2", common.LiveState, 1)
+		})
+	}
+}
+
+func TestSubmitContextPassesDeadlineBoundContextToSend(t *testing.T) {
+	var hasDeadline bool
+	sent, err := submitContext(context.Background(), nil, func(pubCtx context.Context) error {
+		_, hasDeadline = pubCtx.Deadline()
+		return nil
+	})
+	if err != nil || !sent {
+		t.Fatalf("submitContext returned (%v, %v), want (true, nil)", sent, err)
+	}
+	if !hasDeadline {
+		t.Fatal("submitContext did not pass a deadline-bound context to send")
+	}
 }

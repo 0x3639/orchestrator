@@ -12,7 +12,9 @@ import (
 
 	"github.com/pkg/errors"
 	"github.com/zenon-network/go-zenon/chain/nom"
+	zcrypto "github.com/zenon-network/go-zenon/common/crypto"
 	"github.com/zenon-network/go-zenon/common/types"
+	"github.com/zenon-network/go-zenon/pow"
 	"github.com/zenon-network/go-zenon/protocol"
 	"github.com/zenon-network/go-zenon/rpc/api"
 	"github.com/zenon-network/go-zenon/rpc/api/embedded"
@@ -22,6 +24,7 @@ import (
 	"github.com/zenon-network/go-zenon/vm/embedded/definition"
 	"github.com/zenon-network/go-zenon/wallet"
 	"math"
+	"math/big"
 	"orchestrator/common"
 	"orchestrator/common/config"
 	"orchestrator/common/events"
@@ -145,6 +148,91 @@ func (r *ZnnRpc) prepareTransaction(tx *nom.AccountBlock, keyPair *wallet.KeyPai
 	return nil
 }
 
+// prepareTransactionContext performs the same account-block autofill, PoW, and
+// signing as prepareTransaction while executing all preparation RPCs directly
+// through settingsClient with ctx so cancellation immediately aborts any
+// in-flight frontier or plasma RPC instead of leaving background calls running.
+func (r *ZnnRpc) prepareTransactionContext(ctx context.Context, tx *nom.AccountBlock, keyPair *wallet.KeyPair) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if r.settingsClient == nil {
+		return r.prepareTransaction(tx, keyPair)
+	}
+	tx.Address = keyPair.Address
+	tx.PublicKey = keyPair.Public
+	tx.Version = 1
+	tx.ChainIdentifier = 1
+
+	var frontierBlock *api.AccountBlock
+	if err := r.settingsClient.CallContext(ctx, &frontierBlock, "ledger.getFrontierAccountBlock", tx.Address); err != nil {
+		return err
+	}
+	height := uint64(1)
+	previousHash := types.ZeroHash
+	if frontierBlock != nil {
+		height = frontierBlock.Height + 1
+		previousHash = frontierBlock.Hash
+	}
+	tx.Height = height
+	tx.PreviousHash = previousHash
+
+	var frontierMomentum *api.Momentum
+	if err := r.settingsClient.CallContext(ctx, &frontierMomentum, "ledger.getFrontierMomentum"); err != nil {
+		return err
+	}
+	if frontierMomentum == nil {
+		return errors.New("missing Zenon frontier momentum")
+	}
+	tx.MomentumAcknowledged = types.HashHeight{
+		Hash:   frontierMomentum.Hash,
+		Height: frontierMomentum.Height,
+	}
+
+	powParam := embedded.GetRequiredParam{
+		SelfAddr:  tx.Address,
+		BlockType: tx.BlockType,
+		ToAddr:    &tx.ToAddress,
+		Data:      tx.Data,
+	}
+	var powResp *embedded.GetRequiredResult
+	if err := r.settingsClient.CallContext(ctx, &powResp, "embedded.plasma.getRequiredPoWForAccountBlock", powParam); err != nil {
+		return err
+	}
+	if powResp == nil {
+		return errors.New("missing Zenon PoW response")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if powResp.RequiredDifficulty > 0 {
+		tx.FusedPlasma = powResp.AvailablePlasma
+		tx.Difficulty = powResp.RequiredDifficulty
+		hashBytes := zcrypto.Hash(tx.Address.Bytes(), tx.PreviousHash.Bytes())
+		powData, err := types.BytesToHash(hashBytes)
+		if err != nil {
+			return err
+		}
+		nonceFound := pow.GetPoWNonce(new(big.Int).SetUint64(powResp.RequiredDifficulty), powData)
+		tx.Nonce = nom.DeSerializeNonce(nonceFound)
+	} else {
+		tx.FusedPlasma = powResp.BasePlasma
+		tx.Difficulty = 0
+		if err := tx.Nonce.UnmarshalText([]byte("0000000000000000")); err != nil {
+			return err
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	tx.Hash = tx.ComputeHash()
+	tx.Signature = keyPair.Sign(tx.Hash.Bytes())
+	return nil
+}
+
 // PublishTransaction publishes a block that prepareTransaction made.
 func (r *ZnnRpc) PublishTransaction(tx *nom.AccountBlock) error {
 	return r.rpcClient.LedgerApi.PublishRawTransaction(tx)
@@ -207,17 +295,8 @@ func (r *ZnnRpc) ChangeTssEcdsaPubKeyContext(ctx context.Context, pubKey, signat
 		return context.Canceled
 	}
 	tx := r.rpcClient.BridgeApi.ChangeTssECDSAPubKey(pubKey, signature, newSignature)
-	prepErrCh := make(chan error, 1)
-	go func() {
-		prepErrCh <- r.prepareTransaction(tx, keyPair)
-	}()
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case err := <-prepErrCh:
-		if err != nil {
-			return err
-		}
+	if err := r.prepareTransactionContext(ctx, tx, keyPair); err != nil {
+		return err
 	}
 	if err := ctx.Err(); err != nil {
 		return err
@@ -225,10 +304,7 @@ func (r *ZnnRpc) ChangeTssEcdsaPubKeyContext(ctx context.Context, pubKey, signat
 	if allowSend != nil && !allowSend() {
 		return context.Canceled
 	}
-	if r.settingsClient != nil {
-		return r.settingsClient.CallContext(ctx, nil, "ledger.publishRawTransaction", tx)
-	}
-	return r.PublishTransaction(tx)
+	return r.PublishTransactionContext(ctx, tx)
 }
 
 func (r *ZnnRpc) Halt(signature string, keyPair *wallet.KeyPair) error {
@@ -253,21 +329,11 @@ func (r *ZnnRpc) PrepareHaltContext(ctx context.Context, signature string, keyPa
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	type prepRes struct {
-		tx  *nom.AccountBlock
-		err error
+	tx := r.rpcClient.BridgeApi.Halt(signature)
+	if err := r.prepareTransactionContext(ctx, tx, keyPair); err != nil {
+		return nil, err
 	}
-	ch := make(chan prepRes, 1)
-	go func() {
-		tx, err := r.PrepareHalt(signature, keyPair)
-		ch <- prepRes{tx: tx, err: err}
-	}()
-	select {
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	case res := <-ch:
-		return res.tx, res.err
-	}
+	return tx, nil
 }
 
 /// RPC Calls

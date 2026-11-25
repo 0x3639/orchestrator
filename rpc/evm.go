@@ -801,9 +801,26 @@ func (r *EvmRpc) reconcileSentTx(tx *etypes.Transaction, attempt *pendingAttempt
 
 	r.txMu.Lock()
 	store := r.pendingTxStore
+	curKey := clonePendingEvmTx(r.pendingTx[key])
+	otherKey := evmTxKey{sender: key.sender, contract: key.contract, kind: otherEvmTxKind(key.kind)}
+	curOther := clonePendingEvmTx(r.pendingTx[otherKey])
 	r.txMu.Unlock()
 
+	// Verify that key's durable/in-memory record still belongs to attempt
+	// before applying any rollback batch: a newer reservation (e.g. a higher
+	// nonce accepted while this older nonce was still in flight) must never be
+	// overwritten or deleted by a late rejection of an older nonce.
+	if curKey == nil || curKey.nonce != tx.Nonce() || curKey.txHash != tx.Hash() {
+		if len(remaining) == 0 {
+			delete(r.nonceStack, nk)
+		} else {
+			r.nonceStack[nk] = remaining
+		}
+		return
+	}
+
 	var ops []common.PendingEvmTxOp
+	restoreOther := false
 	if surviving == nil {
 		ops = append(ops, common.PendingEvmTxOp{
 			Sender:   key.sender,
@@ -819,20 +836,23 @@ func (r *EvmRpc) reconcileSentTx(tx *etypes.Transaction, attempt *pendingAttempt
 			Record:   toCommonPendingEvmTx(surviving.entry),
 		})
 	} else {
-		ops = append(ops,
-			common.PendingEvmTxOp{
-				Sender:   key.sender,
-				Contract: key.contract,
-				Kind:     key.kind,
-				Record:   nil,
-			},
-			common.PendingEvmTxOp{
+		ops = append(ops, common.PendingEvmTxOp{
+			Sender:   key.sender,
+			Contract: key.contract,
+			Kind:     key.kind,
+			Record:   nil,
+		})
+		// Only restore the competing action key if no newer reservation already
+		// occupies it at a higher nonce.
+		if curOther == nil || curOther.nonce <= surviving.nonce {
+			restoreOther = true
+			ops = append(ops, common.PendingEvmTxOp{
 				Sender:   key.sender,
 				Contract: key.contract,
 				Kind:     surviving.kind,
 				Record:   toCommonPendingEvmTx(surviving.entry),
-			},
-		)
+			})
+		}
 	}
 	if store != nil {
 		if err := store.ApplyPendingEvmTxBatch(ops); err != nil {
@@ -852,7 +872,9 @@ func (r *EvmRpc) reconcileSentTx(tx *etypes.Transaction, attempt *pendingAttempt
 		r.pendingTx[key] = clonePendingEvmTx(surviving.entry)
 	} else {
 		delete(r.pendingTx, key)
-		r.pendingTx[evmTxKey{sender: key.sender, contract: key.contract, kind: surviving.kind}] = clonePendingEvmTx(surviving.entry)
+		if restoreOther {
+			r.pendingTx[otherKey] = clonePendingEvmTx(surviving.entry)
+		}
 	}
 	r.txMu.Unlock()
 }

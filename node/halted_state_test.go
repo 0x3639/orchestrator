@@ -1,10 +1,12 @@
 package node
 
 import (
+	"context"
 	"crypto/ed25519"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"math/big"
 	"net/http"
 	"net/http/httptest"
@@ -1589,5 +1591,250 @@ func TestSignKeyGenMessagesContextPreemptsHeldCeremonyOnEmergencyState(t *testin
 		}
 	case <-time.After(1 * time.Second):
 		t.Fatal("signKeyGenMessagesContext stayed blocked behind held signing ceremony after EmergencyState")
+	}
+}
+
+func TestEmergencyHaltPublishesAvailableGroupWhenAnotherGroupTimesOut(t *testing.T) {
+	oldKey, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	newKey, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldCompressed := base64.StdEncoding.EncodeToString(crypto.CompressPubkey(&oldKey.PublicKey))
+	newCompressed := base64.StdEncoding.EncodeToString(crypto.CompressPubkey(&newKey.PublicKey))
+	oldAddr := crypto.PubkeyToAddress(oldKey.PublicKey)
+	contract := ecommon.HexToAddress("0x7777777777777777777777777777777777777777")
+
+	producerPub := []byte("test-producer-pubkey-32-bytes!!!")
+	producerPubB64 := base64.StdEncoding.EncodeToString(producerPub)
+	baseDir := t.TempDir()
+	writeLocalTssStateFile(t, baseDir, oldCompressed, []string{producerPubB64})
+	writeLocalTssStateFile(t, baseDir, newCompressed, []string{producerPubB64})
+
+	// Split rotation: Zenon holds newKey (whose signing group will time out),
+	// EVM holds oldKey (whose signing group succeeds and must halt EVM promptly).
+	zMock := &partialRotateZenon{
+		compressedTss: newCompressed,
+		evmContracts: []*definition.NetworkInfo{
+			{NetworkClass: definition.EvmClass, Id: 1, Name: "eth-partial-group", ContractAddress: contract.Hex()},
+		},
+	}
+	znnSrv := server.NewServer()
+	if err := znnSrv.RegisterName("embedded.bridge", zMock); err != nil {
+		t.Fatal(err)
+	}
+	znnHTTP := httptest.NewServer(znnSrv.WebsocketHandler([]string{"*"}))
+	t.Cleanup(func() { znnSrv.Stop(); znnHTTP.Close() })
+
+	var evmHalted atomic.Bool
+	var evmSendCalls atomic.Int32
+	evmHTTP := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			ID     json.RawMessage   `json:"id"`
+			Method string            `json:"method"`
+			Params []json.RawMessage `json:"params"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		resp := map[string]interface{}{"jsonrpc": "2.0", "id": req.ID}
+		switch req.Method {
+		case "eth_chainId":
+			resp["result"] = hexutil.EncodeUint64(1)
+		case "eth_blockNumber":
+			resp["result"] = hexutil.EncodeUint64(100)
+		case "eth_getBalance":
+			resp["result"] = (*hexutil.Big)(new(big.Int).Mul(big.NewInt(10), big.NewInt(1e18)))
+		case "eth_getTransactionCount":
+			resp["result"] = hexutil.EncodeUint64(1)
+		case "eth_getBlockByNumber":
+			resp["result"] = map[string]interface{}{
+				"number":        hexutil.EncodeUint64(100),
+				"hash":          ecommon.HexToHash("0x11"),
+				"baseFeePerGas": (*hexutil.Big)(big.NewInt(20_000_000_000)),
+			}
+		case "eth_maxPriorityFeePerGas":
+			resp["result"] = (*hexutil.Big)(big.NewInt(2_000_000_000))
+		case "eth_estimateGas":
+			resp["result"] = hexutil.EncodeUint64(100_000)
+		case "eth_sendRawTransaction":
+			evmSendCalls.Add(1)
+			evmHalted.Store(true)
+			resp["result"] = ecommon.HexToHash("0xbeef").Hex()
+		case "eth_call":
+			var call struct {
+				Data  hexutil.Bytes `json:"data"`
+				Input hexutil.Bytes `json:"input"`
+			}
+			_ = json.Unmarshal(req.Params[0], &call)
+			sel := append(call.Data, call.Input...)
+			switch {
+			case len(sel) >= 4 && string(sel[:4]) == string(common.EvmContractAbi.Methods["tss"].ID):
+				resp["result"] = ecommon.BytesToHash(oldAddr.Bytes()).Hex()
+			case len(sel) >= 4 && string(sel[:4]) == string(common.EvmContractAbi.Methods["actionsNonce"].ID):
+				resp["result"] = ecommon.BigToHash(big.NewInt(4)).Hex()
+			default:
+				if evmHalted.Load() {
+					resp["result"] = "0x" + strings.Repeat("0", 63) + "1"
+				} else {
+					resp["result"] = "0x" + strings.Repeat("0", 64)
+				}
+			}
+		default:
+			resp["result"] = "0x" + strings.Repeat("0", 64)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	t.Cleanup(evmHTTP.Close)
+
+	stopChan := make(chan os.Signal, 1)
+	stateVal := common.EmergencyState
+	gs := common.NewGlobalState(&stateVal)
+	t.Setenv("HOME", t.TempDir())
+	nm, err := network.NewNetworksManager(stopChan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dbMgr, err := manager.NewDbManager(stopChan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nets := map[string]config.BaseNetworkConfig{
+		common.ZenonNetworkName: {Urls: []string{"ws" + strings.TrimPrefix(znnHTTP.URL, "http")}},
+		"eth-partial-group":     {Urls: []string{evmHTTP.URL}},
+	}
+	if err := nm.Init(nets, dbMgr, gs, func(*common.BridgeMetadata) {}); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { nm.Stop() })
+
+	var signedGroups []string
+	node := &Node{
+		config: &config.Config{TssConfig: config.TssManagerConfig{
+			BaseDir:      baseDir,
+			PublicKey:    newCompressed,
+			LocalPubKeys: []string{producerPubB64},
+		}},
+		networksManager: nm,
+		dbManager:       dbMgr,
+		producerKeyPair: &wallet.KeyPair{Public: producerPub},
+		ecdsaPrivateKey: oldKey,
+		evmAddress:      oldAddr,
+		state:           gs,
+		stopChan:        stopChan,
+		logger:          zap.NewNop().Sugar(),
+		signMessagesHook: func(pubKey string, messagesToSign [][]byte, msgsIndexes map[string]int) (*keysign.Response, error) {
+			signedGroups = append(signedGroups, pubKey)
+			if pubKey == newCompressed {
+				return nil, errors.New("tss group timeout for newKey")
+			}
+			sigs := make([]keysign.Signature, len(messagesToSign))
+			for i, msg := range messagesToSign {
+				rawSig, err := crypto.Sign(msg, oldKey)
+				if err != nil {
+					return nil, err
+				}
+				sigs[i] = keysign.Signature{
+					Msg:        base64.StdEncoding.EncodeToString(msg),
+					Signature:  base64.StdEncoding.EncodeToString(rawSig[:64]),
+					RecoveryID: base64.StdEncoding.EncodeToString(rawSig[64:]),
+				}
+			}
+			return &keysign.Response{Signatures: sigs, Status: tcommon.Success}, nil
+		},
+	}
+
+	znnMsg, err := implementation.GetBasicMethodMessage("Halt", 1, definition.NoMClass, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	evmBatch, evmMsgs, signedEvmNonces, signedEvmTss, err := nm.GetHaltMessagesWithState()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Signing MUST continue to oldKey EVM group despite newKey Zenon timeout!
+	plan, err := node.signEmergencyHaltMessages(znnMsg, newCompressed, evmBatch, evmMsgs, signedEvmTss)
+	if err != nil {
+		t.Fatalf("signEmergencyHaltMessages failed instead of returning partial plan: %v", err)
+	}
+	if len(signedGroups) != 2 {
+		t.Fatalf("expected both groups attempted, got %d (%v)", len(signedGroups), signedGroups)
+	}
+	if !plan.hasFailedGroups {
+		t.Fatal("expected plan.hasFailedGroups=true when Zenon group timed out")
+	}
+	if plan.znnSignature != "" {
+		t.Fatalf("expected empty Zenon signature for timed-out group, got %q", plan.znnSignature)
+	}
+	if len(plan.evmFullSignatures) != 1 || len(plan.evmFullSignatures[0]) != 65 {
+		t.Fatalf("expected valid 65-byte EVM halt signature for available oldKey group, got %v", plan.evmFullSignatures)
+	}
+
+	// publishEmergencyHalt MUST submit EVM halt and return aborted=true promptly
+	// (without blocking on the unsigned Zenon group) so the failed group retries.
+	done := make(chan bool, 1)
+	go func() {
+		done <- node.publishEmergencyHalt(evmBatch, plan, newCompressed, 1, signedEvmTss, signedEvmNonces)
+	}()
+	select {
+	case aborted := <-done:
+		if !aborted {
+			t.Fatal("expected publishEmergencyHalt to return aborted=true so failed Zenon group is retried")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("publishEmergencyHalt blocked instead of publishing available EVM group and retrying failed Zenon group")
+	}
+	if evmSendCalls.Load() == 0 || !evmHalted.Load() {
+		t.Fatalf("expected EVM halt tx to be submitted and halt EVM, sendCalls=%d halted=%v", evmSendCalls.Load(), evmHalted.Load())
+	}
+}
+
+func TestSignKeyGenMessagesContextSkipsCeremonyIfCancelledBeforeStart(t *testing.T) {
+	stopChan := make(chan os.Signal, 1)
+	stateVal := common.KeyGenState
+	gs := common.NewGlobalState(&stateVal)
+
+	var hookCalls atomic.Int32
+	node := &Node{
+		config:   &config.Config{TssConfig: config.TssManagerConfig{LocalPubKeys: []string{"partyA"}}},
+		state:    gs,
+		stopChan: stopChan,
+		logger:   zap.NewNop().Sugar(),
+		signMessagesHook: func(pubKey string, messagesToSign [][]byte, msgsIndexes map[string]int) (*keysign.Response, error) {
+			hookCalls.Add(1)
+			return &keysign.Response{Status: tcommon.Success}, nil
+		},
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	// Hold tssSettingsMu so the launched goroutine cannot reach its cancellation
+	// check until after ctx is cancelled.
+	node.tssSettingsMu.Lock()
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := node.signKeyGenMessagesContext(ctx, "newKey", "oldKey", [][]byte{{1}}, map[string]int{"AQ==": 0})
+		errCh <- err
+	}()
+	// Give the inner goroutine a brief moment to launch and park on tssSettingsMu.
+	time.Sleep(30 * time.Millisecond)
+	cancel()
+	node.tssSettingsMu.Unlock()
+
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("signKeyGenMessagesContext err = %v, want context.Canceled", err)
+		}
+	case <-time.After(1 * time.Second):
+		t.Fatal("signKeyGenMessagesContext timed out after cancellation")
+	}
+	// Give the goroutine a moment to exit cleanly and confirm hook was never invoked.
+	time.Sleep(50 * time.Millisecond)
+	if hookCalls.Load() != 0 {
+		t.Fatalf("cancelled keygen signing goroutine invoked ceremony %d times, want 0", hookCalls.Load())
 	}
 }
