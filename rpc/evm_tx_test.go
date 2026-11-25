@@ -5671,6 +5671,35 @@ func TestClearObsoleteHaltAtomicAcrossNoncesPrunesConsumedAndPropagatesErrors(t 
 		if err != nil || gotHalt == nil || gotHalt.Nonce != 7 {
 			t.Fatalf("cleanup skipped PriorTxHashes on older stack entry and erased live halt6A: durable halt = (%+v, %v), want preserved", gotHalt, err)
 		}
+
+		// Process 3: restart AGAIN after nonce-7 send (empty in-memory stack,
+		// only durable nonce-7 record in LevelDB): MUST STILL find live halt6A
+		// via persisted PriorTxHashes and preserve ownership!
+		c2.Stop()
+		if err := db2.Close(); err != nil {
+			t.Fatal(err)
+		}
+		db3, err := leveldb.OpenFile(dbDir, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = db3.Close() }()
+		store3 := wrap.NewPendingEvmTxStore(db3).ForChain(1)
+		c3, err := NewEvmRpcClient(config.BaseNetworkConfig{Urls: []string{srv.URL}}, "restart-older-stack-prior-3", contract)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer c3.Stop()
+		c3.SetChainID(1)
+		c3.SetPendingTxStore(store3)
+
+		if err := c3.ClearObsoleteHaltTx(sender); err != nil {
+			t.Fatalf("ClearObsoleteHaltTx after second restart error: %v", err)
+		}
+		gotHalt, err = store3.LoadPendingEvmTx(sender, contract, evmTxKindHalt)
+		if err != nil || gotHalt == nil || gotHalt.Nonce != 7 {
+			t.Fatalf("after restart following nonce-7 send, cleanup erased live halt6A: durable halt = (%+v, %v), want preserved", gotHalt, err)
+		}
 	})
 
 	t.Run("cleanup defers when retained prior hash history was truncated past 16 retries", func(t *testing.T) {

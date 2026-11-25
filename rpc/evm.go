@@ -750,8 +750,11 @@ func (r *EvmRpc) recordPendingTxAttempt(tx *etypes.Transaction) (*pendingAttempt
 			entry.gasPrice = maxBigInt(prev.gasPrice, entry.gasPrice)
 			entry.tipCap = maxBigInt(prev.tipCap, entry.tipCap)
 			entry.feeCap = maxBigInt(prev.feeCap, entry.feeCap)
-			entry.priorTxHashes, entry.priorHashesTruncated = mergePriorTxHashes(prev.priorTxHashes, prev.priorHashesTruncated, prev.txHash, entry.txHash)
 		}
+		// Carry prior hashes forward across both same-nonce retries and
+		// higher-nonce advances so a queued lower-nonce halt survives a
+		// restart even after a higher-nonce send overwrites the durable row.
+		entry.priorTxHashes, entry.priorHashesTruncated = mergePriorTxHashes(prev.priorTxHashes, prev.priorHashesTruncated, prev.txHash, entry.txHash)
 	}
 	deleteOther := otherPrev != nil && otherPrev.nonce == entry.nonce
 	if deleteOther {
@@ -1528,8 +1531,14 @@ func (r *EvmRpc) ClearObsoleteHaltTxContext(parent context.Context, sender ecomm
 	for _, h := range hashesToCheck {
 		tx, _, txErr := r.TransactionByHashContext(parent, h)
 		if txErr == nil && tx != nil {
-			// Still known to the node; keep ownership.
-			return nil
+			// Any returned transaction with nonce >= confirmedNonce is still
+			// unconfirmed/queued in the mempool and must retain ownership;
+			// already-consumed lower-nonce transactions (< confirmedNonce) are
+			// ignored.
+			if tx.Nonce() >= confirmedNonce {
+				return nil
+			}
+			continue
 		}
 		if txErr != nil && !errors.Is(txErr, ethereum.NotFound) {
 			return txErr
