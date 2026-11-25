@@ -1759,7 +1759,7 @@ func (m *NetworksManager) SetEvmUnwrapRequestAsSent(event *events.UnwrapRequestE
 func (m *NetworksManager) SetEvmUnwrapRequestStatus(event *events.UnwrapRequestEvm, status uint32) error {
 	for _, network := range m.networks() {
 		if network.ChainId() == event.ChainId {
-			if err := network.eventsStore().ApplyUnwrapReconciliationStatus(event.TransactionHash, event.LogIndex, event.RedeemStatus, status); err != nil {
+			if err := network.ApplyUnwrapReconciliationStatus(event.TransactionHash, event.LogIndex, event.RedeemStatus, status); err != nil {
 				return err
 			}
 		}
