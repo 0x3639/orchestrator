@@ -122,17 +122,37 @@ func (s *secureLocalStateManager) RetrieveP2PAddresses() (addr.AddrList, error) 
 }
 
 // installSecureStateManager replaces go-tss's default FileStateMgr on server
-// with mgr before any Keygen/KeySign call runs. It validates the field name
-// and interface type so any incompatible dependency change fails startup
-// loudly instead of silently reverting to insecure 0655 pathname storage.
-func installSecureStateManager(server *gotss.TssServer, mgr tstorage.LocalStateManager) error {
+// with mgr before any Keygen/KeySign call runs. It accepts *gotss.TssServer or
+// a test transport wrapper embedding *gotss.TssServer (e.g. the bend overlay's
+// signtransport.TssServer), and validates the stateManager field name and type
+// so any incompatible dependency change fails startup loudly instead of
+// silently reverting to insecure 0655 pathname storage.
+func installSecureStateManager(server any, mgr tstorage.LocalStateManager) error {
 	if server == nil {
 		return errors.New("tss server is nil")
 	}
-	v := reflect.ValueOf(server)
-	if v.Kind() != reflect.Ptr || v.Elem().Kind() != reflect.Struct {
-		return errors.New("unexpected tss server representation")
+	var target *gotss.TssServer
+	if s, ok := server.(*gotss.TssServer); ok {
+		target = s
+	} else {
+		v := reflect.ValueOf(server)
+		if v.Kind() != reflect.Ptr || v.IsNil() || v.Elem().Kind() != reflect.Struct {
+			return errors.New("unexpected tss server representation")
+		}
+		embedded := v.Elem().FieldByName("TssServer")
+		if !embedded.IsValid() || embedded.Type() != reflect.TypeOf((*gotss.TssServer)(nil)) {
+			return errors.New("unexpected tss server representation")
+		}
+		if embedded.IsNil() {
+			// Test-only transport stub with no underlying go-tss server.
+			return nil
+		}
+		target = embedded.Interface().(*gotss.TssServer)
 	}
+	if target == nil {
+		return errors.New("tss server is nil")
+	}
+	v := reflect.ValueOf(target)
 	field := v.Elem().FieldByName("stateManager")
 	wantType := reflect.TypeOf((*tstorage.LocalStateManager)(nil)).Elem()
 	if !field.IsValid() || field.Type() != wantType || !field.CanAddr() {

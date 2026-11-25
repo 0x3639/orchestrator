@@ -5,6 +5,7 @@ import (
 	"crypto/ed25519"
 	"encoding/base64"
 	"errors"
+	"net"
 	"os"
 	"path/filepath"
 	"slices"
@@ -494,4 +495,161 @@ func TestNewTssManagerUsesAnchoredAddressBookAndRejectsUnsafeSeed(t *testing.T) 
 			t.Fatalf("address_book.seed mode = %04o, want %04o", info.Mode().Perm(), oconfig.ConfigFilePerm)
 		}
 	})
+}
+
+func TestNewTssManagerPreservesPrivateLogsAndRejectsLogsAddressBook(t *testing.T) {
+	priv, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	pubKey := base64.StdEncoding.EncodeToString(crypto.CompressPubkey(&priv.PublicKey))
+	logNames := []string{"tss.communication.log", "tss.party.log", "tss.server.log"}
+
+	t.Run("rejects planted address_book.seed inside logs subdir", func(t *testing.T) {
+		dir := t.TempDir()
+		logsDir := filepath.Join(dir, "logs")
+		if err := os.Mkdir(logsDir, 0700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(logsDir, addressBookFileName), []byte("bad"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		mgr, err := NewTssManager(oconfig.TssManagerConfig{
+			BaseDir:   dir,
+			PublicKey: pubKey,
+		}, testPrivateKeyBase64(t))
+		if err == nil {
+			mgr.Stop()
+			t.Fatal("expected NewTssManager to reject unexpected address_book.seed inside logs subdir")
+		}
+	})
+
+	t.Run("rejects symlinked log file in BaseDir", func(t *testing.T) {
+		dir := t.TempDir()
+		target := filepath.Join(dir, "decoy.log")
+		if err := os.WriteFile(target, []byte("decoy"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(target, filepath.Join(dir, "tss.server.log")); err != nil {
+			t.Skipf("symlinks unavailable: %v", err)
+		}
+		mgr, err := NewTssManager(oconfig.TssManagerConfig{
+			BaseDir:   dir,
+			PublicKey: pubKey,
+		}, testPrivateKeyBase64(t))
+		if err == nil {
+			mgr.Stop()
+			t.Fatal("expected NewTssManager to reject symlinked tss.server.log")
+		}
+	})
+
+	t.Run("preserves 0600 logs in BaseDir across startup and Stop", func(t *testing.T) {
+		dir := filepath.Join(t.TempDir(), "tss-durable")
+		mgr, err := NewTssManager(oconfig.TssManagerConfig{
+			BaseDir:   dir,
+			Port:      0,
+			PublicKey: pubKey,
+		}, testPrivateKeyBase64(t))
+		if err != nil {
+			t.Fatalf("NewTssManager failed: %v", err)
+		}
+
+		logsDirInfo, err := os.Stat(filepath.Join(dir, "logs"))
+		if err != nil {
+			mgr.Stop()
+			t.Fatalf("expected BaseDir/logs to exist: %v", err)
+		}
+		if logsDirInfo.Mode().Perm() != oconfig.DataDirPerm {
+			mgr.Stop()
+			t.Fatalf("BaseDir/logs mode = %04o, want %04o", logsDirInfo.Mode().Perm(), oconfig.DataDirPerm)
+		}
+
+		for _, name := range logNames {
+			baseInfo, err := os.Stat(filepath.Join(dir, name))
+			if err != nil {
+				mgr.Stop()
+				t.Fatalf("expected %s in BaseDir: %v", name, err)
+			}
+			if baseInfo.Mode().Perm() != oconfig.ConfigFilePerm {
+				mgr.Stop()
+				t.Fatalf("%s mode = %04o, want %04o", name, baseInfo.Mode().Perm(), oconfig.ConfigFilePerm)
+			}
+			subInfo, err := os.Stat(filepath.Join(dir, "logs", name))
+			if err != nil {
+				mgr.Stop()
+				t.Fatalf("expected %s in BaseDir/logs: %v", name, err)
+			}
+			if !os.SameFile(baseInfo, subInfo) {
+				mgr.Stop()
+				t.Fatalf("%s in BaseDir and BaseDir/logs are not hardlinked to the same inode", name)
+			}
+		}
+
+		mgr.Stop()
+
+		// Logs must remain durable at BaseDir after shutdown.
+		for _, name := range logNames {
+			info, err := os.Stat(filepath.Join(dir, name))
+			if err != nil {
+				t.Fatalf("expected %s to remain after Stop: %v", name, err)
+			}
+			if info.Mode().Perm() != oconfig.ConfigFilePerm {
+				t.Fatalf("%s mode after Stop = %04o, want %04o", name, info.Mode().Perm(), oconfig.ConfigFilePerm)
+			}
+		}
+	})
+
+	t.Run("preserves BaseDir logs when go-tss startup fails", func(t *testing.T) {
+		ln, err := net.Listen("tcp", "0.0.0.0:0")
+		if err != nil {
+			t.Fatalf("failed to reserve occupied port: %v", err)
+		}
+		defer ln.Close()
+		occupiedPort := ln.Addr().(*net.TCPAddr).Port
+
+		dir := filepath.Join(t.TempDir(), "tss-fail")
+		mgr, err := NewTssManager(oconfig.TssManagerConfig{
+			BaseDir:   dir,
+			Port:      occupiedPort,
+			PublicKey: pubKey,
+		}, testPrivateKeyBase64(t))
+		if err == nil {
+			mgr.Stop()
+			t.Fatal("expected NewTssManager to fail when port is already bound")
+		}
+
+		for _, name := range logNames {
+			info, statErr := os.Stat(filepath.Join(dir, name))
+			if statErr != nil {
+				t.Fatalf("expected %s to be preserved after startup failure: %v", name, statErr)
+			}
+			if info.Mode().Perm() != oconfig.ConfigFilePerm {
+				t.Fatalf("%s mode after startup failure = %04o, want %04o", name, info.Mode().Perm(), oconfig.ConfigFilePerm)
+			}
+		}
+	})
+}
+
+func TestInstallSecureStateManagerSupportsEmbeddedWrapper(t *testing.T) {
+	dir, err := oconfig.OpenOwnedDir(filepath.Join(t.TempDir(), "tss"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dir.Close()
+	mgr := newSecureLocalStateManager(dir)
+
+	type embeddedWrapper struct {
+		*gotss.TssServer
+	}
+
+	if err := installSecureStateManager(&embeddedWrapper{TssServer: nil}, mgr); err != nil {
+		t.Fatalf("nil embedded *gotss.TssServer wrapper should succeed for test transport stubs: %v", err)
+	}
+	if err := installSecureStateManager(&embeddedWrapper{TssServer: &gotss.TssServer{}}, mgr); err != nil {
+		t.Fatalf("non-nil embedded *gotss.TssServer wrapper failed: %v", err)
+	}
+	type unrelated struct{ X int }
+	if err := installSecureStateManager(&unrelated{}, mgr); err == nil {
+		t.Fatal("expected error for unrelated server struct")
+	}
 }

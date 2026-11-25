@@ -2222,6 +2222,354 @@ func TestReSignStateRestartsOnSameCountZenonFrontierRollback(t *testing.T) {
 	}
 }
 
+func TestReSignStateRejectsOrphanedPageWhenReplacementDescendsFromPreviousAnchor(t *testing.T) {
+	prevDelay := resignRetryDelay
+	prevPageSize := resignPageSize
+	resignRetryDelay = 20 * time.Millisecond
+	resignPageSize = 2
+	t.Cleanup(func() {
+		resignRetryDelay = prevDelay
+		resignPageSize = prevPageSize
+	})
+
+	evmSrv := fakeEvmRpcServer(t)
+	defer evmSrv.Close()
+
+	makeEntry := func(id types.Hash, height uint64) *embedded.WrapTokenRequest {
+		return &embedded.WrapTokenRequest{
+			WrapTokenRequest: &definition.WrapTokenRequest{
+				NetworkClass: definition.EvmClass, ChainId: 1, Id: id,
+				Amount: big.NewInt(10), Fee: big.NewInt(1), CreationMomentumHeight: height,
+			},
+			ConfirmationsToFinality: 0,
+		}
+	}
+
+	// Previous canonical anchor is B10 (height 10, hash 0x01).
+	// On call 2 (tail page 1), preAcct is B10. During the page RPC, Zenon
+	// briefly serves an orphaned row from B11_forkA (orphanWrap) and then rolls
+	// back B11_forkA -> B10 -> B11_forkB (height 11, hash 0x02, which STILL
+	// descends from B10 at height 10 and contains canonicalWrap instead).
+	// fetchAnchoredWrapPage must reject the straddling page (preAcct != postAcct),
+	// never cache orphanWrap, re-read on B11_forkB, and mark canonicalWrap.
+	f1 := types.Hash{0xf1}
+	w2 := types.Hash{0x31}
+	w1 := types.Hash{0x32}
+	orphanWrap := types.Hash{0x33}
+	canonicalWrap := types.Hash{0x34}
+
+	forkA := []*embedded.WrapTokenRequest{
+		makeEntry(f1, 101),
+		makeEntry(w2, 99),
+		makeEntry(w1, 99),
+		makeEntry(orphanWrap, 98),
+	}
+	forkB := []*embedded.WrapTokenRequest{
+		makeEntry(f1, 101),
+		makeEntry(w2, 99),
+		makeEntry(w1, 99),
+		makeEntry(canonicalWrap, 98),
+	}
+	sortZenonWraps(forkA)
+	sortZenonWraps(forkB)
+
+	var stage atomic.Int32 // 0 = B10, 1 = B11_forkB (descends from B10)
+	bridge := &wrapTestBridge{
+		networks: &embedded.NetworkInfoList{
+			Count: 1,
+			List: []*definition.NetworkInfo{{
+				NetworkClass: definition.EvmClass, Id: 1, Name: "Ethereum",
+				ContractAddress: "0x0000000000000000000000000000000000000001",
+			}},
+		},
+		frontierMomFn: func(_ context.Context, _ int32) (*api.Momentum, error) {
+			return &api.Momentum{Momentum: &nom.Momentum{Height: 100, Hash: types.Hash{0x11}}}, nil
+		},
+		momByHeightFn: func(_ context.Context, height uint64) (*api.MomentumList, error) {
+			return &api.MomentumList{
+				Count: 1,
+				List:  []*api.Momentum{{Momentum: &nom.Momentum{Height: height, Hash: types.Hash{0x11}}}},
+			}, nil
+		},
+		frontierFn: func(_ context.Context, _ int32) (*api.AccountBlock, error) {
+			if stage.Load() == 0 {
+				return testAccountBlock(10, types.Hash{0x01}), nil
+			}
+			return testAccountBlock(11, types.Hash{0x02}), nil
+		},
+		acctByHeightFn: func(_ context.Context, height uint64) (*api.AccountBlockList, error) {
+			// B11_forkB descends from B10, so height 10 STILL has hash 0x01.
+			hashByte := byte(0x01)
+			if height == 11 {
+				hashByte = 0x02
+			}
+			return &api.AccountBlockList{
+				Count: int(height),
+				List:  []*api.AccountBlock{testAccountBlock(height, types.Hash{hashByte})},
+			}, nil
+		},
+		pageHandler: func(pageIndex, pageSize uint32, call int32) *embedded.WrapTokenRequestList {
+			if call == 2 {
+				// Serve orphaned rows from B11_forkA while flipping frontier to
+				// B11_forkB before the post-read check runs.
+				stage.Store(1)
+				return paginateZenonWraps(forkA, pageIndex, pageSize)
+			}
+			return paginateZenonWraps(forkB, pageIndex, pageSize)
+		},
+	}
+
+	n := wrapTestNodeWithEvm(t, common.LiveState, bridge, map[string]string{"Ethereum": evmSrv.URL})
+	if activated, err := n.state.ActivateResign(definition.EvmClass, 1); err != nil || !activated {
+		t.Fatalf("ActivateResign failed: activated=%v err=%v", activated, err)
+	}
+	n.state.CompleteStartup()
+
+	n.workers.start(n.processSignatures)
+	t.Cleanup(func() {
+		done := n.workers.shutdown()
+		<-done
+	})
+
+	eventually(t, "ReSignState to reject straddling orphaned page and mark canonicalWrap", func() bool {
+		st, _ := n.state.GetState()
+		for _, id := range []types.Hash{w2, w1, canonicalWrap} {
+			r, err := n.dbManager.ZnnStorage().GetResignStatus(id)
+			if err != nil || !r {
+				return false
+			}
+		}
+		return st == common.LiveState
+	})
+
+	if resign, err := n.dbManager.ZnnStorage().GetResignStatus(orphanWrap); err != nil || resign {
+		t.Fatalf("orphaned wrap from rolled-back B11_forkA should not be marked: resign=%v err=%v", resign, err)
+	}
+	if ev, err := n.dbManager.ZnnStorage().GetWrapRequestById(orphanWrap); err != nil || ev != nil {
+		t.Fatalf("orphaned wrap from rolled-back B11_forkA should not be stored: ev=%+v err=%v", ev, err)
+	}
+}
+
+func TestReSignStateRevalidatesAnchorAfterFinalityAndEligibilityWaitOnRollback(t *testing.T) {
+	prevDelay := resignRetryDelay
+	resignRetryDelay = 20 * time.Millisecond
+	t.Cleanup(func() { resignRetryDelay = prevDelay })
+
+	makeEntry := func(id types.Hash, confs uint64) *embedded.WrapTokenRequest {
+		return &embedded.WrapTokenRequest{
+			WrapTokenRequest: &definition.WrapTokenRequest{
+				NetworkClass: definition.EvmClass, ChainId: 1, Id: id,
+				Amount: big.NewInt(10), Fee: big.NewInt(1), CreationMomentumHeight: 99,
+			},
+			ConfirmationsToFinality: confs,
+		}
+	}
+
+	t.Run("rollback during deferred finality wait", func(t *testing.T) {
+		evmSrv := fakeEvmRpcServer(t)
+		defer evmSrv.Close()
+
+		deferredOld := types.Hash{0x41}
+		replacementWrap := types.Hash{0x42}
+		var epoch atomic.Int32 // 0 = fork1, 1 = fork2
+
+		bridge := &wrapTestBridge{
+			networks: &embedded.NetworkInfoList{
+				Count: 1,
+				List: []*definition.NetworkInfo{{
+					NetworkClass: definition.EvmClass, Id: 1, Name: "Ethereum",
+					ContractAddress: "0x0000000000000000000000000000000000000001",
+				}},
+			},
+			frontierMomFn: func(_ context.Context, _ int32) (*api.Momentum, error) {
+				hashByte := byte(0x11)
+				if epoch.Load() > 0 {
+					hashByte = 0x22
+				}
+				return &api.Momentum{Momentum: &nom.Momentum{Height: 100, Hash: types.Hash{hashByte}}}, nil
+			},
+			momByHeightFn: func(_ context.Context, height uint64) (*api.MomentumList, error) {
+				hashByte := byte(0x11)
+				if epoch.Load() > 0 {
+					hashByte = 0x22
+				}
+				return &api.MomentumList{
+					Count: 1,
+					List:  []*api.Momentum{{Momentum: &nom.Momentum{Height: height, Hash: types.Hash{hashByte}}}},
+				}, nil
+			},
+			frontierFn: func(_ context.Context, _ int32) (*api.AccountBlock, error) {
+				hashByte := byte(0x01)
+				if epoch.Load() > 0 {
+					hashByte = 0x02
+				}
+				return testAccountBlock(10, types.Hash{hashByte}), nil
+			},
+			acctByHeightFn: func(_ context.Context, height uint64) (*api.AccountBlockList, error) {
+				hashByte := byte(0x01)
+				if epoch.Load() > 0 {
+					hashByte = 0x02
+				}
+				return &api.AccountBlockList{
+					Count: int(height),
+					List:  []*api.AccountBlock{testAccountBlock(height, types.Hash{hashByte})},
+				}, nil
+			},
+			pageHandler: func(pageIndex, pageSize uint32, _ int32) *embedded.WrapTokenRequestList {
+				if epoch.Load() == 0 {
+					return paginateZenonWraps([]*embedded.WrapTokenRequest{makeEntry(deferredOld, 2)}, pageIndex, pageSize)
+				}
+				return paginateZenonWraps([]*embedded.WrapTokenRequest{makeEntry(replacementWrap, 0)}, pageIndex, pageSize)
+			},
+			byIDHandler: func(_ context.Context, id types.Hash, _ int32) (*embedded.WrapTokenRequest, error) {
+				if id == deferredOld {
+					// Roll back Zenon while deferredOld is waiting for finality so
+					// deferredOld vanishes and replacementWrap takes its place.
+					epoch.Store(1)
+					return nil, errors.New("data non existent")
+				}
+				return makeEntry(id, 0), nil
+			},
+		}
+
+		n := wrapTestNodeWithEvm(t, common.LiveState, bridge, map[string]string{"Ethereum": evmSrv.URL})
+		if activated, err := n.state.ActivateResign(definition.EvmClass, 1); err != nil || !activated {
+			t.Fatalf("ActivateResign failed: activated=%v err=%v", activated, err)
+		}
+		n.state.CompleteStartup()
+
+		n.workers.start(n.processSignatures)
+		t.Cleanup(func() {
+			done := n.workers.shutdown()
+			<-done
+		})
+
+		eventually(t, "ReSignState to restart after rollback during finality wait and mark replacementWrap", func() bool {
+			st, _ := n.state.GetState()
+			r, err := n.dbManager.ZnnStorage().GetResignStatus(replacementWrap)
+			return err == nil && r && st == common.LiveState
+		})
+
+		if ev, err := n.dbManager.ZnnStorage().GetWrapRequestById(deferredOld); err != nil || ev != nil {
+			t.Fatalf("vanished deferred wrap should not be stored: ev=%+v err=%v", ev, err)
+		}
+	})
+
+	t.Run("rollback during EVM eligibility retry", func(t *testing.T) {
+		wrapOld := types.Hash{0x51}
+		wrapNew := types.Hash{0x52}
+		var epoch atomic.Int32 // 0 = fork1, 1 = fork2
+		var evmCalls atomic.Int32
+
+		evmSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			var req struct {
+				JSONRPC string          `json:"jsonrpc"`
+				ID      json.RawMessage `json:"id"`
+				Method  string          `json:"method"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&req)
+			w.Header().Set("Content-Type", "application/json")
+			if req.Method == "eth_call" && evmCalls.Add(1) == 1 {
+				// First RedeemsInfo call fails transiently while Zenon rolls back
+				// from wrapOld to wrapNew. The retry succeeds for wrapOld, so only
+				// pre-publish anchor revalidation catches the rollback.
+				epoch.Store(1)
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"jsonrpc": "2.0",
+					"id":      req.ID,
+					"error":   map[string]any{"code": -32000, "message": "transient rpc failure"},
+				})
+				return
+			}
+			result := "0x" + strings.Repeat("00", 64)
+			if req.Method == "eth_chainId" {
+				result = "0x1"
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"jsonrpc": "2.0",
+				"id":      req.ID,
+				"result":  result,
+			})
+		}))
+		defer evmSrv.Close()
+
+		bridge := &wrapTestBridge{
+			networks: &embedded.NetworkInfoList{
+				Count: 1,
+				List: []*definition.NetworkInfo{{
+					NetworkClass: definition.EvmClass, Id: 1, Name: "Ethereum",
+					ContractAddress: "0x0000000000000000000000000000000000000001",
+				}},
+			},
+			frontierMomFn: func(_ context.Context, _ int32) (*api.Momentum, error) {
+				hashByte := byte(0x11)
+				if epoch.Load() > 0 {
+					hashByte = 0x22
+				}
+				return &api.Momentum{Momentum: &nom.Momentum{Height: 100, Hash: types.Hash{hashByte}}}, nil
+			},
+			momByHeightFn: func(_ context.Context, height uint64) (*api.MomentumList, error) {
+				hashByte := byte(0x11)
+				if epoch.Load() > 0 {
+					hashByte = 0x22
+				}
+				return &api.MomentumList{
+					Count: 1,
+					List:  []*api.Momentum{{Momentum: &nom.Momentum{Height: height, Hash: types.Hash{hashByte}}}},
+				}, nil
+			},
+			frontierFn: func(_ context.Context, _ int32) (*api.AccountBlock, error) {
+				hashByte := byte(0x01)
+				if epoch.Load() > 0 {
+					hashByte = 0x02
+				}
+				return testAccountBlock(10, types.Hash{hashByte}), nil
+			},
+			acctByHeightFn: func(_ context.Context, height uint64) (*api.AccountBlockList, error) {
+				hashByte := byte(0x01)
+				if epoch.Load() > 0 {
+					hashByte = 0x02
+				}
+				return &api.AccountBlockList{
+					Count: int(height),
+					List:  []*api.AccountBlock{testAccountBlock(height, types.Hash{hashByte})},
+				}, nil
+			},
+			pageHandler: func(pageIndex, pageSize uint32, _ int32) *embedded.WrapTokenRequestList {
+				if epoch.Load() == 0 {
+					return paginateZenonWraps([]*embedded.WrapTokenRequest{makeEntry(wrapOld, 0)}, pageIndex, pageSize)
+				}
+				return paginateZenonWraps([]*embedded.WrapTokenRequest{makeEntry(wrapNew, 0)}, pageIndex, pageSize)
+			},
+		}
+
+		n := wrapTestNodeWithEvm(t, common.LiveState, bridge, map[string]string{"Ethereum": evmSrv.URL})
+		if activated, err := n.state.ActivateResign(definition.EvmClass, 1); err != nil || !activated {
+			t.Fatalf("ActivateResign failed: activated=%v err=%v", activated, err)
+		}
+		n.state.CompleteStartup()
+
+		n.workers.start(n.processSignatures)
+		t.Cleanup(func() {
+			done := n.workers.shutdown()
+			<-done
+		})
+
+		eventually(t, "ReSignState to detect rollback before publishing and mark wrapNew", func() bool {
+			st, _ := n.state.GetState()
+			r, err := n.dbManager.ZnnStorage().GetResignStatus(wrapNew)
+			return err == nil && r && st == common.LiveState
+		})
+
+		if resign, err := n.dbManager.ZnnStorage().GetResignStatus(wrapOld); err != nil || resign {
+			t.Fatalf("rolled-back wrapOld should not be marked after pre-publish revalidation: resign=%v err=%v", resign, err)
+		}
+		if ev, err := n.dbManager.ZnnStorage().GetWrapRequestById(wrapOld); err != nil || ev != nil {
+			t.Fatalf("rolled-back wrapOld should not be stored after pre-publish revalidation: ev=%+v err=%v", ev, err)
+		}
+	})
+}
+
 func TestReSignStateBoundsAndCancelsStalledDeferredWrapRPC(t *testing.T) {
 	prevDelay := resignRetryDelay
 	prevTimeout := resignRPCTimeout

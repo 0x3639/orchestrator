@@ -229,6 +229,96 @@ func (d *OwnedDir) verifyLocked() error {
 	return verifyAndChmodOwnedDir(d.file, d.file.Name())
 }
 
+// AnchoredPath returns a path bound to the open directory descriptor when the
+// OS supports /proc/self/fd (Linux), falling back to the original path.
+func (d *OwnedDir) AnchoredPath() string {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.file == nil {
+		return ""
+	}
+	return fdDirPath(d.file)
+}
+
+// OpenSubDir creates (if missing) and opens a direct child directory anchored
+// to d without following symlinks, verifying ownership and exact mode 0700.
+func (d *OwnedDir) OpenSubDir(name string) (*OwnedDir, error) {
+	if !isSafeDirEntryName(name) {
+		return nil, fmt.Errorf("invalid subdirectory name %q", name)
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if err := d.verifyLocked(); err != nil {
+		return nil, err
+	}
+	if err := mkdirAt(d.file, name, DataDirPerm); err != nil && !os.IsExist(err) {
+		return nil, fmt.Errorf("cannot create subdirectory %s: %w", filepath.Join(d.file.Name(), name), err)
+	}
+	sub, err := openDirAtNoFollow(d.file, name)
+	if err != nil {
+		return nil, fmt.Errorf("cannot open subdirectory %s: %w", filepath.Join(d.file.Name(), name), err)
+	}
+	if err := verifyAndChmodOwnedDir(sub, sub.Name()); err != nil {
+		_ = sub.Close()
+		return nil, err
+	}
+	return &OwnedDir{file: sub}, nil
+}
+
+// EnsureAbsent returns an error if any directory entry named name exists in d
+// (including symlinks or special files).
+func (d *OwnedDir) EnsureAbsent(name string) error {
+	if !isSafeDirEntryName(name) {
+		return fmt.Errorf("invalid file name %q", name)
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if err := d.verifyLocked(); err != nil {
+		return err
+	}
+	exists, err := statAtNoFollowExists(d.file, name)
+	if err != nil {
+		return err
+	}
+	if exists {
+		return fmt.Errorf("unexpected file %s present in private subdirectory", filepath.Join(d.file.Name(), name))
+	}
+	return nil
+}
+
+// LinkOwnedFileTo ensures name exists as an owned regular file with exact mode
+// perm inside d and hardlinks that exact inode into dst under the same name.
+func (d *OwnedDir) LinkOwnedFileTo(dst *OwnedDir, name string, perm os.FileMode) error {
+	if !isSafeDirEntryName(name) {
+		return fmt.Errorf("invalid file name %q", name)
+	}
+	if d == dst {
+		return fmt.Errorf("source and destination directories must differ")
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if err := d.verifyLocked(); err != nil {
+		return err
+	}
+	dst.mu.Lock()
+	defer dst.mu.Unlock()
+	if err := dst.verifyLocked(); err != nil {
+		return err
+	}
+	f, err := ensureFileAtNoFollow(d.file, name, perm)
+	if err != nil {
+		return fmt.Errorf("file %s: %w", filepath.Join(d.file.Name(), name), err)
+	}
+	defer f.Close()
+	if err := verifyAndChmodOwnedFile(f, filepath.Join(d.file.Name(), name), perm); err != nil {
+		return err
+	}
+	if err := unlinkAt(dst.file, name); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return linkAt(d.file, name, dst.file, name)
+}
+
 // SecureKeyShareFiles enumerates the open directory, verifies ownership and
 // enforces exact mode 0600 (no special bits) on every localstate-*.json file,
 // and when requiredFileName is non-empty verifies that it is present.

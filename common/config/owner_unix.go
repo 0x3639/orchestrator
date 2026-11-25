@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"syscall"
 
 	"golang.org/x/sys/unix"
@@ -84,4 +85,56 @@ func unlinkAt(dir *os.File, name string) error {
 		return &os.PathError{Op: "unlinkat", Path: filepath.Join(dir.Name(), name), Err: err}
 	}
 	return nil
+}
+
+func mkdirAt(dir *os.File, name string, perm os.FileMode) error {
+	if err := unix.Mkdirat(int(dir.Fd()), name, uint32(perm)); err != nil {
+		return &os.PathError{Op: "mkdirat", Path: filepath.Join(dir.Name(), name), Err: err}
+	}
+	return nil
+}
+
+func openDirAtNoFollow(dir *os.File, name string) (*os.File, error) {
+	fd, err := unix.Openat(int(dir.Fd()), name, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return nil, &os.PathError{Op: "openat", Path: filepath.Join(dir.Name(), name), Err: err}
+	}
+	return os.NewFile(uintptr(fd), filepath.Join(dir.Name(), name)), nil
+}
+
+func ensureFileAtNoFollow(dir *os.File, name string, perm os.FileMode) (*os.File, error) {
+	fd, err := unix.Openat(int(dir.Fd()), name, unix.O_RDWR|unix.O_CREAT|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, uint32(perm))
+	if err != nil {
+		return nil, &os.PathError{Op: "openat", Path: filepath.Join(dir.Name(), name), Err: err}
+	}
+	return os.NewFile(uintptr(fd), filepath.Join(dir.Name(), name)), nil
+}
+
+func linkAt(oldDir *os.File, oldName string, newDir *os.File, newName string) error {
+	if err := unix.Linkat(int(oldDir.Fd()), oldName, int(newDir.Fd()), newName, 0); err != nil {
+		return &os.LinkError{Op: "linkat", Old: filepath.Join(oldDir.Name(), oldName), New: filepath.Join(newDir.Name(), newName), Err: err}
+	}
+	return nil
+}
+
+func statAtNoFollowExists(dir *os.File, name string) (bool, error) {
+	var st unix.Stat_t
+	err := unix.Fstatat(int(dir.Fd()), name, &st, unix.AT_SYMLINK_NOFOLLOW)
+	if err == nil {
+		return true, nil
+	}
+	if err == unix.ENOENT {
+		return false, nil
+	}
+	return false, &os.PathError{Op: "fstatat", Path: filepath.Join(dir.Name(), name), Err: err}
+}
+
+func fdDirPath(dir *os.File) string {
+	if runtime.GOOS == "linux" {
+		p := fmt.Sprintf("/proc/self/fd/%d", dir.Fd())
+		if info, err := os.Stat(p); err == nil && info.IsDir() {
+			return p
+		}
+	}
+	return dir.Name()
 }

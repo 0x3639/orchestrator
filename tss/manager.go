@@ -34,7 +34,7 @@ type TssManager struct {
 	voteMu            sync.Mutex
 	unwrapVotes       *leveldb.DB
 	stateDir          *oconfig.OwnedDir
-	runtimeDir        string
+	logsDir           *oconfig.OwnedDir
 	keyShareDir       string
 	server            *tss.TssServer
 	port              int
@@ -120,20 +120,33 @@ func NewTssManager(conf oconfig.TssManagerConfig, privateKey string) (_ *TssMana
 	if err != nil {
 		return nil, err
 	}
-	// Pass a private empty 0700 runtime directory to go-tss's NewTss so it
-	// cannot read address_book.seed from conf.BaseDir via its pathname-based
-	// FileStateMgr before installSecureStateManager installs secureStateMgr.
-	// Saved bootstrap peers were already read above through secureStateMgr.
-	runtimeDir, err := os.MkdirTemp("", "orchestrator-tss-runtime-*")
+	// Pass a durable, private 0700 subdirectory anchored to stateDir to go-tss's
+	// NewTss so go-tss never reads BaseDir/address_book.seed through its
+	// pathname-based FileStateMgr (saved peers were already read above through
+	// secureStateMgr), while hardlinking go-tss's log files to owned 0600 files
+	// in BaseDir so startup/runtime diagnostics remain durable at their expected
+	// paths even after startup failure or shutdown.
+	logsDir, err := stateDir.OpenSubDir("logs")
 	if err != nil {
 		votes.Close()
 		return nil, err
 	}
 	defer func() {
 		if retErr != nil {
-			_ = os.RemoveAll(runtimeDir)
+			_ = logsDir.Close()
 		}
 	}()
+	if err := logsDir.EnsureAbsent(addressBookFileName); err != nil {
+		votes.Close()
+		return nil, err
+	}
+	for _, logName := range []string{"tss.communication.log", "tss.party.log", "tss.server.log"} {
+		if err := stateDir.LinkOwnedFileTo(logsDir, logName, oconfig.ConfigFilePerm); err != nil {
+			votes.Close()
+			return nil, err
+		}
+	}
+	tssBaseDir := logsDir.AnchoredPath()
 	var server *tss.TssServer
 	var wg sync.WaitGroup
 	wg.Add(1)
@@ -147,7 +160,7 @@ func NewTssManager(conf oconfig.TssManagerConfig, privateKey string) (_ *TssMana
 		}
 
 		// we call pre params with nil because we want to recompute it when we key gen, at key signs it takes it from the pubKey file
-		server, err = tss.NewTss(peerIDs, conf.Port, priKey, "Zenon", runtimeDir, conf.BaseConfig, nil, "", algo, conf.PubKeyWhitelist)
+		server, err = tss.NewTss(peerIDs, conf.Port, priKey, "Zenon", tssBaseDir, conf.BaseConfig, nil, "", algo, conf.PubKeyWhitelist)
 	}()
 	wg.Wait()
 	if err != nil {
@@ -163,7 +176,7 @@ func NewTssManager(conf oconfig.TssManagerConfig, privateKey string) (_ *TssMana
 	return &TssManager{
 		unwrapVotes:       votes,
 		stateDir:          stateDir,
-		runtimeDir:        runtimeDir,
+		logsDir:           logsDir,
 		keyShareDir:       conf.BaseDir,
 		port:              conf.Port,
 		server:            server,
@@ -185,11 +198,11 @@ func (m *TssManager) Start() error {
 func (m *TssManager) Stop() {
 	m.server.Stop()
 	m.unwrapVotes.Close()
+	if m.logsDir != nil {
+		_ = m.logsDir.Close()
+	}
 	if m.stateDir != nil {
 		_ = m.stateDir.Close()
-	}
-	if m.runtimeDir != "" {
-		_ = os.RemoveAll(m.runtimeDir)
 	}
 }
 
