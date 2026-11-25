@@ -2387,3 +2387,218 @@ func TestUnsignedRotationDefersRefreshUntilUnhaltedSignedChainGetsTurn(t *testin
 		t.Fatalf("unsigned Chain 3 rotation aborted round before Chain 2 got its tick-2 turn: sends=%d halted=%v", chain2Sends.Load(), chain2Halted.Load())
 	}
 }
+
+func TestSkippedSignedHaltOnUnreadableFlagDoesNotTriggerUnsignedRefresh(t *testing.T) {
+	oldKey, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	thirdKey, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldAddr := crypto.PubkeyToAddress(oldKey.PublicKey)
+	thirdAddr := crypto.PubkeyToAddress(thirdKey.PublicKey)
+	oldCompressed := base64.StdEncoding.EncodeToString(crypto.CompressPubkey(&oldKey.PublicKey))
+
+	c1 := ecommon.HexToAddress("0xb1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1")
+	c2 := ecommon.HexToAddress("0xb2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2")
+
+	zMock := &partialRotateZenon{
+		haltedTestZenon: haltedTestZenon{halted: true},
+		compressedTss:   oldCompressed,
+		evmContracts: []*definition.NetworkInfo{
+			{NetworkClass: definition.EvmClass, Id: 1, Name: "eth-flaky-signed", ContractAddress: c1.Hex()},
+			{NetworkClass: definition.EvmClass, Id: 2, Name: "eth-unsigned-rot", ContractAddress: c2.Hex()},
+		},
+	}
+	znnSrv := server.NewServer()
+	if err := znnSrv.RegisterName("embedded.bridge", zMock); err != nil {
+		t.Fatal(err)
+	}
+	znnHTTP := httptest.NewServer(znnSrv.WebsocketHandler([]string{"*"}))
+	t.Cleanup(func() { znnSrv.Stop(); znnHTTP.Close() })
+
+	// Fail the first halt-flag read inside SendHaltEvmWithExpectedTrackingContext
+	// (after the pre-check in publishEmergencyHalt) so the signed chain is
+	// skipped on tick 1 without broadcasting, then succeed on tick 2.
+	var chain1HaltedReads atomic.Int32
+	var chain1Sends atomic.Int32
+	var chain1Halted atomic.Bool
+	var chain2Mu sync.Mutex
+	chain2Tss := thirdAddr
+
+	evm1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			ID     json.RawMessage   `json:"id"`
+			Method string            `json:"method"`
+			Params []json.RawMessage `json:"params"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		resp := map[string]interface{}{"jsonrpc": "2.0", "id": req.ID}
+		switch req.Method {
+		case "eth_chainId":
+			resp["result"] = hexutil.EncodeUint64(1)
+		case "eth_blockNumber":
+			resp["result"] = hexutil.EncodeUint64(100)
+		case "eth_getBalance":
+			resp["result"] = (*hexutil.Big)(new(big.Int).Mul(big.NewInt(10), big.NewInt(1e18)))
+		case "eth_getTransactionCount":
+			resp["result"] = hexutil.EncodeUint64(1)
+		case "eth_getBlockByNumber":
+			resp["result"] = map[string]interface{}{
+				"number":        hexutil.EncodeUint64(100),
+				"hash":          ecommon.HexToHash("0x11"),
+				"baseFeePerGas": (*hexutil.Big)(big.NewInt(20_000_000_000)),
+			}
+		case "eth_maxPriorityFeePerGas":
+			resp["result"] = (*hexutil.Big)(big.NewInt(2_000_000_000))
+		case "eth_estimateGas":
+			resp["result"] = hexutil.EncodeUint64(100_000)
+		case "eth_sendRawTransaction":
+			chain1Sends.Add(1)
+			chain1Halted.Store(true)
+			resp["result"] = ecommon.HexToHash("0xbeef").Hex()
+		case "eth_call":
+			var call struct {
+				Data  hexutil.Bytes `json:"data"`
+				Input hexutil.Bytes `json:"input"`
+			}
+			_ = json.Unmarshal(req.Params[0], &call)
+			sel := append(call.Data, call.Input...)
+			switch {
+			case len(sel) >= 4 && string(sel[:4]) == string(common.EvmContractAbi.Methods["tss"].ID):
+				resp["result"] = ecommon.BytesToHash(oldAddr.Bytes()).Hex()
+			case len(sel) >= 4 && string(sel[:4]) == string(common.EvmContractAbi.Methods["actionsNonce"].ID):
+				resp["result"] = ecommon.BigToHash(big.NewInt(3)).Hex()
+			default:
+				// Fail the 3rd halted() call (the one inside SendHaltEvm on tick 1).
+				if chain1HaltedReads.Add(1) == 3 {
+					resp["error"] = map[string]interface{}{"code": -32000, "message": "temporary RPC failure"}
+				} else if chain1Halted.Load() {
+					resp["result"] = "0x" + strings.Repeat("0", 63) + "1"
+				} else {
+					resp["result"] = "0x" + strings.Repeat("0", 64)
+				}
+			}
+		default:
+			resp["result"] = "0x" + strings.Repeat("0", 64)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	t.Cleanup(evm1.Close)
+
+	evm2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			ID     json.RawMessage   `json:"id"`
+			Method string            `json:"method"`
+			Params []json.RawMessage `json:"params"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		resp := map[string]interface{}{"jsonrpc": "2.0", "id": req.ID}
+		switch req.Method {
+		case "eth_chainId":
+			resp["result"] = hexutil.EncodeUint64(2)
+		case "eth_call":
+			var call struct {
+				Data  hexutil.Bytes `json:"data"`
+				Input hexutil.Bytes `json:"input"`
+			}
+			_ = json.Unmarshal(req.Params[0], &call)
+			sel := append(call.Data, call.Input...)
+			switch {
+			case len(sel) >= 4 && string(sel[:4]) == string(common.EvmContractAbi.Methods["tss"].ID):
+				chain2Mu.Lock()
+				addr := chain2Tss
+				chain2Mu.Unlock()
+				resp["result"] = ecommon.BytesToHash(addr.Bytes()).Hex()
+			case len(sel) >= 4 && string(sel[:4]) == string(common.EvmContractAbi.Methods["actionsNonce"].ID):
+				resp["result"] = ecommon.BigToHash(big.NewInt(3)).Hex()
+			default:
+				resp["result"] = "0x" + strings.Repeat("0", 64)
+			}
+		default:
+			resp["result"] = "0x" + strings.Repeat("0", 64)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	t.Cleanup(evm2.Close)
+
+	stopChan := make(chan os.Signal, 1)
+	stateVal := common.EmergencyState
+	gs := common.NewGlobalState(&stateVal)
+	t.Setenv("HOME", t.TempDir())
+	nm, err := network.NewNetworksManager(stopChan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dbMgr, err := manager.NewDbManager(stopChan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nets := map[string]config.BaseNetworkConfig{
+		common.ZenonNetworkName: {Urls: []string{"ws" + strings.TrimPrefix(znnHTTP.URL, "http")}},
+		"eth-flaky-signed":      {Urls: []string{evm1.URL}},
+		"eth-unsigned-rot":      {Urls: []string{evm2.URL}},
+	}
+	if err := nm.Init(nets, dbMgr, gs, func(*common.BridgeMetadata) {}); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { nm.Stop() })
+
+	evmBatch, _, signedEvmNonces, signedEvmTss, err := nm.GetHaltMessagesWithState()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Rotate unsigned Chain 2 to oldAddr BEFORE tick 1!
+	chain2Mu.Lock()
+	chain2Tss = oldAddr
+	chain2Mu.Unlock()
+
+	producerPub := []byte("test-producer-pubkey-32-bytes!!!")
+	producerPubB64 := base64.StdEncoding.EncodeToString(producerPub)
+	plan := &emergencyHaltPlan{
+		znnSignature:      "AAAA",
+		znnParticipants:   []string{producerPubB64},
+		evmFullSignatures: make([][]byte, len(signedEvmTss)),
+		evmParticipants:   make([][]string, len(signedEvmTss)),
+	}
+	for i := range signedEvmTss {
+		if signedEvmTss[i] == oldAddr {
+			plan.evmFullSignatures[i] = make([]byte, 65)
+			plan.evmParticipants[i] = []string{producerPubB64}
+		}
+	}
+
+	node := &Node{
+		config:          &config.Config{TssConfig: config.TssManagerConfig{PublicKey: oldCompressed, LocalPubKeys: []string{producerPubB64}}},
+		networksManager: nm,
+		dbManager:       dbMgr,
+		producerKeyPair: &wallet.KeyPair{Public: producerPub},
+		ecdsaPrivateKey: oldKey,
+		evmAddress:      oldAddr,
+		state:           gs,
+		stopChan:        stopChan,
+		logger:          zap.NewNop().Sugar(),
+	}
+
+	done := make(chan bool, 1)
+	go func() {
+		done <- node.publishEmergencyHalt(evmBatch, plan, oldCompressed, 0, signedEvmTss, signedEvmNonces)
+	}()
+
+	select {
+	case aborted := <-done:
+		if !aborted {
+			t.Fatal("expected publishEmergencyHalt to refresh after Chain 1 actually broadcast")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("publishEmergencyHalt timed out")
+	}
+	if chain1Sends.Load() == 0 || !chain1Halted.Load() {
+		t.Fatalf("skipped Chain 1 (unreadable halt flag on tick 1) triggered unsigned refresh with 0 broadcasts: sends=%d halted=%v", chain1Sends.Load(), chain1Halted.Load())
+	}
+}

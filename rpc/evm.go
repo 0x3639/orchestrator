@@ -63,10 +63,11 @@ type EvmRpc struct {
 	secondaryStopped bool
 
 	// pendingMu serializes durable pendingTxStore read/modify/write batches
-	// with in-memory pendingTx and nonceStack updates (never held across
-	// network RPCs).
-	pendingMu  sync.Mutex
-	nonceStack map[evmNonceKey][]*pendingAttempt
+	// with in-memory pendingTx, nonceStack, and failedRollbacks updates
+	// (never held across network RPCs).
+	pendingMu       sync.Mutex
+	nonceStack      map[evmNonceKey][]*pendingAttempt
+	failedRollbacks map[evmNonceKey]struct{}
 	// txMu guards storageName, chainID, pendingTx, pendingTxStore, and
 	// sendTimeout, which track the latest unconfirmed halt or key-change
 	// transaction per (sender, contract, action) so retries reuse the same
@@ -621,7 +622,9 @@ func (r *EvmRpc) recordPendingTxAttempt(tx *etypes.Transaction) (*pendingAttempt
 	if _, err := r.loadPendingTxLocked(otherKey); err != nil {
 		return nil, false, fmt.Errorf("load competing EVM tx record before broadcast: %w", err)
 	}
-	r.reconcileDeferredOwnersLocked(key.sender, key.contract)
+	if err := r.retryFailedRollbacksLocked(key.sender, key.contract); err != nil {
+		return nil, false, fmt.Errorf("retry failed rollback before broadcast: %w", err)
+	}
 
 	r.txMu.Lock()
 	if r.pendingTx == nil {
@@ -759,142 +762,23 @@ func (r *EvmRpc) findFallbackOwnerLocked(sender, contract ecommon.Address, kind 
 	return best
 }
 
-// reconcileDeferredOwnersLocked retries restoring any surviving action owner
-// still present in r.nonceStack whose durable/in-memory slot is nil because an
-// earlier rollback batch write transiently failed. Caller must hold r.pendingMu.
-func (r *EvmRpc) reconcileDeferredOwnersLocked(sender, contract ecommon.Address) {
-	r.txMu.Lock()
-	store := r.pendingTxStore
-	r.txMu.Unlock()
-
-	var ops []common.PendingEvmTxOp
-	type restoreItem struct {
-		key   evmTxKey
-		entry *pendingEvmTx
+// markFailedRollbackLocked records nk as having a transiently failed rollback
+// batch awaiting atomic retry. Caller must hold r.pendingMu.
+func (r *EvmRpc) markFailedRollbackLocked(nk evmNonceKey) {
+	if r.failedRollbacks == nil {
+		r.failedRollbacks = make(map[evmNonceKey]struct{})
 	}
-	var items []restoreItem
-	for _, kind := range []string{evmTxKindHalt, evmTxKindSetTss} {
-		k := evmTxKey{sender: sender, contract: contract, kind: kind}
-		r.txMu.Lock()
-		cur := r.pendingTx[k]
-		r.txMu.Unlock()
-		if cur != nil {
-			continue
-		}
-		best := r.findFallbackOwnerLocked(sender, contract, kind, false, 0)
-		if best == nil {
-			continue
-		}
-		ops = append(ops, common.PendingEvmTxOp{
-			Sender:   sender,
-			Contract: contract,
-			Kind:     kind,
-			Record:   toCommonPendingEvmTx(best.entry),
-		})
-		items = append(items, restoreItem{key: k, entry: clonePendingEvmTx(best.entry)})
-	}
-	if len(ops) == 0 {
-		return
-	}
-	if store != nil {
-		if err := store.ApplyPendingEvmTxBatch(ops); err != nil {
-			r.logger.Errorf("failed to recover deferred pending EVM tx record: %v", err)
-			return
-		}
-	}
-	r.txMu.Lock()
-	if r.pendingTx == nil {
-		r.pendingTx = make(map[evmTxKey]*pendingEvmTx)
-	}
-	for _, item := range items {
-		if r.pendingTx[item.key] == nil {
-			r.pendingTx[item.key] = item.entry
-		}
-	}
-	r.txMu.Unlock()
+	r.failedRollbacks[nk] = struct{}{}
 }
 
-// pruneConfirmedNonceStacksLocked discards nonce-lineage stacks for nonces
-// already confirmed on-chain so rollbacks never restore a mined transaction.
-// Caller must hold r.pendingMu.
-func (r *EvmRpc) pruneConfirmedNonceStacksLocked(sender, contract ecommon.Address, confirmedNonce uint64) {
-	for nk := range r.nonceStack {
-		if nk.sender == sender && nk.contract == contract && nk.nonce < confirmedNonce {
-			delete(r.nonceStack, nk)
-		}
-	}
-}
-
-// reconcileSentTx updates or rolls back the pre-broadcast watermark based on
-// the broadcast outcome. Both setTss and halt attempts for a nonce share one
-// lineage stack under pendingMu so:
-//   - An accepted attempt collapses all older attempts below it.
-//   - Ambiguous failures (EOF, timeouts, underpriced) remain viable.
-//   - A rejected attempt that is no longer top of stack is marked rejected and
-//     never mutates durable storage while a newer owner is active.
-//   - When the top attempt is definitively rejected, ALL trailing rejected
-//     attempts across both actions unwind together in one atomic batch,
-//     reconciling surviving ownership across nonces (including any deferred
-//     restoration whose earlier write transiently failed) before deleting any slot.
-func (r *EvmRpc) reconcileSentTx(tx *etypes.Transaction, attempt *pendingAttempt, sendErr error) {
-	if attempt == nil {
-		return
-	}
-	key, ok := evmTxKeyFromTx(tx)
-	if !ok {
-		return
-	}
-	r.pendingMu.Lock()
-	defer r.pendingMu.Unlock()
-
-	nk := evmNonceKey{sender: key.sender, contract: key.contract, nonce: tx.Nonce()}
+// applyStackRollbackLocked atomically applies the pending rollback for nk by
+// unwinding all trailing rejected attempts in r.nonceStack[nk] and updating
+// durable storage + in-memory pendingTx in a single ApplyPendingEvmTxBatch
+// call (so deleting a rejected owner and restoring a surviving owner never
+// split across batches). On store write failure, nk is recorded in
+// r.failedRollbacks and the error is returned. Caller must hold r.pendingMu.
+func (r *EvmRpc) applyStackRollbackLocked(nk evmNonceKey, key evmTxKey, rejectedHash ecommon.Hash) error {
 	stack := r.nonceStack[nk]
-	if sendErr == nil {
-		for i, a := range stack {
-			if a == attempt {
-				r.nonceStack[nk] = stack[i:]
-				break
-			}
-		}
-		r.reconcileDeferredOwnersLocked(key.sender, key.contract)
-		return
-	}
-
-	if isNonceTooLowErr(sendErr) {
-		attempt.rejected = true
-		r.pruneConfirmedNonceStacksLocked(key.sender, key.contract, tx.Nonce()+1)
-		r.txMu.Lock()
-		store := r.pendingTxStore
-		cur := r.pendingTx[key]
-		shouldDelete := cur != nil && (cur.nonce < tx.Nonce() || (cur.nonce == tx.Nonce() && cur.txHash == tx.Hash()))
-		r.txMu.Unlock()
-		if !shouldDelete {
-			r.reconcileDeferredOwnersLocked(key.sender, key.contract)
-			return
-		}
-		if store != nil {
-			if err := store.DeletePendingEvmTx(key.sender, key.contract, key.kind); err != nil {
-				r.logger.Errorf("failed to delete obsolete pending EVM tx record: %v", err)
-				return
-			}
-		}
-		r.txMu.Lock()
-		if cur := r.pendingTx[key]; cur != nil && (cur.nonce < tx.Nonce() || (cur.nonce == tx.Nonce() && cur.txHash == tx.Hash())) {
-			delete(r.pendingTx, key)
-		}
-		r.txMu.Unlock()
-		r.reconcileDeferredOwnersLocked(key.sender, key.contract)
-		return
-	}
-	if !isDefinitivePreMempoolRejection(sendErr) {
-		return
-	}
-
-	attempt.rejected = true
-	if len(stack) == 0 || stack[len(stack)-1] != attempt {
-		return
-	}
-
 	cut := len(stack)
 	for cut > 0 && stack[cut-1].rejected {
 		cut--
@@ -912,39 +796,20 @@ func (r *EvmRpc) reconcileSentTx(tx *etypes.Transaction, attempt *pendingAttempt
 	curOther := clonePendingEvmTx(r.pendingTx[otherKey])
 	r.txMu.Unlock()
 
-	// Reconcile surviving ownership across nonces and actions:
-	//   - If key's slot still belongs to attempt, restore the surviving owner
-	//     for key.kind (same nonce or highest-nonce fallback at another nonce),
-	//     and restore any surviving competing-action owner at tx.Nonce() unless
-	//     a higher-nonce reservation already occupies otherKey.
-	//   - If key's slot already moved on (e.g. a higher-nonce halt(6) is active
-	//     while older halt(5) rejects), preserve key's slot untouched while
-	//     still restoring any uncovered competing-action owner (e.g. accepted
-	//     setTss(5) beneath rejected halt(5)) if no newer reservation occupies
-	//     otherKey.
-	//   - If otherKey's slot is currently nil and another nonce still holds a
-	//     surviving owner of otherKey.kind (e.g. from an earlier rollback batch
-	//     write that transiently failed), include it in this atomic batch so
-	//     clearing the last halt slot never leaves accepted rotations lost.
-	ownsKey := curKey != nil && curKey.nonce == tx.Nonce() && curKey.txHash == tx.Hash()
+	ownsKey := curKey != nil && curKey.nonce == nk.nonce && curKey.txHash == rejectedHash
 	var keyReplacement *pendingAttempt
 	var otherReplacement *pendingAttempt
 	if ownsKey {
 		if surviving != nil && surviving.kind == key.kind {
 			keyReplacement = surviving
 		} else {
-			keyReplacement = r.findFallbackOwnerLocked(key.sender, key.contract, key.kind, true, tx.Nonce())
+			keyReplacement = r.findFallbackOwnerLocked(key.sender, key.contract, key.kind, true, nk.nonce)
 			if surviving != nil && (curOther == nil || curOther.nonce <= surviving.nonce) {
 				otherReplacement = surviving
 			}
 		}
 	} else if surviving != nil && surviving.kind != key.kind && (curOther == nil || curOther.nonce <= surviving.nonce) {
 		otherReplacement = surviving
-	}
-	if otherReplacement == nil && curOther == nil {
-		if deferredOther := r.findFallbackOwnerLocked(key.sender, key.contract, otherKey.kind, true, tx.Nonce()); deferredOther != nil {
-			otherReplacement = deferredOther
-		}
 	}
 
 	var ops []common.PendingEvmTxOp
@@ -975,10 +840,12 @@ func (r *EvmRpc) reconcileSentTx(tx *etypes.Transaction, attempt *pendingAttempt
 	}
 	if len(ops) > 0 && store != nil {
 		if err := store.ApplyPendingEvmTxBatch(ops); err != nil {
+			r.markFailedRollbackLocked(nk)
 			r.logger.Errorf("failed to atomically roll back rejected pending EVM tx record: %v", err)
-			return
+			return err
 		}
 	}
+	delete(r.failedRollbacks, nk)
 	if len(remaining) == 0 {
 		delete(r.nonceStack, nk)
 	} else {
@@ -998,6 +865,141 @@ func (r *EvmRpc) reconcileSentTx(tx *etypes.Transaction, attempt *pendingAttempt
 		}
 		r.txMu.Unlock()
 	}
+	return nil
+}
+
+// retryFailedRollbacksLocked retries only rollbacks that explicitly failed a
+// prior ApplyPendingEvmTxBatch write for (sender, contract), executing each
+// failed rollback's delete+restore atomically in nonce order. Unrelated
+// cleared reservations are never touched. Caller must hold r.pendingMu.
+func (r *EvmRpc) retryFailedRollbacksLocked(sender, contract ecommon.Address) error {
+	if len(r.failedRollbacks) == 0 {
+		return nil
+	}
+	var pending []evmNonceKey
+	for nk := range r.failedRollbacks {
+		if nk.sender == sender && nk.contract == contract {
+			pending = append(pending, nk)
+		}
+	}
+	if len(pending) == 0 {
+		return nil
+	}
+	sort.Slice(pending, func(i, j int) bool {
+		return pending[i].nonce < pending[j].nonce
+	})
+	for _, nk := range pending {
+		stack := r.nonceStack[nk]
+		if len(stack) == 0 || !stack[len(stack)-1].rejected {
+			delete(r.failedRollbacks, nk)
+			continue
+		}
+		lastRej := stack[len(stack)-1]
+		rejKey := evmTxKey{sender: nk.sender, contract: nk.contract, kind: lastRej.kind}
+		if err := r.applyStackRollbackLocked(nk, rejKey, lastRej.txHash); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// pruneConfirmedNonceStacksLocked discards nonce-lineage stacks and any failed
+// rollback markers for nonces already confirmed on-chain so rollbacks never
+// restore a mined transaction. Caller must hold r.pendingMu.
+func (r *EvmRpc) pruneConfirmedNonceStacksLocked(sender, contract ecommon.Address, confirmedNonce uint64) {
+	for nk := range r.nonceStack {
+		if nk.sender == sender && nk.contract == contract && nk.nonce < confirmedNonce {
+			delete(r.nonceStack, nk)
+		}
+	}
+	for nk := range r.failedRollbacks {
+		if nk.sender == sender && nk.contract == contract && nk.nonce < confirmedNonce {
+			delete(r.failedRollbacks, nk)
+		}
+	}
+}
+
+// reconcileSentTx updates or rolls back the pre-broadcast watermark based on
+// the broadcast outcome. Both setTss and halt attempts for a nonce share one
+// lineage stack under pendingMu so:
+//   - An accepted attempt collapses all older attempts below it.
+//   - Ambiguous failures (EOF, timeouts, underpriced) remain viable.
+//   - A rejected attempt that is no longer top of stack is marked rejected and
+//     never mutates durable storage while a newer owner is active.
+//   - When the top attempt is definitively rejected, any earlier failed
+//     rollbacks for (sender, contract) are retried atomically first, and then
+//     ALL trailing rejected attempts at tx.Nonce() unwind together in one
+//     atomic batch.
+func (r *EvmRpc) reconcileSentTx(tx *etypes.Transaction, attempt *pendingAttempt, sendErr error) {
+	if attempt == nil {
+		return
+	}
+	key, ok := evmTxKeyFromTx(tx)
+	if !ok {
+		return
+	}
+	r.pendingMu.Lock()
+	defer r.pendingMu.Unlock()
+
+	nk := evmNonceKey{sender: key.sender, contract: key.contract, nonce: tx.Nonce()}
+	stack := r.nonceStack[nk]
+	if sendErr == nil {
+		for i, a := range stack {
+			if a == attempt {
+				r.nonceStack[nk] = stack[i:]
+				break
+			}
+		}
+		delete(r.failedRollbacks, nk)
+		_ = r.retryFailedRollbacksLocked(key.sender, key.contract)
+		return
+	}
+
+	if isNonceTooLowErr(sendErr) {
+		attempt.rejected = true
+		r.pruneConfirmedNonceStacksLocked(key.sender, key.contract, tx.Nonce()+1)
+		r.txMu.Lock()
+		store := r.pendingTxStore
+		cur := r.pendingTx[key]
+		shouldDelete := cur != nil && (cur.nonce < tx.Nonce() || (cur.nonce == tx.Nonce() && cur.txHash == tx.Hash()))
+		r.txMu.Unlock()
+		if !shouldDelete {
+			_ = r.retryFailedRollbacksLocked(key.sender, key.contract)
+			return
+		}
+		if store != nil {
+			if err := store.DeletePendingEvmTx(key.sender, key.contract, key.kind); err != nil {
+				r.logger.Errorf("failed to delete obsolete pending EVM tx record: %v", err)
+				return
+			}
+		}
+		r.txMu.Lock()
+		if cur := r.pendingTx[key]; cur != nil && (cur.nonce < tx.Nonce() || (cur.nonce == tx.Nonce() && cur.txHash == tx.Hash())) {
+			delete(r.pendingTx, key)
+		}
+		r.txMu.Unlock()
+		_ = r.retryFailedRollbacksLocked(key.sender, key.contract)
+		return
+	}
+	if !isDefinitivePreMempoolRejection(sendErr) {
+		return
+	}
+
+	attempt.rejected = true
+	if len(stack) == 0 || stack[len(stack)-1] != attempt {
+		return
+	}
+
+	// Retry any earlier transiently failed rollbacks for (sender, contract)
+	// before applying this rollback so deferred restorations (e.g. setTss(5)
+	// beneath an earlier rejected halt(5)) recover before clearing the last
+	// halt slot. If an earlier rollback still fails to write, defer this
+	// rollback too instead of deleting the last reservation prematurely.
+	if err := r.retryFailedRollbacksLocked(key.sender, key.contract); err != nil {
+		r.markFailedRollbackLocked(nk)
+		return
+	}
+	_ = r.applyStackRollbackLocked(nk, key, tx.Hash())
 }
 
 func (r *EvmRpc) loadPendingTx(key evmTxKey) (*pendingEvmTx, error) {
@@ -1128,7 +1130,27 @@ func (r *EvmRpc) ClearObsoleteHaltTxContext(parent context.Context, sender ecomm
 			return txErr
 		}
 	}
-	r.clearPendingTxIfMatches(key, rec)
+	r.pendingMu.Lock()
+	r.clearPendingTxIfMatchesLocked(key, rec)
+	// With pendingNonce == confirmedNonce (empty mempool), any earlier dropped
+	// halt attempts at or below rec.nonce are also gone from the mempool.
+	for nk, st := range r.nonceStack {
+		if nk.sender != sender || nk.contract != r.bridgeAddress || nk.nonce > rec.nonce {
+			continue
+		}
+		var top *pendingAttempt
+		for i := len(st) - 1; i >= 0; i-- {
+			if !st[i].rejected {
+				top = st[i]
+				break
+			}
+		}
+		if top != nil && top.kind == evmTxKindHalt {
+			delete(r.nonceStack, nk)
+			delete(r.failedRollbacks, nk)
+		}
+	}
+	r.pendingMu.Unlock()
 	return nil
 }
 
@@ -1140,7 +1162,9 @@ func (r *EvmRpc) lookupPendingTx(key evmTxKey, confirmedNonce, pendingNonce uint
 	if _, err := r.loadPendingTxLocked(key); err != nil {
 		return nil, err
 	}
-	r.reconcileDeferredOwnersLocked(key.sender, key.contract)
+	if err := r.retryFailedRollbacksLocked(key.sender, key.contract); err != nil {
+		return nil, err
+	}
 
 	r.txMu.Lock()
 	prev := r.pendingTx[key]
@@ -1180,7 +1204,9 @@ func (r *EvmRpc) otherTrackedNonces(key evmTxKey, confirmedNonce uint64) (maxNex
 			return 0, 0, nil, false, loadErr
 		}
 	}
-	r.reconcileDeferredOwnersLocked(key.sender, key.contract)
+	if err := r.retryFailedRollbacksLocked(key.sender, key.contract); err != nil {
+		return 0, 0, nil, false, err
+	}
 	type staleEntry struct {
 		key evmTxKey
 		rec *pendingEvmTx

@@ -1166,28 +1166,38 @@ func (m *NetworksManager) SendHaltEvmWithExpected(batch EvmBatch, signatures [][
 // Staleness checks are applied per signed target so an unsigned or stale slot
 // in the batch never blocks another signed target from sending its halt.
 func (m *NetworksManager) SendHaltEvmWithExpectedContext(ctx context.Context, batch EvmBatch, signatures [][]byte, expectedTss []ecommon.Address, expectedNonces []*big.Int, ecdsaPrivateKey *ecdsa.PrivateKey, evmAddress ecommon.Address, while WhileEmergency) (bool, error) {
+	ok, _, err := m.SendHaltEvmWithExpectedTrackingContext(ctx, batch, signatures, expectedTss, expectedNonces, ecdsaPrivateKey, evmAddress, while)
+	return ok, err
+}
+
+// SendHaltEvmWithExpectedTrackingContext behaves like
+// SendHaltEvmWithExpectedContext and also reports the batch index of the signed
+// slot that actually completed a halt broadcast (or -1 if no slot reached a
+// successful broadcast in this call).
+func (m *NetworksManager) SendHaltEvmWithExpectedTrackingContext(ctx context.Context, batch EvmBatch, signatures [][]byte, expectedTss []ecommon.Address, expectedNonces []*big.Int, ecdsaPrivateKey *ecdsa.PrivateKey, evmAddress ecommon.Address, while WhileEmergency) (bool, int, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	if err := ctx.Err(); err != nil {
-		return false, err
+		return false, -1, err
 	}
 	targets, err := m.targets(batch, signatures)
 	if err != nil {
-		return false, err
+		return false, -1, err
 	}
 	// true means that all evm networks are halted
 	ok := true
+	submittedIdx := -1
 	var staleErr error
 	for _, target := range targets {
 		if err := ctx.Err(); err != nil {
-			return false, err
+			return false, submittedIdx, err
 		}
 		network, idx := target.network, target.index
 		halted, err := network.EvmRpc().HaltFlagSetContext(ctx)
 		if err != nil {
 			if ctx.Err() != nil {
-				return false, ctx.Err()
+				return false, submittedIdx, ctx.Err()
 			}
 			m.logger.Errorf("cannot read the halt flag of EVM network %d: %v", network.ChainId(), err)
 			ok = false
@@ -1208,7 +1218,7 @@ func (m *NetworksManager) SendHaltEvmWithExpectedContext(ctx context.Context, ba
 			curTss, err := network.GetCurrentTssContext(ctx)
 			if err != nil {
 				if ctx.Err() != nil {
-					return false, ctx.Err()
+					return false, submittedIdx, ctx.Err()
 				}
 				m.logger.Errorf("cannot read current TSS of EVM network %d: %v", network.ChainId(), err)
 				continue
@@ -1224,7 +1234,7 @@ func (m *NetworksManager) SendHaltEvmWithExpectedContext(ctx context.Context, ba
 			curNonce, err := network.EvmRpc().GetActionNonceContext(ctx)
 			if err != nil {
 				if ctx.Err() != nil {
-					return false, ctx.Err()
+					return false, submittedIdx, ctx.Err()
 				}
 				m.logger.Errorf("cannot read action nonce of EVM network %d: %v", network.ChainId(), err)
 				continue
@@ -1239,7 +1249,7 @@ func (m *NetworksManager) SendHaltEvmWithExpectedContext(ctx context.Context, ba
 		tx, err := network.GetHaltEvmTxContext(ctx, signatures[idx], evmAddress)
 		if err != nil {
 			if ctx.Err() != nil {
-				return false, ctx.Err()
+				return false, submittedIdx, ctx.Err()
 			}
 			m.logger.Error(err)
 			continue
@@ -1254,20 +1264,21 @@ func (m *NetworksManager) SendHaltEvmWithExpectedContext(ctx context.Context, ba
 		})
 		if err != nil {
 			if ctx.Err() != nil {
-				return false, ctx.Err()
+				return false, submittedIdx, ctx.Err()
 			}
 			m.logger.Error(err)
 			continue
 		}
 		if !sent {
-			return false, ErrEmergencyEnded
+			return false, submittedIdx, ErrEmergencyEnded
 		}
+		submittedIdx = idx
 		break
 	}
 	if staleErr != nil {
-		return false, staleErr
+		return false, submittedIdx, staleErr
 	}
-	return ok, nil
+	return ok, submittedIdx, nil
 }
 
 // IsBatchNetworkHaltedContext reports whether the EVM network at idx in batch

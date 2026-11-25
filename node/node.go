@@ -2270,7 +2270,6 @@ func (node *Node) publishEmergencyHalt(evmBatch network.EvmBatch, plan *emergenc
 					return
 				}
 				turnSigs := make([][]byte, len(plan.evmFullSignatures))
-				unhaltedTurnSlot := -1
 				for i, sig := range plan.evmFullSignatures {
 					if len(sig) == 0 {
 						continue
@@ -2300,11 +2299,8 @@ func (node *Node) publishEmergencyHalt(evmBatch network.EvmBatch, plan *emergenc
 						continue
 					}
 					turnSigs[i] = sig
-					if unhaltedTurnSlot == -1 {
-						unhaltedTurnSlot = i
-					}
 				}
-				changed, err := node.networksManager.SendHaltEvmWithExpectedContext(roundCtx, evmBatch, turnSigs, signedEvmTss, signedEvmNonces, node.ecdsaPrivateKey, node.evmAddress, node.state.WhileEmergency)
+				changed, submittedIdx, err := node.networksManager.SendHaltEvmWithExpectedTrackingContext(roundCtx, evmBatch, turnSigs, signedEvmTss, signedEvmNonces, node.ecdsaPrivateKey, node.evmAddress, node.state.WhileEmergency)
 				if roundCtx.Err() != nil {
 					return
 				}
@@ -2325,8 +2321,8 @@ func (node *Node) publishEmergencyHalt(evmBatch network.EvmBatch, plan *emergenc
 				case changed:
 					return
 				default:
-					if unhaltedTurnSlot >= 0 {
-						attemptedSignedEvm[unhaltedTurnSlot] = true
+					if submittedIdx >= 0 && submittedIdx < len(attemptedSignedEvm) {
+						attemptedSignedEvm[submittedIdx] = true
 					}
 					allSignedHalted, checkErr := node.allSignedEvmHalted(roundCtx, evmBatch, plan.evmFullSignatures)
 					if plan.hasFailedGroups && hasSignedEvm && checkErr == nil && allSignedHalted {
@@ -2337,7 +2333,7 @@ func (node *Node) publishEmergencyHalt(evmBatch network.EvmBatch, plan *emergenc
 					}
 					// Only refresh for an unsigned EVM chain's key rotation
 					// once EVERY signed EVM target is either confirmed halted
-					// or has had an actual submission opportunity.
+					// or actually completed a halt broadcast.
 					allHandled := (checkErr == nil && allSignedHalted) || node.allSignedEvmHaltedOrAttempted(roundCtx, evmBatch, plan.evmFullSignatures, attemptedSignedEvm)
 					if allHandled {
 						if node.anyUnsignedEvmKeyChanged(roundCtx, evmBatch, plan.evmFullSignatures, signedEvmTss) {
@@ -2346,7 +2342,7 @@ func (node *Node) publishEmergencyHalt(evmBatch network.EvmBatch, plan *emergenc
 							return
 						}
 					}
-					if unhaltedTurnSlot >= 0 && allHandled {
+					if submittedIdx >= 0 && allHandled {
 						if !sleepRound(15 * time.Second) {
 							return
 						}
