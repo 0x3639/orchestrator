@@ -1855,18 +1855,145 @@ type confirmedTokenPair struct {
 	minAmount     *big.Int
 }
 
-// resolveConfirmedTokenPairAtReceive replays the confirmed, PreviousHash-linked
-// bridge account chain strictly below wrapRecv (heights 1..wrapRecv.Height-1)
-// to reconstruct the applied TokenPair state in effect when wrapRecv executed
-// WrapToken. Because SetTokenPair uses go-zenon's two-step TimeChallenge (first
-// accepted call starts/replaces the challenge without mutating TokenPairs; the
-// matching second accepted call completes the challenge and applies the update),
-// replaying in chronological order distinguishes uncompleted proposals from
-// applied pair updates.
-func (node *Node) resolveConfirmedTokenPairAtReceive(networkClass, chainID uint32, tokenStandard types.ZenonTokenStandard, wrapRecv *api.AccountBlock, resignGen uint64) (pair confirmedTokenPair, found, stale, stop bool) {
-	if wrapRecv == nil || wrapRecv.Height <= 1 {
-		return confirmedTokenPair{}, false, false, false
+const (
+	tokenPairEventSetPair uint8 = iota + 1
+	tokenPairEventRemovePair
+	tokenPairEventSetNetwork
+	tokenPairEventRemoveNetwork
+)
+
+type confirmedTokenPairEvent struct {
+	height    uint64
+	kind      uint8
+	pairParam *definition.TokenPairParam
+	netParam  *definition.NetworkInfoParam
+}
+
+// confirmedTokenPairHistory caches the compact stream of confirmed, accepted
+// TokenPair/Network admin events replayed along the PreviousHash-linked bridge
+// account chain up to tipBlock. Replaying once per scan avoids O(N * H) block
+// reads across multi-wrap pre-publish batches while allowing exact per-height
+// state reconstruction at each wrap receive height.
+type confirmedTokenPairHistory struct {
+	tipBlock *api.AccountBlock
+	events   []confirmedTokenPairEvent
+}
+
+func (h *confirmedTokenPairHistory) reset() {
+	if h == nil {
+		return
 	}
+	h.tipBlock = nil
+	h.events = nil
+}
+
+// tokenPairBeforeHeight replays the cached admin events strictly before
+// wrapRecvHeight, mirroring go-zenon's two-step SetTokenPair TimeChallenge and
+// network/pair mutation rules.
+func (h *confirmedTokenPairHistory) tokenPairBeforeHeight(networkClass, chainID uint32, tokenStandard types.ZenonTokenStandard, wrapRecvHeight uint64) (confirmedTokenPair, bool) {
+	if h == nil || wrapRecvHeight <= 1 {
+		return confirmedTokenPair{}, false
+	}
+	type netKey struct {
+		class uint32
+		chain uint32
+	}
+	var pendingSetPairHash types.Hash
+	pairsByNet := make(map[netKey][]definition.TokenPair)
+	for _, ev := range h.events {
+		if ev.height >= wrapRecvHeight {
+			break
+		}
+		switch ev.kind {
+		case tokenPairEventSetPair:
+			param := ev.pairParam
+			paramsHash, err := types.BytesToHash(param.Hash())
+			if err != nil {
+				continue
+			}
+			// Mirror go-zenon TimeChallenge(context, "SetTokenPair", ...):
+			// an accepted call whose paramsHash differs from the pending
+			// challenge only starts/replaces the challenge; a matching
+			// accepted call completes it and mutates TokenPairs.
+			if paramsHash != pendingSetPairHash {
+				pendingSetPairHash = paramsHash
+				continue
+			}
+			pendingSetPairHash = types.ZeroHash
+			tp := definition.TokenPair{
+				TokenStandard: param.TokenStandard,
+				TokenAddress:  strings.ToLower(param.TokenAddress),
+				Bridgeable:    param.Bridgeable,
+				Redeemable:    param.Redeemable,
+				Owned:         param.Owned,
+				MinAmount:     param.MinAmount,
+				FeePercentage: param.FeePercentage,
+				RedeemDelay:   param.RedeemDelay,
+				Metadata:      param.Metadata,
+			}
+			key := netKey{class: param.NetworkClass, chain: param.ChainId}
+			list := pairsByNet[key]
+			replaced := false
+			for j := range list {
+				if list[j].TokenStandard == tp.TokenStandard || list[j].TokenAddress == tp.TokenAddress {
+					list[j] = tp
+					replaced = true
+					break
+				}
+			}
+			if !replaced {
+				list = append(list, tp)
+			}
+			pairsByNet[key] = list
+		case tokenPairEventRemovePair:
+			param := ev.pairParam
+			key := netKey{class: param.NetworkClass, chain: param.ChainId}
+			list := pairsByNet[key]
+			for j := range list {
+				if list[j].TokenStandard == param.TokenStandard && list[j].TokenAddress == param.TokenAddress {
+					pairsByNet[key] = append(list[:j], list[j+1:]...)
+					break
+				}
+			}
+		case tokenPairEventSetNetwork:
+			param := ev.netParam
+			pairsByNet[netKey{class: param.NetworkClass, chain: param.ChainId}] = nil
+		case tokenPairEventRemoveNetwork:
+			param := ev.netParam
+			delete(pairsByNet, netKey{class: param.NetworkClass, chain: param.ChainId})
+		}
+	}
+	for _, tp := range pairsByNet[netKey{class: networkClass, chain: chainID}] {
+		if tp.TokenStandard == tokenStandard {
+			return confirmedTokenPair{
+				tokenAddress:  tp.TokenAddress,
+				feePercentage: tp.FeePercentage,
+				bridgeable:    tp.Bridgeable,
+				minAmount:     tp.MinAmount,
+			}, true
+		}
+	}
+	return confirmedTokenPair{}, false
+}
+
+// ensureConfirmedTokenPairHistory advances cache along the confirmed,
+// PreviousHash-linked bridge account chain up to targetBlock. If cache.tipBlock
+// already equals targetBlock, no ledger RPCs are performed; if targetBlock
+// extends cache.tipBlock canonically, only the new delta is scanned; if the
+// verified chain rolled back, cache is invalidated and consistent=false is
+// returned. Passing resignGen == 0 skips resign-generation staleness checks.
+func (node *Node) ensureConfirmedTokenPairHistory(targetBlock *api.AccountBlock, cache *confirmedTokenPairHistory, resignGen uint64) (consistent, stale, stop bool) {
+	if targetBlock == nil || targetBlock.Height == 0 || !isConfirmedBridgeBlock(targetBlock) {
+		cache.reset()
+		return false, false, false
+	}
+	if cache == nil {
+		return false, false, false
+	}
+	if cache.tipBlock != nil && sameAccountBlockFrontier(cache.tipBlock, targetBlock) {
+		return true, false, false
+	}
+
 	setPairID := definition.ABIBridge.Methods[definition.SetTokenPairMethod].Id()
 	removePairID := definition.ABIBridge.Methods[definition.RemoveTokenPairMethodName].Id()
 	setNetID := definition.ABIBridge.Methods[definition.SetNetworkMethodName].Id()
@@ -1877,36 +2004,59 @@ func (node *Node) resolveConfirmedTokenPairAtReceive(networkClass, chainID uint3
 			(len(data) >= len(setNetID) && bytes.Equal(data[:len(setNetID)], setNetID)) ||
 			(len(data) >= len(removeNetID) && bytes.Equal(data[:len(removeNetID)], removeNetID))
 	}
-	type netKey struct {
-		class uint32
-		chain uint32
-	}
 
-	targetHeight := wrapRecv.Height - 1
 	for {
 		if node.workerStopping() {
-			return confirmedTokenPair{}, false, false, true
+			return false, false, true
 		}
-		if !node.state.IsResignGenerationCurrent(resignGen) {
-			return confirmedTokenPair{}, false, true, false
+		if resignGen != 0 && !node.state.IsResignGenerationCurrent(resignGen) {
+			return false, true, false
 		}
 
+		startHeight := uint64(1)
 		var prevHash types.Hash
-		var pendingSetPairHash types.Hash
-		pairsByNet := make(map[netKey][]definition.TokenPair)
+		if cache.tipBlock != nil {
+			if targetBlock.Height <= cache.tipBlock.Height {
+				// Chain rolled back below our cached tip.
+				cache.reset()
+				return false, false, false
+			}
+			ancCtx, ancCancel := context.WithTimeout(node.workers.context(), resignRPCTimeout)
+			blocks, err := node.networksManager.Znn().GetAccountBlocksByHeightContext(ancCtx, types.BridgeContract, cache.tipBlock.Height, 1)
+			ancCancel()
+			if node.workerStopping() {
+				return false, false, true
+			}
+			if err != nil {
+				node.logger.Debugf("failed to verify cached token pair tip %d: %v", cache.tipBlock.Height, err)
+				if !node.workerSleep(resignRetryDelay) {
+					return false, false, true
+				}
+				continue
+			}
+			if blocks == nil || len(blocks.List) == 0 || blocks.List[0] == nil ||
+				!isConfirmedBridgeBlock(blocks.List[0]) || !sameAccountBlockFrontier(cache.tipBlock, blocks.List[0]) {
+				cache.reset()
+				return false, false, false
+			}
+			startHeight = cache.tipBlock.Height + 1
+			prevHash = cache.tipBlock.Hash
+		}
+
+		deltaEvents := make([]confirmedTokenPairEvent, 0)
 		needRetry := false
 		rolledBack := false
 
-		for lo := uint64(1); lo <= targetHeight; {
+		for lo := startHeight; lo <= targetBlock.Height; {
 			if node.workerStopping() {
-				return confirmedTokenPair{}, false, false, true
+				return false, false, true
 			}
-			if !node.state.IsResignGenerationCurrent(resignGen) {
-				return confirmedTokenPair{}, false, true, false
+			if resignGen != 0 && !node.state.IsResignGenerationCurrent(resignGen) {
+				return false, true, false
 			}
 			hi := lo + api.RpcMaxCountSize - 1
-			if hi > targetHeight {
-				hi = targetHeight
+			if hi > targetBlock.Height {
+				hi = targetBlock.Height
 			}
 			count := hi - lo + 1
 
@@ -1914,10 +2064,10 @@ func (node *Node) resolveConfirmedTokenPairAtReceive(networkClass, chainID uint3
 			page, err := node.networksManager.Znn().GetAccountBlocksByHeightContext(pageCtx, types.BridgeContract, lo, count)
 			pageCancel()
 			if node.workerStopping() {
-				return confirmedTokenPair{}, false, false, true
+				return false, false, true
 			}
 			if err != nil {
-				node.logger.Debugf("failed to read bridge blocks [%d..%d] for token pair state: %v", lo, hi, err)
+				node.logger.Debugf("failed to read bridge blocks [%d..%d] for token pair history: %v", lo, hi, err)
 				needRetry = true
 				break
 			}
@@ -1942,6 +2092,10 @@ func (node *Node) resolveConfirmedTokenPairAtReceive(networkClass, chainID uint3
 					rolledBack = true
 					break
 				}
+				if expectedHeight == targetBlock.Height && !sameAccountBlockFrontier(targetBlock, b) {
+					rolledBack = true
+					break
+				}
 				prevHash = b.Hash
 
 				if !isAcceptedReceiveBlock(b) {
@@ -1957,7 +2111,7 @@ func (node *Node) resolveConfirmedTokenPairAtReceive(networkClass, chainID uint3
 				send, err := node.networksManager.Znn().GetAccountBlockByHashContext(sendCtx, b.FromBlockHash)
 				sendCancel()
 				if node.workerStopping() {
-					return confirmedTokenPair{}, false, false, true
+					return false, false, true
 				}
 				if err != nil {
 					node.logger.Debugf("failed to verify token pair send %s in momentumStore: %v", b.FromBlockHash, err)
@@ -1981,7 +2135,7 @@ func (node *Node) resolveConfirmedTokenPairAtReceive(networkClass, chainID uint3
 				momList, err := node.networksManager.Znn().GetMomentumsByHeightContext(momCtx, b.ConfirmationDetail.MomentumHeight, 1)
 				momCancel()
 				if node.workerStopping() {
-					return confirmedTokenPair{}, false, false, true
+					return false, false, true
 				}
 				if err != nil {
 					needRetry = true
@@ -1999,69 +2153,41 @@ func (node *Node) resolveConfirmedTokenPairAtReceive(networkClass, chainID uint3
 					if err := definition.ABIBridge.UnpackMethod(param, definition.SetTokenPairMethod, send.Data); err != nil {
 						continue
 					}
-					paramsHash, err := types.BytesToHash(param.Hash())
-					if err != nil {
-						continue
-					}
-					// Mirror go-zenon TimeChallenge(context, "SetTokenPair", ...):
-					// an accepted call whose paramsHash differs from the pending
-					// challenge only starts/replaces the challenge; a matching
-					// accepted call completes it and mutates TokenPairs.
-					if paramsHash != pendingSetPairHash {
-						pendingSetPairHash = paramsHash
-						continue
-					}
-					pendingSetPairHash = types.ZeroHash
-					tp := definition.TokenPair{
-						TokenStandard: param.TokenStandard,
-						TokenAddress:  strings.ToLower(param.TokenAddress),
-						Bridgeable:    param.Bridgeable,
-						Redeemable:    param.Redeemable,
-						Owned:         param.Owned,
-						MinAmount:     param.MinAmount,
-						FeePercentage: param.FeePercentage,
-						RedeemDelay:   param.RedeemDelay,
-						Metadata:      param.Metadata,
-					}
-					key := netKey{class: param.NetworkClass, chain: param.ChainId}
-					list := pairsByNet[key]
-					replaced := false
-					for j := range list {
-						if list[j].TokenStandard == tp.TokenStandard || list[j].TokenAddress == tp.TokenAddress {
-							list[j] = tp
-							replaced = true
-							break
-						}
-					}
-					if !replaced {
-						list = append(list, tp)
-					}
-					pairsByNet[key] = list
+					deltaEvents = append(deltaEvents, confirmedTokenPairEvent{
+						height:    expectedHeight,
+						kind:      tokenPairEventSetPair,
+						pairParam: param,
+					})
 				case len(send.Data) >= len(removePairID) && bytes.Equal(send.Data[:len(removePairID)], removePairID):
 					param := new(definition.TokenPairParam)
 					if err := definition.ABIBridge.UnpackMethod(param, definition.RemoveTokenPairMethodName, send.Data); err != nil {
 						continue
 					}
-					key := netKey{class: param.NetworkClass, chain: param.ChainId}
-					list := pairsByNet[key]
-					for j := range list {
-						if list[j].TokenStandard == param.TokenStandard && list[j].TokenAddress == param.TokenAddress {
-							pairsByNet[key] = append(list[:j], list[j+1:]...)
-							break
-						}
-					}
+					deltaEvents = append(deltaEvents, confirmedTokenPairEvent{
+						height:    expectedHeight,
+						kind:      tokenPairEventRemovePair,
+						pairParam: param,
+					})
 				case len(send.Data) >= len(setNetID) && bytes.Equal(send.Data[:len(setNetID)], setNetID):
 					param := new(definition.NetworkInfoParam)
 					if err := definition.ABIBridge.UnpackMethod(param, definition.SetNetworkMethodName, send.Data); err != nil {
 						continue
 					}
-					pairsByNet[netKey{class: param.NetworkClass, chain: param.ChainId}] = nil
+					deltaEvents = append(deltaEvents, confirmedTokenPairEvent{
+						height:   expectedHeight,
+						kind:     tokenPairEventSetNetwork,
+						netParam: param,
+					})
 				case len(send.Data) >= len(removeNetID) && bytes.Equal(send.Data[:len(removeNetID)], removeNetID):
 					param := new(definition.NetworkInfoParam)
 					if err := definition.ABIBridge.UnpackMethod(param, definition.RemoveNetworkMethodName, send.Data); err != nil {
 						continue
 					}
-					delete(pairsByNet, netKey{class: param.NetworkClass, chain: param.ChainId})
+					deltaEvents = append(deltaEvents, confirmedTokenPairEvent{
+						height:   expectedHeight,
+						kind:     tokenPairEventRemoveNetwork,
+						netParam: param,
+					})
 				}
 			}
 
@@ -2072,28 +2198,22 @@ func (node *Node) resolveConfirmedTokenPairAtReceive(networkClass, chainID uint3
 		}
 
 		if rolledBack {
-			return confirmedTokenPair{}, false, false, false
+			cache.reset()
+			return false, false, false
 		}
 		if needRetry {
 			if !node.workerSleep(resignRetryDelay) {
-				return confirmedTokenPair{}, false, false, true
+				return false, false, true
 			}
 			continue
 		}
-		if prevHash != wrapRecv.PreviousHash {
-			return confirmedTokenPair{}, false, false, false
+		if prevHash != targetBlock.Hash {
+			cache.reset()
+			return false, false, false
 		}
-		for _, tp := range pairsByNet[netKey{class: networkClass, chain: chainID}] {
-			if tp.TokenStandard == tokenStandard {
-				return confirmedTokenPair{
-					tokenAddress:  tp.TokenAddress,
-					feePercentage: tp.FeePercentage,
-					bridgeable:    tp.Bridgeable,
-					minAmount:     tp.MinAmount,
-				}, true, false, false
-			}
-		}
-		return confirmedTokenPair{}, false, false, false
+		cache.events = append(cache.events, deltaEvents...)
+		cache.tipBlock = targetBlock
+		return true, false, false
 	}
 }
 
@@ -2103,9 +2223,10 @@ func (node *Node) resolveConfirmedTokenPairAtReceive(networkClass, chainID uint3
 // block whose paired bridge receive block succeeded (execution status == 1, not
 // rolled-back status == 2), matches wrap's full signing payload (including
 // TokenAddress and Fee derived from confirmed SetTokenPair execution state at
-// recv.Height) and CreationMomentumHeight, and is anchored in the canonical
-// momentum chain and canonical bridge account chain at or below anchor.
-func (node *Node) verifyWrapConfirmedInLedger(wrap *definition.WrapTokenRequest, anchor reSignChainAnchor, resignGen uint64) (confirmed, stale, stop bool) {
+// recv.Height via pairHistory) and CreationMomentumHeight, and is anchored in
+// the canonical momentum chain and canonical bridge account chain at or below
+// anchor. Passing resignGen == 0 skips resign-generation staleness checks.
+func (node *Node) verifyWrapConfirmedInLedger(wrap *definition.WrapTokenRequest, anchor reSignChainAnchor, pairHistory *confirmedTokenPairHistory, resignGen uint64) (confirmed, stale, stop bool) {
 	if wrap == nil || wrap.Amount == nil || wrap.Fee == nil {
 		return false, false, false
 	}
@@ -2116,7 +2237,7 @@ func (node *Node) verifyWrapConfirmedInLedger(wrap *definition.WrapTokenRequest,
 		if node.workerStopping() {
 			return false, false, true
 		}
-		if !node.state.IsResignGenerationCurrent(resignGen) {
+		if resignGen != 0 && !node.state.IsResignGenerationCurrent(resignGen) {
 			return false, true, false
 		}
 		ctx, cancel := context.WithTimeout(node.workers.context(), resignRPCTimeout)
@@ -2222,13 +2343,25 @@ func (node *Node) verifyWrapConfirmedInLedger(wrap *definition.WrapTokenRequest,
 
 		// Bind TokenAddress and Fee (both inputs to the wrap signing digest) to
 		// the confirmed TokenPair execution state active when recv executed.
-		pair, pairFound, pairStale, pairStop := node.resolveConfirmedTokenPairAtReceive(wrap.NetworkClass, wrap.ChainId, send.TokenStandard, recv, resignGen)
-		if pairStop {
+		history := pairHistory
+		if history == nil {
+			history = &confirmedTokenPairHistory{}
+		}
+		historyTarget := anchor.bridgeBlock
+		if historyTarget == nil || historyTarget.Height < recv.Height {
+			historyTarget = recv
+		}
+		histConsistent, histStale, histStop := node.ensureConfirmedTokenPairHistory(historyTarget, history, resignGen)
+		if histStop {
 			return false, false, true
 		}
-		if pairStale {
+		if histStale {
 			return false, true, false
 		}
+		if !histConsistent {
+			return false, false, false
+		}
+		pair, pairFound := history.tokenPairBeforeHeight(wrap.NetworkClass, wrap.ChainId, send.TokenStandard, recv.Height)
 		if !pairFound || !pair.bridgeable || (pair.minAmount != nil && send.Amount.Cmp(pair.minAmount) < 0) {
 			return false, false, false
 		}
@@ -2321,7 +2454,7 @@ func (node *Node) fetchAnchoredWrapPage(pageIndex, pageSize uint32, anchor reSig
 // verifyStraddledWraps confirms by ID that every <= cutoff wrap collected from
 // a straddling page still exists on the canonical Zenon chain with matching
 // metadata, updating finality from the verified read and rejecting orphaned rows.
-func (node *Node) verifyStraddledWraps(wraps []*embedded.WrapTokenRequest, straddledIDs map[types.Hash]struct{}, anchor reSignChainAnchor, resignGen uint64) (nextAnchor reSignChainAnchor, ok, stale, stop bool) {
+func (node *Node) verifyStraddledWraps(wraps []*embedded.WrapTokenRequest, straddledIDs map[types.Hash]struct{}, anchor reSignChainAnchor, pairHistory *confirmedTokenPairHistory, resignGen uint64) (nextAnchor reSignChainAnchor, ok, stale, stop bool) {
 	cur := anchor
 	for i, w := range wraps {
 		if _, needsCheck := straddledIDs[w.Id]; !needsCheck {
@@ -2391,7 +2524,7 @@ func (node *Node) verifyStraddledWraps(wraps []*embedded.WrapTokenRequest, strad
 				cur.bridgeBlock = postAnchor.bridgeBlock
 				continue
 			}
-			ledgerConfirmed, staleLedger, stopLedger := node.verifyWrapConfirmedInLedger(got.WrapTokenRequest, postAnchor, resignGen)
+			ledgerConfirmed, staleLedger, stopLedger := node.verifyWrapConfirmedInLedger(got.WrapTokenRequest, postAnchor, pairHistory, resignGen)
 			if staleLedger || stopLedger {
 				return reSignChainAnchor{}, false, staleLedger, stopLedger
 			}
@@ -2416,7 +2549,7 @@ func (node *Node) verifyStraddledWraps(wraps []*embedded.WrapTokenRequest, strad
 // frontier momentum cutoff on a single consistent (rollback-free) chain view,
 // and returns the chain anchor so runReSignScan can revalidate consistency
 // across finality/eligibility waits before publishing flags.
-func (node *Node) captureReSignSnapshot(resignNetworkClass, resignChainId uint32, resignGen uint64) (wraps []*embedded.WrapTokenRequest, anchor reSignChainAnchor, stale, stop bool) {
+func (node *Node) captureReSignSnapshot(resignNetworkClass, resignChainId uint32, pairHistory *confirmedTokenPairHistory, resignGen uint64) (wraps []*embedded.WrapTokenRequest, anchor reSignChainAnchor, stale, stop bool) {
 	pageSize := resignPageSize
 	if pageSize == 0 {
 		pageSize = 100
@@ -2698,7 +2831,7 @@ func (node *Node) captureReSignSnapshot(resignNetworkClass, resignChainId uint32
 					collected[k] = coveredByRevIdx[k]
 				}
 				boundaryBlock := curAnchor.bridgeBlock
-				verifiedAnchor, verified, staleVerify, stopVerify := node.verifyStraddledWraps(collected, straddledIDs, curAnchor, resignGen)
+				verifiedAnchor, verified, staleVerify, stopVerify := node.verifyStraddledWraps(collected, straddledIDs, curAnchor, pairHistory, resignGen)
 				if staleVerify || stopVerify {
 					return nil, reSignChainAnchor{}, staleVerify, stopVerify
 				}
@@ -2781,9 +2914,10 @@ func (node *Node) captureReSignSnapshot(resignNetworkClass, resignChainId uint32
 func (node *Node) runReSignScan() bool {
 	resignNetworkClass, resignChainId, resignGen := node.state.GetResignTarget()
 	node.logger.Debug("Parsing all the wraps in resign state")
+	pairHistory := &confirmedTokenPairHistory{}
 
 	for {
-		snapshot, anchor, staleResign, stop := node.captureReSignSnapshot(resignNetworkClass, resignChainId, resignGen)
+		snapshot, anchor, staleResign, stop := node.captureReSignSnapshot(resignNetworkClass, resignChainId, pairHistory, resignGen)
 		if stop {
 			return false
 		}
@@ -3041,13 +3175,30 @@ func (node *Node) runReSignScan() bool {
 				node.logger.Debug("Zenon frontier rolled back before publishing resign batch; discarding staged batch and restarting")
 				rolledBack = true
 			} else {
+				// Replay confirmed TokenPair/Network history once up to
+				// finalAnchor.bridgeBlock (delta-extending any prior verified
+				// replay, or invalidating on rollback) and reuse it for every
+				// staged wrap in this batch.
+				histConsistent, histStale, histStop := node.ensureConfirmedTokenPairHistory(finalAnchor.bridgeBlock, pairHistory, resignGen)
+				if histStop {
+					return false
+				}
+				if histStale {
+					staleResign = true
+				} else if !histConsistent {
+					node.logger.Debug("Zenon bridge history changed while replaying confirmed token pair state; discarding staged batch and restarting")
+					rolledBack = true
+				}
 				for _, w := range stagedEligible {
+					if staleResign || rolledBack {
+						break
+					}
 					if !wrapDefFinalizedAtMomentum(w, finalAnchor.finalityMom, reqConf) {
 						node.logger.Debugf("staged wrap %s is no longer finalized at verified momentum %d (required %d); discarding staged batch and restarting", w.Id, finalAnchor.finalityMom, reqConf)
 						rolledBack = true
 						break
 					}
-					ledgerConfirmed, staleLedger, stopLedger := node.verifyWrapConfirmedInLedger(w, finalAnchor, resignGen)
+					ledgerConfirmed, staleLedger, stopLedger := node.verifyWrapConfirmedInLedger(w, finalAnchor, pairHistory, resignGen)
 					if stopLedger {
 						return false
 					}
@@ -3178,11 +3329,54 @@ func (node *Node) requireLiveTransfers() error {
 	return nil
 }
 
+// revalidateLegacyResignWrap verifies a pre-upgrade local resign row (flag == 1,
+// persisted before PublishResignWraps wrote versioned verified markers) against
+// Zenon's confirmed momentumStore and applied SetTokenPair state, refreshes the
+// local row and upgrades its resign marker to verified via PublishResignWraps.
+func (node *Node) revalidateLegacyResignWrap(id types.Hash, pairHistory *confirmedTokenPairHistory) (*definition.WrapTokenRequest, bool, error) {
+	momCtx, momCancel := context.WithTimeout(node.workers.context(), resignRPCTimeout)
+	mom, err := node.networksManager.Znn().GetFrontierMomentumContext(momCtx)
+	momCancel()
+	if err != nil || mom == nil || mom.Momentum == nil || mom.Height == 0 {
+		return nil, false, nil
+	}
+	initAnchor := reSignChainAnchor{
+		cutoffMomentum: mom.Height,
+		cutoffHash:     mom.Hash,
+		finalityMom:    mom.Height,
+		finalityHash:   mom.Hash,
+		observedMom:    mom.Height,
+	}
+	anchor, consistent, retryCheck, stopCheck := node.checkZenonAnchorConsistent(initAnchor, false)
+	if stopCheck || retryCheck || !consistent || anchor.bridgeBlock == nil || anchor.bridgeBlock.Height == 0 {
+		return nil, false, nil
+	}
+	ctx, cancel := context.WithTimeout(node.workers.context(), resignRPCTimeout)
+	wrap, err := node.networksManager.Znn().GetWrapTokenRequestByIdContext(ctx, id)
+	cancel()
+	if err != nil || wrap == nil || wrap.WrapTokenRequest == nil || wrap.Id != id {
+		return nil, false, nil
+	}
+	confirmed, _, stop := node.verifyWrapConfirmedInLedger(wrap.WrapTokenRequest, anchor, pairHistory, 0)
+	if stop || !confirmed {
+		return nil, false, nil
+	}
+	_, postConsistent, postRetry, postStop := node.checkZenonAnchorConsistent(anchor, false)
+	if postStop || postRetry || !postConsistent {
+		return nil, false, nil
+	}
+	if err := node.networksManager.PublishResignWraps([]*definition.WrapTokenRequest{wrap.WrapTokenRequest}); err != nil {
+		return nil, false, err
+	}
+	return wrap.WrapTokenRequest, true, nil
+}
+
 // buildWrapSigningBatch collects and deduplicates wrap candidates for signing.
-// Verified local re-sign rows take precedence over unsigned RPC rows for the
-// same wrap ID (both for payload selection and pool-size priority) so an
-// unverified unsigned RPC row cannot displace or overwrite a ledger-verified
-// re-sign payload.
+// Verified local re-sign rows (marker written by PublishResignWraps) take
+// precedence over unsigned RPC rows for the same wrap ID (both for payload
+// selection and pool-size priority). Legacy pre-upgrade re-sign rows (written
+// by SetResignStatus without payload verification) are revalidated against
+// confirmed ledger state before signing and never gain unverified precedence.
 func (node *Node) buildWrapSigningBatch() ([]*definition.WrapTokenRequest, [][]byte, map[string]int, error) {
 	unsignedWraps, err := node.networksManager.GetUnsignedWrapRequests()
 	if err != nil {
@@ -3198,12 +3392,37 @@ func (node *Node) buildWrapSigningBatch() ([]*definition.WrapTokenRequest, [][]b
 
 	wrapRequestsIds := make([]*definition.WrapTokenRequest, 0, len(resignableWraps)+len(unsignedWraps))
 	seen := make(map[types.Hash]struct{}, len(resignableWraps)+len(unsignedWraps))
+	blockedLegacy := make(map[types.Hash]struct{})
+	var legacyPairHistory *confirmedTokenPairHistory
 	for _, req := range resignableWraps {
 		if req == nil {
 			continue
 		}
 		if _, dup := seen[req.Id]; dup {
 			continue
+		}
+		verified, err := node.networksManager.IsVerifiedResignWrap(req.Id)
+		if err != nil {
+			node.logger.Error(err)
+			common.RequestStop(node.stopChan)
+			return nil, nil, nil, err
+		}
+		if !verified {
+			if legacyPairHistory == nil {
+				legacyPairHistory = &confirmedTokenPairHistory{}
+			}
+			refreshed, ok, err := node.revalidateLegacyResignWrap(req.Id, legacyPairHistory)
+			if err != nil {
+				node.logger.Error(err)
+				common.RequestStop(node.stopChan)
+				return nil, nil, nil, err
+			}
+			if !ok {
+				node.logger.Debugf("skipping unverified legacy resign wrap %s until confirmed ledger revalidation succeeds", req.Id)
+				blockedLegacy[req.Id] = struct{}{}
+				continue
+			}
+			req = refreshed
 		}
 		seen[req.Id] = struct{}{}
 		wrapRequestsIds = append(wrapRequestsIds, req)
@@ -3213,6 +3432,9 @@ func (node *Node) buildWrapSigningBatch() ([]*definition.WrapTokenRequest, [][]b
 			continue
 		}
 		if _, dup := seen[req.Id]; dup {
+			continue
+		}
+		if _, blocked := blockedLegacy[req.Id]; blocked {
 			continue
 		}
 		seen[req.Id] = struct{}{}
@@ -3234,7 +3456,7 @@ func (node *Node) buildWrapSigningBatch() ([]*definition.WrapTokenRequest, [][]b
 			common.RequestStop(node.stopChan)
 			return nil, nil, nil, err
 		}
-		resignStatus := false
+		verifiedResign := false
 		if event == nil {
 			// if the rpc returns it but we don't have it locally there was a problem
 			// if we don't have it we just add it now
@@ -3253,7 +3475,7 @@ func (node *Node) buildWrapSigningBatch() ([]*definition.WrapTokenRequest, [][]b
 				return nil, nil, nil, err
 			}
 		} else {
-			resignStatus, err = node.networksManager.GetResignStatus(event.Id)
+			resignStatus, err := node.networksManager.GetResignStatus(event.Id)
 			if err != nil {
 				node.logger.Error(err)
 				common.RequestStop(node.stopChan)
@@ -3262,13 +3484,24 @@ func (node *Node) buildWrapSigningBatch() ([]*definition.WrapTokenRequest, [][]b
 			if !resignStatus && len(event.Signature) > 0 {
 				continue
 			}
+			if resignStatus {
+				verifiedResign, err = node.networksManager.IsVerifiedResignWrap(event.Id)
+				if err != nil {
+					node.logger.Error(err)
+					common.RequestStop(node.stopChan)
+					return nil, nil, nil, err
+				}
+				if !verifiedResign {
+					continue
+				}
+			}
 		}
 
-		// When the local row is marked for re-signing, always sign the verified
-		// local payload written by PublishResignWraps rather than an unsigned RPC
-		// row that may have raced ahead of it.
+		// When the local row holds a verified resign marker written by
+		// PublishResignWraps, always sign the verified local payload rather
+		// than an unverified unsigned RPC row.
 		var signingEvent events.WrapRequestZnn
-		if resignStatus {
+		if verifiedResign {
 			signingEvent = *event
 			wrapRequestsIds[idx] = common.OrchestratorWrapToZnnWrap(event)
 		} else {

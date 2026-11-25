@@ -457,37 +457,53 @@ func (es *eventStore) SetLastUpdateHeight(accBlHeight uint64) error {
 	return nil
 }
 
+const (
+	resignStatusNone     uint32 = 0
+	resignStatusLegacy   uint32 = 1
+	resignStatusVerified uint32 = 2
+)
+
 func getResignedStatusKey(id types.Hash) []byte {
 	return zcommon.JoinBytes(resignedStatusPrefix, id.Bytes())
 }
 
-func (es *eventStore) GetResignStatus(id types.Hash) (bool, error) {
+func (es *eventStore) getResignStatusValue(id types.Hash) (uint32, error) {
 	data, err := es.DB.Get(getResignedStatusKey(id))
 	if errors.Is(err, leveldb.ErrNotFound) {
-		return false, nil
+		return resignStatusNone, nil
 	}
-
 	if err != nil {
 		es.SendSigInt()
-		return false, err
+		return resignStatusNone, err
 	}
 	if err := db.CheckFixedWidth(fmt.Sprintf("Zenon wrap resign status for %s (key 0x02)", id), data, 4); err != nil {
 		es.SendSigInt()
+		return resignStatusNone, err
+	}
+	return binary.LittleEndian.Uint32(data), nil
+}
+
+func (es *eventStore) GetResignStatus(id types.Hash) (bool, error) {
+	value, err := es.getResignStatusValue(id)
+	if err != nil {
 		return false, err
 	}
-	value := binary.LittleEndian.Uint32(data)
-	ans := false
-	if value > 0 {
-		ans = true
+	return value > resignStatusNone, nil
+}
+
+func (es *eventStore) IsVerifiedResignWrap(id types.Hash) (bool, error) {
+	value, err := es.getResignStatusValue(id)
+	if err != nil {
+		return false, err
 	}
-	return ans, nil
+	return value >= resignStatusVerified, nil
 }
 
 func (es *eventStore) SetResignStatus(id types.Hash, status bool) error {
 	bytes := make([]byte, 4)
-	value := uint32(0)
+	value := resignStatusNone
 	if status {
-		value = 1
+		value = resignStatusLegacy
 	}
 	binary.LittleEndian.PutUint32(bytes, value)
 	if err := es.DB.Put(getResignedStatusKey(id), bytes); err != nil {
@@ -499,8 +515,8 @@ func (es *eventStore) SetResignStatus(id types.Hash, status bool) error {
 
 // PublishResignWraps atomically persists any missing wrap records, refreshes
 // existing unredeemed rows with the validated canonical wrap signing payload,
-// and sets their resign flags in a single durable batch. Rows that have already
-// moved past UnredeemedStatus are skipped.
+// and sets their verified resign markers in a single durable batch. Rows that
+// have already moved past UnredeemedStatus are skipped.
 func (es *eventStore) PublishResignWraps(wraps []events.WrapRequestZnn) error {
 	if len(wraps) == 0 {
 		return nil
@@ -509,7 +525,7 @@ func (es *eventStore) PublishResignWraps(wraps []events.WrapRequestZnn) error {
 	defer es.mu.Unlock()
 
 	var resignTrue [4]byte
-	binary.LittleEndian.PutUint32(resignTrue[:], 1)
+	binary.LittleEndian.PutUint32(resignTrue[:], resignStatusVerified)
 
 	entries := make([]kvEntry, 0, len(wraps)*2)
 	seen := make(map[types.Hash]struct{}, len(wraps))

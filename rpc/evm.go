@@ -2,6 +2,7 @@ package rpc
 
 import (
 	"context"
+	stderrors "errors"
 	"fmt"
 	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/accounts/abi"
@@ -10,6 +11,7 @@ import (
 	"github.com/ethereum/go-ethereum/common/hexutil"
 	etypes "github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/ethclient"
+	gethrpc "github.com/ethereum/go-ethereum/rpc"
 	"github.com/pkg/errors"
 	"github.com/zenon-network/go-zenon/common/types"
 	"github.com/zenon-network/go-zenon/vm/embedded/definition"
@@ -76,6 +78,12 @@ func verifyEvmChainID(parent context.Context, client *ethclient.Client, expected
 	defer cancel()
 	got, err := client.ChainID(ctx)
 	if err != nil {
+		// Never surface raw HTTP error bodies (which can echo credential-bearing
+		// path or query components); report only the status code for HTTP errors.
+		var httpErr gethrpc.HTTPError
+		if stderrors.As(err, &httpErr) {
+			return fmt.Errorf("network %s (%s): failed to verify eth_chainId: HTTP %d", networkName, config.RedactURL(url), httpErr.StatusCode)
+		}
 		return fmt.Errorf("network %s (%s): failed to verify eth_chainId: %s", networkName, config.RedactURL(url), config.RedactErrorForURL(err, url))
 	}
 	if got == nil || !got.IsUint64() || got.Uint64() != uint64(expectedChainId) {

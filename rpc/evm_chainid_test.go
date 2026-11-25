@@ -89,10 +89,11 @@ func TestEvmDialAndChainIDErrorsRedactCredentials(t *testing.T) {
 		}
 	}
 
-	// 2. HTTP error during eth_chainId on a credential-bearing URL must also
-	// scrub userinfo, path, and query parameters from the returned error.
+	// 2. HTTP error during eth_chainId whose response body echoes the request
+	// path and query string must report only the status code and never leak
+	// userinfo, path, or query credentials.
 	failingSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		http.Error(w, "unauthorized for "+r.URL.RequestURI(), http.StatusUnauthorized)
 	}))
 	defer failingSrv.Close()
 	host := strings.TrimPrefix(failingSrv.URL, "http://")
@@ -101,9 +102,21 @@ func TestEvmDialAndChainIDErrorsRedactCredentials(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected eth_chainId failure on HTTP 401 server")
 	}
-	for _, secret := range []string{"chainsecret", "chain-api-key", "chaintoken"} {
+	if !strings.Contains(err.Error(), "HTTP 401") {
+		t.Fatalf("expected HTTP 401 status in error, got: %v", err)
+	}
+	for _, secret := range []string{"bob", "chainsecret", "chain-api-key", "chaintoken", "token="} {
 		if strings.Contains(err.Error(), secret) {
 			t.Fatalf("eth_chainId error leaked credential %q: %v", secret, err)
+		}
+	}
+
+	// 3. RedactErrorForURL must also scrub partial path/query echoes directly.
+	partialErr := fmt.Errorf("upstream rejected %s and %s", "/v2/chain-api-key", "token=chaintoken")
+	redacted := config.RedactErrorForURL(partialErr, chainURL)
+	for _, secret := range []string{"chain-api-key", "chaintoken", "token="} {
+		if strings.Contains(redacted, secret) {
+			t.Fatalf("RedactErrorForURL leaked credential %q: %s", secret, redacted)
 		}
 	}
 }

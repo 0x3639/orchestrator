@@ -117,9 +117,9 @@ func RedactURLs(raw []string) []string {
 	return out
 }
 
-// RedactErrorForURL renders err for logging with the raw URL, and any
-// password embedded in it, replaced. Client libraries frequently echo the
-// dial target inside their error strings.
+// RedactErrorForURL renders err for logging with the raw URL, credentials,
+// non-root path, and query string replaced. Client libraries and HTTP error
+// responses can echo the full URL or only its path/query components.
 func RedactErrorForURL(err error, raw string) string {
 	if err == nil {
 		return ""
@@ -128,12 +128,26 @@ func RedactErrorForURL(err error, raw string) string {
 	if raw != "" {
 		msg = strings.ReplaceAll(msg, raw, RedactURL(raw))
 	}
-	if parsed, perr := url.Parse(raw); perr == nil && parsed.User != nil {
-		if password, ok := parsed.User.Password(); ok && password != "" {
-			msg = strings.ReplaceAll(msg, password, redactedPlaceholder)
+	if parsed, perr := url.Parse(raw); perr == nil {
+		if parsed.User != nil {
+			if password, ok := parsed.User.Password(); ok && password != "" {
+				msg = strings.ReplaceAll(msg, password, redactedPlaceholder)
+			}
+			if username := parsed.User.Username(); username != "" {
+				msg = strings.ReplaceAll(msg, username, redactedPlaceholder)
+			}
 		}
-		if username := parsed.User.Username(); username != "" {
-			msg = strings.ReplaceAll(msg, username, redactedPlaceholder)
+		if parsed.RawQuery != "" {
+			msg = strings.ReplaceAll(msg, parsed.RawQuery, redactedPlaceholder)
+		}
+		if reqURI := parsed.RequestURI(); len(reqURI) > 1 {
+			msg = strings.ReplaceAll(msg, reqURI, "/"+redactedPlaceholder)
+		}
+		if escPath := parsed.EscapedPath(); len(escPath) > 1 {
+			msg = strings.ReplaceAll(msg, escPath, "/"+redactedPlaceholder)
+		}
+		if len(parsed.Path) > 1 {
+			msg = strings.ReplaceAll(msg, parsed.Path, "/"+redactedPlaceholder)
 		}
 	}
 	return msg
