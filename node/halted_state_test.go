@@ -2807,3 +2807,216 @@ func TestUnavailableSignedChainDoesNotBlockHealthyChainHaltRetries(t *testing.T)
 		t.Fatal("publishEmergencyHalt did not exit after leaving EmergencyState")
 	}
 }
+
+func TestSlowUnavailableChainDoesNotStarveLaterHealthyChainFirstBroadcast(t *testing.T) {
+	oldKey, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldAddr := crypto.PubkeyToAddress(oldKey.PublicKey)
+	oldCompressed := base64.StdEncoding.EncodeToString(crypto.CompressPubkey(&oldKey.PublicKey))
+
+	c1 := ecommon.HexToAddress("0xd1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1")
+	c2 := ecommon.HexToAddress("0xd2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2")
+	c3 := ecommon.HexToAddress("0xd3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3")
+
+	zMock := &partialRotateZenon{
+		haltedTestZenon: haltedTestZenon{halted: true},
+		compressedTss:   oldCompressed,
+		evmContracts: []*definition.NetworkInfo{
+			{NetworkClass: definition.EvmClass, Id: 1, Name: "eth-healthy-1", ContractAddress: c1.Hex()},
+			{NetworkClass: definition.EvmClass, Id: 2, Name: "eth-slow-down-2", ContractAddress: c2.Hex()},
+			{NetworkClass: definition.EvmClass, Id: 3, Name: "eth-healthy-3", ContractAddress: c3.Hex()},
+		},
+	}
+	znnSrv := server.NewServer()
+	if err := znnSrv.RegisterName("embedded.bridge", zMock); err != nil {
+		t.Fatal(err)
+	}
+	znnHTTP := httptest.NewServer(znnSrv.WebsocketHandler([]string{"*"}))
+	t.Cleanup(func() { znnSrv.Stop(); znnHTTP.Close() })
+
+	var chain1Sends, chain3Sends atomic.Int32
+	chain3Sent := make(chan struct{})
+	var chain3Once sync.Once
+	var chain2SlowDown atomic.Bool
+
+	makeHealthyEvm := func(chainID uint64, sends *atomic.Int32, onSend func()) *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			var req struct {
+				ID     json.RawMessage   `json:"id"`
+				Method string            `json:"method"`
+				Params []json.RawMessage `json:"params"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&req)
+			resp := map[string]interface{}{"jsonrpc": "2.0", "id": req.ID}
+			switch req.Method {
+			case "eth_chainId":
+				resp["result"] = hexutil.EncodeUint64(chainID)
+			case "eth_blockNumber":
+				resp["result"] = hexutil.EncodeUint64(100)
+			case "eth_getBalance":
+				resp["result"] = (*hexutil.Big)(new(big.Int).Mul(big.NewInt(10), big.NewInt(1e18)))
+			case "eth_getTransactionCount":
+				resp["result"] = hexutil.EncodeUint64(1)
+			case "eth_getBlockByNumber":
+				resp["result"] = map[string]interface{}{
+					"number":        hexutil.EncodeUint64(100),
+					"hash":          ecommon.HexToHash("0x11"),
+					"baseFeePerGas": (*hexutil.Big)(big.NewInt(20_000_000_000)),
+				}
+			case "eth_maxPriorityFeePerGas":
+				resp["result"] = (*hexutil.Big)(big.NewInt(2_000_000_000))
+			case "eth_estimateGas":
+				resp["result"] = hexutil.EncodeUint64(100_000)
+			case "eth_sendRawTransaction":
+				sends.Add(1)
+				if onSend != nil {
+					onSend()
+				}
+				resp["result"] = ecommon.HexToHash("0xbeef").Hex()
+			case "eth_call":
+				var call struct {
+					Data  hexutil.Bytes `json:"data"`
+					Input hexutil.Bytes `json:"input"`
+				}
+				_ = json.Unmarshal(req.Params[0], &call)
+				sel := append(call.Data, call.Input...)
+				switch {
+				case len(sel) >= 4 && string(sel[:4]) == string(common.EvmContractAbi.Methods["tss"].ID):
+					resp["result"] = ecommon.BytesToHash(oldAddr.Bytes()).Hex()
+				case len(sel) >= 4 && string(sel[:4]) == string(common.EvmContractAbi.Methods["actionsNonce"].ID):
+					resp["result"] = ecommon.BigToHash(big.NewInt(3)).Hex()
+				default:
+					resp["result"] = "0x" + strings.Repeat("0", 64)
+				}
+			default:
+				resp["result"] = "0x" + strings.Repeat("0", 64)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(resp)
+		}))
+	}
+	evm1 := makeHealthyEvm(1, &chain1Sends, nil)
+	t.Cleanup(evm1.Close)
+	evm3 := makeHealthyEvm(3, &chain3Sends, func() {
+		chain3Once.Do(func() { close(chain3Sent) })
+	})
+	t.Cleanup(evm3.Close)
+	evm2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			ID     json.RawMessage   `json:"id"`
+			Method string            `json:"method"`
+			Params []json.RawMessage `json:"params"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		resp := map[string]interface{}{"jsonrpc": "2.0", "id": req.ID}
+		if chain2SlowDown.Load() {
+			// Outlast evmHaltRetryCooldown (150ms) and then fail!
+			select {
+			case <-time.After(300 * time.Millisecond):
+			case <-r.Context().Done():
+				return
+			}
+			resp["error"] = map[string]interface{}{"code": -32000, "message": "slow chain 2 unavailable"}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(resp)
+			return
+		}
+		switch req.Method {
+		case "eth_chainId":
+			resp["result"] = hexutil.EncodeUint64(2)
+		case "eth_call":
+			var call struct {
+				Data  hexutil.Bytes `json:"data"`
+				Input hexutil.Bytes `json:"input"`
+			}
+			_ = json.Unmarshal(req.Params[0], &call)
+			sel := append(call.Data, call.Input...)
+			switch {
+			case len(sel) >= 4 && string(sel[:4]) == string(common.EvmContractAbi.Methods["tss"].ID):
+				resp["result"] = ecommon.BytesToHash(oldAddr.Bytes()).Hex()
+			case len(sel) >= 4 && string(sel[:4]) == string(common.EvmContractAbi.Methods["actionsNonce"].ID):
+				resp["result"] = ecommon.BigToHash(big.NewInt(3)).Hex()
+			default:
+				resp["result"] = "0x" + strings.Repeat("0", 64)
+			}
+		default:
+			resp["result"] = "0x" + strings.Repeat("0", 64)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	t.Cleanup(evm2.Close)
+
+	stopChan := make(chan os.Signal, 1)
+	stateVal := common.EmergencyState
+	gs := common.NewGlobalState(&stateVal)
+	t.Setenv("HOME", t.TempDir())
+	nm, err := network.NewNetworksManager(stopChan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dbMgr, err := manager.NewDbManager(stopChan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nets := map[string]config.BaseNetworkConfig{
+		common.ZenonNetworkName: {Urls: []string{"ws" + strings.TrimPrefix(znnHTTP.URL, "http")}},
+		"eth-healthy-1":         {Urls: []string{evm1.URL}},
+		"eth-slow-down-2":       {Urls: []string{evm2.URL}},
+		"eth-healthy-3":         {Urls: []string{evm3.URL}},
+	}
+	if err := nm.Init(nets, dbMgr, gs, func(*common.BridgeMetadata) {}); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { nm.Stop() })
+
+	evmBatch, _, signedEvmNonces, signedEvmTss, err := nm.GetHaltMessagesWithState()
+	if err != nil {
+		t.Fatal(err)
+	}
+	chain2SlowDown.Store(true)
+
+	producerPub := []byte("test-producer-pubkey-32-bytes!!!")
+	producerPubB64 := base64.StdEncoding.EncodeToString(producerPub)
+	plan := &emergencyHaltPlan{
+		znnSignature:      "AAAA",
+		znnParticipants:   []string{producerPubB64},
+		evmFullSignatures: [][]byte{make([]byte, 65), make([]byte, 65), make([]byte, 65)},
+		evmParticipants:   [][]string{{producerPubB64}, {producerPubB64}, {producerPubB64}},
+	}
+
+	node := &Node{
+		config:               &config.Config{TssConfig: config.TssManagerConfig{PublicKey: oldCompressed, LocalPubKeys: []string{producerPubB64}}},
+		networksManager:      nm,
+		dbManager:            dbMgr,
+		producerKeyPair:      &wallet.KeyPair{Public: producerPub},
+		ecdsaPrivateKey:      oldKey,
+		evmAddress:           oldAddr,
+		state:                gs,
+		stopChan:             stopChan,
+		logger:               zap.NewNop().Sugar(),
+		evmHaltRetryCooldown: 150 * time.Millisecond,
+	}
+
+	done := make(chan bool, 1)
+	go func() {
+		done <- node.publishEmergencyHalt(evmBatch, plan, oldCompressed, 0, signedEvmTss, signedEvmNonces)
+	}()
+
+	// Healthy Chain 3 MUST broadcast even when Chain 2's slow RPC outlasts Chain 1's cooldown!
+	select {
+	case <-chain3Sent:
+	case <-time.After(4 * time.Second):
+		t.Fatalf("slow unavailable Chain 2 starved Chain 3's first broadcast (chain1Sends=%d chain3Sends=%d)", chain1Sends.Load(), chain3Sends.Load())
+	}
+	if err := gs.SetState(common.HaltedState); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("publishEmergencyHalt did not exit after leaving EmergencyState")
+	}
+}

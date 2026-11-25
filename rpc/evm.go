@@ -1077,7 +1077,18 @@ func (r *EvmRpc) clearPendingTxIfMatchesLocked(key evmTxKey, expected *pendingEv
 		if cur != nil {
 			nk := evmNonceKey{sender: key.sender, contract: key.contract, nonce: cur.nonce}
 			if st := r.nonceStack[nk]; len(st) > 0 && st[len(st)-1].kind == key.kind {
-				delete(r.nonceStack, nk)
+				// Pop only trailing entries of key.kind so any live competing
+				// action attempt underneath on the same nonce is preserved.
+				cut := len(st)
+				for cut > 0 && st[cut-1].kind == key.kind {
+					cut--
+				}
+				if cut == 0 {
+					delete(r.nonceStack, nk)
+					delete(r.failedRollbacks, nk)
+				} else {
+					r.nonceStack[nk] = st[:cut]
+				}
 			}
 		}
 		delete(r.pendingTx, key)
@@ -1098,7 +1109,16 @@ func (r *EvmRpc) ClearObsoleteHaltTx(sender ecommon.Address) error {
 
 func (r *EvmRpc) ClearObsoleteHaltTxContext(parent context.Context, sender ecommon.Address) error {
 	key := evmTxKey{sender: sender, contract: r.bridgeAddress, kind: evmTxKindHalt}
-	rec, err := r.loadPendingTx(key)
+	// Resolve any pending failed rollback BEFORE inspecting or clearing a halt
+	// reservation so an accepted rotation beneath a rejected halt is restored
+	// atomically rather than erased as an obsolete halt.
+	r.pendingMu.Lock()
+	if err := r.retryFailedRollbacksLocked(sender, r.bridgeAddress); err != nil {
+		r.pendingMu.Unlock()
+		return err
+	}
+	rec, err := r.loadPendingTxLocked(key)
+	r.pendingMu.Unlock()
 	if err != nil {
 		return err
 	}
@@ -1140,23 +1160,27 @@ func (r *EvmRpc) ClearObsoleteHaltTxContext(parent context.Context, sender ecomm
 		}
 	}
 	r.pendingMu.Lock()
+	if err := r.retryFailedRollbacksLocked(sender, r.bridgeAddress); err != nil {
+		r.pendingMu.Unlock()
+		return err
+	}
 	if r.clearPendingTxIfMatchesLocked(key, rec) {
 		// Only prune earlier dropped halt stacks when rec itself still owned
-		// key (a concurrent replacement at the same nonce keeps its stack).
+		// key (a concurrent replacement at the same nonce keeps its stack),
+		// and preserve any competing-action entries underneath.
 		for nk, st := range r.nonceStack {
 			if nk.sender != sender || nk.contract != r.bridgeAddress || nk.nonce > rec.nonce {
 				continue
 			}
-			var top *pendingAttempt
-			for i := len(st) - 1; i >= 0; i-- {
-				if !st[i].rejected {
-					top = st[i]
-					break
-				}
+			cut := len(st)
+			for cut > 0 && st[cut-1].kind == evmTxKindHalt {
+				cut--
 			}
-			if top != nil && top.kind == evmTxKindHalt {
+			if cut == 0 {
 				delete(r.nonceStack, nk)
 				delete(r.failedRollbacks, nk)
+			} else if cut < len(st) {
+				r.nonceStack[nk] = st[:cut]
 			}
 		}
 	}

@@ -2306,7 +2306,7 @@ func (node *Node) publishEmergencyHalt(evmBatch network.EvmBatch, plan *emergenc
 					}
 					turnSigs[i] = sig
 				}
-				changed, submittedIdx, err := node.networksManager.SendHaltEvmWithExpectedTrackingContext(roundCtx, evmBatch, turnSigs, signedEvmTss, signedEvmNonces, node.ecdsaPrivateKey, node.evmAddress, node.state.WhileEmergency)
+				changed, submittedSlots, err := node.networksManager.SendHaltEvmWithExpectedTrackingContext(roundCtx, evmBatch, turnSigs, signedEvmTss, signedEvmNonces, node.ecdsaPrivateKey, node.evmAddress, node.state.WhileEmergency)
 				if roundCtx.Err() != nil {
 					return
 				}
@@ -2327,9 +2327,14 @@ func (node *Node) publishEmergencyHalt(evmBatch network.EvmBatch, plan *emergenc
 				case changed:
 					return
 				default:
-					if submittedIdx >= 0 && submittedIdx < len(attemptedSignedEvm) {
-						attemptedSignedEvm[submittedIdx] = true
-						lastBroadcast[submittedIdx] = time.Now()
+					if len(submittedSlots) > 0 {
+						broadcastAt := time.Now()
+						for _, idx := range submittedSlots {
+							if idx >= 0 && idx < len(attemptedSignedEvm) {
+								attemptedSignedEvm[idx] = true
+								lastBroadcast[idx] = broadcastAt
+							}
+						}
 					}
 					allSignedHalted, checkErr := node.allSignedEvmHalted(roundCtx, evmBatch, plan.evmFullSignatures)
 					if plan.hasFailedGroups && hasSignedEvm && checkErr == nil && allSignedHalted {
@@ -2349,7 +2354,7 @@ func (node *Node) publishEmergencyHalt(evmBatch network.EvmBatch, plan *emergenc
 							return
 						}
 					}
-					if submittedIdx >= 0 && allHandled {
+					if len(submittedSlots) > 0 && allHandled {
 						if !sleepRound(retryCooldown) {
 							return
 						}
