@@ -95,14 +95,15 @@ type evmNonceKey struct {
 }
 
 type pendingEvmTx struct {
-	nonce                uint64
-	txHash               ecommon.Hash
-	priorTxHashes        []ecommon.Hash
-	priorHashesTruncated bool
-	gasPrice             *big.Int
-	tipCap               *big.Int
-	feeCap               *big.Int
-	isDynamic            bool
+	nonce              uint64
+	txHash             ecommon.Hash
+	priorTxHashes      []common.PendingEvmTxHash
+	priorTruncatedUpTo *uint64
+	supersededOther    *pendingEvmTx
+	gasPrice           *big.Int
+	tipCap             *big.Int
+	feeCap             *big.Int
+	isDynamic          bool
 }
 
 type pendingAttempt struct {
@@ -572,69 +573,198 @@ func isNonceTooLowErr(err error) bool {
 
 const maxPriorPendingTxHashes = 16
 
-func mergePriorTxHashes(existing []ecommon.Hash, existingTruncated bool, priorHash, currentHash ecommon.Hash) ([]ecommon.Hash, bool) {
-	var out []ecommon.Hash
-	seen := make(map[ecommon.Hash]struct{}, len(existing)+1)
-	add := func(h ecommon.Hash) {
-		if h == (ecommon.Hash{}) || h == currentHash {
-			return
-		}
-		if _, ok := seen[h]; ok {
-			return
-		}
-		seen[h] = struct{}{}
-		out = append(out, h)
-	}
-	for _, h := range existing {
-		add(h)
-	}
-	add(priorHash)
-	truncated := existingTruncated
-	if len(out) > maxPriorPendingTxHashes {
-		out = out[len(out)-maxPriorPendingTxHashes:]
-		truncated = true
-	}
-	return out, truncated
-}
-
-func clonePendingEvmTx(p *pendingEvmTx) *pendingEvmTx {
+func cloneUint64Ptr(p *uint64) *uint64 {
 	if p == nil {
 		return nil
 	}
-	var prior []ecommon.Hash
+	v := *p
+	return &v
+}
+
+func maxUint64Ptr(a, b *uint64) *uint64 {
+	if a == nil && b == nil {
+		return nil
+	}
+	var v uint64
+	switch {
+	case a == nil:
+		v = *b
+	case b == nil:
+		v = *a
+	case *a >= *b:
+		v = *a
+	default:
+		v = *b
+	}
+	return &v
+}
+
+// mergePriorTxHashList merges nonce-tagged prior transaction hashes and caps
+// the retained slice at maxPriorPendingTxHashes. When eviction is needed, it
+// evicts the lowest-nonce (oldest-first within a nonce) entry and updates
+// truncatedUpTo to the maximum evicted nonce so higher-nonce history stays
+// intact and post-restart cleanup only defers when an evicted nonce is still
+// unconfirmed (>= confirmedNonce).
+func mergePriorTxHashList(
+	existing []common.PendingEvmTxHash,
+	existingTruncatedUpTo *uint64,
+	additions []common.PendingEvmTxHash,
+	additionsTruncatedUpTo *uint64,
+	currentNonce uint64,
+	currentHash ecommon.Hash,
+) ([]common.PendingEvmTxHash, *uint64) {
+	out := make([]common.PendingEvmTxHash, 0, len(existing)+len(additions))
+	seen := make(map[common.PendingEvmTxHash]struct{}, len(existing)+len(additions))
+	add := func(item common.PendingEvmTxHash) {
+		if item.Hash == (ecommon.Hash{}) || (item.Nonce == currentNonce && item.Hash == currentHash) {
+			return
+		}
+		if _, ok := seen[item]; ok {
+			return
+		}
+		seen[item] = struct{}{}
+		out = append(out, item)
+	}
+	for _, item := range existing {
+		add(item)
+	}
+	for _, item := range additions {
+		add(item)
+	}
+	truncatedUpTo := maxUint64Ptr(existingTruncatedUpTo, additionsTruncatedUpTo)
+	for len(out) > maxPriorPendingTxHashes {
+		evictIdx := 0
+		for i := 1; i < len(out); i++ {
+			if out[i].Nonce < out[evictIdx].Nonce {
+				evictIdx = i
+			}
+		}
+		evictedNonce := out[evictIdx].Nonce
+		truncatedUpTo = maxUint64Ptr(truncatedUpTo, &evictedNonce)
+		out = append(out[:evictIdx], out[evictIdx+1:]...)
+	}
+	if len(out) == 0 {
+		out = nil
+	}
+	return out, truncatedUpTo
+}
+
+func clonePendingEvmTxWithoutSuperseded(p *pendingEvmTx) *pendingEvmTx {
+	if p == nil {
+		return nil
+	}
+	var prior []common.PendingEvmTxHash
 	if len(p.priorTxHashes) > 0 {
-		prior = append([]ecommon.Hash(nil), p.priorTxHashes...)
+		prior = append([]common.PendingEvmTxHash(nil), p.priorTxHashes...)
 	}
 	return &pendingEvmTx{
-		nonce:                p.nonce,
-		txHash:               p.txHash,
-		priorTxHashes:        prior,
-		priorHashesTruncated: p.priorHashesTruncated,
-		gasPrice:             cloneBigInt(p.gasPrice),
-		tipCap:               cloneBigInt(p.tipCap),
-		feeCap:               cloneBigInt(p.feeCap),
-		isDynamic:            p.isDynamic,
+		nonce:              p.nonce,
+		txHash:             p.txHash,
+		priorTxHashes:      prior,
+		priorTruncatedUpTo: cloneUint64Ptr(p.priorTruncatedUpTo),
+		gasPrice:           cloneBigInt(p.gasPrice),
+		tipCap:             cloneBigInt(p.tipCap),
+		feeCap:             cloneBigInt(p.feeCap),
+		isDynamic:          p.isDynamic,
+	}
+}
+
+func clonePendingEvmTx(p *pendingEvmTx) *pendingEvmTx {
+	cp := clonePendingEvmTxWithoutSuperseded(p)
+	if cp != nil && p.supersededOther != nil {
+		cp.supersededOther = clonePendingEvmTxWithoutSuperseded(p.supersededOther)
+	}
+	return cp
+}
+
+// mergeSupersededOther retains the highest-nonce superseded competing-action
+// record (depth capped at 1) while preserving prior hashes and monotonic fees
+// if two superseded records exist.
+func mergeSupersededOther(a, b *pendingEvmTx) *pendingEvmTx {
+	if a == nil {
+		return clonePendingEvmTxWithoutSuperseded(b)
+	}
+	if b == nil {
+		return clonePendingEvmTxWithoutSuperseded(a)
+	}
+	primary, secondary := b, a
+	if a.nonce > b.nonce {
+		primary, secondary = a, b
+	}
+	out := clonePendingEvmTxWithoutSuperseded(primary)
+	if primary.nonce == secondary.nonce {
+		out.gasPrice = maxBigInt(out.gasPrice, secondary.gasPrice)
+		out.tipCap = maxBigInt(out.tipCap, secondary.tipCap)
+		out.feeCap = maxBigInt(out.feeCap, secondary.feeCap)
+	}
+	additions := make([]common.PendingEvmTxHash, 0, len(secondary.priorTxHashes)+1)
+	additions = append(additions, secondary.priorTxHashes...)
+	additions = append(additions, common.PendingEvmTxHash{Nonce: secondary.nonce, Hash: secondary.txHash})
+	out.priorTxHashes, out.priorTruncatedUpTo = mergePriorTxHashList(
+		out.priorTxHashes,
+		out.priorTruncatedUpTo,
+		additions,
+		secondary.priorTruncatedUpTo,
+		out.nonce,
+		out.txHash,
+	)
+	return out
+}
+
+func toCommonPendingEvmTxWithoutSuperseded(p *pendingEvmTx) *common.PendingEvmTx {
+	if p == nil {
+		return nil
+	}
+	var prior []common.PendingEvmTxHash
+	if len(p.priorTxHashes) > 0 {
+		prior = append([]common.PendingEvmTxHash(nil), p.priorTxHashes...)
+	}
+	return &common.PendingEvmTx{
+		Nonce:              p.nonce,
+		TxHash:             p.txHash,
+		PriorTxHashes:      prior,
+		PriorTruncatedUpTo: cloneUint64Ptr(p.priorTruncatedUpTo),
+		GasPrice:           cloneBigInt(p.gasPrice),
+		TipCap:             cloneBigInt(p.tipCap),
+		FeeCap:             cloneBigInt(p.feeCap),
+		IsDynamic:          p.isDynamic,
 	}
 }
 
 func toCommonPendingEvmTx(p *pendingEvmTx) *common.PendingEvmTx {
-	if p == nil {
+	out := toCommonPendingEvmTxWithoutSuperseded(p)
+	if out != nil && p.supersededOther != nil {
+		out.SupersededOther = toCommonPendingEvmTxWithoutSuperseded(p.supersededOther)
+	}
+	return out
+}
+
+func fromCommonPendingEvmTxWithoutSuperseded(rec *common.PendingEvmTx) *pendingEvmTx {
+	if rec == nil {
 		return nil
 	}
-	var prior []ecommon.Hash
-	if len(p.priorTxHashes) > 0 {
-		prior = append([]ecommon.Hash(nil), p.priorTxHashes...)
+	var prior []common.PendingEvmTxHash
+	if len(rec.PriorTxHashes) > 0 {
+		prior = append([]common.PendingEvmTxHash(nil), rec.PriorTxHashes...)
 	}
-	return &common.PendingEvmTx{
-		Nonce:                p.nonce,
-		TxHash:               p.txHash,
-		PriorTxHashes:        prior,
-		PriorHashesTruncated: p.priorHashesTruncated,
-		GasPrice:             cloneBigInt(p.gasPrice),
-		TipCap:               cloneBigInt(p.tipCap),
-		FeeCap:               cloneBigInt(p.feeCap),
-		IsDynamic:            p.isDynamic,
+	return &pendingEvmTx{
+		nonce:              rec.Nonce,
+		txHash:             rec.TxHash,
+		priorTxHashes:      prior,
+		priorTruncatedUpTo: cloneUint64Ptr(rec.PriorTruncatedUpTo),
+		gasPrice:           cloneBigInt(rec.GasPrice),
+		tipCap:             cloneBigInt(rec.TipCap),
+		feeCap:             cloneBigInt(rec.FeeCap),
+		isDynamic:          rec.IsDynamic,
 	}
+}
+
+func fromCommonPendingEvmTx(rec *common.PendingEvmTx) *pendingEvmTx {
+	out := fromCommonPendingEvmTxWithoutSuperseded(rec)
+	if out != nil && rec.SupersededOther != nil {
+		out.supersededOther = fromCommonPendingEvmTxWithoutSuperseded(rec.SupersededOther)
+	}
+	return out
 }
 
 func otherEvmTxKind(kind string) string {
@@ -701,12 +831,44 @@ func (r *EvmRpc) recordPendingTxAttempt(tx *etypes.Transaction) (*pendingAttempt
 	if prev != nil {
 		if prev.nonce > entry.nonce {
 			r.txMu.Unlock()
-			// Leave the higher-nonce durable owner intact, while still tracking
-			// this lower-nonce attempt in nonceStack through reconciliation so
-			// in-flight cleanup guards and hash checks observe it. Merge fees
-			// monotonically with BOTH any durable competing owner at entry.nonce
-			// and any existing viable stack attempt at entry.nonce so a lower-fee
-			// retry can never reduce the rollback fee watermark.
+			// Leave the higher-nonce durable owner intact, while durably
+			// recording this lower-nonce tx hash on the higher-nonce record
+			// BEFORE broadcast so post-restart cleanup still sees a live
+			// lower-nonce queued halt, and tracking the attempt in nonceStack
+			// through reconciliation so in-flight guards, fee watermarks, and
+			// superseded rotation recovery remain intact.
+			updatedPrev := clonePendingEvmTx(prevSnapshot)
+			updatedPrev.priorTxHashes, updatedPrev.priorTruncatedUpTo = mergePriorTxHashList(
+				updatedPrev.priorTxHashes,
+				updatedPrev.priorTruncatedUpTo,
+				[]common.PendingEvmTxHash{{Nonce: entry.nonce, Hash: entry.txHash}},
+				nil,
+				updatedPrev.nonce,
+				updatedPrev.txHash,
+			)
+			if store != nil {
+				if err := store.ApplyPendingEvmTxBatch([]common.PendingEvmTxOp{{
+					Sender:   key.sender,
+					Contract: key.contract,
+					Kind:     key.kind,
+					Record:   toCommonPendingEvmTx(updatedPrev),
+				}}); err != nil {
+					r.logger.Errorf("failed to persist lower-nonce pending EVM tx hash before broadcast: %v", err)
+					return nil, false, fmt.Errorf("persist lower-nonce pending EVM tx before broadcast: %w", err)
+				}
+			}
+			r.txMu.Lock()
+			r.pendingTx[key] = updatedPrev
+			r.txMu.Unlock()
+			prevNk := evmNonceKey{sender: key.sender, contract: key.contract, nonce: updatedPrev.nonce}
+			for i := len(r.nonceStack[prevNk]) - 1; i >= 0; i-- {
+				a := r.nonceStack[prevNk][i]
+				if !a.rejected && a.kind == key.kind && a.txHash == updatedPrev.txHash && a.entry != nil {
+					a.entry = clonePendingEvmTx(updatedPrev)
+					break
+				}
+			}
+
 			nk := evmNonceKey{sender: key.sender, contract: key.contract, nonce: entry.nonce}
 			if r.nonceStack == nil {
 				r.nonceStack = make(map[evmNonceKey][]*pendingAttempt)
@@ -715,6 +877,7 @@ func (r *EvmRpc) recordPendingTxAttempt(tx *etypes.Transaction) (*pendingAttempt
 				entry.gasPrice = maxBigInt(otherSnapshot.gasPrice, entry.gasPrice)
 				entry.tipCap = maxBigInt(otherSnapshot.tipCap, entry.tipCap)
 				entry.feeCap = maxBigInt(otherSnapshot.feeCap, entry.feeCap)
+				entry.supersededOther = mergeSupersededOther(entry.supersededOther, otherSnapshot)
 				if len(r.nonceStack[nk]) == 0 {
 					r.nonceStack[nk] = append(r.nonceStack[nk], &pendingAttempt{
 						kind:   otherKey.kind,
@@ -731,10 +894,26 @@ func (r *EvmRpc) recordPendingTxAttempt(tx *etypes.Transaction) (*pendingAttempt
 					entry.tipCap = maxBigInt(topEntry.tipCap, entry.tipCap)
 					entry.feeCap = maxBigInt(topEntry.feeCap, entry.feeCap)
 					if r.nonceStack[nk][i].kind == key.kind {
-						entry.priorTxHashes, entry.priorHashesTruncated = mergePriorTxHashes(topEntry.priorTxHashes, topEntry.priorHashesTruncated, topEntry.txHash, entry.txHash)
+						additions := make([]common.PendingEvmTxHash, 0, len(topEntry.priorTxHashes)+1)
+						additions = append(additions, topEntry.priorTxHashes...)
+						additions = append(additions, common.PendingEvmTxHash{Nonce: topEntry.nonce, Hash: topEntry.txHash})
+						entry.priorTxHashes, entry.priorTruncatedUpTo = mergePriorTxHashList(
+							entry.priorTxHashes,
+							entry.priorTruncatedUpTo,
+							additions,
+							topEntry.priorTruncatedUpTo,
+							entry.nonce,
+							entry.txHash,
+						)
+						entry.supersededOther = mergeSupersededOther(entry.supersededOther, topEntry.supersededOther)
+					} else {
+						entry.supersededOther = mergeSupersededOther(entry.supersededOther, topEntry)
 					}
 					break
 				}
+			}
+			if prevSnapshot.supersededOther != nil && prevSnapshot.supersededOther.nonce <= entry.nonce {
+				entry.supersededOther = mergeSupersededOther(entry.supersededOther, prevSnapshot.supersededOther)
 			}
 			attempt := &pendingAttempt{
 				kind:     key.kind,
@@ -751,16 +930,27 @@ func (r *EvmRpc) recordPendingTxAttempt(tx *etypes.Transaction) (*pendingAttempt
 			entry.tipCap = maxBigInt(prev.tipCap, entry.tipCap)
 			entry.feeCap = maxBigInt(prev.feeCap, entry.feeCap)
 		}
-		// Carry prior hashes forward across both same-nonce retries and
-		// higher-nonce advances so a queued lower-nonce halt survives a
-		// restart even after a higher-nonce send overwrites the durable row.
-		entry.priorTxHashes, entry.priorHashesTruncated = mergePriorTxHashes(prev.priorTxHashes, prev.priorHashesTruncated, prev.txHash, entry.txHash)
+		// Carry nonce-tagged prior hashes and superseded competing-action state
+		// forward across both same-nonce retries and higher-nonce advances so a
+		// queued lower-nonce halt or superseded rotation survives restarts.
+		entry.priorTxHashes, entry.priorTruncatedUpTo = mergePriorTxHashList(
+			prev.priorTxHashes,
+			prev.priorTruncatedUpTo,
+			[]common.PendingEvmTxHash{{Nonce: prev.nonce, Hash: prev.txHash}},
+			nil,
+			entry.nonce,
+			entry.txHash,
+		)
+		if prev.supersededOther != nil {
+			entry.supersededOther = mergeSupersededOther(entry.supersededOther, prev.supersededOther)
+		}
 	}
 	deleteOther := otherPrev != nil && otherPrev.nonce == entry.nonce
 	if deleteOther {
 		entry.gasPrice = maxBigInt(otherPrev.gasPrice, entry.gasPrice)
 		entry.tipCap = maxBigInt(otherPrev.tipCap, entry.tipCap)
 		entry.feeCap = maxBigInt(otherPrev.feeCap, entry.feeCap)
+		entry.supersededOther = mergeSupersededOther(entry.supersededOther, otherPrev)
 	}
 	ops := []common.PendingEvmTxOp{{
 		Sender:   key.sender,
@@ -908,23 +1098,59 @@ func (r *EvmRpc) applyStackRollbackLocked(nk evmNonceKey, key evmTxKey, rejected
 				otherReplacement = surviving
 			}
 		}
-		// If keyReplacement resolves to a fallback at the exact same nonce
-		// currently owned by otherKey (e.g. halt(5) superseding setTss(5)
-		// while halt(6) was in flight, then halt(6) rejects), merge curOther's
-		// fee watermark monotonically and clear otherKey atomically in the
-		// same batch so two owners are never persisted for the same nonce.
-		if keyReplacement != nil && otherReplacement == nil && curOther != nil && curOther.nonce == keyReplacement.nonce {
+		if keyReplacement != nil {
 			merged := clonePendingEvmTx(keyReplacement.entry)
-			merged.gasPrice = maxBigInt(curOther.gasPrice, merged.gasPrice)
-			merged.tipCap = maxBigInt(curOther.tipCap, merged.tipCap)
-			merged.feeCap = maxBigInt(curOther.feeCap, merged.feeCap)
+			// Preserve all viable same-or-lower-nonce prior hashes and
+			// superseded competing-action state from r.nonceStack (e.g. a
+			// lower-nonce send accepted while the rolled-back attempt was in
+			// flight) so restarting after rollback cannot lose them.
+			for stackNk, st := range r.nonceStack {
+				if stackNk.sender != key.sender || stackNk.contract != key.contract || stackNk.nonce > keyReplacement.nonce {
+					continue
+				}
+				for _, a := range st {
+					if a.rejected || a.kind != key.kind {
+						continue
+					}
+					additions := []common.PendingEvmTxHash{{Nonce: a.nonce, Hash: a.txHash}}
+					var addTrunc *uint64
+					if a.entry != nil {
+						additions = append(additions, a.entry.priorTxHashes...)
+						addTrunc = a.entry.priorTruncatedUpTo
+						if a.entry.supersededOther != nil && a.entry.supersededOther.nonce <= merged.nonce {
+							merged.supersededOther = mergeSupersededOther(merged.supersededOther, a.entry.supersededOther)
+						}
+					}
+					merged.priorTxHashes, merged.priorTruncatedUpTo = mergePriorTxHashList(
+						merged.priorTxHashes,
+						merged.priorTruncatedUpTo,
+						additions,
+						addTrunc,
+						merged.nonce,
+						merged.txHash,
+					)
+				}
+			}
+			// If keyReplacement resolves to a fallback at the exact same nonce
+			// currently owned by otherKey (e.g. halt(5) superseding setTss(5)
+			// while halt(6) was in flight, then halt(6) rejects), merge curOther's
+			// fee watermark monotonically, preserve curOther in supersededOther
+			// so post-restart cleanup still restores a live rotation, and clear
+			// otherKey atomically in the same batch so two owners are never
+			// persisted for the same nonce.
+			if otherReplacement == nil && curOther != nil && curOther.nonce == keyReplacement.nonce {
+				merged.gasPrice = maxBigInt(curOther.gasPrice, merged.gasPrice)
+				merged.tipCap = maxBigInt(curOther.tipCap, merged.tipCap)
+				merged.feeCap = maxBigInt(curOther.feeCap, merged.feeCap)
+				merged.supersededOther = mergeSupersededOther(merged.supersededOther, curOther)
+				clearOtherConflict = true
+			}
 			keyReplacement = &pendingAttempt{
 				kind:   keyReplacement.kind,
 				txHash: keyReplacement.txHash,
 				nonce:  keyReplacement.nonce,
 				entry:  merged,
 			}
-			clearOtherConflict = true
 		}
 	} else if surviving != nil && surviving.kind != key.kind && (curOther == nil || curOther.nonce <= surviving.nonce) {
 		otherReplacement = surviving
@@ -977,6 +1203,12 @@ func (r *EvmRpc) applyStackRollbackLocked(nk evmNonceKey, key evmTxKey, rejected
 		r.nonceStack[nk] = remaining
 	}
 	if len(ops) > 0 {
+		if ownsKey {
+			if r.sendGen == nil {
+				r.sendGen = make(map[evmTxKey]uint64)
+			}
+			r.sendGen[key]++
+		}
 		r.txMu.Lock()
 		if ownsKey {
 			if keyReplacement != nil {
@@ -1155,20 +1387,7 @@ func (r *EvmRpc) loadPendingTxLocked(key evmTxKey) (*pendingEvmTx, error) {
 			return nil, fmt.Errorf("load pending %s EVM tx record: %w", key.kind, err)
 		}
 		if rec != nil {
-			var prior []ecommon.Hash
-			if len(rec.PriorTxHashes) > 0 {
-				prior = append([]ecommon.Hash(nil), rec.PriorTxHashes...)
-			}
-			loaded := &pendingEvmTx{
-				nonce:                rec.Nonce,
-				txHash:               rec.TxHash,
-				priorTxHashes:        prior,
-				priorHashesTruncated: rec.PriorHashesTruncated,
-				gasPrice:             cloneBigInt(rec.GasPrice),
-				tipCap:               cloneBigInt(rec.TipCap),
-				feeCap:               cloneBigInt(rec.FeeCap),
-				isDynamic:            rec.IsDynamic,
-			}
+			loaded := fromCommonPendingEvmTx(rec)
 			r.txMu.Lock()
 			if r.pendingTx == nil {
 				r.pendingTx = make(map[evmTxKey]*pendingEvmTx)
@@ -1183,13 +1402,7 @@ func (r *EvmRpc) loadPendingTxLocked(key evmTxKey) (*pendingEvmTx, error) {
 	return clonePendingEvmTx(prev), nil
 }
 
-func (r *EvmRpc) clearPendingTxIfMatches(key evmTxKey, expected *pendingEvmTx) {
-	r.pendingMu.Lock()
-	defer r.pendingMu.Unlock()
-	r.clearPendingTxIfMatchesLocked(key, expected)
-}
-
-func (r *EvmRpc) clearPendingTxIfMatchesLocked(key evmTxKey, expected *pendingEvmTx) (bool, error) {
+func (r *EvmRpc) clearPendingTxIfMatchesLocked(key evmTxKey, expected *pendingEvmTx, confirmedNonce uint64) (bool, error) {
 	otherKey := evmTxKey{sender: key.sender, contract: key.contract, kind: otherEvmTxKind(key.kind)}
 	r.txMu.Lock()
 	cur := clonePendingEvmTx(r.pendingTx[key])
@@ -1204,7 +1417,7 @@ func (r *EvmRpc) clearPendingTxIfMatchesLocked(key evmTxKey, expected *pendingEv
 	var nk evmNonceKey
 	hasStack := false
 	cut := 0
-	var restoreOther *pendingAttempt
+	var restoreOther *pendingEvmTx
 	if cur != nil {
 		nk = evmNonceKey{sender: key.sender, contract: key.contract, nonce: cur.nonce}
 		if st := r.nonceStack[nk]; len(st) > 0 && st[len(st)-1].kind == key.kind {
@@ -1215,10 +1428,18 @@ func (r *EvmRpc) clearPendingTxIfMatchesLocked(key evmTxKey, expected *pendingEv
 			}
 			if cut > 0 {
 				surviving := st[cut-1]
-				if surviving.kind == otherKey.kind && (curOther == nil || curOther.nonce <= surviving.nonce) {
-					restoreOther = surviving
+				if surviving.kind == otherKey.kind && surviving.nonce >= confirmedNonce && surviving.entry != nil {
+					restoreOther = surviving.entry
 				}
 			}
+		}
+		if cur.supersededOther != nil && cur.supersededOther.nonce >= confirmedNonce {
+			if restoreOther == nil || cur.supersededOther.nonce > restoreOther.nonce {
+				restoreOther = cur.supersededOther
+			}
+		}
+		if restoreOther != nil && curOther != nil && curOther.nonce > restoreOther.nonce {
+			restoreOther = nil
 		}
 	}
 
@@ -1235,7 +1456,7 @@ func (r *EvmRpc) clearPendingTxIfMatchesLocked(key evmTxKey, expected *pendingEv
 					Sender:   otherKey.sender,
 					Contract: otherKey.contract,
 					Kind:     otherKey.kind,
-					Record:   toCommonPendingEvmTx(restoreOther.entry),
+					Record:   toCommonPendingEvmTx(restoreOther),
 				},
 			}
 			if err := store.ApplyPendingEvmTxBatch(ops); err != nil {
@@ -1268,7 +1489,7 @@ func (r *EvmRpc) clearPendingTxIfMatchesLocked(key evmTxKey, expected *pendingEv
 			if r.pendingTx == nil {
 				r.pendingTx = make(map[evmTxKey]*pendingEvmTx)
 			}
-			r.pendingTx[otherKey] = clonePendingEvmTx(restoreOther.entry)
+			r.pendingTx[otherKey] = clonePendingEvmTx(restoreOther)
 		}
 		cleared = true
 	}
@@ -1312,7 +1533,7 @@ func (r *EvmRpc) hasFailedRollbacksLocked(sender, contract ecommon.Address) bool
 // rollbacks, and commits both the halt deletion and any surviving unconfirmed
 // rotation uncovered across nonces <= expected.nonce in a single
 // ApplyPendingEvmTxBatch. Caller must hold r.pendingMu.
-func (r *EvmRpc) clearObsoleteHaltLocked(key evmTxKey, expected *pendingEvmTx, confirmedNonce uint64, obsGen uint64) error {
+func (r *EvmRpc) clearObsoleteHaltLocked(key evmTxKey, expected *pendingEvmTx, confirmedNonce uint64, obsGen uint64, restoreSupersededOther bool) error {
 	r.pruneConfirmedNonceStacksLocked(key.sender, key.contract, confirmedNonce)
 	if err := r.retryFailedRollbacksLocked(key.sender, key.contract); err != nil {
 		return err
@@ -1343,7 +1564,7 @@ func (r *EvmRpc) clearObsoleteHaltLocked(key evmTxKey, expected *pendingEvmTx, c
 		cut int
 	}
 	var plans []prunePlan
-	var bestSurvivingOther *pendingAttempt
+	var restoreOther *pendingEvmTx
 	for nk, st := range r.nonceStack {
 		if nk.sender != key.sender || nk.contract != key.contract || nk.nonce > cur.nonce {
 			continue
@@ -1357,15 +1578,18 @@ func (r *EvmRpc) clearObsoleteHaltLocked(key evmTxKey, expected *pendingEvmTx, c
 		}
 		plans = append(plans, prunePlan{nk: nk, cut: cut})
 		if cut > 0 {
-			if top := st[cut-1]; top.kind == evmTxKindSetTss && (bestSurvivingOther == nil || top.nonce > bestSurvivingOther.nonce) {
-				bestSurvivingOther = top
+			if top := st[cut-1]; top.kind == evmTxKindSetTss && top.entry != nil && (restoreOther == nil || top.nonce > restoreOther.nonce) {
+				restoreOther = top.entry
 			}
 		}
 	}
-
-	var restoreOther *pendingAttempt
-	if bestSurvivingOther != nil && (curOther == nil || curOther.nonce <= bestSurvivingOther.nonce) {
-		restoreOther = bestSurvivingOther
+	if restoreSupersededOther && cur.supersededOther != nil && cur.supersededOther.nonce >= confirmedNonce {
+		if restoreOther == nil || cur.supersededOther.nonce > restoreOther.nonce {
+			restoreOther = cur.supersededOther
+		}
+	}
+	if restoreOther != nil && curOther != nil && curOther.nonce > restoreOther.nonce {
+		restoreOther = nil
 	}
 
 	if store != nil {
@@ -1381,7 +1605,7 @@ func (r *EvmRpc) clearObsoleteHaltLocked(key evmTxKey, expected *pendingEvmTx, c
 					Sender:   otherKey.sender,
 					Contract: otherKey.contract,
 					Kind:     otherKey.kind,
-					Record:   toCommonPendingEvmTx(restoreOther.entry),
+					Record:   toCommonPendingEvmTx(restoreOther),
 				},
 			}
 			if err := store.ApplyPendingEvmTxBatch(ops); err != nil {
@@ -1410,7 +1634,7 @@ func (r *EvmRpc) clearObsoleteHaltLocked(key evmTxKey, expected *pendingEvmTx, c
 		if r.pendingTx == nil {
 			r.pendingTx = make(map[evmTxKey]*pendingEvmTx)
 		}
-		r.pendingTx[otherKey] = clonePendingEvmTx(restoreOther.entry)
+		r.pendingTx[otherKey] = clonePendingEvmTx(restoreOther)
 	}
 	r.txMu.Unlock()
 	return nil
@@ -1463,7 +1687,7 @@ func (r *EvmRpc) ClearObsoleteHaltTxContext(parent context.Context, sender ecomm
 		return nil
 	}
 	if rec.nonce < confirmedNonce {
-		_, clrErr := r.clearPendingTxIfMatchesLocked(key, rec)
+		_, clrErr := r.clearPendingTxIfMatchesLocked(key, rec, confirmedNonce)
 		r.pendingMu.Unlock()
 		return clrErr
 	}
@@ -1487,14 +1711,16 @@ func (r *EvmRpc) ClearObsoleteHaltTxContext(parent context.Context, sender ecomm
 		seenHashes[h] = struct{}{}
 		hashesToCheck = append(hashesToCheck, h)
 	}
-	// If retained same-nonce hash history was truncated past maxPriorPendingTxHashes
-	// for this unconfirmed reservation or any viable stack entry in
-	// [confirmedNonce..rec.nonce], defer cleanup rather than risking deleting a
-	// reservation whose evicted earlier hash is still queued behind a gap.
-	historyIncomplete := rec.priorHashesTruncated
+	// Only treat truncated hash history as incomplete when an evicted hash
+	// belonged to an unconfirmed nonce (>= confirmedNonce). Evictions strictly
+	// below confirmedNonce are already mined/consumed and must not strand later
+	// nonces behind an empty slot.
+	historyIncomplete := rec.priorTruncatedUpTo != nil && *rec.priorTruncatedUpTo >= confirmedNonce
 	addHash(rec.txHash)
-	for _, h := range rec.priorTxHashes {
-		addHash(h)
+	for _, item := range rec.priorTxHashes {
+		if item.Nonce >= confirmedNonce {
+			addHash(item.Hash)
+		}
 	}
 	for nk, st := range r.nonceStack {
 		if nk.sender != sender || nk.contract != r.bridgeAddress || nk.nonce < confirmedNonce || nk.nonce > rec.nonce {
@@ -1504,13 +1730,37 @@ func (r *EvmRpc) ClearObsoleteHaltTxContext(parent context.Context, sender ecomm
 			if !a.rejected && a.kind == evmTxKindHalt {
 				addHash(a.txHash)
 				if a.entry != nil {
-					if a.entry.priorHashesTruncated {
+					if a.entry.priorTruncatedUpTo != nil && *a.entry.priorTruncatedUpTo >= confirmedNonce {
 						historyIncomplete = true
 					}
-					for _, h := range a.entry.priorTxHashes {
-						addHash(h)
+					for _, item := range a.entry.priorTxHashes {
+						if item.Nonce >= confirmedNonce {
+							addHash(item.Hash)
+						}
 					}
 				}
+			}
+		}
+	}
+	var supersededHashes []ecommon.Hash
+	supersededTruncated := false
+	if rec.supersededOther != nil && rec.supersededOther.nonce >= confirmedNonce {
+		supersededTruncated = rec.supersededOther.priorTruncatedUpTo != nil && *rec.supersededOther.priorTruncatedUpTo >= confirmedNonce
+		seenSup := make(map[ecommon.Hash]struct{})
+		addSup := func(h ecommon.Hash) {
+			if h == (ecommon.Hash{}) {
+				return
+			}
+			if _, ok := seenSup[h]; ok {
+				return
+			}
+			seenSup[h] = struct{}{}
+			supersededHashes = append(supersededHashes, h)
+		}
+		addSup(rec.supersededOther.txHash)
+		for _, item := range rec.supersededOther.priorTxHashes {
+			if item.Nonce >= confirmedNonce {
+				addSup(item.Hash)
 			}
 		}
 	}
@@ -1544,9 +1794,25 @@ func (r *EvmRpc) ClearObsoleteHaltTxContext(parent context.Context, sender ecomm
 			return txErr
 		}
 	}
+	restoreSupersededOther := supersededTruncated
+	if !restoreSupersededOther {
+		for _, h := range supersededHashes {
+			tx, _, txErr := r.TransactionByHashContext(parent, h)
+			if txErr == nil && tx != nil {
+				if tx.Nonce() >= confirmedNonce {
+					restoreSupersededOther = true
+					break
+				}
+				continue
+			}
+			if txErr != nil && !errors.Is(txErr, ethereum.NotFound) {
+				return txErr
+			}
+		}
+	}
 	r.pendingMu.Lock()
 	defer r.pendingMu.Unlock()
-	return r.clearObsoleteHaltLocked(key, rec, confirmedNonce, obsGen)
+	return r.clearObsoleteHaltLocked(key, rec, confirmedNonce, obsGen, restoreSupersededOther)
 }
 
 func (r *EvmRpc) lookupPendingTx(key evmTxKey, confirmedNonce, pendingNonce uint64, havePending, otherOwnsLower bool) (*pendingEvmTx, error) {
@@ -1574,7 +1840,7 @@ func (r *EvmRpc) lookupPendingTx(key evmTxKey, confirmedNonce, pendingNonce uint
 	// evicted leaving a nonce gap (pendingNonce < prev.nonce) that is NOT
 	// owned by another persisted tracked action.
 	if cloned.nonce < confirmedNonce || (havePending && pendingNonce < cloned.nonce && !otherOwnsLower) {
-		r.clearPendingTxIfMatchesLocked(key, cloned)
+		r.clearPendingTxIfMatchesLocked(key, cloned, confirmedNonce)
 		return nil, nil
 	}
 	return cloned, nil
@@ -1629,7 +1895,7 @@ func (r *EvmRpc) otherTrackedNonces(key evmTxKey, confirmedNonce uint64) (maxNex
 	}
 	r.txMu.Unlock()
 	for _, item := range toClear {
-		r.clearPendingTxIfMatchesLocked(item.key, item.rec)
+		r.clearPendingTxIfMatchesLocked(item.key, item.rec, confirmedNonce)
 	}
 	return maxNext, minOwned, atConfirmed, hasOwner, nil
 }

@@ -510,7 +510,14 @@ func cloneCommonPending(tx *common.PendingEvmTx) *common.PendingEvmTx {
 	}
 	cp := *tx
 	if len(tx.PriorTxHashes) > 0 {
-		cp.PriorTxHashes = append([]ecommon.Hash(nil), tx.PriorTxHashes...)
+		cp.PriorTxHashes = append([]common.PendingEvmTxHash(nil), tx.PriorTxHashes...)
+	}
+	if tx.PriorTruncatedUpTo != nil {
+		v := *tx.PriorTruncatedUpTo
+		cp.PriorTruncatedUpTo = &v
+	}
+	if tx.SupersededOther != nil {
+		cp.SupersededOther = cloneCommonPending(tx.SupersededOther)
 	}
 	if tx.GasPrice != nil {
 		cp.GasPrice = new(big.Int).Set(tx.GasPrice)
@@ -5857,7 +5864,7 @@ func TestClearObsoleteHaltAtomicAcrossNoncesPrunesConsumedAndPropagatesErrors(t 
 			t.Fatal(err)
 		}
 
-		// Process 2: reopen LevelDB; cleanup MUST see PriorHashesTruncated==true
+		// Process 2: reopen LevelDB; cleanup MUST see PriorTruncatedUpTo >= confirmedNonce
 		// and defer deletion while nonce 6 is still unconfirmed!
 		db2, err := leveldb.OpenFile(dbDir, nil)
 		if err != nil {
@@ -5889,6 +5896,627 @@ func TestClearObsoleteHaltAtomicAcrossNoncesPrunesConsumedAndPropagatesErrors(t 
 		}
 		if gotHalt, err := store2.LoadPendingEvmTx(sender, contract, evmTxKindHalt); err != nil || gotHalt != nil {
 			t.Fatalf("after confirmation, durable halt = (%+v, %v), want nil", gotHalt, err)
+		}
+	})
+
+	t.Run("rollback preserves live superseded rotation across restart and cleanup", func(t *testing.T) {
+		key, err := crypto.GenerateKey()
+		if err != nil {
+			t.Fatal(err)
+		}
+		sender := crypto.PubkeyToAddress(key.PublicKey)
+		signer := etypes.LatestSignerForChainID(big.NewInt(1))
+		dbDir := t.TempDir()
+
+		var setTss6Hash, halt6LowHash, halt7Hash ecommon.Hash
+		var setTss6Raw *etypes.Transaction
+		halt7Entered := make(chan struct{})
+		releaseHalt7 := make(chan struct{})
+		var releaseOnce sync.Once
+		release := func() { releaseOnce.Do(func() { close(releaseHalt7) }) }
+		var confirmedNonce, pendingNonce atomic.Uint64
+		confirmedNonce.Store(5)
+		pendingNonce.Store(5)
+
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			var req struct {
+				ID     json.RawMessage   `json:"id"`
+				Method string            `json:"method"`
+				Params []json.RawMessage `json:"params"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&req)
+			resp := map[string]interface{}{"jsonrpc": "2.0", "id": req.ID}
+			switch req.Method {
+			case "eth_chainId":
+				resp["result"] = hexutil.EncodeUint64(1)
+			case "eth_blockNumber":
+				resp["result"] = hexutil.EncodeUint64(100)
+			case "eth_getBalance":
+				resp["result"] = (*hexutil.Big)(new(big.Int).Mul(big.NewInt(10), big.NewInt(1e18)))
+			case "eth_getTransactionCount":
+				var tag string
+				if len(req.Params) >= 2 {
+					_ = json.Unmarshal(req.Params[1], &tag)
+				}
+				if tag == "pending" {
+					resp["result"] = hexutil.EncodeUint64(pendingNonce.Load())
+				} else {
+					resp["result"] = hexutil.EncodeUint64(confirmedNonce.Load())
+				}
+			case "eth_getBlockByNumber":
+				resp["result"] = map[string]interface{}{
+					"number":        hexutil.EncodeUint64(100),
+					"hash":          ecommon.HexToHash("0x11"),
+					"baseFeePerGas": (*hexutil.Big)(big.NewInt(1)),
+				}
+			case "eth_maxPriorityFeePerGas":
+				resp["result"] = (*hexutil.Big)(big.NewInt(1))
+			case "eth_estimateGas":
+				resp["result"] = hexutil.EncodeUint64(100_000)
+			case "eth_getTransactionByHash":
+				var hashHex ecommon.Hash
+				_ = json.Unmarshal(req.Params[0], &hashHex)
+				if hashHex == setTss6Hash && setTss6Raw != nil {
+					v, rSig, sSig := setTss6Raw.RawSignatureValues()
+					resp["result"] = map[string]interface{}{
+						"hash":                 setTss6Hash,
+						"nonce":                hexutil.EncodeUint64(setTss6Raw.Nonce()),
+						"from":                 sender,
+						"to":                   setTss6Raw.To(),
+						"gas":                  hexutil.EncodeUint64(setTss6Raw.Gas()),
+						"maxFeePerGas":         (*hexutil.Big)(setTss6Raw.GasFeeCap()),
+						"maxPriorityFeePerGas": (*hexutil.Big)(setTss6Raw.GasTipCap()),
+						"value":                (*hexutil.Big)(setTss6Raw.Value()),
+						"input":                hexutil.Bytes(setTss6Raw.Data()),
+						"type":                 hexutil.EncodeUint64(uint64(setTss6Raw.Type())),
+						"chainId":              (*hexutil.Big)(big.NewInt(1)),
+						"v":                    (*hexutil.Big)(v),
+						"r":                    (*hexutil.Big)(rSig),
+						"s":                    (*hexutil.Big)(sSig),
+					}
+				} else {
+					resp["result"] = nil
+				}
+			case "eth_sendRawTransaction":
+				var raw hexutil.Bytes
+				_ = json.Unmarshal(req.Params[0], &raw)
+				var tx etypes.Transaction
+				_ = tx.UnmarshalBinary(raw)
+				switch tx.Hash() {
+				case halt6LowHash:
+					resp["error"] = map[string]interface{}{"code": -32000, "message": "replacement transaction underpriced"}
+				case halt7Hash:
+					close(halt7Entered)
+					select {
+					case <-releaseHalt7:
+					case <-r.Context().Done():
+						return
+					}
+					resp["error"] = map[string]interface{}{"code": -32000, "message": "insufficient funds for gas * price + value"}
+				default:
+					resp["result"] = tx.Hash().Hex()
+				}
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(resp)
+		}))
+		t.Cleanup(func() {
+			release()
+			srv.Close()
+		})
+
+		// Process 1: queue setTss(6) at 100 wei, start halt(7), send cheaper halt(6)
+		// (underpriced), and definitively reject halt(7).
+		db1, err := leveldb.OpenFile(dbDir, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		store1 := wrap.NewPendingEvmTxStore(db1).ForChain(1)
+		c1, err := NewEvmRpcClient(config.BaseNetworkConfig{Urls: []string{srv.URL}}, "rollback-live-rot-1", contract)
+		if err != nil {
+			_ = db1.Close()
+			t.Fatal(err)
+		}
+		c1.SetChainID(1)
+		c1.SetPendingTxStore(store1)
+
+		rotTemplate, err := c1.GetSetTssEcdsaPubKeyEvmTx(ecommon.HexToAddress("0x3333333333333333333333333333333333333333"), sender, []byte{4}, []byte{5}, &contract)
+		if err != nil {
+			c1.Stop()
+			_ = db1.Close()
+			t.Fatal(err)
+		}
+		haltTemplate, err := c1.GetHaltTxEvm(sender, []byte{1, 2, 3}, &contract)
+		if err != nil {
+			c1.Stop()
+			_ = db1.Close()
+			t.Fatal(err)
+		}
+
+		setTss6, err := etypes.SignTx(etypes.NewTx(&etypes.DynamicFeeTx{
+			ChainID:   big.NewInt(1),
+			Nonce:     6,
+			GasTipCap: big.NewInt(100),
+			GasFeeCap: big.NewInt(100),
+			Gas:       rotTemplate.Gas(),
+			To:        rotTemplate.To(),
+			Value:     big.NewInt(0),
+			Data:      rotTemplate.Data(),
+		}), signer, key)
+		if err != nil {
+			c1.Stop()
+			_ = db1.Close()
+			t.Fatal(err)
+		}
+		setTss6Raw = setTss6
+		setTss6Hash = setTss6.Hash()
+		if err := c1.SendTransaction(setTss6); err != nil {
+			c1.Stop()
+			_ = db1.Close()
+			t.Fatal(err)
+		}
+
+		halt7, err := etypes.SignTx(etypes.NewTx(&etypes.DynamicFeeTx{
+			ChainID:   big.NewInt(1),
+			Nonce:     7,
+			GasTipCap: big.NewInt(100),
+			GasFeeCap: big.NewInt(100),
+			Gas:       haltTemplate.Gas(),
+			To:        haltTemplate.To(),
+			Value:     big.NewInt(0),
+			Data:      haltTemplate.Data(),
+		}), signer, key)
+		if err != nil {
+			c1.Stop()
+			_ = db1.Close()
+			t.Fatal(err)
+		}
+		halt7Hash = halt7.Hash()
+		halt7Done := make(chan error, 1)
+		go func() { halt7Done <- c1.SendTransaction(halt7) }()
+		select {
+		case <-halt7Entered:
+		case <-time.After(2 * time.Second):
+			c1.Stop()
+			_ = db1.Close()
+			t.Fatal("timed out waiting for halt7 send")
+		}
+
+		halt6Low, err := etypes.SignTx(etypes.NewTx(&etypes.DynamicFeeTx{
+			ChainID:   big.NewInt(1),
+			Nonce:     6,
+			GasTipCap: big.NewInt(10),
+			GasFeeCap: big.NewInt(10),
+			Gas:       haltTemplate.Gas(),
+			To:        haltTemplate.To(),
+			Value:     big.NewInt(0),
+			Data:      haltTemplate.Data(),
+		}), signer, key)
+		if err != nil {
+			release()
+			<-halt7Done
+			c1.Stop()
+			_ = db1.Close()
+			t.Fatal(err)
+		}
+		halt6LowHash = halt6Low.Hash()
+		if err := c1.SendTransaction(halt6Low); err == nil {
+			release()
+			<-halt7Done
+			c1.Stop()
+			_ = db1.Close()
+			t.Fatal("expected underpriced error for halt6Low")
+		}
+
+		release()
+		if err := <-halt7Done; err == nil {
+			c1.Stop()
+			_ = db1.Close()
+			t.Fatal("expected halt7 rejection")
+		}
+		c1.Stop()
+		if err := db1.Close(); err != nil {
+			t.Fatal(err)
+		}
+
+		// Process 2: reopen LevelDB and run ClearObsoleteHaltTx while setTss(6)
+		// is still visible by hash. Cleanup MUST delete halt and restore setTss(6)!
+		db2, err := leveldb.OpenFile(dbDir, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = db2.Close() }()
+		store2 := wrap.NewPendingEvmTxStore(db2).ForChain(1)
+		c2, err := NewEvmRpcClient(config.BaseNetworkConfig{Urls: []string{srv.URL}}, "rollback-live-rot-2", contract)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer c2.Stop()
+		c2.SetChainID(1)
+		c2.SetPendingTxStore(store2)
+
+		if err := c2.ClearObsoleteHaltTx(sender); err != nil {
+			t.Fatalf("ClearObsoleteHaltTx after restart error: %v", err)
+		}
+		if gotHalt, err := store2.LoadPendingEvmTx(sender, contract, evmTxKindHalt); err != nil || gotHalt != nil {
+			t.Fatalf("after cleanup, durable halt = (%+v, %v), want nil", gotHalt, err)
+		}
+		gotRot, err := store2.LoadPendingEvmTx(sender, contract, evmTxKindSetTss)
+		if err != nil || gotRot == nil || gotRot.Nonce != 6 || gotRot.TxHash != setTss6Hash {
+			t.Fatalf("after cleanup, durable setTss = (%+v, %v), want restored nonce 6 hash %s", gotRot, err, setTss6Hash)
+		}
+		if gotRot.TipCap.Cmp(big.NewInt(100)) < 0 || gotRot.FeeCap.Cmp(big.NewInt(100)) < 0 {
+			t.Fatalf("restored setTss(6) fee watermark = (%s, %s), want >= (100, 100)", gotRot.TipCap, gotRot.FeeCap)
+		}
+		confirmedNonce.Store(6)
+		pendingNonce.Store(7)
+		nextRot, err := c2.GetSetTssEcdsaPubKeyEvmTx(ecommon.HexToAddress("0x3333333333333333333333333333333333333333"), sender, []byte{4}, []byte{5}, &contract)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if nextRot.Nonce() != 6 || nextRot.GasTipCap().Cmp(big.NewInt(120)) < 0 || nextRot.GasFeeCap().Cmp(big.NewInt(120)) < 0 {
+			t.Fatalf("next setTss = (nonce=%d tip=%s fee=%s), want nonce 6 with caps >= 120", nextRot.Nonce(), nextRot.GasTipCap(), nextRot.GasFeeCap())
+		}
+	})
+
+	t.Run("lower-nonce halt sent after higher-nonce attempt survives restart and cleanup", func(t *testing.T) {
+		key, err := crypto.GenerateKey()
+		if err != nil {
+			t.Fatal(err)
+		}
+		sender := crypto.PubkeyToAddress(key.PublicKey)
+		signer := etypes.LatestSignerForChainID(big.NewInt(1))
+		dbDir := t.TempDir()
+
+		var halt6Hash, halt7Hash ecommon.Hash
+		var halt6Raw *etypes.Transaction
+		var confirmedNonce, pendingNonce atomic.Uint64
+		confirmedNonce.Store(5)
+		pendingNonce.Store(5)
+
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			var req struct {
+				ID     json.RawMessage   `json:"id"`
+				Method string            `json:"method"`
+				Params []json.RawMessage `json:"params"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&req)
+			resp := map[string]interface{}{"jsonrpc": "2.0", "id": req.ID}
+			switch req.Method {
+			case "eth_chainId":
+				resp["result"] = hexutil.EncodeUint64(1)
+			case "eth_blockNumber":
+				resp["result"] = hexutil.EncodeUint64(100)
+			case "eth_getBalance":
+				resp["result"] = (*hexutil.Big)(new(big.Int).Mul(big.NewInt(10), big.NewInt(1e18)))
+			case "eth_getTransactionCount":
+				var tag string
+				if len(req.Params) >= 2 {
+					_ = json.Unmarshal(req.Params[1], &tag)
+				}
+				if tag == "pending" {
+					resp["result"] = hexutil.EncodeUint64(pendingNonce.Load())
+				} else {
+					resp["result"] = hexutil.EncodeUint64(confirmedNonce.Load())
+				}
+			case "eth_getBlockByNumber":
+				resp["result"] = map[string]interface{}{
+					"number":        hexutil.EncodeUint64(100),
+					"hash":          ecommon.HexToHash("0x11"),
+					"baseFeePerGas": (*hexutil.Big)(big.NewInt(20_000_000_000)),
+				}
+			case "eth_maxPriorityFeePerGas":
+				resp["result"] = (*hexutil.Big)(big.NewInt(2_000_000_000))
+			case "eth_estimateGas":
+				resp["result"] = hexutil.EncodeUint64(100_000)
+			case "eth_getTransactionByHash":
+				var hashHex ecommon.Hash
+				_ = json.Unmarshal(req.Params[0], &hashHex)
+				if hashHex == halt6Hash && halt6Raw != nil {
+					v, rSig, sSig := halt6Raw.RawSignatureValues()
+					resp["result"] = map[string]interface{}{
+						"hash":                 halt6Hash,
+						"nonce":                hexutil.EncodeUint64(halt6Raw.Nonce()),
+						"from":                 sender,
+						"to":                   halt6Raw.To(),
+						"gas":                  hexutil.EncodeUint64(halt6Raw.Gas()),
+						"maxFeePerGas":         (*hexutil.Big)(halt6Raw.GasFeeCap()),
+						"maxPriorityFeePerGas": (*hexutil.Big)(halt6Raw.GasTipCap()),
+						"value":                (*hexutil.Big)(halt6Raw.Value()),
+						"input":                hexutil.Bytes(halt6Raw.Data()),
+						"type":                 hexutil.EncodeUint64(uint64(halt6Raw.Type())),
+						"chainId":              (*hexutil.Big)(big.NewInt(1)),
+						"v":                    (*hexutil.Big)(v),
+						"r":                    (*hexutil.Big)(rSig),
+						"s":                    (*hexutil.Big)(sSig),
+					}
+				} else {
+					resp["result"] = nil
+				}
+			case "eth_sendRawTransaction":
+				var raw hexutil.Bytes
+				_ = json.Unmarshal(req.Params[0], &raw)
+				var tx etypes.Transaction
+				_ = tx.UnmarshalBinary(raw)
+				if tx.Hash() == halt7Hash {
+					if hj, ok := w.(http.Hijacker); ok {
+						conn, _, hErr := hj.Hijack()
+						if hErr == nil {
+							_ = conn.Close()
+							return
+						}
+					}
+					resp["error"] = map[string]interface{}{"code": -32000, "message": "read tcp: connection reset by peer"}
+				} else {
+					resp["result"] = tx.Hash().Hex()
+				}
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(resp)
+		}))
+		t.Cleanup(srv.Close)
+
+		// Process 1: ambiguous halt(7) (connection dropped), then accepted halt(6).
+		db1, err := leveldb.OpenFile(dbDir, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		store1 := wrap.NewPendingEvmTxStore(db1).ForChain(1)
+		c1, err := NewEvmRpcClient(config.BaseNetworkConfig{Urls: []string{srv.URL}}, "lower-after-higher-1", contract)
+		if err != nil {
+			_ = db1.Close()
+			t.Fatal(err)
+		}
+		c1.SetChainID(1)
+		c1.SetPendingTxStore(store1)
+		haltTemplate, err := c1.GetHaltTxEvm(sender, []byte{1, 2, 3}, &contract)
+		if err != nil {
+			c1.Stop()
+			_ = db1.Close()
+			t.Fatal(err)
+		}
+
+		halt7, err := etypes.SignTx(etypes.NewTx(&etypes.DynamicFeeTx{
+			ChainID:   big.NewInt(1),
+			Nonce:     7,
+			GasTipCap: haltTemplate.GasTipCap(),
+			GasFeeCap: haltTemplate.GasFeeCap(),
+			Gas:       haltTemplate.Gas(),
+			To:        haltTemplate.To(),
+			Value:     big.NewInt(0),
+			Data:      haltTemplate.Data(),
+		}), signer, key)
+		if err != nil {
+			c1.Stop()
+			_ = db1.Close()
+			t.Fatal(err)
+		}
+		halt7Hash = halt7.Hash()
+		if err := c1.SendTransaction(halt7); err == nil {
+			c1.Stop()
+			_ = db1.Close()
+			t.Fatal("expected ambiguous transport error for halt7")
+		}
+
+		halt6, err := etypes.SignTx(etypes.NewTx(&etypes.DynamicFeeTx{
+			ChainID:   big.NewInt(1),
+			Nonce:     6,
+			GasTipCap: haltTemplate.GasTipCap(),
+			GasFeeCap: haltTemplate.GasFeeCap(),
+			Gas:       haltTemplate.Gas(),
+			To:        haltTemplate.To(),
+			Value:     big.NewInt(0),
+			Data:      haltTemplate.Data(),
+		}), signer, key)
+		if err != nil {
+			c1.Stop()
+			_ = db1.Close()
+			t.Fatal(err)
+		}
+		halt6Raw = halt6
+		halt6Hash = halt6.Hash()
+		if err := c1.SendTransaction(halt6); err != nil {
+			c1.Stop()
+			_ = db1.Close()
+			t.Fatalf("expected halt6 acceptance, got %v", err)
+		}
+		if err := c1.ClearObsoleteHaltTx(sender); err != nil {
+			c1.Stop()
+			_ = db1.Close()
+			t.Fatalf("ClearObsoleteHaltTx before restart error: %v", err)
+		}
+		if gotHalt, err := store1.LoadPendingEvmTx(sender, contract, evmTxKindHalt); err != nil || gotHalt == nil || gotHalt.Nonce != 7 {
+			c1.Stop()
+			_ = db1.Close()
+			t.Fatalf("before restart, durable halt = (%+v, %v), want nonce 7 preserved", gotHalt, err)
+		}
+		c1.Stop()
+		if err := db1.Close(); err != nil {
+			t.Fatal(err)
+		}
+
+		// Process 2: reopen LevelDB; cleanup MUST STILL see queued halt(6) via
+		// persisted PriorTxHashes on the nonce-7 row and preserve the reservation!
+		db2, err := leveldb.OpenFile(dbDir, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = db2.Close() }()
+		store2 := wrap.NewPendingEvmTxStore(db2).ForChain(1)
+		c2, err := NewEvmRpcClient(config.BaseNetworkConfig{Urls: []string{srv.URL}}, "lower-after-higher-2", contract)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer c2.Stop()
+		c2.SetChainID(1)
+		c2.SetPendingTxStore(store2)
+
+		if err := c2.ClearObsoleteHaltTx(sender); err != nil {
+			t.Fatalf("ClearObsoleteHaltTx after restart error: %v", err)
+		}
+		gotHalt, err := store2.LoadPendingEvmTx(sender, contract, evmTxKindHalt)
+		if err != nil || gotHalt == nil || gotHalt.Nonce != 7 {
+			t.Fatalf("after restart, cleanup erased reservation despite live queued halt(6): durable halt = (%+v, %v)", gotHalt, err)
+		}
+	})
+
+	t.Run("truncated lower-nonce history does not block cleanup or strand rotation after confirmation advances", func(t *testing.T) {
+		key, err := crypto.GenerateKey()
+		if err != nil {
+			t.Fatal(err)
+		}
+		sender := crypto.PubkeyToAddress(key.PublicKey)
+		signer := etypes.LatestSignerForChainID(big.NewInt(1))
+		dbDir := t.TempDir()
+
+		var confirmedNonce, pendingNonce atomic.Uint64
+		confirmedNonce.Store(5)
+		pendingNonce.Store(5)
+
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			var req struct {
+				ID     json.RawMessage   `json:"id"`
+				Method string            `json:"method"`
+				Params []json.RawMessage `json:"params"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&req)
+			resp := map[string]interface{}{"jsonrpc": "2.0", "id": req.ID}
+			switch req.Method {
+			case "eth_chainId":
+				resp["result"] = hexutil.EncodeUint64(1)
+			case "eth_blockNumber":
+				resp["result"] = hexutil.EncodeUint64(100)
+			case "eth_getBalance":
+				resp["result"] = (*hexutil.Big)(new(big.Int).Mul(big.NewInt(10), big.NewInt(1e18)))
+			case "eth_getTransactionCount":
+				var tag string
+				if len(req.Params) >= 2 {
+					_ = json.Unmarshal(req.Params[1], &tag)
+				}
+				if tag == "pending" {
+					resp["result"] = hexutil.EncodeUint64(pendingNonce.Load())
+				} else {
+					resp["result"] = hexutil.EncodeUint64(confirmedNonce.Load())
+				}
+			case "eth_getBlockByNumber":
+				resp["result"] = map[string]interface{}{
+					"number":        hexutil.EncodeUint64(100),
+					"hash":          ecommon.HexToHash("0x11"),
+					"baseFeePerGas": (*hexutil.Big)(big.NewInt(20_000_000_000)),
+				}
+			case "eth_maxPriorityFeePerGas":
+				resp["result"] = (*hexutil.Big)(big.NewInt(2_000_000_000))
+			case "eth_estimateGas":
+				resp["result"] = hexutil.EncodeUint64(100_000)
+			case "eth_getTransactionByHash":
+				resp["result"] = nil
+			case "eth_sendRawTransaction":
+				resp["error"] = map[string]interface{}{"code": -32000, "message": "replacement transaction underpriced"}
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(resp)
+		}))
+		t.Cleanup(srv.Close)
+
+		// Process 1: send 18 distinct ambiguous halt(6) attempts (truncating nonce-6
+		// history) followed by 1 ambiguous halt(7) attempt.
+		db1, err := leveldb.OpenFile(dbDir, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		store1 := wrap.NewPendingEvmTxStore(db1).ForChain(1)
+		c1, err := NewEvmRpcClient(config.BaseNetworkConfig{Urls: []string{srv.URL}}, "trunc-lower-nonce-1", contract)
+		if err != nil {
+			_ = db1.Close()
+			t.Fatal(err)
+		}
+		c1.SetChainID(1)
+		c1.SetPendingTxStore(store1)
+		haltTemplate, err := c1.GetHaltTxEvm(sender, []byte{1, 2, 3}, &contract)
+		if err != nil {
+			c1.Stop()
+			_ = db1.Close()
+			t.Fatal(err)
+		}
+		for i := int64(1); i <= 18; i++ {
+			tx6, err := etypes.SignTx(etypes.NewTx(&etypes.DynamicFeeTx{
+				ChainID:   big.NewInt(1),
+				Nonce:     6,
+				GasTipCap: new(big.Int).Add(haltTemplate.GasTipCap(), big.NewInt(i)),
+				GasFeeCap: new(big.Int).Add(haltTemplate.GasFeeCap(), big.NewInt(i)),
+				Gas:       haltTemplate.Gas(),
+				To:        haltTemplate.To(),
+				Value:     big.NewInt(0),
+				Data:      haltTemplate.Data(),
+			}), signer, key)
+			if err != nil {
+				c1.Stop()
+				_ = db1.Close()
+				t.Fatal(err)
+			}
+			_ = c1.SendTransaction(tx6)
+		}
+		tx7, err := etypes.SignTx(etypes.NewTx(&etypes.DynamicFeeTx{
+			ChainID:   big.NewInt(1),
+			Nonce:     7,
+			GasTipCap: new(big.Int).Add(haltTemplate.GasTipCap(), big.NewInt(100)),
+			GasFeeCap: new(big.Int).Add(haltTemplate.GasFeeCap(), big.NewInt(100)),
+			Gas:       haltTemplate.Gas(),
+			To:        haltTemplate.To(),
+			Value:     big.NewInt(0),
+			Data:      haltTemplate.Data(),
+		}), signer, key)
+		if err != nil {
+			c1.Stop()
+			_ = db1.Close()
+			t.Fatal(err)
+		}
+		_ = c1.SendTransaction(tx7)
+		c1.Stop()
+		if err := db1.Close(); err != nil {
+			t.Fatal(err)
+		}
+
+		// Process 2: reopen LevelDB.
+		// While confirmedNonce == 5, evicted nonce-6 hashes are still unconfirmed,
+		// so cleanup defers. Once confirmedNonce == pendingNonce == 7, every
+		// evicted hash belonged to consumed nonce 6, so cleanup MUST clear halt(7)
+		// and allow the next rotation to build at nonce 7 (not stranded at 8).
+		db2, err := leveldb.OpenFile(dbDir, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = db2.Close() }()
+		store2 := wrap.NewPendingEvmTxStore(db2).ForChain(1)
+		c2, err := NewEvmRpcClient(config.BaseNetworkConfig{Urls: []string{srv.URL}}, "trunc-lower-nonce-2", contract)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer c2.Stop()
+		c2.SetChainID(1)
+		c2.SetPendingTxStore(store2)
+
+		if err := c2.ClearObsoleteHaltTx(sender); err != nil {
+			t.Fatalf("ClearObsoleteHaltTx at confirmed=5 error: %v", err)
+		}
+		if gotHalt, err := store2.LoadPendingEvmTx(sender, contract, evmTxKindHalt); err != nil || gotHalt == nil || gotHalt.Nonce != 7 {
+			t.Fatalf("at confirmed=5, durable halt = (%+v, %v), want nonce 7 preserved while truncated nonce 6 is unconfirmed", gotHalt, err)
+		}
+
+		confirmedNonce.Store(7)
+		pendingNonce.Store(7)
+		if err := c2.ClearObsoleteHaltTx(sender); err != nil {
+			t.Fatalf("ClearObsoleteHaltTx at confirmed=7 error: %v", err)
+		}
+		if gotHalt, err := store2.LoadPendingEvmTx(sender, contract, evmTxKindHalt); err != nil || gotHalt != nil {
+			t.Fatalf("at confirmed=7, durable halt = (%+v, %v), want nil (consumed nonce-6 truncation must not block nonce-7 cleanup)", gotHalt, err)
+		}
+		rotTx, err := c2.GetSetTssEcdsaPubKeyEvmTx(ecommon.HexToAddress("0x3333333333333333333333333333333333333333"), sender, []byte{4}, []byte{5}, &contract)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if rotTx.Nonce() != 7 {
+			t.Fatalf("next rotation nonce = %d, want 7 (must not be stranded at 8)", rotTx.Nonce())
 		}
 	})
 }

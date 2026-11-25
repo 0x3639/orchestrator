@@ -38,12 +38,16 @@ func TestPendingEvmTxStoreAtomicBatchAndPersistenceAcrossReopen(t *testing.T) {
 	}
 
 	// Atomically transfer ownership from setTss -> halt.
+	truncNonce := uint64(4)
 	haltRec := &common.PendingEvmTx{
-		Nonce:     5,
-		TxHash:    ecommon.HexToHash("0xbbb2"),
-		TipCap:    big.NewInt(2_400_000_000),
-		FeeCap:    big.NewInt(50_400_000_000),
-		IsDynamic: true,
+		Nonce:              5,
+		TxHash:             ecommon.HexToHash("0xbbb2"),
+		PriorTxHashes:      []common.PendingEvmTxHash{{Nonce: 5, Hash: ecommon.HexToHash("0xbbb1")}},
+		PriorTruncatedUpTo: &truncNonce,
+		SupersededOther:    setTssRec,
+		TipCap:             big.NewInt(2_400_000_000),
+		FeeCap:             big.NewInt(50_400_000_000),
+		IsDynamic:          true,
 	}
 	if err := store.ApplyPendingEvmTxBatch([]common.PendingEvmTxOp{
 		{Sender: sender, Contract: contract, Kind: "halt", Record: haltRec},
@@ -73,6 +77,15 @@ func TestPendingEvmTxStoreAtomicBatchAndPersistenceAcrossReopen(t *testing.T) {
 	}
 	if gotHalt.Nonce != 5 || gotHalt.TxHash != haltRec.TxHash || gotHalt.FeeCap.Cmp(haltRec.FeeCap) != 0 {
 		t.Fatalf("unexpected reopened halt record: %+v", gotHalt)
+	}
+	if len(gotHalt.PriorTxHashes) != 1 || gotHalt.PriorTxHashes[0] != haltRec.PriorTxHashes[0] {
+		t.Fatalf("unexpected reopened priorTxHashes: %+v", gotHalt.PriorTxHashes)
+	}
+	if gotHalt.PriorTruncatedUpTo == nil || *gotHalt.PriorTruncatedUpTo != truncNonce {
+		t.Fatalf("unexpected reopened priorTruncatedUpTo: %v", gotHalt.PriorTruncatedUpTo)
+	}
+	if gotHalt.SupersededOther == nil || gotHalt.SupersededOther.TxHash != setTssRec.TxHash {
+		t.Fatalf("unexpected reopened supersededOther: %+v", gotHalt.SupersededOther)
 	}
 
 	// Atomically roll back halt -> setTss.
