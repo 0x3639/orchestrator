@@ -1,6 +1,7 @@
 package node
 
 import (
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"encoding/base64"
@@ -78,6 +79,10 @@ type Node struct {
 	stopped chan struct{}
 	// Prevents concurrent use of instance directory
 	dataDirLock fileutil.Releaser
+
+	// Round-robin cursor for bounded legacy pre-upgrade resign revalidation.
+	legacyRevalidateMu     sync.Mutex
+	legacyRevalidateLastID types.Hash
 }
 
 func NewNode(config *oconfig.Config, logger *zap.Logger) (_ *Node, initErr error) {
@@ -1340,6 +1345,7 @@ func (node *Node) runReSignScan() bool {
 	node.logger.Debug("Parsing all the wraps in resign state")
 	snapshot := make([]*embedded.WrapTokenRequest, 0)
 	seen := make(map[types.Hash]struct{})
+	expectedCount := -1
 	for pageIndex := uint32(0); ; {
 		if node.workerStopping() {
 			return false
@@ -1369,6 +1375,18 @@ func (node *Node) runReSignScan() bool {
 			}
 			continue
 		}
+		if expectedCount >= 0 && wrapRequests.Count != expectedCount {
+			// Total wrap count changed mid-pagination (e.g. a wrap arrived or
+			// disappeared, shifting page boundaries); restart from page 0 so no
+			// wrap shifted across pages can be skipped.
+			node.logger.Debugf("wrap request count changed during resign scan (%d -> %d); restarting from page 0",
+				expectedCount, wrapRequests.Count)
+			snapshot = snapshot[:0]
+			seen = make(map[types.Hash]struct{})
+			expectedCount = -1
+			pageIndex = 0
+			continue
+		}
 		if wrapRequests.Count == 0 {
 			break
 		}
@@ -1384,12 +1402,18 @@ func (node *Node) runReSignScan() bool {
 		if expected == 0 {
 			break
 		}
+		expectedCount = wrapRequests.Count
 		node.logger.Debugf("len(wrapRequests.List): %d, pageIndex: %d", len(wrapRequests.List), pageIndex)
+		shifted := false
 		for _, wrap := range wrapRequests.List {
 			if wrap == nil || wrap.WrapTokenRequest == nil {
 				continue
 			}
 			if _, dup := seen[wrap.Id]; dup {
+				if pageIndex > 0 {
+					shifted = true
+					break
+				}
 				continue
 			}
 			seen[wrap.Id] = struct{}{}
@@ -1397,6 +1421,14 @@ func (node *Node) runReSignScan() bool {
 				continue
 			}
 			snapshot = append(snapshot, wrap)
+		}
+		if shifted {
+			node.logger.Debugf("wrap page boundary shifted on page %d; restarting from page 0", pageIndex)
+			snapshot = snapshot[:0]
+			seen = make(map[types.Hash]struct{})
+			expectedCount = -1
+			pageIndex = 0
+			continue
 		}
 		if int(pageIndex+1)*int(pageSize) >= wrapRequests.Count {
 			break
@@ -1595,13 +1627,21 @@ func (node *Node) requireLiveTransfers() error {
 	return nil
 }
 
+// legacyRevalidateBudget caps total wall-clock time spent revalidating
+// pre-upgrade legacy resign markers in a single signing batch so timeouts can
+// never stall ceremonies or delay an EmergencyState / HaltedState transition.
+var legacyRevalidateBudget = 2 * time.Second
+
 // revalidateLegacyResignWrap checks a pre-upgrade resign marker (written by
 // SetResignStatus before PublishResignWraps existed) by ID against the trusted
-// Zenon RPC: clears obsolete missing markers, skips unfinalized wraps, and
-// upgrades finalized wraps via PublishResignWraps.
-func (node *Node) revalidateLegacyResignWrap(id types.Hash) (*definition.WrapTokenRequest, bool, error) {
-	ctx, cancel := context.WithTimeout(node.workers.context(), resignRPCTimeout)
-	wrap, err := node.networksManager.Znn().GetWrapTokenRequestByIdContext(ctx, id)
+// Zenon RPC within ctx: clears obsolete missing markers, skips unfinalized
+// wraps, and upgrades finalized wraps via PublishResignWraps.
+func (node *Node) revalidateLegacyResignWrap(ctx context.Context, id types.Hash) (*definition.WrapTokenRequest, bool, error) {
+	if ctx.Err() != nil {
+		return nil, false, nil
+	}
+	callCtx, cancel := context.WithTimeout(ctx, resignRPCTimeout)
+	wrap, err := node.networksManager.Znn().GetWrapTokenRequestByIdContext(callCtx, id)
 	cancel()
 	if rpc.WrapNotFound(err) {
 		if clearErr := node.networksManager.SetResignStatus(id, false); clearErr != nil {
@@ -1620,9 +1660,9 @@ func (node *Node) revalidateLegacyResignWrap(id types.Hash) (*definition.WrapTok
 
 // buildWrapSigningBatch collects and deduplicates wrap candidates for signing.
 // Local resignable rows take precedence over unsigned RPC rows for the same
-// wrap ID, pre-upgrade legacy markers are revalidated by ID against Zenon
-// before signing, and settled wraps (RedeemStatus != UnredeemedStatus) are
-// excluded.
+// wrap ID, pre-upgrade legacy markers are revalidated by ID within a shared
+// time budget (preserving round-robin progress across ceremonies and stopping
+// immediately if the node leaves LiveState), and settled wraps are excluded.
 func (node *Node) buildWrapSigningBatch() ([]*definition.WrapTokenRequest, [][]byte, map[string]int, error) {
 	unsignedWraps, err := node.networksManager.GetUnsignedWrapRequests()
 	if err != nil {
@@ -1639,6 +1679,8 @@ func (node *Node) buildWrapSigningBatch() ([]*definition.WrapTokenRequest, [][]b
 	wrapRequestsIds := make([]*definition.WrapTokenRequest, 0, len(resignableWraps)+len(unsignedWraps))
 	seen := make(map[types.Hash]struct{}, len(resignableWraps)+len(unsignedWraps))
 	blockedLegacy := make(map[types.Hash]struct{})
+	var legacyWraps []*definition.WrapTokenRequest
+	legacySeen := make(map[types.Hash]struct{})
 	for _, req := range resignableWraps {
 		if req == nil {
 			continue
@@ -1653,20 +1695,69 @@ func (node *Node) buildWrapSigningBatch() ([]*definition.WrapTokenRequest, [][]b
 			return nil, nil, nil, err
 		}
 		if !published {
-			refreshed, ok, err := node.revalidateLegacyResignWrap(req.Id)
+			if _, dup := legacySeen[req.Id]; !dup {
+				legacySeen[req.Id] = struct{}{}
+				legacyWraps = append(legacyWraps, req)
+			}
+			continue
+		}
+		seen[req.Id] = struct{}{}
+		wrapRequestsIds = append(wrapRequestsIds, req)
+	}
+	if len(legacyWraps) == 0 {
+		node.legacyRevalidateMu.Lock()
+		node.legacyRevalidateLastID = types.ZeroHash
+		node.legacyRevalidateMu.Unlock()
+	} else {
+		sort.Slice(legacyWraps, func(i, j int) bool {
+			return bytes.Compare(legacyWraps[i].Id.Bytes(), legacyWraps[j].Id.Bytes()) < 0
+		})
+		node.legacyRevalidateMu.Lock()
+		startIdx := 0
+		if node.legacyRevalidateLastID != types.ZeroHash {
+			for i, req := range legacyWraps {
+				if bytes.Compare(req.Id.Bytes(), node.legacyRevalidateLastID.Bytes()) > 0 {
+					startIdx = i
+					break
+				}
+			}
+		}
+		legacyCtx, cancel := context.WithTimeout(node.workers.context(), legacyRevalidateBudget)
+		var legacyErr error
+		var leftLive bool
+		for offset := 0; offset < len(legacyWraps); offset++ {
+			req := legacyWraps[(startIdx+offset)%len(legacyWraps)]
+			if node.requireLiveTransfers() != nil {
+				leftLive = true
+				break
+			}
+			if legacyCtx.Err() != nil {
+				blockedLegacy[req.Id] = struct{}{}
+				continue
+			}
+			node.legacyRevalidateLastID = req.Id
+			refreshed, ok, err := node.revalidateLegacyResignWrap(legacyCtx, req.Id)
 			if err != nil {
-				node.logger.Error(err)
-				common.RequestStop(node.stopChan)
-				return nil, nil, nil, err
+				legacyErr = err
+				break
 			}
 			if !ok {
 				blockedLegacy[req.Id] = struct{}{}
 				continue
 			}
-			req = refreshed
+			seen[req.Id] = struct{}{}
+			wrapRequestsIds = append(wrapRequestsIds, refreshed)
 		}
-		seen[req.Id] = struct{}{}
-		wrapRequestsIds = append(wrapRequestsIds, req)
+		cancel()
+		node.legacyRevalidateMu.Unlock()
+		if legacyErr != nil {
+			node.logger.Error(legacyErr)
+			common.RequestStop(node.stopChan)
+			return nil, nil, nil, legacyErr
+		}
+		if leftLive {
+			return nil, nil, nil, nil
+		}
 	}
 	for _, req := range unsignedWraps {
 		if req == nil {
@@ -2174,9 +2265,43 @@ func (node *Node) sendSignaturesWrap(seenEventsCount map[string]uint32) {
 			if err := node.requireLiveTransfers(); err != nil {
 				return
 			}
-			err = node.networksManager.UpdateWrapRequest(req.Id, req.Signature, node.producerKeyPair, node.state.WhileLive)
+			// Recheck current redeem status and expected signature immediately
+			// before publishing so a wrap settled (or re-signed) during waits,
+			// RPC lookups, or PoW is never submitted.
+			var (
+				skippedPublish bool
+				settledNow     bool
+			)
+			whileEligible := func(send func() error) (bool, error) {
+				return node.state.WhileLive(func() error {
+					latest, err := node.networksManager.GetWrapEventById(req.Id)
+					if err != nil {
+						return err
+					}
+					if latest == nil || latest.RedeemStatus != common.UnredeemedStatus {
+						skippedPublish = true
+						settledNow = latest != nil && latest.RedeemStatus != common.UnredeemedStatus
+						return nil
+					}
+					if latest.Signature != req.Signature {
+						skippedPublish = true
+						return nil
+					}
+					return send()
+				})
+			}
+			err = node.networksManager.UpdateWrapRequest(req.Id, req.Signature, node.producerKeyPair, whileEligible)
 			if errors.Is(err, network.ErrNotLive) {
 				return
+			}
+			if skippedPublish {
+				if settledNow {
+					if _, errSet := node.networksManager.MarkWrapRequestSignatureSent(req.Id, req.Signature); errSet != nil {
+						node.logger.Debug(errSet)
+					}
+					delete(seenEventsCount, req.Id.String())
+				}
+				continue
 			}
 			if err != nil {
 				node.logger.Debug(err)

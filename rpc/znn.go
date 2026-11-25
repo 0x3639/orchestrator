@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	sdk_rpc_client "github.com/MoonBaZZe/znn-sdk-go/rpc_client"
 	"github.com/MoonBaZZe/znn-sdk-go/zenon"
+	ecommon "github.com/ethereum/go-ethereum/common"
 	ic "github.com/libp2p/go-libp2p-core/crypto"
 	"github.com/libp2p/go-libp2p-core/peer"
 	"time"
@@ -290,6 +291,14 @@ func decodeWrapTokenRequestWithFinality(raw json.RawMessage) (*embedded.WrapToke
 	}
 	if wrap == nil {
 		return nil, nil
+	}
+	if wrap.NetworkClass == definition.EvmClass {
+		if !ecommon.IsHexAddress(wrap.ToAddress) {
+			return nil, errors.New("wrap request reply without a valid EVM toAddress")
+		}
+		if !ecommon.IsHexAddress(wrap.TokenAddress) {
+			return nil, errors.New("wrap request reply without a valid EVM tokenAddress")
+		}
 	}
 	return &embedded.WrapTokenRequest{
 		WrapTokenRequest:        wrap,

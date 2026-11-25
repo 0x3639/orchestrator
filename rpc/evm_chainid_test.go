@@ -255,8 +255,10 @@ func TestWebSocketReconnectReverifiesChainID(t *testing.T) {
 	servedChain.Store(73405)
 	var blockCalls atomic.Int32
 	var (
-		connMu    sync.Mutex
-		activeCon *websocket.Conn
+		connMu         sync.Mutex
+		activeCon      *websocket.Conn
+		lastChainTime  time.Time
+		lastBlockTime  time.Time
 	)
 	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -279,9 +281,15 @@ func TestWebSocketReconnectReverifiesChainID(t *testing.T) {
 			var res string
 			switch req.Method {
 			case "eth_chainId":
+				connMu.Lock()
+				lastChainTime = time.Now()
+				connMu.Unlock()
 				res = fmt.Sprintf("0x%x", servedChain.Load())
 			case "eth_blockNumber":
 				blockCalls.Add(1)
+				connMu.Lock()
+				lastBlockTime = time.Now()
+				connMu.Unlock()
 				res = "0x10"
 			default:
 				res = "0x0"
@@ -299,7 +307,9 @@ func TestWebSocketReconnectReverifiesChainID(t *testing.T) {
 
 	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
 	client, err := NewEvmRpcClientForChain(config.BaseNetworkConfig{
-		Urls: []string{wsURL},
+		Urls:                 []string{wsURL},
+		RpcRequestsPerSecond: 4, // 250ms per permit
+		RpcBurst:             1,
 	}, 73405, "Supernova", ecommon.HexToAddress("0x0000000000000000000000000000000000000001"))
 	if err != nil {
 		t.Fatalf("initial WebSocket dial failed: %v", err)
@@ -334,10 +344,17 @@ func TestWebSocketReconnectReverifiesChainID(t *testing.T) {
 		t.Fatalf("expected eth_blockNumber never to run on unverified wrong-chain reconnect, got %d calls", calls)
 	}
 
-	// Restore correct chain: next call reconnects, verifies eth_chainId, and succeeds.
+	// Restore correct chain: next call reconnects, verifies eth_chainId, waits
+	// for a fresh rate-limit permit, and succeeds.
 	servedChain.Store(73405)
 	if num, err := client.BlockNumber(); err != nil || num != 0x10 {
 		t.Fatalf("expected BlockNumber to recover once endpoint serves expected chain again, num=%d err=%v", num, err)
+	}
+	connMu.Lock()
+	gap := lastBlockTime.Sub(lastChainTime)
+	connMu.Unlock()
+	if gap < 180*time.Millisecond {
+		t.Fatalf("expected retried eth_blockNumber after WS reconnect to wait for fresh permit (>=180ms at 4 req/s burst 1), got %v", gap)
 	}
 }
 

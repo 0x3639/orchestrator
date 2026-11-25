@@ -96,6 +96,8 @@ func TestGetAllWrapTokenRequestsContextRejectsMissingNullFinalityAndNullPage(t *
 		{"zero id", `{"count":1,"list":[{` + testWrapFieldsNoID + `,"id":"0000000000000000000000000000000000000000000000000000000000000000"}]}`},
 		{"omitted creationMomentumHeight", `{"count":1,"list":[{` + testWrapFieldsNoHeight + `}]}`},
 		{"null creationMomentumHeight", `{"count":1,"list":[{` + testWrapFieldsNoHeight + `,"creationMomentumHeight":null}]}`},
+		{"missing toAddress", `{"count":1,"list":[{"networkClass":2,"chainId":1,"id":"00000000000000000000000000000000000000000000000000000000000000bb","tokenStandard":"zts1znnxxxxxxxxxxxxx9z4ulx","tokenAddress":"0x0000000000000000000000000000000000000002","amount":"100","fee":"1","creationMomentumHeight":42,"confirmationsToFinality":0}]}`},
+		{"missing tokenAddress", `{"count":1,"list":[{"networkClass":2,"chainId":1,"id":"00000000000000000000000000000000000000000000000000000000000000bb","toAddress":"0x0000000000000000000000000000000000000001","tokenStandard":"zts1znnxxxxxxxxxxxxx9z4ulx","amount":"100","fee":"1","creationMomentumHeight":42,"confirmationsToFinality":0}]}`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			znn := newRawZnnRPC(t, tc.reply)

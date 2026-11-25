@@ -961,7 +961,7 @@ func (eN *evmNetwork) subscribeToEvents() {
 				logSub.Unsubscribe()
 				return
 			case subErr := <-logSub.Err():
-				eN.logger.Errorf("log subscription for chainId %d ended: %v; catching up and resubscribing", eN.ChainId(), subErr)
+				eN.logger.Errorf("log subscription for chainId %d ended: %v; catching up and resubscribing", eN.ChainId(), eN.EvmRpc().SanitizeError(subErr))
 				dropped = true
 				break consume
 			case newLog := <-logChan:

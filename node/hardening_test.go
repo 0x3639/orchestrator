@@ -488,6 +488,18 @@ func (b *wrapTestBridge) GetAllUnsignedWrapTokenRequests(uint32, uint32) *embedd
 	return b.unsigned
 }
 
+func fillDefaultMockWrapAddresses(w *embedded.WrapTokenRequest) {
+	if w == nil || w.WrapTokenRequest == nil || w.NetworkClass != definition.EvmClass {
+		return
+	}
+	if w.ToAddress == "" {
+		w.ToAddress = "0x000000000000000000000000000000000000beef"
+	}
+	if w.TokenAddress == "" {
+		w.TokenAddress = "0x0000000000000000000000000000000000001111"
+	}
+}
+
 func (b *wrapTestBridge) GetAllWrapTokenRequests(pageIndex, pageSize uint32) *embedded.WrapTokenRequestList {
 	n := b.pages.Add(1)
 	if b.onPage != nil {
@@ -497,13 +509,20 @@ func (b *wrapTestBridge) GetAllWrapTokenRequests(pageIndex, pageSize uint32) *em
 	handler := b.pageHandler
 	allWraps := b.allWraps
 	b.mu.Unlock()
+	var res *embedded.WrapTokenRequestList
 	if handler != nil {
-		return handler(pageIndex, pageSize, n)
+		res = handler(pageIndex, pageSize, n)
+	} else if pageIndex > 0 || allWraps == nil {
+		res = &embedded.WrapTokenRequestList{List: []*embedded.WrapTokenRequest{}}
+	} else {
+		res = allWraps
 	}
-	if pageIndex > 0 || allWraps == nil {
-		return &embedded.WrapTokenRequestList{List: []*embedded.WrapTokenRequest{}}
+	if res != nil {
+		for _, w := range res.List {
+			fillDefaultMockWrapAddresses(w)
+		}
 	}
-	return allWraps
+	return res
 }
 
 func (b *wrapTestBridge) GetWrapTokenRequestById(ctx context.Context, id types.Hash) (*embedded.WrapTokenRequest, error) {
@@ -520,9 +539,14 @@ func (b *wrapTestBridge) GetWrapTokenRequestById(ctx context.Context, id types.H
 		hook(id)
 	}
 	if handler != nil {
-		return handler(ctx, id, call)
+		res, err := handler(ctx, id, call)
+		if err == nil {
+			fillDefaultMockWrapAddresses(res)
+		}
+		return res, err
 	}
 	if req != nil {
+		fillDefaultMockWrapAddresses(req)
 		return req, nil
 	}
 	return nil, constants.ErrDataNonExistent
@@ -1475,6 +1499,158 @@ func TestBuildWrapSigningBatchRevalidatesLegacyResignMarkersByID(t *testing.T) {
 	}
 	if pub, err := n.dbManager.ZnnStorage().IsPublishedResignWrap(finalizedID); err != nil || !pub {
 		t.Fatalf("expected finalizedID to be upgraded to published marker, pub=%v err=%v", pub, err)
+	}
+}
+
+func TestReSignStateRestartsWhenCountShiftsBetweenPages(t *testing.T) {
+	prevDelay := resignRetryDelay
+	prevPageSize := resignPageSize
+	resignRetryDelay = 10 * time.Millisecond
+	resignPageSize = 2
+	t.Cleanup(func() {
+		resignRetryDelay = prevDelay
+		resignPageSize = prevPageSize
+	})
+
+	evmSrv := fakeEvmRpcServer(t)
+	defer evmSrv.Close()
+
+	vanished := &embedded.WrapTokenRequest{
+		WrapTokenRequest: &definition.WrapTokenRequest{
+			NetworkClass: definition.EvmClass, ChainId: 1, Id: types.Hash{0xc1},
+			ToAddress: "0x000000000000000000000000000000000000beef", TokenAddress: "0x0000000000000000000000000000000000001111",
+			Amount: big.NewInt(10), Fee: big.NewInt(1), CreationMomentumHeight: 100,
+		},
+		ConfirmationsToFinality: 2,
+	}
+	wA := &embedded.WrapTokenRequest{
+		WrapTokenRequest: &definition.WrapTokenRequest{
+			NetworkClass: definition.EvmClass, ChainId: 1, Id: types.Hash{0xc2},
+			ToAddress: "0x000000000000000000000000000000000000beef", TokenAddress: "0x0000000000000000000000000000000000001111",
+			Amount: big.NewInt(20), Fee: big.NewInt(2), CreationMomentumHeight: 90,
+		},
+		ConfirmationsToFinality: 0,
+	}
+	wShifted := &embedded.WrapTokenRequest{
+		WrapTokenRequest: &definition.WrapTokenRequest{
+			NetworkClass: definition.EvmClass, ChainId: 1, Id: types.Hash{0xc3},
+			ToAddress: "0x000000000000000000000000000000000000beef", TokenAddress: "0x0000000000000000000000000000000000001111",
+			Amount: big.NewInt(30), Fee: big.NewInt(3), CreationMomentumHeight: 80,
+		},
+		ConfirmationsToFinality: 0,
+	}
+
+	var vanishedRemoved atomic.Bool
+	bridge := &wrapTestBridge{
+		networks: &embedded.NetworkInfoList{
+			Count: 1,
+			List: []*definition.NetworkInfo{{
+				NetworkClass: definition.EvmClass, Id: 1, Name: "Ethereum",
+				ContractAddress: "0x0000000000000000000000000000000000000001",
+			}},
+		},
+		pageHandler: func(pageIndex, _ uint32, _ int32) *embedded.WrapTokenRequestList {
+			if !vanishedRemoved.Load() {
+				if pageIndex == 0 {
+					// On the first page-0 read, vanished is present (count=3);
+					// remove it before page 1 is read so wShifted shifts onto page 0.
+					vanishedRemoved.Store(true)
+					return &embedded.WrapTokenRequestList{Count: 3, List: []*embedded.WrapTokenRequest{vanished, wA}}
+				}
+			}
+			if pageIndex == 0 {
+				return &embedded.WrapTokenRequestList{Count: 2, List: []*embedded.WrapTokenRequest{wA, wShifted}}
+			}
+			return &embedded.WrapTokenRequestList{Count: 2, List: []*embedded.WrapTokenRequest{}}
+		},
+	}
+
+	n := wrapTestNodeWithEvm(t, common.LiveState, bridge, map[string]string{"Ethereum": evmSrv.URL})
+	if _, err := n.state.ActivateResign(definition.EvmClass, 1); err != nil {
+		t.Fatal(err)
+	}
+	if !n.runReSignScan() {
+		t.Fatal("runReSignScan returned false")
+	}
+	for _, id := range []types.Hash{wA.Id, wShifted.Id} {
+		resign, err := n.dbManager.ZnnStorage().GetResignStatus(id)
+		if err != nil || !resign {
+			t.Fatalf("expected wrap %s marked for resign after page-shift restart, resign=%v err=%v", id, resign, err)
+		}
+	}
+}
+
+func TestBuildWrapSigningBatchBoundsLegacyRevalidationAndRotatesProgress(t *testing.T) {
+	prevBudget := legacyRevalidateBudget
+	legacyRevalidateBudget = 120 * time.Millisecond
+	t.Cleanup(func() { legacyRevalidateBudget = prevBudget })
+
+	evmSrv := fakeEvmRpcServer(t)
+	defer evmSrv.Close()
+
+	slowID := types.Hash{0x01}
+	healthyID := types.Hash{0x02}
+	makeWrap := func(id types.Hash) *embedded.WrapTokenRequest {
+		return &embedded.WrapTokenRequest{
+			WrapTokenRequest: &definition.WrapTokenRequest{
+				NetworkClass: definition.EvmClass, ChainId: 1, Id: id,
+				ToAddress: "0x000000000000000000000000000000000000beef",
+				TokenAddress: "0x0000000000000000000000000000000000001111",
+				Amount: big.NewInt(100), Fee: big.NewInt(1), CreationMomentumHeight: 50,
+			},
+			ConfirmationsToFinality: 0,
+		}
+	}
+	slowWrap := makeWrap(slowID)
+	healthyWrap := makeWrap(healthyID)
+
+	bridge := &wrapTestBridge{
+		networks: &embedded.NetworkInfoList{
+			Count: 1,
+			List: []*definition.NetworkInfo{{
+				NetworkClass: definition.EvmClass, Id: 1, Name: "Ethereum",
+				ContractAddress: "0x0000000000000000000000000000000000000001",
+			}},
+		},
+		byIDHandler: func(ctx context.Context, id types.Hash, _ int32) (*embedded.WrapTokenRequest, error) {
+			if id == slowID {
+				<-ctx.Done()
+				return nil, ctx.Err()
+			}
+			return healthyWrap, nil
+		},
+	}
+
+	n := wrapTestNodeWithEvm(t, common.LiveState, bridge, map[string]string{"Ethereum": evmSrv.URL})
+	for _, w := range []*embedded.WrapTokenRequest{slowWrap, healthyWrap} {
+		if err := n.dbManager.ZnnStorage().AddWrapRequest(common.ZnnWrapToOrchestratorWrap(w.WrapTokenRequest)); err != nil {
+			t.Fatal(err)
+		}
+		if err := n.dbManager.ZnnStorage().SetResignStatus(w.Id, true); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Batch 1: slowID hits legacyRevalidateBudget promptly instead of resignRPCTimeout.
+	start := time.Now()
+	reqs, _, _, err := n.buildWrapSigningBatch()
+	if err != nil {
+		t.Fatalf("batch 1 failed: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("legacy revalidation exceeded budget: %v", elapsed)
+	}
+	if len(reqs) != 0 {
+		t.Fatalf("expected batch 1 to defer both wraps, got %+v", reqs)
+	}
+
+	// Batch 2: rotates to healthyID first and promotes it even while slowID stays stalled.
+	reqs, msgs, _, err := n.buildWrapSigningBatch()
+	if err != nil {
+		t.Fatalf("batch 2 failed: %v", err)
+	}
+	if len(reqs) != 1 || len(msgs) != 1 || reqs[0].Id != healthyID {
+		t.Fatalf("expected batch 2 to promote healthyID via round-robin, got reqs=%+v msgs=%d", reqs, len(msgs))
 	}
 }
 
