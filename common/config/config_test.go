@@ -464,11 +464,28 @@ func TestEnsureDataDirRejectsEmptySymlinkAndNormalizesMode(t *testing.T) {
 		t.Fatalf("mode = %04o, want %04o", info.Mode().Perm(), DataDirPerm)
 	}
 
-	// Symlinked directory must be rejected.
+	// Symlinked directory (with or without trailing separator) must be rejected.
 	linkDir := filepath.Join(t.TempDir(), "link-dir")
 	if err := os.Symlink(dir, linkDir); err == nil {
 		if err := EnsureDataDir(linkDir); err == nil {
 			t.Fatal("expected error for symlinked data dir")
+		}
+		if err := EnsureDataDir(linkDir + string(os.PathSeparator)); err == nil {
+			t.Fatal("expected error for symlinked data dir with trailing separator")
+		}
+	}
+
+	// Special mode bits (e.g. sticky bit) on the directory must be cleared to exact 0700.
+	if err := os.Chmod(dir, DataDirPerm|os.ModeSticky); err == nil {
+		if err := EnsureDataDir(dir); err != nil {
+			t.Fatalf("EnsureDataDir with sticky bit failed: %v", err)
+		}
+		info, err := os.Stat(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.Mode()&fullPermMask != DataDirPerm {
+			t.Fatalf("dir mode after clearing sticky bit = %04o, want %04o", info.Mode()&fullPermMask, DataDirPerm)
 		}
 	}
 }
@@ -555,6 +572,20 @@ func TestSecureKeyShareFilesTightensPermissionsAndRejectsUnsafeEntries(t *testin
 			t.Fatal("expected error for symlinked localstate file")
 		}
 		_ = os.Remove(linkPath)
+	}
+
+	// Special mode bits on a key share file must be cleared to exact 0600.
+	if err := os.Chmod(shareA, KeyShareFilePerm|os.ModeSticky); err == nil {
+		if err := SecureKeyShareFiles(dir); err != nil {
+			t.Fatalf("SecureKeyShareFiles with sticky bit failed: %v", err)
+		}
+		info, err := os.Stat(shareA)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.Mode()&fullPermMask != KeyShareFilePerm {
+			t.Fatalf("share mode after clearing sticky bit = %04o, want %04o", info.Mode()&fullPermMask, KeyShareFilePerm)
+		}
 	}
 
 	// Non-regular key share (directory) must be rejected.

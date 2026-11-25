@@ -11,6 +11,9 @@ import (
 	tcommon "github.com/HyperCore-Team/go-tss/common"
 	"github.com/HyperCore-Team/go-tss/keygen"
 	"github.com/HyperCore-Team/go-tss/messages"
+	tstorage "github.com/HyperCore-Team/go-tss/storage"
+	gotss "github.com/HyperCore-Team/go-tss/tss"
+	"github.com/ethereum/go-ethereum/crypto"
 
 	"orchestrator/common"
 	oconfig "orchestrator/common/config"
@@ -189,6 +192,88 @@ func TestKeyGenHardensNewShareAndFailsOnMissingOrUnsafeShare(t *testing.T) {
 		}
 		if _, err := mgrSym.KeyGen(messages.ECDSAKEYGEN); !errors.Is(err, ErrKeyShareSecurity) {
 			t.Fatalf("symlink share err = %v, want ErrKeyShareSecurity", err)
+		}
+	}
+}
+
+func TestSecureLocalStateManagerWrites0600AndAnchorsToOpenDir(t *testing.T) {
+	priv, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	pubKey := base64.StdEncoding.EncodeToString(crypto.CompressPubkey(&priv.PublicKey))
+	fileName, err := common.GetPublicKeyFileName(pubKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	parent := t.TempDir()
+	origDir := filepath.Join(parent, "tss-orig")
+	ownedDir, err := oconfig.OpenOwnedDir(origDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ownedDir.Close()
+
+	mgr := newSecureLocalStateManager(ownedDir)
+
+	// Verify installSecureStateManager wires cleanly onto go-tss's TssServer.
+	srv := &gotss.TssServer{}
+	if err := installSecureStateManager(srv, mgr); err != nil {
+		t.Fatalf("installSecureStateManager failed: %v", err)
+	}
+
+	want := tstorage.KeygenLocalState{
+		PubKey:          pubKey,
+		LocalData:       []byte("secret-share-material"),
+		ParticipantKeys: []string{"p1", "p2"},
+		LocalPartyKey:   "p1",
+	}
+	if err := mgr.SaveLocalState(want, messages.ECDSAKEYGEN); err != nil {
+		t.Fatalf("SaveLocalState failed: %v", err)
+	}
+
+	// The created share must be born exact 0600 (never 0655).
+	info, err := os.Stat(filepath.Join(origDir, fileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode()&(os.ModePerm|os.ModeSetuid|os.ModeSetgid|os.ModeSticky) != oconfig.KeyShareFilePerm {
+		t.Fatalf("share mode = %04o, want %04o", info.Mode(), oconfig.KeyShareFilePerm)
+	}
+
+	// Substitute the original directory pathname with a decoy directory:
+	// the fd-anchored state manager must still read the original share, NOT the decoy.
+	movedDir := filepath.Join(parent, "tss-moved")
+	if err := os.Rename(origDir, movedDir); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(origDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(origDir, fileName), []byte(`{"pub_key":"decoy","local_data":"ZGVjb3k="}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := mgr.GetLocalState(pubKey, messages.ECDSAKEYSIGN)
+	if err != nil {
+		t.Fatalf("GetLocalState after ancestor rename failed: %v", err)
+	}
+	if string(got.LocalData) != string(want.LocalData) || got.PubKey != want.PubKey {
+		t.Fatalf("GetLocalState read decoy instead of anchored dir: got %+v", got)
+	}
+
+	// Symlink inside the anchored directory must be refused by GetLocalState.
+	if err := os.Remove(filepath.Join(movedDir, fileName)); err != nil {
+		t.Fatal(err)
+	}
+	decoy := filepath.Join(movedDir, "other.json")
+	if err := os.WriteFile(decoy, []byte(`{}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(decoy, filepath.Join(movedDir, fileName)); err == nil {
+		if _, err := mgr.GetLocalState(pubKey, messages.ECDSAKEYSIGN); err == nil {
+			t.Fatal("expected GetLocalState to reject symlinked share")
 		}
 	}
 }

@@ -1283,7 +1283,7 @@ func (node *Node) processSignatures() {
 				} else {
 					// we wait so the administrator unhalts all the networks if znn is unhalted
 					if halted == 0 {
-						if err := node.state.SetState(common.LiveState); err != nil {
+						if _, err := node.state.SetStateIf(common.HaltedState, common.LiveState); err != nil {
 							node.logger.Debug(err)
 							continue
 						}
@@ -1291,133 +1291,259 @@ func (node *Node) processSignatures() {
 				}
 			}
 		case common.ReSignState:
-			pageIndex := uint32(0)
-			pageSize := uint32(100)
-
-			resignNetworkClass, resignChainId, resignGen := node.state.GetResignTarget()
-			deferredUnfinalized := false
-			staleResign := false
-			// Gather all wraps that need to be resigned
-			node.logger.Debug("Parsing all the wraps in resign state")
-			for {
-				// Returning keeps ReSignState; the next start resumes the scan.
-				if node.workerStopping() {
-					return
-				}
-				if !node.state.IsResignGenerationCurrent(resignGen) {
-					staleResign = true
-					break
-				}
-				wrapRequests, err := node.networksManager.Znn().GetAllWrapTokenRequests(pageIndex, pageSize)
-				if err != nil {
-					node.logger.Debug(err)
-					node.workerSleep(10 * time.Second)
-					continue
-				} else if wrapRequests == nil || len(wrapRequests.List) == 0 {
-					break
-				} else {
-					node.logger.Debugf("len(wrapRequests.List): %d, pageIndex: %d", len(wrapRequests.List), pageIndex)
-					for _, wrap := range wrapRequests.List {
-						if !node.state.IsResignGenerationCurrent(resignGen) {
-							staleResign = true
-							break
-						}
-						if wrap == nil || wrap.WrapTokenRequest == nil {
-							continue
-						}
-						if wrap.NetworkClass != resignNetworkClass || wrap.ChainId != resignChainId {
-							continue
-						}
-						if wrap.ConfirmationsToFinality != 0 {
-							deferredUnfinalized = true
-							continue
-						}
-						// A storage failure stops the node and leaves it in
-						// ReSignState, so the next start scans every wrap
-						// again; going on would reach LiveState with this
-						// wrap never marked.
-						event, errGetWrap := node.networksManager.GetWrapEventById(wrap.Id)
-						if errGetWrap != nil {
-							// A failed read is not a missing record.
-							node.logger.Error(errGetWrap)
-							common.RequestStop(node.stopChan)
-							return
-						}
-						if event == nil {
-							// if the rpc returns it but we don't have it locally there was a problem
-							// if we don't have it we just add it now
-							if errStorage := node.networksManager.Znn().AddWrapEvent(wrap.WrapTokenRequest); errStorage != nil {
-								node.logger.Error(errStorage)
-								common.RequestStop(node.stopChan)
-								return
-							}
-							event, errGetWrap = node.networksManager.GetWrapEventById(wrap.Id)
-							if errGetWrap == nil && event == nil {
-								errGetWrap = fmt.Errorf("wrap %s is missing right after it was stored", wrap.Id)
-							}
-							if errGetWrap != nil {
-								node.logger.Error(errGetWrap)
-								common.RequestStop(node.stopChan)
-								return
-							}
-						}
-
-						if event.RedeemStatus != common.UnredeemedStatus {
-							continue
-						}
-						if !node.workerSleep(50 * time.Millisecond) {
-							return
-						}
-						if !node.state.IsResignGenerationCurrent(resignGen) {
-							staleResign = true
-							break
-						}
-						evmNetwork := node.networksManager.LookupEvm(wrap.ChainId)
-						if evmNetwork == nil {
-							node.logger.Infof("EVM network %d is no longer listed by the bridge; its wraps are not re-signed", wrap.ChainId)
-							continue
-						}
-						redeemStatus, err := evmNetwork.RedeemsInfo(wrap.Id)
-						if err != nil {
-							node.logger.Debug(err.Error())
-							continue
-						}
-						if !node.state.IsResignGenerationCurrent(resignGen) {
-							staleResign = true
-							break
-						}
-						// The wrap is not redeemed or in pendingRedeem so we resign it
-						if redeemStatus.BlockNumber.Cmp(big.NewInt(0)) == 0 {
-							if err = node.networksManager.SetResignStatus(wrap.Id, true); err != nil {
-								node.logger.Error(err)
-								common.RequestStop(node.stopChan)
-								return
-							}
-							//node.logger.Debugf("Set wrap %s status as true", wrap.Id.String())
-						}
-						// A positive latest-state lookup suppresses re-signing. Only the
-						// finalized EVM events distinguish redemption from revocation.
-					}
-					if staleResign {
-						break
-					}
-				}
-				pageIndex++
-			}
-			if staleResign || !node.state.IsResignGenerationCurrent(resignGen) {
-				node.logger.Debug("ReSignState target or state changed during scan; skipping completion")
-				continue
-			}
-			if deferredUnfinalized {
-				node.logger.Debug("Deferring ReSignState completion while matching wraps await NoM finality")
-				continue
-			}
-			node.logger.Debug("Finished parsing all the wraps in resign state")
-			if _, err := node.state.CompleteResign(resignGen); err != nil {
-				node.logger.Debug(err.Error())
+			if !node.runReSignScan() {
+				return
 			}
 		}
 	}
+}
+
+// resignRetryDelay paces retries for deferred unfinalized wraps and failed
+// eligibility lookups during a ReSignState scan.
+var resignRetryDelay = time.Second
+
+// runReSignScan walks a stable snapshot of matching wraps for the active
+// ReSignState request, retrying wraps that were unfinalized at the start of
+// the scan and wraps whose EVM RedeemsInfo lookup transiently failed, without
+// letting newly arriving unfinalized wraps prolong the scan indefinitely.
+// Returns false if the worker is stopping or encountered a fatal storage error.
+func (node *Node) runReSignScan() bool {
+	const pageSize = uint32(100)
+
+	resignNetworkClass, resignChainId, resignGen := node.state.GetResignTarget()
+	deferredUnfinalized := make(map[types.Hash]struct{})
+	retryEligibility := make(map[types.Hash]*definition.WrapTokenRequest)
+	staleResign := false
+
+	node.logger.Debug("Parsing all the wraps in resign state")
+	pageIndex := uint32(0)
+	for {
+		// Returning keeps ReSignState; the next start resumes the scan.
+		if node.workerStopping() {
+			return false
+		}
+		if !node.state.IsResignGenerationCurrent(resignGen) {
+			staleResign = true
+			break
+		}
+		wrapRequests, err := node.networksManager.Znn().GetAllWrapTokenRequests(pageIndex, pageSize)
+		if err != nil {
+			node.logger.Debug(err)
+			if !node.workerSleep(10 * time.Second) {
+				return false
+			}
+			continue
+		}
+		if wrapRequests == nil || len(wrapRequests.List) == 0 {
+			break
+		}
+		node.logger.Debugf("len(wrapRequests.List): %d, pageIndex: %d", len(wrapRequests.List), pageIndex)
+		for _, wrap := range wrapRequests.List {
+			if !node.state.IsResignGenerationCurrent(resignGen) {
+				staleResign = true
+				break
+			}
+			if wrap == nil || wrap.WrapTokenRequest == nil {
+				continue
+			}
+			if wrap.NetworkClass != resignNetworkClass || wrap.ChainId != resignChainId {
+				continue
+			}
+			if wrap.ConfirmationsToFinality != 0 {
+				deferredUnfinalized[wrap.Id] = struct{}{}
+				continue
+			}
+			needRetry, stale, fatal := node.processReSignWrap(wrap.WrapTokenRequest, resignGen)
+			if fatal {
+				return false
+			}
+			if stale {
+				staleResign = true
+				break
+			}
+			if needRetry {
+				retryEligibility[wrap.Id] = wrap.WrapTokenRequest
+			}
+		}
+		if staleResign {
+			break
+		}
+		pageIndex++
+	}
+
+	// Retry only the wraps captured in this scan's stable set: wraps that were
+	// unfinalized when the scan started and wraps whose eligibility lookup failed.
+	for !staleResign && (len(deferredUnfinalized) > 0 || len(retryEligibility) > 0) {
+		if node.workerStopping() {
+			return false
+		}
+		if !node.state.IsResignGenerationCurrent(resignGen) {
+			staleResign = true
+			break
+		}
+		if !node.workerSleep(resignRetryDelay) {
+			return false
+		}
+
+		for id, wrap := range retryEligibility {
+			needRetry, stale, fatal := node.processReSignWrap(wrap, resignGen)
+			if fatal {
+				return false
+			}
+			if stale {
+				staleResign = true
+				break
+			}
+			if !needRetry {
+				delete(retryEligibility, id)
+			}
+		}
+		if staleResign || len(deferredUnfinalized) == 0 {
+			continue
+		}
+
+		seen := make(map[types.Hash]bool, len(deferredUnfinalized))
+		scanComplete := true
+		pageIndex = 0
+		for {
+			if node.workerStopping() {
+				return false
+			}
+			if !node.state.IsResignGenerationCurrent(resignGen) {
+				staleResign = true
+				scanComplete = false
+				break
+			}
+			wrapRequests, err := node.networksManager.Znn().GetAllWrapTokenRequests(pageIndex, pageSize)
+			if err != nil {
+				node.logger.Debug(err)
+				scanComplete = false
+				break
+			}
+			if wrapRequests == nil || len(wrapRequests.List) == 0 {
+				break
+			}
+			for _, wrap := range wrapRequests.List {
+				if wrap == nil || wrap.WrapTokenRequest == nil {
+					continue
+				}
+				if _, tracked := deferredUnfinalized[wrap.Id]; !tracked {
+					continue
+				}
+				seen[wrap.Id] = true
+				if wrap.ConfirmationsToFinality != 0 {
+					continue
+				}
+				delete(deferredUnfinalized, wrap.Id)
+				needRetry, stale, fatal := node.processReSignWrap(wrap.WrapTokenRequest, resignGen)
+				if fatal {
+					return false
+				}
+				if stale {
+					staleResign = true
+					scanComplete = false
+					break
+				}
+				if needRetry {
+					retryEligibility[wrap.Id] = wrap.WrapTokenRequest
+				}
+			}
+			if staleResign {
+				break
+			}
+			pageIndex++
+		}
+		if scanComplete {
+			for id := range deferredUnfinalized {
+				if !seen[id] {
+					delete(deferredUnfinalized, id)
+				}
+			}
+		}
+	}
+
+	if staleResign || !node.state.IsResignGenerationCurrent(resignGen) {
+		node.logger.Debug("ReSignState target or state changed during scan; skipping completion")
+		return true
+	}
+	node.logger.Debug("Finished parsing all the wraps in resign state")
+	if _, err := node.state.CompleteResign(resignGen); err != nil {
+		node.logger.Debug(err.Error())
+	}
+	return true
+}
+
+func (node *Node) processReSignWrap(wrap *definition.WrapTokenRequest, resignGen uint64) (retryEligibility, stale, fatal bool) {
+	if !node.state.IsResignGenerationCurrent(resignGen) {
+		return false, true, false
+	}
+	// A storage failure stops the node and leaves it in ReSignState, so the
+	// next start scans every wrap again; going on would reach LiveState with
+	// this wrap never marked.
+	event, errGetWrap := node.networksManager.GetWrapEventById(wrap.Id)
+	if errGetWrap != nil {
+		// A failed read is not a missing record.
+		node.logger.Error(errGetWrap)
+		common.RequestStop(node.stopChan)
+		return false, false, true
+	}
+	if event == nil {
+		// if the rpc returns it but we don't have it locally there was a problem
+		// if we don't have it we just add it now
+		if errStorage := node.networksManager.Znn().AddWrapEvent(wrap); errStorage != nil {
+			node.logger.Error(errStorage)
+			common.RequestStop(node.stopChan)
+			return false, false, true
+		}
+		event, errGetWrap = node.networksManager.GetWrapEventById(wrap.Id)
+		if errGetWrap == nil && event == nil {
+			errGetWrap = fmt.Errorf("wrap %s is missing right after it was stored", wrap.Id)
+		}
+		if errGetWrap != nil {
+			node.logger.Error(errGetWrap)
+			common.RequestStop(node.stopChan)
+			return false, false, true
+		}
+	}
+
+	if event.RedeemStatus != common.UnredeemedStatus {
+		return false, false, false
+	}
+	if !node.workerSleep(50 * time.Millisecond) {
+		return false, false, true
+	}
+	if !node.state.IsResignGenerationCurrent(resignGen) {
+		return false, true, false
+	}
+	evmNetwork := node.networksManager.LookupEvm(wrap.ChainId)
+	if evmNetwork == nil {
+		node.logger.Infof("EVM network %d is no longer listed by the bridge; its wraps are not re-signed", wrap.ChainId)
+		return false, false, false
+	}
+	redeemStatus, err := evmNetwork.RedeemsInfo(wrap.Id)
+	if err != nil {
+		node.logger.Debug(err.Error())
+		return true, false, false
+	}
+	// The wrap is not redeemed or in pendingRedeem so we resign it.
+	// Check the resign generation and persist the flag atomically under stateMu
+	// so a concurrent retarget, cancellation, or halt cannot leave an obsolete flag.
+	if redeemStatus.BlockNumber.Cmp(big.NewInt(0)) == 0 {
+		marked, err := node.state.WhileResignGenerationIs(resignGen, func() error {
+			return node.networksManager.SetResignStatus(wrap.Id, true)
+		})
+		if err != nil {
+			node.logger.Error(err)
+			common.RequestStop(node.stopChan)
+			return false, false, true
+		}
+		if !marked {
+			return false, true, false
+		}
+	}
+	// A positive latest-state lookup suppresses re-signing. Only the
+	// finalized EVM events distinguish redemption from revocation.
+	return false, false, false
 }
 
 func (node *Node) requireLiveTransfers() error {

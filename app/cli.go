@@ -19,8 +19,11 @@ import (
 )
 
 var (
-	app         = cli.NewApp()
-	nodeManager *Manager
+	app          = cli.NewApp()
+	nodeManager  *Manager
+	onPprofError = func(address string, err error) {
+		common.GlobalLogger.Errorf("pprof server failed on %s: %v", address, err)
+	}
 )
 
 func Run() {
@@ -78,7 +81,7 @@ func beforeAction(ctx *cli.Context) error {
 
 		go func() {
 			if err := http.ListenAndServe(address, nil); err != nil {
-				common.GlobalLogger.Errorf("pprof server failed on %s: %v", address, err)
+				onPprofError(address, err)
 			}
 		}()
 	}

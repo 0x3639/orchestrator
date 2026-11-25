@@ -46,7 +46,8 @@ func openNoFollow(path string) (*os.File, error) {
 }
 
 // openDirNoFollow opens path as a directory without following a symlink at the
-// final path component.
+// final path component. Callers must strip trailing separators (filepath.Clean)
+// first so POSIX does not resolve a symlinked final component before '.'.
 func openDirNoFollow(path string) (*os.File, error) {
 	return os.OpenFile(path, os.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
 }
@@ -59,4 +60,28 @@ func openAtNoFollow(dir *os.File, name string) (*os.File, error) {
 		return nil, &os.PathError{Op: "openat", Path: filepath.Join(dir.Name(), name), Err: err}
 	}
 	return os.NewFile(uintptr(fd), filepath.Join(dir.Name(), name)), nil
+}
+
+// createAtNoFollow exclusively creates a new file relative to dir with perm,
+// never following symlinks.
+func createAtNoFollow(dir *os.File, name string, perm os.FileMode) (*os.File, error) {
+	fd, err := unix.Openat(int(dir.Fd()), name, unix.O_WRONLY|unix.O_CREAT|unix.O_EXCL|unix.O_NOFOLLOW|unix.O_CLOEXEC, uint32(perm))
+	if err != nil {
+		return nil, &os.PathError{Op: "openat", Path: filepath.Join(dir.Name(), name), Err: err}
+	}
+	return os.NewFile(uintptr(fd), filepath.Join(dir.Name(), name)), nil
+}
+
+func renameAt(dir *os.File, oldName, newName string) error {
+	if err := unix.Renameat(int(dir.Fd()), oldName, int(dir.Fd()), newName); err != nil {
+		return &os.LinkError{Op: "renameat", Old: filepath.Join(dir.Name(), oldName), New: filepath.Join(dir.Name(), newName), Err: err}
+	}
+	return nil
+}
+
+func unlinkAt(dir *os.File, name string) error {
+	if err := unix.Unlinkat(int(dir.Fd()), name, 0); err != nil {
+		return &os.PathError{Op: "unlinkat", Path: filepath.Join(dir.Name(), name), Err: err}
+	}
+	return nil
 }

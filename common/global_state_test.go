@@ -318,3 +318,97 @@ func TestResignGenerationPreventsStaleCompletion(t *testing.T) {
 		t.Fatalf("current gen3 failed to complete: completed=%v err=%v state=%s", completed, err, StateToText(state))
 	}
 }
+
+func TestPendingResignPreservedAcrossProtectedStatesAndInterruptions(t *testing.T) {
+	// 1. ActivateResign during HaltedState is preserved and applied on resume.
+	state := HaltedState
+	gs := NewGlobalState(&state)
+	if activated, err := gs.ActivateResign(2, 56); err != nil || activated || state != HaltedState {
+		t.Fatalf("during HaltedState: activated=%v err=%v state=%s", activated, err, StateToText(state))
+	}
+	if changed, err := gs.SetStateIf(HaltedState, LiveState); err != nil || !changed || state != ReSignState {
+		t.Fatalf("resume from HaltedState: changed=%v err=%v state=%s, want ReSignState", changed, err, StateToText(state))
+	}
+	if class, chain := gs.GetResignNetwork(); class != 2 || chain != 56 {
+		t.Fatalf("preserved resign target = (%d, %d), want (2, 56)", class, chain)
+	}
+
+	// 2. Halt interrupting active ReSignState preserves it until unhalted.
+	if err := gs.SetState(HaltedState); err != nil {
+		t.Fatal(err)
+	}
+	if changed, err := gs.SetStateIf(HaltedState, LiveState); err != nil || !changed || state != ReSignState {
+		t.Fatalf("resume after interrupted ReSignState: changed=%v err=%v state=%s, want ReSignState", changed, err, StateToText(state))
+	}
+
+	// 3. DeactivateResign during KeyGenState cancels a pending resign.
+	state = KeyGenState
+	gs = NewGlobalState(&state)
+	if _, err := gs.ActivateResign(2, 1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := gs.DeactivateResign(); err != nil {
+		t.Fatal(err)
+	}
+	if changed, err := gs.SetStateIf(KeyGenState, LiveState); err != nil || !changed || state != LiveState {
+		t.Fatalf("after cancelled pending resign: changed=%v err=%v state=%s, want LiveState", changed, err, StateToText(state))
+	}
+
+	// 4. ActivateResign during KeyGenState enters ReSignState when KeyGen finishes.
+	state = KeyGenState
+	gs = NewGlobalState(&state)
+	if _, err := gs.ActivateResign(2, 42); err != nil {
+		t.Fatal(err)
+	}
+	if changed, err := gs.SetStateIf(KeyGenState, LiveState); err != nil || !changed || state != ReSignState {
+		t.Fatalf("after KeyGen with pending resign: changed=%v err=%v state=%s, want ReSignState", changed, err, StateToText(state))
+	}
+	if class, chain := gs.GetResignNetwork(); class != 2 || chain != 42 {
+		t.Fatalf("preserved resign target after KeyGen = (%d, %d), want (2, 42)", class, chain)
+	}
+}
+
+func TestWhileResignGenerationIsSerializesWriteBoundary(t *testing.T) {
+	state := LiveState
+	gs := NewGlobalState(&state)
+	if _, err := gs.ActivateResign(2, 1); err != nil {
+		t.Fatal(err)
+	}
+	_, _, gen1 := gs.GetResignTarget()
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	retargetDone := make(chan struct{})
+
+	go func() {
+		<-entered
+		_, _ = gs.ActivateResign(2, 56)
+		close(retargetDone)
+	}()
+
+	ran, err := gs.WhileResignGenerationIs(gen1, func() error {
+		close(entered)
+		// Retarget must block on stateMu while this write is in progress.
+		select {
+		case <-retargetDone:
+			t.Error("retarget completed while WhileResignGenerationIs callback was still running")
+		default:
+		}
+		close(release)
+		return nil
+	})
+	if err != nil || !ran {
+		t.Fatalf("first WhileResignGenerationIs: ran=%v err=%v", ran, err)
+	}
+	<-retargetDone
+
+	// Once retarget completed, the stale generation must NOT run the write.
+	staleRan := false
+	ran, err = gs.WhileResignGenerationIs(gen1, func() error {
+		staleRan = true
+		return nil
+	})
+	if err != nil || ran || staleRan {
+		t.Fatalf("stale generation ran write: ran=%v staleRan=%v err=%v", ran, staleRan, err)
+	}
+}

@@ -31,6 +31,7 @@ type TssManager struct {
 	settingsMu        sync.RWMutex
 	voteMu            sync.Mutex
 	unwrapVotes       *leveldb.DB
+	stateDir          *oconfig.OwnedDir
 	keyShareDir       string
 	server            *tss.TssServer
 	port              int
@@ -48,15 +49,21 @@ type TssManager struct {
 	partyConfig func() tcommon.TssConfig
 }
 
-func NewTssManager(conf oconfig.TssManagerConfig, privateKey string) (*TssManager, error) {
+func NewTssManager(conf oconfig.TssManagerConfig, privateKey string) (_ *TssManager, retErr error) {
 	priKey, err := conversion.GetPriKey(privateKey)
 	if err != nil {
 		return nil, err
 	}
-	if err := oconfig.EnsureDataDir(conf.BaseDir); err != nil {
+	stateDir, err := oconfig.OpenOwnedDir(conf.BaseDir)
+	if err != nil {
 		return nil, err
 	}
-	if err := oconfig.SecureKeyShareFiles(conf.BaseDir); err != nil {
+	defer func() {
+		if retErr != nil {
+			_ = stateDir.Close()
+		}
+	}()
+	if err := stateDir.SecureKeyShareFiles(""); err != nil {
 		return nil, err
 	}
 
@@ -123,9 +130,15 @@ func NewTssManager(conf oconfig.TssManagerConfig, privateKey string) (*TssManage
 		votes.Close()
 		return nil, err
 	}
+	if err := installSecureStateManager(server, newSecureLocalStateManager(stateDir)); err != nil {
+		server.Stop()
+		votes.Close()
+		return nil, err
+	}
 
 	return &TssManager{
 		unwrapVotes:       votes,
+		stateDir:          stateDir,
 		keyShareDir:       conf.BaseDir,
 		port:              conf.Port,
 		server:            server,
@@ -147,6 +160,9 @@ func (m *TssManager) Start() error {
 func (m *TssManager) Stop() {
 	m.server.Stop()
 	m.unwrapVotes.Close()
+	if m.stateDir != nil {
+		_ = m.stateDir.Close()
+	}
 }
 
 func (m *TssManager) BulkSign(messagesBytes [][]byte, algo messages.Algo) (*keysign.Response, error) {
@@ -218,7 +234,13 @@ func (m *TssManager) KeyGen(algo messages.Algo) (*keygen.Response, error) {
 			if nameErr != nil {
 				return nil, fmt.Errorf("%w: invalid generated pubKey: %w", ErrKeyShareSecurity, nameErr)
 			}
-			if secErr := oconfig.SecureKeyShareFilesExpecting(m.keyShareDir, expectedFile); secErr != nil {
+			var secErr error
+			if m.stateDir != nil {
+				secErr = m.stateDir.SecureKeyShareFiles(expectedFile)
+			} else {
+				secErr = oconfig.SecureKeyShareFilesExpecting(m.keyShareDir, expectedFile)
+			}
+			if secErr != nil {
 				return nil, fmt.Errorf("%w: %w", ErrKeyShareSecurity, secErr)
 			}
 		}

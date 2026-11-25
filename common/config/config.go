@@ -1,6 +1,8 @@
 package config
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	gotss "github.com/HyperCore-Team/go-tss/common"
@@ -9,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 )
 
 var DefaultNodeConfigFileName = "config.json"
@@ -25,6 +28,10 @@ const (
 	DataDirPerm      = os.FileMode(0700)
 	ConfigFilePerm   = os.FileMode(0600)
 	KeyShareFilePerm = os.FileMode(0600)
+
+	// fullPermMask includes permission bits plus setuid, setgid, and sticky bits
+	// so exact mode enforcement rejects and clears special bits too.
+	fullPermMask = os.ModePerm | os.ModeSetuid | os.ModeSetgid | os.ModeSticky
 )
 
 type BaseNetworkConfig struct {
@@ -180,6 +187,146 @@ func (c *Config) ConfigPath() string {
 	return filepath.Join(c.DataPath, DefaultNodeConfigFileName)
 }
 
+// OwnedDir holds an open descriptor to a verified, owner-only (0700)
+// directory. All file operations on it are anchored to this descriptor via
+// *at syscalls so ancestor directory substitution cannot redirect reads or
+// writes.
+type OwnedDir struct {
+	mu   sync.Mutex
+	file *os.File
+}
+
+// OpenOwnedDir creates dataPath if needed, opens it without following a
+// final-component symlink (even with trailing separators), verifies ownership,
+// and enforces exact mode 0700 (clearing any special mode bits).
+func OpenOwnedDir(dataPath string) (*OwnedDir, error) {
+	dir, err := ensureOwnedDir(dataPath)
+	if err != nil {
+		return nil, err
+	}
+	return &OwnedDir{file: dir}, nil
+}
+
+// Close closes the underlying directory descriptor.
+func (d *OwnedDir) Close() error {
+	if d == nil {
+		return nil
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.file == nil {
+		return nil
+	}
+	err := d.file.Close()
+	d.file = nil
+	return err
+}
+
+func (d *OwnedDir) verifyLocked() error {
+	if d == nil || d.file == nil {
+		return fmt.Errorf("directory handle is closed")
+	}
+	return verifyAndChmodOwnedDir(d.file, d.file.Name())
+}
+
+// SecureKeyShareFiles enumerates the open directory, verifies ownership and
+// enforces exact mode 0600 (no special bits) on every localstate-*.json file,
+// and when requiredFileName is non-empty verifies that it is present.
+func (d *OwnedDir) SecureKeyShareFiles(requiredFileName string) error {
+	if requiredFileName != "" && !isKeyShareFileName(requiredFileName) {
+		return fmt.Errorf("invalid key share file name %q", requiredFileName)
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if err := d.verifyLocked(); err != nil {
+		return err
+	}
+	return secureKeyShareFilesInDir(d.file, requiredFileName)
+}
+
+// ReadFile opens fileName anchored to the open directory descriptor without
+// following symlinks, verifies it is an owned regular file, enforces exact
+// mode perm (clearing any special bits), and returns its contents. Returns
+// (nil, false, nil) when fileName does not exist.
+func (d *OwnedDir) ReadFile(fileName string, perm os.FileMode) ([]byte, bool, error) {
+	if !isSafeDirEntryName(fileName) {
+		return nil, false, fmt.Errorf("invalid file name %q", fileName)
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if err := d.verifyLocked(); err != nil {
+		return nil, false, err
+	}
+	f, err := openAtNoFollow(d.file, fileName)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, false, nil
+		}
+		return nil, false, fmt.Errorf("file %s: %w", filepath.Join(d.file.Name(), fileName), err)
+	}
+	defer f.Close()
+
+	fullPath := filepath.Join(d.file.Name(), fileName)
+	if err := verifyAndChmodOwnedFile(f, fullPath, perm); err != nil {
+		return nil, false, err
+	}
+	raw, readErr := io.ReadAll(f)
+	if readErr != nil {
+		return nil, false, fmt.Errorf("file %s: %w", fullPath, readErr)
+	}
+	return raw, true, nil
+}
+
+// WriteFileAtomic creates a temporary file anchored to the open directory
+// descriptor with exact mode perm (never wider even transiently), syncs it,
+// atomically renames it over fileName inside the same directory descriptor,
+// and syncs the directory.
+func (d *OwnedDir) WriteFileAtomic(fileName string, data []byte, perm os.FileMode) error {
+	if !isSafeDirEntryName(fileName) {
+		return fmt.Errorf("invalid file name %q", fileName)
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if err := d.verifyLocked(); err != nil {
+		return err
+	}
+
+	var rnd [8]byte
+	if _, err := rand.Read(rnd[:]); err != nil {
+		return err
+	}
+	tmpName := fmt.Sprintf(".%s.%s.tmp", fileName, hex.EncodeToString(rnd[:]))
+	f, err := createAtNoFollow(d.file, tmpName, perm)
+	if err != nil {
+		return err
+	}
+	cleanup := func() {
+		_ = f.Close()
+		_ = unlinkAt(d.file, tmpName)
+	}
+	if err := verifyAndChmodOwnedFile(f, filepath.Join(d.file.Name(), tmpName), perm); err != nil {
+		cleanup()
+		return err
+	}
+	if _, err := f.Write(data); err != nil {
+		cleanup()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		cleanup()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		_ = unlinkAt(d.file, tmpName)
+		return err
+	}
+	if err := renameAt(d.file, tmpName, fileName); err != nil {
+		_ = unlinkAt(d.file, tmpName)
+		return err
+	}
+	return d.file.Sync()
+}
+
 // EnsureDataDir creates DataPath with owner-only permissions (0700) and
 // verifies the current user owns it through an open descriptor before any
 // credential-bearing file is touched.
@@ -192,78 +339,90 @@ func EnsureDataDir(dataPath string) error {
 }
 
 // ensureOwnedDir ensures dataPath exists as a non-symlink directory owned by
-// the current user with exact mode 0700, returning the open directory handle
-// so callers can anchor subsequent operations to that descriptor.
+// the current user with exact mode 0700 (no special bits), returning the open
+// directory handle so callers can anchor subsequent operations to it.
 func ensureOwnedDir(dataPath string) (*os.File, error) {
 	if strings.TrimSpace(dataPath) == "" {
 		return nil, fmt.Errorf("data directory path is empty")
 	}
-	if err := os.MkdirAll(dataPath, DataDirPerm); err != nil {
+	// Strip trailing path separators so O_NOFOLLOW rejects a symlink at the
+	// final path component instead of resolving through trailing '/'.
+	cleanPath := filepath.Clean(dataPath)
+	if err := os.MkdirAll(cleanPath, DataDirPerm); err != nil {
 		return nil, err
 	}
-	dir, err := openDirNoFollow(dataPath)
+	dir, err := openDirNoFollow(cleanPath)
 	if err != nil {
 		return nil, err
 	}
-	info, err := dir.Stat()
-	if err != nil {
+	if err := verifyAndChmodOwnedDir(dir, cleanPath); err != nil {
 		_ = dir.Close()
 		return nil, err
-	}
-	if !info.IsDir() {
-		_ = dir.Close()
-		return nil, fmt.Errorf("%s is not a directory", dataPath)
-	}
-	if err := verifyOwnedInfo(dataPath, info); err != nil {
-		_ = dir.Close()
-		return nil, err
-	}
-	// MkdirAll only applies the mode to directories it creates; legacy
-	// installations or restricted directories (e.g. 0500/0777) are normalized
-	// to exact 0700 through the open descriptor.
-	if info.Mode().Perm() != DataDirPerm {
-		if err := dir.Chmod(DataDirPerm); err != nil {
-			_ = dir.Close()
-			return nil, fmt.Errorf("data directory %s has mode %04o and could not be set to %04o: %w", dataPath, info.Mode().Perm(), DataDirPerm, err)
-		}
-		common.GlobalLogger.Warnf("data directory %s had mode %04o; set it to %04o", dataPath, info.Mode().Perm(), DataDirPerm)
 	}
 	return dir, nil
 }
 
-func isKeyShareFileName(name string) bool {
-	if name == "" || strings.ContainsAny(name, "/\\") || strings.ContainsRune(name, 0) {
+func verifyAndChmodOwnedDir(dir *os.File, path string) error {
+	info, err := dir.Stat()
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("%s is not a directory", path)
+	}
+	if err := verifyOwnedInfo(path, info); err != nil {
+		return err
+	}
+	if mode := info.Mode() & fullPermMask; mode != DataDirPerm {
+		if err := dir.Chmod(DataDirPerm); err != nil {
+			return fmt.Errorf("data directory %s has mode %04o and could not be set to %04o: %w", path, mode, DataDirPerm, err)
+		}
+		info, err = dir.Stat()
+		if err != nil {
+			return err
+		}
+		if after := info.Mode() & fullPermMask; after != DataDirPerm {
+			return fmt.Errorf("data directory %s remained at mode %04o after chmod to %04o", path, after, DataDirPerm)
+		}
+		common.GlobalLogger.Warnf("data directory %s had mode %04o; set it to %04o", path, mode, DataDirPerm)
+	}
+	return nil
+}
+
+func isSafeDirEntryName(name string) bool {
+	if name == "" || name == "." || name == ".." || strings.ContainsAny(name, "/\\") || strings.ContainsRune(name, 0) {
 		return false
 	}
-	return filepath.Base(name) == name && strings.HasPrefix(name, "localstate-") && strings.HasSuffix(name, ".json")
+	return filepath.Base(name) == name && filepath.Clean(name) == name
+}
+
+func isKeyShareFileName(name string) bool {
+	return isSafeDirEntryName(name) && strings.HasPrefix(name, "localstate-") && strings.HasSuffix(name, ".json")
 }
 
 // SecureKeyShareFiles ensures baseDir is an owned 0700 directory, then
-// verifies ownership and enforces mode 0600 on every localstate-*.json file
-// anchored to that open directory descriptor. Symlinks and non-regular files
-// are rejected.
+// verifies ownership and enforces exact mode 0600 on every localstate-*.json
+// file anchored to that open directory descriptor. Symlinks and non-regular
+// files are rejected.
 func SecureKeyShareFiles(baseDir string) error {
-	dir, err := ensureOwnedDir(baseDir)
+	dir, err := OpenOwnedDir(baseDir)
 	if err != nil {
 		return err
 	}
 	defer dir.Close()
-	return secureKeyShareFilesInDir(dir, "")
+	return dir.SecureKeyShareFiles("")
 }
 
 // SecureKeyShareFilesExpecting hardens baseDir and all localstate-*.json files
 // anchored to the open directory descriptor and verifies that requiredFileName
 // exists among them.
 func SecureKeyShareFilesExpecting(baseDir, requiredFileName string) error {
-	if !isKeyShareFileName(requiredFileName) {
-		return fmt.Errorf("invalid key share file name %q", requiredFileName)
-	}
-	dir, err := ensureOwnedDir(baseDir)
+	dir, err := OpenOwnedDir(baseDir)
 	if err != nil {
 		return err
 	}
 	defer dir.Close()
-	return secureKeyShareFilesInDir(dir, requiredFileName)
+	return dir.SecureKeyShareFiles(requiredFileName)
 }
 
 // ReadKeyShareFile hardens baseDir and all localstate-*.json files anchored to
@@ -273,37 +432,22 @@ func ReadKeyShareFile(baseDir, fileName string) ([]byte, bool, error) {
 	if !isKeyShareFileName(fileName) {
 		return nil, false, fmt.Errorf("invalid key share file name %q", fileName)
 	}
-	dir, err := ensureOwnedDir(baseDir)
+	dir, err := OpenOwnedDir(baseDir)
 	if err != nil {
 		return nil, false, err
 	}
 	defer dir.Close()
 
-	if err := secureKeyShareFilesInDir(dir, ""); err != nil {
+	if err := dir.SecureKeyShareFiles(""); err != nil {
 		return nil, false, err
 	}
-
-	f, err := openAtNoFollow(dir, fileName)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, false, nil
-		}
-		return nil, false, fmt.Errorf("key share file %s: %w", filepath.Join(baseDir, fileName), err)
-	}
-	defer f.Close()
-
-	fullPath := filepath.Join(baseDir, fileName)
-	if err := verifyAndChmodKeyShareFile(f, fullPath); err != nil {
-		return nil, false, err
-	}
-	raw, readErr := io.ReadAll(f)
-	if readErr != nil {
-		return nil, false, fmt.Errorf("key share file %s: %w", fullPath, readErr)
-	}
-	return raw, true, nil
+	return dir.ReadFile(fileName, KeyShareFilePerm)
 }
 
 func secureKeyShareFilesInDir(dir *os.File, requiredFileName string) error {
+	if _, err := dir.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
 	entries, err := dir.ReadDir(-1)
 	if err != nil {
 		return err
@@ -319,7 +463,7 @@ func secureKeyShareFilesInDir(dir *os.File, requiredFileName string) error {
 		if err != nil {
 			return fmt.Errorf("key share file %s: %w", fullPath, err)
 		}
-		err = verifyAndChmodKeyShareFile(f, fullPath)
+		err = verifyAndChmodOwnedFile(f, fullPath, KeyShareFilePerm)
 		closeErr := f.Close()
 		if err != nil {
 			return err
@@ -337,22 +481,29 @@ func secureKeyShareFilesInDir(dir *os.File, requiredFileName string) error {
 	return nil
 }
 
-func verifyAndChmodKeyShareFile(f *os.File, path string) error {
+func verifyAndChmodOwnedFile(f *os.File, path string, wantPerm os.FileMode) error {
 	info, err := f.Stat()
 	if err != nil {
-		return fmt.Errorf("key share file %s: %w", path, err)
+		return fmt.Errorf("file %s: %w", path, err)
 	}
 	if !info.Mode().IsRegular() {
-		return fmt.Errorf("key share file %s is not a regular file", path)
+		return fmt.Errorf("file %s is not a regular file", path)
 	}
 	if err := verifyOwnedInfo(path, info); err != nil {
-		return fmt.Errorf("key share file: %w", err)
+		return fmt.Errorf("file: %w", err)
 	}
-	if info.Mode().Perm() != KeyShareFilePerm {
-		if err := f.Chmod(KeyShareFilePerm); err != nil {
-			return fmt.Errorf("key share file %s has mode %04o and could not be set to %04o: %w", path, info.Mode().Perm(), KeyShareFilePerm, err)
+	if mode := info.Mode() & fullPermMask; mode != wantPerm {
+		if err := f.Chmod(wantPerm); err != nil {
+			return fmt.Errorf("file %s has mode %04o and could not be set to %04o: %w", path, mode, wantPerm, err)
 		}
-		common.GlobalLogger.Warnf("key share file %s had mode %04o; set it to %04o", path, info.Mode().Perm(), KeyShareFilePerm)
+		info, err = f.Stat()
+		if err != nil {
+			return fmt.Errorf("file %s: %w", path, err)
+		}
+		if after := info.Mode() & fullPermMask; after != wantPerm {
+			return fmt.Errorf("file %s remained at mode %04o after chmod to %04o", path, after, wantPerm)
+		}
+		common.GlobalLogger.Warnf("file %s had mode %04o; set it to %04o", path, mode, wantPerm)
 	}
 	return nil
 }

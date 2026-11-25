@@ -440,6 +440,7 @@ type wrapTestBridge struct {
 	unsigned *embedded.WrapTokenRequestList
 	allWraps *embedded.WrapTokenRequestList
 	byID     map[types.Hash]*definition.WrapTokenRequest
+	onGetID  func(id types.Hash)
 	pages    atomic.Int32
 	onPage   func(page int32)
 }
@@ -487,11 +488,17 @@ func (b *wrapTestBridge) GetAllWrapTokenRequests(pageIndex, _ uint32) *embedded.
 
 func (b *wrapTestBridge) GetWrapTokenRequestById(id types.Hash) (*definition.WrapTokenRequest, error) {
 	b.mu.Lock()
-	defer b.mu.Unlock()
+	hook := b.onGetID
+	var req *definition.WrapTokenRequest
 	if b.byID != nil {
-		if req, ok := b.byID[id]; ok {
-			return req, nil
-		}
+		req = b.byID[id]
+	}
+	b.mu.Unlock()
+	if hook != nil {
+		hook(id)
+	}
+	if req != nil {
+		return req, nil
 	}
 	return nil, constants.ErrDataNonExistent
 }
@@ -754,46 +761,244 @@ func TestReSignStateIgnoresStaleScanAfterRetargetAndRespectsHaltedState(t *testi
 }
 
 func TestSendSignaturesWrapDoesNotMarkReplacedSignatureSent(t *testing.T) {
-	wrapID := types.Hash{0x91}
+	replacedID := types.Hash{0x91}
+	stableID := types.Hash{0x92}
+
 	bridge := &wrapTestBridge{
 		byID: map[types.Hash]*definition.WrapTokenRequest{
-			wrapID: {
-				Id:        wrapID,
-				Signature: "old-sig",
-			},
+			replacedID: {Id: replacedID, Signature: "old-sig"},
+			stableID:   {Id: stableID, Signature: "stable-sig"},
 		},
 	}
 	n := wrapTestNode(t, common.LiveState, bridge)
 	n.producerKeyPair = &wallet.KeyPair{Public: make([]byte, 32)}
 	n.config.TssConfig.LocalPubKeys = []string{"other-participant"}
 
-	if err := n.dbManager.ZnnStorage().AddWrapRequest(events.WrapRequestZnn{
-		NetworkClass:  definition.EvmClass,
-		ChainId:       1,
-		Id:            wrapID,
-		Amount:        big.NewInt(10),
-		Fee:           big.NewInt(1),
-		Signature:     "old-sig",
-		SentSignature: false,
-		RedeemStatus:  common.UnredeemedStatus,
-	}); err != nil {
-		t.Fatal(err)
+	for _, w := range []events.WrapRequestZnn{
+		{NetworkClass: definition.EvmClass, ChainId: 1, Id: replacedID, Amount: big.NewInt(10), Fee: big.NewInt(1), Signature: "old-sig", SentSignature: false, RedeemStatus: common.UnredeemedStatus},
+		{NetworkClass: definition.EvmClass, ChainId: 1, Id: stableID, Amount: big.NewInt(20), Fee: big.NewInt(1), Signature: "stable-sig", SentSignature: false, RedeemStatus: common.UnredeemedStatus},
+	} {
+		if err := n.dbManager.ZnnStorage().AddWrapRequest(w); err != nil {
+			t.Fatal(err)
+		}
 	}
 
-	// Simulate replacement signature installed concurrently while RPC still serves old-sig.
-	if err := n.networksManager.SaveSignedWrapRequest(wrapID, "new-sig"); err != nil {
-		t.Fatal(err)
+	// While sendSignaturesWrap is polling Zenon RPC for replacedID (which still
+	// returns "old-sig"), install a replacement signature "new-sig" locally.
+	var replacedOnce sync.Once
+	bridge.onGetID = func(id types.Hash) {
+		if id == replacedID {
+			replacedOnce.Do(func() {
+				if err := n.networksManager.SaveSignedWrapRequest(replacedID, "new-sig"); err != nil {
+					t.Errorf("SaveSignedWrapRequest failed: %v", err)
+				}
+			})
+		}
 	}
-	// Verify stale poll with old-sig cannot mark new-sig as sent.
-	if marked, err := n.networksManager.MarkWrapRequestSignatureSent(wrapID, "old-sig"); err != nil || marked {
-		t.Fatalf("expected stale poll not to mark replaced signature sent: marked=%v err=%v", marked, err)
-	}
-	got, err := n.dbManager.ZnnStorage().GetWrapRequestById(wrapID)
+
+	// Execute the real production sendSignaturesWrap path.
+	n.sendSignaturesWrap(make(map[string]uint32))
+
+	gotReplaced, err := n.dbManager.ZnnStorage().GetWrapRequestById(replacedID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Signature != "new-sig" || got.SentSignature {
-		t.Fatalf("expected new-sig to remain unsent, got %+v", got)
+	if gotReplaced.Signature != "new-sig" || gotReplaced.SentSignature {
+		t.Fatalf("stale sendSignaturesWrap poll corrupted replacement signature: %+v", gotReplaced)
+	}
+
+	gotStable, err := n.dbManager.ZnnStorage().GetWrapRequestById(stableID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotStable.Signature != "stable-sig" || !gotStable.SentSignature {
+		t.Fatalf("sendSignaturesWrap did not acknowledge matching stable signature: %+v", gotStable)
+	}
+}
+
+func TestReSignStateStableSetIgnoresNewUnfinalizedWrapsAndRetriesFailedRedeemsInfo(t *testing.T) {
+	prevDelay := resignRetryDelay
+	resignRetryDelay = 50 * time.Millisecond
+	t.Cleanup(func() { resignRetryDelay = prevDelay })
+
+	// EVM RPC fails the first eth_call transiently, then succeeds with blockNumber=0.
+	var ethCalls atomic.Int32
+	evmSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			ID     json.RawMessage `json:"id"`
+			Method string          `json:"method"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		w.Header().Set("Content-Type", "application/json")
+		if req.Method == "eth_call" && ethCalls.Add(1) == 1 {
+			_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":` + string(req.ID) + `,"error":{"code":-32000,"message":"transient rpc failure"}}`))
+			return
+		}
+		result := `"0x` + strings.Repeat("00", 64) + `"`
+		if req.Method == "eth_getCode" {
+			result = `"0x01"`
+		}
+		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":` + string(req.ID) + `,"result":` + result + `}`))
+	}))
+	defer evmSrv.Close()
+
+	deferredID := types.Hash{0xa1}
+	retryID := types.Hash{0xa2}
+	newUnfinalizedID := types.Hash{0xa3}
+
+	initialWraps := &embedded.WrapTokenRequestList{
+		Count: 2,
+		List: []*embedded.WrapTokenRequest{
+			{
+				WrapTokenRequest: &definition.WrapTokenRequest{
+					NetworkClass: definition.EvmClass, ChainId: 1, Id: deferredID,
+					Amount: big.NewInt(10), Fee: big.NewInt(1), Signature: "signed-1",
+				},
+				ConfirmationsToFinality: 2,
+			},
+			{
+				WrapTokenRequest: &definition.WrapTokenRequest{
+					NetworkClass: definition.EvmClass, ChainId: 1, Id: retryID,
+					Amount: big.NewInt(20), Fee: big.NewInt(1), Signature: "signed-2",
+				},
+				ConfirmationsToFinality: 0,
+			},
+		},
+	}
+	laterWraps := &embedded.WrapTokenRequestList{
+		Count: 3,
+		List: []*embedded.WrapTokenRequest{
+			{
+				WrapTokenRequest: &definition.WrapTokenRequest{
+					NetworkClass: definition.EvmClass, ChainId: 1, Id: deferredID,
+					Amount: big.NewInt(10), Fee: big.NewInt(1), Signature: "signed-1",
+				},
+				ConfirmationsToFinality: 0,
+			},
+			{
+				WrapTokenRequest: &definition.WrapTokenRequest{
+					NetworkClass: definition.EvmClass, ChainId: 1, Id: retryID,
+					Amount: big.NewInt(20), Fee: big.NewInt(1), Signature: "signed-2",
+				},
+				ConfirmationsToFinality: 0,
+			},
+			// Newly arrived unfinalized wrap must NOT prolong the active scan indefinitely.
+			{
+				WrapTokenRequest: &definition.WrapTokenRequest{
+					NetworkClass: definition.EvmClass, ChainId: 1, Id: newUnfinalizedID,
+					Amount: big.NewInt(30), Fee: big.NewInt(1),
+				},
+				ConfirmationsToFinality: 5,
+			},
+		},
+	}
+
+	bridge := &wrapTestBridge{
+		networks: &embedded.NetworkInfoList{
+			Count: 1,
+			List: []*definition.NetworkInfo{{
+				NetworkClass:    definition.EvmClass,
+				Id:              1,
+				Name:            "Ethereum",
+				ContractAddress: "0x0000000000000000000000000000000000000001",
+			}},
+		},
+		allWraps: initialWraps,
+	}
+	bridge.onPage = func(call int32) {
+		if call == 2 {
+			// Initial scan finished; switch to laterWraps where deferredID is
+			// finalized and a brand-new unfinalized wrap has arrived.
+			bridge.mu.Lock()
+			bridge.allWraps = laterWraps
+			bridge.mu.Unlock()
+		}
+	}
+
+	n := wrapTestNodeWithEvm(t, common.LiveState, bridge, map[string]string{"Ethereum": evmSrv.URL})
+	if activated, err := n.state.ActivateResign(definition.EvmClass, 1); err != nil || !activated {
+		t.Fatalf("ActivateResign failed: activated=%v err=%v", activated, err)
+	}
+	n.state.CompleteStartup()
+
+	n.workers.start(n.processSignatures)
+	t.Cleanup(func() {
+		done := n.workers.shutdown()
+		<-done
+	})
+
+	eventually(t, "ReSignState to retry RedeemsInfo, process deferred wrap, ignore new unfinalized wrap, and return to LiveState", func() bool {
+		st, _ := n.state.GetState()
+		r1, err1 := n.dbManager.ZnnStorage().GetResignStatus(deferredID)
+		r2, err2 := n.dbManager.ZnnStorage().GetResignStatus(retryID)
+		return err1 == nil && err2 == nil && r1 && r2 && st == common.LiveState
+	})
+
+	if ethCalls.Load() < 3 {
+		t.Fatalf("expected RedeemsInfo retry after transient error, got only %d eth_calls", ethCalls.Load())
+	}
+	if ev, err := n.dbManager.ZnnStorage().GetWrapRequestById(newUnfinalizedID); err != nil || ev != nil {
+		t.Fatalf("new unfinalized wrap outside scan snapshot should not have been stored: ev=%+v err=%v", ev, err)
+	}
+}
+
+func TestProcessReSignWrapWriteBoundaryDropsObsoleteFlagOnConcurrentHalt(t *testing.T) {
+	wrapID := types.Hash{0xb1}
+	var stateChanged sync.Once
+	var n *Node
+
+	// Trigger a halt right when RedeemsInfo returns, immediately before the
+	// atomic WhileResignGenerationIs + SetResignStatus write boundary.
+	evmSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			ID     json.RawMessage `json:"id"`
+			Method string          `json:"method"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		if req.Method == "eth_call" && n != nil {
+			stateChanged.Do(func() {
+				_, _ = n.state.DeactivateResign()
+			})
+		}
+		w.Header().Set("Content-Type", "application/json")
+		result := `"0x` + strings.Repeat("00", 64) + `"`
+		if req.Method == "eth_getCode" {
+			result = `"0x01"`
+		}
+		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":` + string(req.ID) + `,"result":` + result + `}`))
+	}))
+	defer evmSrv.Close()
+
+	bridge := &wrapTestBridge{
+		networks: &embedded.NetworkInfoList{
+			Count: 1,
+			List: []*definition.NetworkInfo{{
+				NetworkClass:    definition.EvmClass,
+				Id:              1,
+				Name:            "Ethereum",
+				ContractAddress: "0x0000000000000000000000000000000000000001",
+			}},
+		},
+	}
+	n = wrapTestNodeWithEvm(t, common.LiveState, bridge, map[string]string{"Ethereum": evmSrv.URL})
+	if activated, err := n.state.ActivateResign(definition.EvmClass, 1); err != nil || !activated {
+		t.Fatalf("ActivateResign failed: activated=%v err=%v", activated, err)
+	}
+	_, _, gen := n.state.GetResignTarget()
+
+	wrap := &definition.WrapTokenRequest{
+		NetworkClass: definition.EvmClass,
+		ChainId:      1,
+		Id:           wrapID,
+		Amount:       big.NewInt(10),
+		Fee:          big.NewInt(1),
+	}
+	retry, stale, fatal := n.processReSignWrap(wrap, gen)
+	if retry || !stale || fatal {
+		t.Fatalf("processReSignWrap at write boundary = (retry=%v, stale=%v, fatal=%v), want (false, true, false)", retry, stale, fatal)
+	}
+	if resign, err := n.dbManager.ZnnStorage().GetResignStatus(wrapID); err != nil || resign {
+		t.Fatalf("obsolete resign flag was written after deactivation: resign=%v err=%v", resign, err)
 	}
 }
 
