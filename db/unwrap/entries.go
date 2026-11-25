@@ -248,7 +248,9 @@ func (es *evmStorage) setUnwrapRequestStatus(txHash ecommon.Hash, logIndex, stat
 	}
 	if expected != nil {
 		current := event.RedeemStatus
-		if current == common.RedeemedStatus || current == common.RevokedStatus {
+		// Terminal statuses are final, and a record Zenon knows about never
+		// goes back to unredeemed.
+		if current == common.RedeemedStatus || current == common.RevokedStatus || status == common.UnredeemedStatus {
 			return nil
 		}
 		advancesPending := current == common.PendingRedeemStatus &&
