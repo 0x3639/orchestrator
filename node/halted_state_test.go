@@ -2602,3 +2602,208 @@ func TestSkippedSignedHaltOnUnreadableFlagDoesNotTriggerUnsignedRefresh(t *testi
 		t.Fatalf("skipped Chain 1 (unreadable halt flag on tick 1) triggered unsigned refresh with 0 broadcasts: sends=%d halted=%v", chain1Sends.Load(), chain1Halted.Load())
 	}
 }
+
+func TestUnavailableSignedChainDoesNotBlockHealthyChainHaltRetries(t *testing.T) {
+	oldKey, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldAddr := crypto.PubkeyToAddress(oldKey.PublicKey)
+	oldCompressed := base64.StdEncoding.EncodeToString(crypto.CompressPubkey(&oldKey.PublicKey))
+
+	c1 := ecommon.HexToAddress("0xc1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1")
+	c2 := ecommon.HexToAddress("0xc2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2")
+
+	zMock := &partialRotateZenon{
+		haltedTestZenon: haltedTestZenon{halted: true},
+		compressedTss:   oldCompressed,
+		evmContracts: []*definition.NetworkInfo{
+			{NetworkClass: definition.EvmClass, Id: 1, Name: "eth-healthy-retry", ContractAddress: c1.Hex()},
+			{NetworkClass: definition.EvmClass, Id: 2, Name: "eth-unavailable", ContractAddress: c2.Hex()},
+		},
+	}
+	znnSrv := server.NewServer()
+	if err := znnSrv.RegisterName("embedded.bridge", zMock); err != nil {
+		t.Fatal(err)
+	}
+	znnHTTP := httptest.NewServer(znnSrv.WebsocketHandler([]string{"*"}))
+	t.Cleanup(func() { znnSrv.Stop(); znnHTTP.Close() })
+
+	var chain1Sends atomic.Int32
+	var chain1Halted atomic.Bool
+	chain1SecondSend := make(chan struct{})
+	var secondOnce sync.Once
+	var chain2Down atomic.Bool
+
+	evm1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			ID     json.RawMessage   `json:"id"`
+			Method string            `json:"method"`
+			Params []json.RawMessage `json:"params"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		resp := map[string]interface{}{"jsonrpc": "2.0", "id": req.ID}
+		switch req.Method {
+		case "eth_chainId":
+			resp["result"] = hexutil.EncodeUint64(1)
+		case "eth_blockNumber":
+			resp["result"] = hexutil.EncodeUint64(100)
+		case "eth_getBalance":
+			resp["result"] = (*hexutil.Big)(new(big.Int).Mul(big.NewInt(10), big.NewInt(1e18)))
+		case "eth_getTransactionCount":
+			resp["result"] = hexutil.EncodeUint64(1)
+		case "eth_getBlockByNumber":
+			resp["result"] = map[string]interface{}{
+				"number":        hexutil.EncodeUint64(100),
+				"hash":          ecommon.HexToHash("0x11"),
+				"baseFeePerGas": (*hexutil.Big)(big.NewInt(20_000_000_000)),
+			}
+		case "eth_maxPriorityFeePerGas":
+			resp["result"] = (*hexutil.Big)(big.NewInt(2_000_000_000))
+		case "eth_estimateGas":
+			resp["result"] = hexutil.EncodeUint64(100_000)
+		case "eth_sendRawTransaction":
+			// First broadcast fails to halt the bridge; second broadcast halts it!
+			if chain1Sends.Add(1) >= 2 {
+				chain1Halted.Store(true)
+				secondOnce.Do(func() { close(chain1SecondSend) })
+			}
+			resp["result"] = ecommon.HexToHash("0xbeef").Hex()
+		case "eth_call":
+			var call struct {
+				Data  hexutil.Bytes `json:"data"`
+				Input hexutil.Bytes `json:"input"`
+			}
+			_ = json.Unmarshal(req.Params[0], &call)
+			sel := append(call.Data, call.Input...)
+			switch {
+			case len(sel) >= 4 && string(sel[:4]) == string(common.EvmContractAbi.Methods["tss"].ID):
+				resp["result"] = ecommon.BytesToHash(oldAddr.Bytes()).Hex()
+			case len(sel) >= 4 && string(sel[:4]) == string(common.EvmContractAbi.Methods["actionsNonce"].ID):
+				resp["result"] = ecommon.BigToHash(big.NewInt(3)).Hex()
+			default:
+				if chain1Halted.Load() {
+					resp["result"] = "0x" + strings.Repeat("0", 63) + "1"
+				} else {
+					resp["result"] = "0x" + strings.Repeat("0", 64)
+				}
+			}
+		default:
+			resp["result"] = "0x" + strings.Repeat("0", 64)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	t.Cleanup(evm1.Close)
+
+	evm2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			ID     json.RawMessage   `json:"id"`
+			Method string            `json:"method"`
+			Params []json.RawMessage `json:"params"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		resp := map[string]interface{}{"jsonrpc": "2.0", "id": req.ID}
+		if chain2Down.Load() {
+			resp["error"] = map[string]interface{}{"code": -32000, "message": "chain 2 unavailable"}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(resp)
+			return
+		}
+		switch req.Method {
+		case "eth_chainId":
+			resp["result"] = hexutil.EncodeUint64(2)
+		case "eth_call":
+			var call struct {
+				Data  hexutil.Bytes `json:"data"`
+				Input hexutil.Bytes `json:"input"`
+			}
+			_ = json.Unmarshal(req.Params[0], &call)
+			sel := append(call.Data, call.Input...)
+			switch {
+			case len(sel) >= 4 && string(sel[:4]) == string(common.EvmContractAbi.Methods["tss"].ID):
+				resp["result"] = ecommon.BytesToHash(oldAddr.Bytes()).Hex()
+			case len(sel) >= 4 && string(sel[:4]) == string(common.EvmContractAbi.Methods["actionsNonce"].ID):
+				resp["result"] = ecommon.BigToHash(big.NewInt(3)).Hex()
+			default:
+				resp["result"] = "0x" + strings.Repeat("0", 64)
+			}
+		default:
+			resp["result"] = "0x" + strings.Repeat("0", 64)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	t.Cleanup(evm2.Close)
+
+	stopChan := make(chan os.Signal, 1)
+	stateVal := common.EmergencyState
+	gs := common.NewGlobalState(&stateVal)
+	t.Setenv("HOME", t.TempDir())
+	nm, err := network.NewNetworksManager(stopChan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dbMgr, err := manager.NewDbManager(stopChan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nets := map[string]config.BaseNetworkConfig{
+		common.ZenonNetworkName: {Urls: []string{"ws" + strings.TrimPrefix(znnHTTP.URL, "http")}},
+		"eth-healthy-retry":     {Urls: []string{evm1.URL}},
+		"eth-unavailable":       {Urls: []string{evm2.URL}},
+	}
+	if err := nm.Init(nets, dbMgr, gs, func(*common.BridgeMetadata) {}); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { nm.Stop() })
+
+	evmBatch, _, signedEvmNonces, signedEvmTss, err := nm.GetHaltMessagesWithState()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Take Chain 2 offline during halt publishing!
+	chain2Down.Store(true)
+
+	producerPub := []byte("test-producer-pubkey-32-bytes!!!")
+	producerPubB64 := base64.StdEncoding.EncodeToString(producerPub)
+	plan := &emergencyHaltPlan{
+		znnSignature:      "AAAA",
+		znnParticipants:   []string{producerPubB64},
+		evmFullSignatures: [][]byte{make([]byte, 65), make([]byte, 65)},
+		evmParticipants:   [][]string{{producerPubB64}, {producerPubB64}},
+	}
+
+	node := &Node{
+		config:               &config.Config{TssConfig: config.TssManagerConfig{PublicKey: oldCompressed, LocalPubKeys: []string{producerPubB64}}},
+		networksManager:      nm,
+		dbManager:            dbMgr,
+		producerKeyPair:      &wallet.KeyPair{Public: producerPub},
+		ecdsaPrivateKey:      oldKey,
+		evmAddress:           oldAddr,
+		state:                gs,
+		stopChan:             stopChan,
+		logger:               zap.NewNop().Sugar(),
+		evmHaltRetryCooldown: 200 * time.Millisecond,
+	}
+
+	done := make(chan bool, 1)
+	go func() {
+		done <- node.publishEmergencyHalt(evmBatch, plan, oldCompressed, 0, signedEvmTss, signedEvmNonces)
+	}()
+
+	// Healthy Chain 1 MUST retry after cooldown even while Chain 2 stays unavailable!
+	select {
+	case <-chain1SecondSend:
+	case <-time.After(4 * time.Second):
+		t.Fatalf("unavailable Chain 2 blocked retries on healthy Chain 1 (sends=%d)", chain1Sends.Load())
+	}
+	if err := gs.SetState(common.HaltedState); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("publishEmergencyHalt did not exit after leaving EmergencyState")
+	}
+}

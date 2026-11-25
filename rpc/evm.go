@@ -950,7 +950,13 @@ func (r *EvmRpc) reconcileSentTx(tx *etypes.Transaction, attempt *pendingAttempt
 				break
 			}
 		}
-		delete(r.failedRollbacks, nk)
+		// Only clear a failed-rollback retry marker if no trailing rejected
+		// attempt remains above attempt on this nonce's stack; otherwise leave
+		// the marker intact so retryFailedRollbacksLocked (now or on retry)
+		// atomically unwinds the rejected attempt above attempt.
+		if curStack := r.nonceStack[nk]; len(curStack) == 0 || !curStack[len(curStack)-1].rejected {
+			delete(r.failedRollbacks, nk)
+		}
 		_ = r.retryFailedRollbacksLocked(key.sender, key.contract)
 		return
 	}
@@ -1049,21 +1055,22 @@ func (r *EvmRpc) clearPendingTxIfMatches(key evmTxKey, expected *pendingEvmTx) {
 	r.clearPendingTxIfMatchesLocked(key, expected)
 }
 
-func (r *EvmRpc) clearPendingTxIfMatchesLocked(key evmTxKey, expected *pendingEvmTx) {
+func (r *EvmRpc) clearPendingTxIfMatchesLocked(key evmTxKey, expected *pendingEvmTx) bool {
 	r.txMu.Lock()
 	cur := r.pendingTx[key]
 	store := r.pendingTxStore
 	if expected != nil && (cur == nil || cur.nonce != expected.nonce || cur.txHash != expected.txHash) {
 		r.txMu.Unlock()
-		return
+		return false
 	}
 	r.txMu.Unlock()
 	if store != nil {
 		if err := store.DeletePendingEvmTx(key.sender, key.contract, key.kind); err != nil {
 			r.logger.Errorf("failed to clear stale pending EVM tx record: %v", err)
-			return
+			return false
 		}
 	}
+	cleared := false
 	r.txMu.Lock()
 	cur = r.pendingTx[key]
 	if expected == nil || (cur != nil && cur.nonce == expected.nonce && cur.txHash == expected.txHash) {
@@ -1074,8 +1081,10 @@ func (r *EvmRpc) clearPendingTxIfMatchesLocked(key evmTxKey, expected *pendingEv
 			}
 		}
 		delete(r.pendingTx, key)
+		cleared = true
 	}
 	r.txMu.Unlock()
+	return cleared
 }
 
 // ClearObsoleteHaltTx clears a persisted halt reservation once the emergency
@@ -1131,23 +1140,24 @@ func (r *EvmRpc) ClearObsoleteHaltTxContext(parent context.Context, sender ecomm
 		}
 	}
 	r.pendingMu.Lock()
-	r.clearPendingTxIfMatchesLocked(key, rec)
-	// With pendingNonce == confirmedNonce (empty mempool), any earlier dropped
-	// halt attempts at or below rec.nonce are also gone from the mempool.
-	for nk, st := range r.nonceStack {
-		if nk.sender != sender || nk.contract != r.bridgeAddress || nk.nonce > rec.nonce {
-			continue
-		}
-		var top *pendingAttempt
-		for i := len(st) - 1; i >= 0; i-- {
-			if !st[i].rejected {
-				top = st[i]
-				break
+	if r.clearPendingTxIfMatchesLocked(key, rec) {
+		// Only prune earlier dropped halt stacks when rec itself still owned
+		// key (a concurrent replacement at the same nonce keeps its stack).
+		for nk, st := range r.nonceStack {
+			if nk.sender != sender || nk.contract != r.bridgeAddress || nk.nonce > rec.nonce {
+				continue
 			}
-		}
-		if top != nil && top.kind == evmTxKindHalt {
-			delete(r.nonceStack, nk)
-			delete(r.failedRollbacks, nk)
+			var top *pendingAttempt
+			for i := len(st) - 1; i >= 0; i-- {
+				if !st[i].rejected {
+					top = st[i]
+					break
+				}
+			}
+			if top != nil && top.kind == evmTxKindHalt {
+				delete(r.nonceStack, nk)
+				delete(r.failedRollbacks, nk)
+			}
 		}
 	}
 	r.pendingMu.Unlock()

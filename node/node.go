@@ -89,6 +89,9 @@ type Node struct {
 	// lastSignedKeyParties records the participant_keys selected per groupKey
 	// during signEmergencyHaltMessages for unit test verification.
 	lastSignedKeyParties map[string][]string
+	// evmHaltRetryCooldown overrides the per-slot 15s cooldown between EVM halt
+	// broadcasts in tests when non-zero.
+	evmHaltRetryCooldown time.Duration
 }
 
 func NewNode(config *oconfig.Config, logger *zap.Logger) (_ *Node, initErr error) {
@@ -2261,23 +2264,26 @@ func (node *Node) publishEmergencyHalt(evmBatch network.EvmBatch, plan *emergenc
 		senders.Add(1)
 		go func() {
 			defer senders.Done()
+			retryCooldown := node.evmHaltRetryCooldown
+			if retryCooldown <= 0 {
+				retryCooldown = 15 * time.Second
+			}
 			attemptedSignedEvm := make([]bool, len(plan.evmFullSignatures))
+			lastBroadcast := make([]time.Time, len(plan.evmFullSignatures))
 			var turnStep uint32
 			for !stopSender() {
 				turnStep++
-				allPriorAttempted := node.allSignedEvmHaltedOrAttempted(roundCtx, evmBatch, plan.evmFullSignatures, attemptedSignedEvm)
-				if roundCtx.Err() != nil {
-					return
-				}
+				now := time.Now()
 				turnSigs := make([][]byte, len(plan.evmFullSignatures))
 				for i, sig := range plan.evmFullSignatures {
 					if len(sig) == 0 {
 						continue
 					}
-					if !allPriorAttempted && attemptedSignedEvm[i] {
-						// Let every remaining unhalted signed chain get a
-						// submission opportunity before retrying an already
-						// attempted slot.
+					if !lastBroadcast[i].IsZero() && now.Sub(lastBroadcast[i]) < retryCooldown {
+						// Throttle retries of a slot that just broadcast while
+						// allowing other unhalted signed chains immediate turns,
+						// and still letting this healthy chain retry once its
+						// cooldown elapses even if another chain is unavailable.
 						continue
 					}
 					var parties []string
@@ -2323,6 +2329,7 @@ func (node *Node) publishEmergencyHalt(evmBatch network.EvmBatch, plan *emergenc
 				default:
 					if submittedIdx >= 0 && submittedIdx < len(attemptedSignedEvm) {
 						attemptedSignedEvm[submittedIdx] = true
+						lastBroadcast[submittedIdx] = time.Now()
 					}
 					allSignedHalted, checkErr := node.allSignedEvmHalted(roundCtx, evmBatch, plan.evmFullSignatures)
 					if plan.hasFailedGroups && hasSignedEvm && checkErr == nil && allSignedHalted {
@@ -2343,7 +2350,7 @@ func (node *Node) publishEmergencyHalt(evmBatch network.EvmBatch, plan *emergenc
 						}
 					}
 					if submittedIdx >= 0 && allHandled {
-						if !sleepRound(15 * time.Second) {
+						if !sleepRound(retryCooldown) {
 							return
 						}
 						continue
