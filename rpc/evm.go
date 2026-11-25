@@ -62,6 +62,9 @@ type EvmRpc struct {
 	secondary        map[string]*secondaryClient
 	secondaryStopped bool
 
+	// pendingMu serializes durable pendingTxStore read/modify/write batches
+	// with in-memory pendingTx updates (never held across network RPCs).
+	pendingMu sync.Mutex
 	// txMu guards storageName, chainID, pendingTx, pendingTxStore, and
 	// sendTimeout, which track the latest unconfirmed halt or key-change
 	// transaction per (sender, contract, action) so retries reuse the same
@@ -91,9 +94,27 @@ type pendingEvmTx struct {
 }
 
 type secondaryClient struct {
-	mu      sync.Mutex
+	sem     chan struct{}
 	client  *ethclient.Client
 	limiter *rate.Limiter
+}
+
+func (s *secondaryClient) acquire(ctx context.Context) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+	}
+	select {
+	case s.sem <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (s *secondaryClient) release() {
+	<-s.sem
 }
 
 func NewEvmRpcClient(networkConfig config.BaseNetworkConfig, networkName string, address ecommon.Address) (*EvmRpc, error) {
@@ -361,6 +382,10 @@ func (r *EvmRpc) SetPendingTxStore(store common.PendingEvmTxStore) {
 }
 
 func (r *EvmRpc) ChainID() (*big.Int, error) {
+	return r.ChainIDContext(r.ctx)
+}
+
+func (r *EvmRpc) ChainIDContext(parent context.Context) (*big.Int, error) {
 	r.txMu.Lock()
 	if r.chainID != nil {
 		id := new(big.Int).Set(r.chainID)
@@ -369,7 +394,7 @@ func (r *EvmRpc) ChainID() (*big.Int, error) {
 	}
 	r.txMu.Unlock()
 
-	ctx, cancel, err := r.callContext(evmCallTimeout)
+	ctx, cancel, err := r.callContextWithParent(parent, evmCallTimeout)
 	if err != nil {
 		return nil, err
 	}
@@ -395,15 +420,34 @@ func (r *EvmRpc) sendCallTimeout() time.Duration {
 }
 
 func (r *EvmRpc) SendTransaction(tx *etypes.Transaction) error {
+	return r.SendTransactionContext(r.ctx, tx, nil)
+}
+
+// SendTransactionContext submits tx while honoring parent cancellation across
+// rate-limiter waits and RPC I/O, and re-checking allowSend right before
+// persisting ownership and broadcasting.
+func (r *EvmRpc) SendTransactionContext(parent context.Context, tx *etypes.Transaction, allowSend func() bool) error {
 	// Start the send deadline BEFORE acquiring a rate-limiter permit so a
 	// depleted limiter cannot stall emergency halt broadcasts (and hold
 	// WhileEmergency's read lock) past evmCallTimeout.
-	ctx, cancel := context.WithTimeout(r.ctx, r.sendCallTimeout())
+	ctx, cancel := combineContexts(r.ctx, parent, r.sendCallTimeout())
 	defer cancel()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if allowSend != nil && !allowSend() {
+		return context.Canceled
+	}
 	if r.limiter != nil {
 		if err := r.limiter.Wait(ctx); err != nil {
 			return err
 		}
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if allowSend != nil && !allowSend() {
+		return context.Canceled
 	}
 	prevSnapshot, superseded, tracked, err := r.recordPendingTxAttempt(tx)
 	if err != nil {
@@ -547,11 +591,14 @@ func (r *EvmRpc) recordPendingTxAttempt(tx *etypes.Transaction) (*pendingEvmTx, 
 	if !ok {
 		return nil, nil, false, nil
 	}
-	if _, err := r.loadPendingTx(key); err != nil {
+	r.pendingMu.Lock()
+	defer r.pendingMu.Unlock()
+
+	if _, err := r.loadPendingTxLocked(key); err != nil {
 		return nil, nil, false, fmt.Errorf("load pending EVM tx record before broadcast: %w", err)
 	}
 	if key.kind == evmTxKindHalt {
-		if _, err := r.loadPendingTx(evmTxKey{sender: key.sender, contract: key.contract, kind: evmTxKindSetTss}); err != nil {
+		if _, err := r.loadPendingTxLocked(evmTxKey{sender: key.sender, contract: key.contract, kind: evmTxKindSetTss}); err != nil {
 			return nil, nil, false, fmt.Errorf("load superseded setTss record before broadcast: %w", err)
 		}
 	}
@@ -585,7 +632,7 @@ func (r *EvmRpc) recordPendingTxAttempt(tx *etypes.Transaction) (*pendingEvmTx, 
 	if prev != nil {
 		if prev.nonce > entry.nonce {
 			r.txMu.Unlock()
-			return prevSnapshot, nil, true, nil
+			return prevSnapshot, nil, false, nil
 		}
 		if prev.nonce == entry.nonce {
 			entry.gasPrice = maxBigInt(prev.gasPrice, entry.gasPrice)
@@ -607,38 +654,30 @@ func (r *EvmRpc) recordPendingTxAttempt(tx *etypes.Transaction) (*pendingEvmTx, 
 			Record:   nil,
 		})
 	}
+	r.txMu.Unlock()
+
+	if store != nil {
+		if err := store.ApplyPendingEvmTxBatch(ops); err != nil {
+			r.logger.Errorf("failed to persist pending EVM tx record before broadcast: %v", err)
+			return nil, nil, false, fmt.Errorf("persist pending EVM tx before broadcast: %w", err)
+		}
+	}
+
+	r.txMu.Lock()
 	r.pendingTx[key] = entry
 	if superseded != nil {
 		delete(r.pendingTx, superseded.key)
 	}
 	r.txMu.Unlock()
-
-	if store != nil {
-		if err := store.ApplyPendingEvmTxBatch(ops); err != nil {
-			r.txMu.Lock()
-			if r.pendingTx[key] == entry {
-				if prevSnapshot != nil {
-					r.pendingTx[key] = prevSnapshot
-				} else {
-					delete(r.pendingTx, key)
-				}
-			}
-			if superseded != nil {
-				r.pendingTx[superseded.key] = clonePendingEvmTx(superseded.entry)
-			}
-			r.txMu.Unlock()
-			r.logger.Errorf("failed to persist pending EVM tx record before broadcast: %v", err)
-			return nil, nil, false, fmt.Errorf("persist pending EVM tx before broadcast: %w", err)
-		}
-	}
 	return prevSnapshot, superseded, true, nil
 }
 
 // reconcileSentTx updates or rolls back the pre-broadcast watermark based on
 // the broadcast outcome. Ambiguous failures (EOF, timeouts, connection resets)
 // and mempool pricing/duplicate errors keep the persisted watermark. Rollback
-// of a superseded ownership transfer executes in a single atomic batch so a
-// crash or write error can never erase both records.
+// and cleanup are serialized with pendingMu and run only while the current
+// record still belongs to tx (matching nonce and txHash), so a late rejection
+// from an older attempt can never erase a newer accepted transaction.
 func (r *EvmRpc) reconcileSentTx(tx *etypes.Transaction, prevSnapshot *pendingEvmTx, superseded *supersededTx, sendErr error) {
 	if sendErr == nil {
 		return
@@ -647,20 +686,29 @@ func (r *EvmRpc) reconcileSentTx(tx *etypes.Transaction, prevSnapshot *pendingEv
 	if !ok {
 		return
 	}
+	r.pendingMu.Lock()
+	defer r.pendingMu.Unlock()
+
 	if isNonceTooLowErr(sendErr) {
 		r.txMu.Lock()
 		store := r.pendingTxStore
-		shouldDelete := false
-		if cur := r.pendingTx[key]; cur != nil && cur.nonce <= tx.Nonce() {
-			delete(r.pendingTx, key)
-			shouldDelete = true
-		}
+		cur := r.pendingTx[key]
+		shouldDelete := cur != nil && (cur.nonce < tx.Nonce() || (cur.nonce == tx.Nonce() && cur.txHash == tx.Hash()))
 		r.txMu.Unlock()
-		if store != nil && shouldDelete {
+		if !shouldDelete {
+			return
+		}
+		if store != nil {
 			if err := store.DeletePendingEvmTx(key.sender, key.contract, key.kind); err != nil {
 				r.logger.Errorf("failed to delete obsolete pending EVM tx record: %v", err)
+				return
 			}
 		}
+		r.txMu.Lock()
+		if cur := r.pendingTx[key]; cur != nil && (cur.nonce < tx.Nonce() || (cur.nonce == tx.Nonce() && cur.txHash == tx.Hash())) {
+			delete(r.pendingTx, key)
+		}
+		r.txMu.Unlock()
 		return
 	}
 	if !isDefinitivePreMempoolRejection(sendErr) {
@@ -668,7 +716,12 @@ func (r *EvmRpc) reconcileSentTx(tx *etypes.Transaction, prevSnapshot *pendingEv
 	}
 	r.txMu.Lock()
 	store := r.pendingTxStore
+	cur := r.pendingTx[key]
+	matchesAttempt := cur != nil && cur.nonce == tx.Nonce() && cur.txHash == tx.Hash()
 	r.txMu.Unlock()
+	if !matchesAttempt {
+		return
+	}
 
 	ops := []common.PendingEvmTxOp{{
 		Sender:   key.sender,
@@ -693,7 +746,7 @@ func (r *EvmRpc) reconcileSentTx(tx *etypes.Transaction, prevSnapshot *pendingEv
 	r.txMu.Lock()
 	if prevSnapshot != nil {
 		r.pendingTx[key] = clonePendingEvmTx(prevSnapshot)
-	} else if cur := r.pendingTx[key]; cur != nil && cur.nonce == tx.Nonce() {
+	} else {
 		delete(r.pendingTx, key)
 	}
 	if superseded != nil {
@@ -703,6 +756,12 @@ func (r *EvmRpc) reconcileSentTx(tx *etypes.Transaction, prevSnapshot *pendingEv
 }
 
 func (r *EvmRpc) loadPendingTx(key evmTxKey) (*pendingEvmTx, error) {
+	r.pendingMu.Lock()
+	defer r.pendingMu.Unlock()
+	return r.loadPendingTxLocked(key)
+}
+
+func (r *EvmRpc) loadPendingTxLocked(key evmTxKey) (*pendingEvmTx, error) {
 	r.txMu.Lock()
 	prev := r.pendingTx[key]
 	store := r.pendingTxStore
@@ -734,19 +793,36 @@ func (r *EvmRpc) loadPendingTx(key evmTxKey) (*pendingEvmTx, error) {
 			r.txMu.Unlock()
 		}
 	}
-	return prev, nil
+	return clonePendingEvmTx(prev), nil
 }
 
-func (r *EvmRpc) clearPendingTx(key evmTxKey) {
+func (r *EvmRpc) clearPendingTxIfMatches(key evmTxKey, expected *pendingEvmTx) {
+	r.pendingMu.Lock()
+	defer r.pendingMu.Unlock()
+	r.clearPendingTxIfMatchesLocked(key, expected)
+}
+
+func (r *EvmRpc) clearPendingTxIfMatchesLocked(key evmTxKey, expected *pendingEvmTx) {
 	r.txMu.Lock()
-	delete(r.pendingTx, key)
+	cur := r.pendingTx[key]
 	store := r.pendingTxStore
+	if expected != nil && (cur == nil || cur.nonce != expected.nonce || cur.txHash != expected.txHash) {
+		r.txMu.Unlock()
+		return
+	}
 	r.txMu.Unlock()
 	if store != nil {
 		if err := store.DeletePendingEvmTx(key.sender, key.contract, key.kind); err != nil {
 			r.logger.Errorf("failed to clear stale pending EVM tx record: %v", err)
+			return
 		}
 	}
+	r.txMu.Lock()
+	cur = r.pendingTx[key]
+	if expected == nil || (cur != nil && cur.nonce == expected.nonce && cur.txHash == expected.txHash) {
+		delete(r.pendingTx, key)
+	}
+	r.txMu.Unlock()
 }
 
 // ClearObsoleteHaltTx clears a persisted halt reservation once the emergency
@@ -755,6 +831,10 @@ func (r *EvmRpc) clearPendingTx(key evmTxKey) {
 // transactions still pending in the mempool (or unreadable pending state) are
 // preserved so later key rotations never collide with them.
 func (r *EvmRpc) ClearObsoleteHaltTx(sender ecommon.Address) error {
+	return r.ClearObsoleteHaltTxContext(r.ctx, sender)
+}
+
+func (r *EvmRpc) ClearObsoleteHaltTxContext(parent context.Context, sender ecommon.Address) error {
 	key := evmTxKey{sender: sender, contract: r.bridgeAddress, kind: evmTxKindHalt}
 	rec, err := r.loadPendingTx(key)
 	if err != nil {
@@ -763,19 +843,19 @@ func (r *EvmRpc) ClearObsoleteHaltTx(sender ecommon.Address) error {
 	if rec == nil {
 		return nil
 	}
-	blockHeight, err := r.BlockNumber()
+	blockHeight, err := r.BlockNumberContext(parent)
 	if err != nil {
 		return err
 	}
-	confirmedNonce, err := r.NonceAt(sender, blockHeight)
+	confirmedNonce, err := r.NonceAtContext(parent, sender, blockHeight)
 	if err != nil {
 		return err
 	}
 	if rec.nonce < confirmedNonce {
-		r.clearPendingTx(key)
+		r.clearPendingTxIfMatches(key, rec)
 		return nil
 	}
-	pendingNonce, err := r.PendingNonceAt(sender)
+	pendingNonce, err := r.PendingNonceAtContext(parent, sender)
 	if err != nil {
 		// Fail safe: keep halt ownership when mempool state is unreadable.
 		return err
@@ -785,7 +865,7 @@ func (r *EvmRpc) ClearObsoleteHaltTx(sender ecommon.Address) error {
 		return nil
 	}
 	if rec.txHash != (ecommon.Hash{}) {
-		tx, _, txErr := r.TransactionByHash(rec.txHash)
+		tx, _, txErr := r.TransactionByHashContext(parent, rec.txHash)
 		if txErr == nil && tx != nil {
 			// Still known to the node; keep ownership.
 			return nil
@@ -794,12 +874,15 @@ func (r *EvmRpc) ClearObsoleteHaltTx(sender ecommon.Address) error {
 			return txErr
 		}
 	}
-	r.clearPendingTx(key)
+	r.clearPendingTxIfMatches(key, rec)
 	return nil
 }
 
 func (r *EvmRpc) lookupPendingTx(key evmTxKey, confirmedNonce, pendingNonce uint64, havePending, otherOwnsLower bool) (*pendingEvmTx, error) {
-	if _, err := r.loadPendingTx(key); err != nil {
+	r.pendingMu.Lock()
+	defer r.pendingMu.Unlock()
+
+	if _, err := r.loadPendingTxLocked(key); err != nil {
 		return nil, err
 	}
 
@@ -809,16 +892,16 @@ func (r *EvmRpc) lookupPendingTx(key evmTxKey, confirmedNonce, pendingNonce uint
 		r.txMu.Unlock()
 		return nil, nil
 	}
+	cloned := clonePendingEvmTx(prev)
+	r.txMu.Unlock()
+
 	// Clear when already mined OR when a preceding pending transaction was
 	// evicted leaving a nonce gap (pendingNonce < prev.nonce) that is NOT
 	// owned by another persisted tracked action.
-	if prev.nonce < confirmedNonce || (havePending && pendingNonce < prev.nonce && !otherOwnsLower) {
-		r.txMu.Unlock()
-		r.clearPendingTx(key)
+	if cloned.nonce < confirmedNonce || (havePending && pendingNonce < cloned.nonce && !otherOwnsLower) {
+		r.clearPendingTxIfMatchesLocked(key, cloned)
 		return nil, nil
 	}
-	cloned := clonePendingEvmTx(prev)
-	r.txMu.Unlock()
 	return cloned, nil
 }
 
@@ -828,23 +911,30 @@ func (r *EvmRpc) lookupPendingTx(key evmTxKey, confirmedNonce, pendingNonce uint
 // never be mistaken for an absent one. Entries already mined (< confirmedNonce)
 // are cleared.
 func (r *EvmRpc) otherTrackedNonces(key evmTxKey, confirmedNonce uint64) (maxNext uint64, minOwned uint64, atConfirmed *pendingEvmTx, hasOwner bool, err error) {
+	r.pendingMu.Lock()
+	defer r.pendingMu.Unlock()
+
 	for _, otherKind := range []string{evmTxKindHalt, evmTxKindSetTss} {
 		if otherKind == key.kind {
 			continue
 		}
 		otherKey := evmTxKey{sender: key.sender, contract: key.contract, kind: otherKind}
-		if _, loadErr := r.loadPendingTx(otherKey); loadErr != nil {
+		if _, loadErr := r.loadPendingTxLocked(otherKey); loadErr != nil {
 			return 0, 0, nil, false, loadErr
 		}
 	}
-	var toClear []evmTxKey
+	type staleEntry struct {
+		key evmTxKey
+		rec *pendingEvmTx
+	}
+	var toClear []staleEntry
 	r.txMu.Lock()
 	for k, entry := range r.pendingTx {
 		if k == key || k.sender != key.sender || entry == nil {
 			continue
 		}
 		if entry.nonce < confirmedNonce {
-			toClear = append(toClear, k)
+			toClear = append(toClear, staleEntry{key: k, rec: clonePendingEvmTx(entry)})
 			continue
 		}
 		if !hasOwner || entry.nonce < minOwned {
@@ -859,21 +949,28 @@ func (r *EvmRpc) otherTrackedNonces(key evmTxKey, confirmedNonce uint64) (maxNex
 		hasOwner = true
 	}
 	r.txMu.Unlock()
-	for _, k := range toClear {
-		r.clearPendingTx(k)
+	for _, item := range toClear {
+		r.clearPendingTxIfMatchesLocked(item.key, item.rec)
 	}
 	return maxNext, minOwned, atConfirmed, hasOwner, nil
 }
 
 func (r *EvmRpc) buildContractTx(sender ecommon.Address, contractAddress *ecommon.Address, kind string, encodedData []byte, label string) (*etypes.Transaction, error) {
+	return r.buildContractTxContext(r.ctx, sender, contractAddress, kind, encodedData, label)
+}
+
+func (r *EvmRpc) buildContractTxContext(parent context.Context, sender ecommon.Address, contractAddress *ecommon.Address, kind string, encodedData []byte, label string) (*etypes.Transaction, error) {
 	if contractAddress == nil {
 		return nil, errors.Errorf("missing contract address for %s", label)
 	}
-	blockHeight, err := r.BlockNumber()
+	if parent == nil {
+		parent = r.ctx
+	}
+	blockHeight, err := r.BlockNumberContext(parent)
 	if err != nil {
 		return nil, err
 	}
-	balance, err := r.BalanceAt(sender, blockHeight)
+	balance, err := r.BalanceAtContext(parent, sender, blockHeight)
 	if err != nil {
 		return nil, err
 	}
@@ -882,12 +979,15 @@ func (r *EvmRpc) buildContractTx(sender ecommon.Address, contractAddress *ecommo
 	}
 	r.logger.Debugf("Balance: %s", balance.String())
 
-	confirmedNonce, err := r.NonceAt(sender, blockHeight)
+	confirmedNonce, err := r.NonceAtContext(parent, sender, blockHeight)
 	if err != nil {
 		return nil, err
 	}
-	pendingNonce, pendErr := r.PendingNonceAt(sender)
+	pendingNonce, pendErr := r.PendingNonceAtContext(parent, sender)
 	havePending := pendErr == nil
+	if pendErr != nil && (parent.Err() != nil || r.ctx.Err() != nil) {
+		return nil, pendErr
+	}
 
 	key := evmTxKey{sender: sender, contract: *contractAddress, kind: kind}
 	// Always reconcile persisted ownership for all other actions of sender
@@ -916,21 +1016,31 @@ func (r *EvmRpc) buildContractTx(sender ecommon.Address, contractAddress *ecommo
 		nonce = confirmedNonce
 		prev = otherAtConfirmed
 	} else if hasOtherOwner {
-		// Non-halt actions (setTss) never supersede an active emergency halt;
-		// allocate past both its persisted nonce and the node's pending nonce.
-		if otherNext > nonce {
-			nonce = otherNext
-		}
-		if havePending && pendingNonce > nonce {
+		if havePending && pendingNonce >= confirmedNonce && pendingNonce < otherMin {
+			// The other tracked reservation sits above a verified nonce gap
+			// (e.g. confirmed=5, pending=5, stranded setTss=6); fill the first
+			// available nonce instead of queueing past the stranded gap.
 			nonce = pendingNonce
+		} else {
+			// Non-halt actions (setTss) never supersede an active emergency halt;
+			// allocate past both its persisted nonce and the node's pending nonce.
+			if otherNext > nonce {
+				nonce = otherNext
+			}
+			if havePending && pendingNonce > nonce {
+				nonce = pendingNonce
+			}
 		}
 	}
 
 	// Prefer EIP-1559 dynamic fees when the latest block carries a baseFeePerGas
 	// and the node serves tip suggestions and chain ID; fall back to legacy
 	// gasPrice on non-1559 chains or endpoints that do not support 1559 RPCs.
-	baseFee, baseFeeErr := r.baseFeeByNumber(blockHeight)
+	baseFee, baseFeeErr := r.baseFeeByNumberContext(parent, blockHeight)
 	if baseFeeErr != nil {
+		if parent.Err() != nil {
+			return nil, parent.Err()
+		}
 		if r.ctx.Err() != nil {
 			return nil, r.ctx.Err()
 		}
@@ -942,8 +1052,8 @@ func (r *EvmRpc) buildContractTx(sender ecommon.Address, contractAddress *ecommo
 	}
 
 	if baseFee != nil {
-		tipCap, tipErr := r.SuggestGasTipCap()
-		chainID, chainErr := r.ChainID()
+		tipCap, tipErr := r.SuggestGasTipCapContext(parent)
+		chainID, chainErr := r.ChainIDContext(parent)
 		if tipErr == nil && chainErr == nil {
 			if tipCap == nil || tipCap.Sign() < 0 {
 				tipCap = big.NewInt(0)
@@ -984,7 +1094,7 @@ func (r *EvmRpc) buildContractTx(sender ecommon.Address, contractAddress *ecommo
 				Value:     big.NewInt(0),
 				Data:      encodedData,
 			}
-			estimatedGas, err := r.EstimateGas(msg)
+			estimatedGas, err := r.EstimateGasContext(parent, msg)
 			if err != nil {
 				return nil, err
 			}
@@ -1005,13 +1115,16 @@ func (r *EvmRpc) buildContractTx(sender ecommon.Address, contractAddress *ecommo
 				Data:      encodedData,
 			}), nil
 		}
+		if parent.Err() != nil {
+			return nil, parent.Err()
+		}
 		if r.ctx.Err() != nil {
 			return nil, r.ctx.Err()
 		}
 		r.logger.Debugf("EIP-1559 fee suggestion unavailable for %s (tipErr=%v chainErr=%v), falling back to legacy gas price", label, tipErr, chainErr)
 	}
 
-	gasPrice, err := r.SuggestGasPrice()
+	gasPrice, err := r.SuggestGasPriceContext(parent)
 	if err != nil {
 		return nil, err
 	}
@@ -1030,7 +1143,7 @@ func (r *EvmRpc) buildContractTx(sender ecommon.Address, contractAddress *ecommo
 		Value:    big.NewInt(0),
 		Data:     encodedData,
 	}
-	estimatedGas, err := r.EstimateGas(msg)
+	estimatedGas, err := r.EstimateGasContext(parent, msg)
 	if err != nil {
 		return nil, err
 	}
@@ -1077,11 +1190,15 @@ func (r *EvmRpc) GetSetTssEcdsaPubKeyEvmMessage(newAddress ecommon.Address, netw
 }
 
 func (r *EvmRpc) GetSetTssEcdsaPubKeyEvmTx(newTss, sender ecommon.Address, oldFullSignature, newFullSignature []byte, contractAddress *ecommon.Address) (*etypes.Transaction, error) {
+	return r.GetSetTssEcdsaPubKeyEvmTxContext(r.ctx, newTss, sender, oldFullSignature, newFullSignature, contractAddress)
+}
+
+func (r *EvmRpc) GetSetTssEcdsaPubKeyEvmTxContext(ctx context.Context, newTss, sender ecommon.Address, oldFullSignature, newFullSignature []byte, contractAddress *ecommon.Address) (*etypes.Transaction, error) {
 	encodedData, err := common.EvmContractAbi.Pack("setTss", newTss, oldFullSignature, newFullSignature)
 	if err != nil {
 		return nil, err
 	}
-	return r.buildContractTx(sender, contractAddress, evmTxKindSetTss, encodedData, "set ecdsa pub key tx")
+	return r.buildContractTxContext(ctx, sender, contractAddress, evmTxKindSetTss, encodedData, "set ecdsa pub key tx")
 }
 
 func (r *EvmRpc) GetHaltEvmMessage(networkClass, chainId uint32, contractAddress *ecommon.Address) ([]byte, error) {
@@ -1125,8 +1242,53 @@ const (
 	defaultFilterQuerySize = 2000
 )
 
+func combineContexts(base, caller context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
+	root := caller
+	if root == nil {
+		root = base
+	}
+	if root == nil {
+		root = context.Background()
+	}
+	var ctx context.Context
+	var cancel context.CancelFunc
+	if timeout > 0 {
+		ctx, cancel = context.WithTimeout(root, timeout)
+	} else {
+		ctx, cancel = context.WithCancel(root)
+	}
+	if base != nil && base != root {
+		stop := context.AfterFunc(base, cancel)
+		if base.Err() != nil {
+			cancel()
+		}
+		orig := cancel
+		cancel = func() {
+			stop()
+			orig()
+		}
+	}
+	return ctx, cancel
+}
+
 func (r *EvmRpc) callContext(timeout time.Duration) (context.Context, context.CancelFunc, error) {
 	return limitedCallContext(r.ctx, r.limiter, timeout)
+}
+
+func (r *EvmRpc) callContextWithParent(parent context.Context, timeout time.Duration) (context.Context, context.CancelFunc, error) {
+	if parent == nil || parent == r.ctx {
+		return r.callContext(timeout)
+	}
+	ctx, cancel := combineContexts(r.ctx, parent, 0)
+	read, end, err := limitedCallContext(ctx, r.limiter, timeout)
+	if err != nil {
+		cancel()
+		return nil, nil, err
+	}
+	return read, func() {
+		end()
+		cancel()
+	}, nil
 }
 
 // Waiting for a local permit can take longer than the provider's call timeout,
@@ -1208,7 +1370,11 @@ func (r *EvmRpc) TransactionReceiptContext(parent context.Context, txHash ecommo
 }
 
 func (r *EvmRpc) EstimateGas(msg ethereum.CallMsg) (uint64, error) {
-	ctx, cancel, err := r.callContext(evmCallTimeout)
+	return r.EstimateGasContext(r.ctx, msg)
+}
+
+func (r *EvmRpc) EstimateGasContext(parent context.Context, msg ethereum.CallMsg) (uint64, error) {
+	ctx, cancel, err := r.callContextWithParent(parent, evmCallTimeout)
 	if err != nil {
 		return 0, err
 	}
@@ -1217,7 +1383,11 @@ func (r *EvmRpc) EstimateGas(msg ethereum.CallMsg) (uint64, error) {
 }
 
 func (r *EvmRpc) SuggestGasPrice() (*big.Int, error) {
-	ctx, cancel, err := r.callContext(evmCallTimeout)
+	return r.SuggestGasPriceContext(r.ctx)
+}
+
+func (r *EvmRpc) SuggestGasPriceContext(parent context.Context) (*big.Int, error) {
+	ctx, cancel, err := r.callContextWithParent(parent, evmCallTimeout)
 	if err != nil {
 		return nil, err
 	}
@@ -1226,7 +1396,11 @@ func (r *EvmRpc) SuggestGasPrice() (*big.Int, error) {
 }
 
 func (r *EvmRpc) SuggestGasTipCap() (*big.Int, error) {
-	ctx, cancel, err := r.callContext(evmCallTimeout)
+	return r.SuggestGasTipCapContext(r.ctx)
+}
+
+func (r *EvmRpc) SuggestGasTipCapContext(parent context.Context) (*big.Int, error) {
+	ctx, cancel, err := r.callContextWithParent(parent, evmCallTimeout)
 	if err != nil {
 		return nil, err
 	}
@@ -1235,7 +1409,11 @@ func (r *EvmRpc) SuggestGasTipCap() (*big.Int, error) {
 }
 
 func (r *EvmRpc) NonceAt(address ecommon.Address, blockNumber uint64) (uint64, error) {
-	ctx, cancel, err := r.callContext(evmCallTimeout)
+	return r.NonceAtContext(r.ctx, address, blockNumber)
+}
+
+func (r *EvmRpc) NonceAtContext(parent context.Context, address ecommon.Address, blockNumber uint64) (uint64, error) {
+	ctx, cancel, err := r.callContextWithParent(parent, evmCallTimeout)
 	if err != nil {
 		return 0, err
 	}
@@ -1244,7 +1422,11 @@ func (r *EvmRpc) NonceAt(address ecommon.Address, blockNumber uint64) (uint64, e
 }
 
 func (r *EvmRpc) PendingNonceAt(address ecommon.Address) (uint64, error) {
-	ctx, cancel, err := r.callContext(evmCallTimeout)
+	return r.PendingNonceAtContext(r.ctx, address)
+}
+
+func (r *EvmRpc) PendingNonceAtContext(parent context.Context, address ecommon.Address) (uint64, error) {
+	ctx, cancel, err := r.callContextWithParent(parent, evmCallTimeout)
 	if err != nil {
 		return 0, err
 	}
@@ -1256,7 +1438,11 @@ func (r *EvmRpc) PendingNonceAt(address ecommon.Address) (uint64, error) {
 // minimal or pre-London RPC responses without full header fields do not fail
 // decoding, and returns (nil, nil) on non-1559 chains.
 func (r *EvmRpc) baseFeeByNumber(blockNumber uint64) (*big.Int, error) {
-	ctx, cancel, err := r.callContext(evmCallTimeout)
+	return r.baseFeeByNumberContext(r.ctx, blockNumber)
+}
+
+func (r *EvmRpc) baseFeeByNumberContext(parent context.Context, blockNumber uint64) (*big.Int, error) {
+	ctx, cancel, err := r.callContextWithParent(parent, evmCallTimeout)
 	if err != nil {
 		return nil, err
 	}
@@ -1274,7 +1460,11 @@ func (r *EvmRpc) baseFeeByNumber(blockNumber uint64) (*big.Int, error) {
 }
 
 func (r *EvmRpc) BalanceAt(address ecommon.Address, blockNumber uint64) (*big.Int, error) {
-	ctx, cancel, err := r.callContext(evmCallTimeout)
+	return r.BalanceAtContext(r.ctx, address, blockNumber)
+}
+
+func (r *EvmRpc) BalanceAtContext(parent context.Context, address ecommon.Address, blockNumber uint64) (*big.Int, error) {
+	ctx, cancel, err := r.callContextWithParent(parent, evmCallTimeout)
 	if err != nil {
 		return nil, err
 	}
@@ -1283,7 +1473,11 @@ func (r *EvmRpc) BalanceAt(address ecommon.Address, blockNumber uint64) (*big.In
 }
 
 func (r *EvmRpc) BlockNumber() (uint64, error) {
-	ctx, cancel, err := r.callContext(evmCallTimeout)
+	return r.BlockNumberContext(r.ctx)
+}
+
+func (r *EvmRpc) BlockNumberContext(parent context.Context) (uint64, error) {
+	ctx, cancel, err := r.callContextWithParent(parent, evmCallTimeout)
 	if err != nil {
 		return 0, err
 	}
@@ -1495,6 +1689,16 @@ func (r *EvmRpc) HasIndependentSecondary() bool {
 // returns (found, lowestVerified, complete, err) so callers can retain
 // verified progress across retries without blocking the bridge listener past
 // its hold-tracking window.
+func isAttemptBudgetErr(err error, attemptCtx, parent context.Context) bool {
+	if err == nil || (parent != nil && parent.Err() != nil) {
+		return false
+	}
+	if attemptCtx.Err() != nil && (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) {
+		return true
+	}
+	return strings.Contains(err.Error(), "would exceed context deadline")
+}
+
 func (r *EvmRpc) AnySecondaryHasUnwrapLogChunked(parent context.Context, fromBlock, targetHead, resumeEnd uint64, txHash ecommon.Hash, logIndex uint32, maxChunks int) (bool, uint64, bool, error) {
 	if !r.HasIndependentSecondary() {
 		return false, 0, false, errors.New("no independent secondary EVM endpoint configured")
@@ -1553,17 +1757,8 @@ func (r *EvmRpc) AnySecondaryHasUnwrapLogChunked(parent context.Context, fromBlo
 			var lowestVerified uint64
 			var scanErr error
 			// Verify the secondary's head covers targetHead so it cannot clip logs.
-			if err := r.callEndpoint(idx, func(ctx context.Context, client *ethclient.Client) error {
-				if attemptCtx.Err() != nil {
-					return attemptCtx.Err()
-				}
-				callCtx, stop := context.WithCancel(ctx)
-				unlink := context.AfterFunc(attemptCtx, stop)
-				defer func() {
-					unlink()
-					stop()
-				}()
-				head, err := client.BlockNumber(callCtx)
+			if err := r.callEndpointContext(attemptCtx, idx, func(ctx context.Context, client *ethclient.Client) error {
+				head, err := client.BlockNumber(ctx)
 				if err != nil {
 					return err
 				}
@@ -1592,14 +1787,8 @@ func (r *EvmRpc) AnySecondaryHasUnwrapLogChunked(parent context.Context, fromBlo
 					Addresses: []ecommon.Address{r.bridgeAddress},
 					Topics:    [][]ecommon.Hash{{common.UnwrapSigHash}},
 				}
-				err := r.callEndpoint(idx, func(ctx context.Context, client *ethclient.Client) error {
-					callCtx, stop := context.WithCancel(ctx)
-					unlink := context.AfterFunc(attemptCtx, stop)
-					defer func() {
-						unlink()
-						stop()
-					}()
-					logs, err := client.FilterLogs(callCtx, query)
+				err := r.callEndpointContext(attemptCtx, idx, func(ctx context.Context, client *ethclient.Client) error {
+					logs, err := client.FilterLogs(ctx, query)
 					if err != nil {
 						return err
 					}
@@ -1613,10 +1802,11 @@ func (r *EvmRpc) AnySecondaryHasUnwrapLogChunked(parent context.Context, fromBlo
 					return nil
 				})
 				if err != nil {
-					// If the per-attempt time budget expired after completing at
-					// least one chunk (and parent was not cancelled), retain the
-					// partial progress so low-rate-limit nodes advance across retries.
-					if completedAny && attemptCtx.Err() != nil && parent.Err() == nil && (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) {
+					// If the per-attempt time budget expired (or the rate limiter
+					// rejected a permit exceeding the remaining attempt budget)
+					// after completing at least one chunk, retain partial progress
+					// so low-rate-limit nodes advance across retries.
+					if completedAny && isAttemptBudgetErr(err, attemptCtx, parent) {
 						break
 					}
 					scanErr = errors.New(config.RedactErrorForURL(err, urls[idx]))
@@ -1699,13 +1889,25 @@ func agreeCanonicalHash(number uint64, results []headerResult) (ecommon.Hash, er
 
 // callEndpoint charges the endpoint's own limiter and reuses its client.
 func (r *EvmRpc) callEndpoint(idx int, read func(context.Context, *ethclient.Client) error) error {
+	return r.callEndpointContext(r.ctx, idx, read)
+}
+
+// callEndpointContext applies parent's deadline and cancellation BEFORE
+// acquiring the endpoint lock, waiting for a rate-limiter permit, dialling,
+// and running read.
+func (r *EvmRpc) callEndpointContext(parent context.Context, idx int, read func(context.Context, *ethclient.Client) error) error {
 	if uint32(idx) == r.Urls.CurrentUrlIndex {
-		ctx, cancel, err := r.callContext(evmCallTimeout)
+		ctx, cancel, err := r.callContextWithParent(parent, evmCallTimeout)
 		if err != nil {
 			return err
 		}
 		defer cancel()
 		return read(ctx, r.rpcClient)
+	}
+	ctx, cancel := combineContexts(r.ctx, parent, evmCallTimeout)
+	defer cancel()
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	url := r.Urls.Urls[idx]
 	r.secondaryMu.Lock()
@@ -1718,7 +1920,7 @@ func (r *EvmRpc) callEndpoint(idx int, read func(context.Context, *ethclient.Cli
 		if r.secondary == nil {
 			r.secondary = make(map[string]*secondaryClient)
 		}
-		entry = &secondaryClient{}
+		entry = &secondaryClient{sem: make(chan struct{}, 1)}
 		if url == r.Urls.GetCurrentUrl() {
 			entry.limiter = r.limiter
 		} else if r.limit > 0 {
@@ -1728,8 +1930,10 @@ func (r *EvmRpc) callEndpoint(idx int, read func(context.Context, *ethclient.Cli
 	}
 	r.secondaryMu.Unlock()
 
-	entry.mu.Lock()
-	defer entry.mu.Unlock()
+	if err := entry.acquire(ctx); err != nil {
+		return err
+	}
+	defer entry.release()
 	// Stop may have closed this entry between the check above and taking
 	// its lock; never dial a client that nothing will close.
 	r.secondaryMu.Lock()
@@ -1738,11 +1942,11 @@ func (r *EvmRpc) callEndpoint(idx int, read func(context.Context, *ethclient.Cli
 	if stopped {
 		return errors.New("evm rpc stopped")
 	}
-	ctx, cancel, err := limitedCallContext(r.ctx, entry.limiter, evmCallTimeout)
-	if err != nil {
-		return err
+	if entry.limiter != nil {
+		if err := entry.limiter.Wait(ctx); err != nil {
+			return err
+		}
 	}
-	defer cancel()
 	if entry.client == nil {
 		client, err := ethclient.DialContext(ctx, url)
 		if err != nil {
@@ -1769,12 +1973,12 @@ func (r *EvmRpc) closeSecondaryClients() {
 	}
 	r.secondaryMu.Unlock()
 	for _, entry := range entries {
-		entry.mu.Lock()
+		entry.sem <- struct{}{}
 		if entry.client != nil {
 			entry.client.Close()
 			entry.client = nil
 		}
-		entry.mu.Unlock()
+		entry.release()
 	}
 }
 
@@ -1813,7 +2017,13 @@ func (b bridgeReadBackend) CodeAt(ctx context.Context, address ecommon.Address, 
 }
 
 func (r *EvmRpc) GetCurrentTss() (ecommon.Address, error) {
-	return r.bridgeContract.Tss(&bind.CallOpts{Context: r.ctx})
+	return r.GetCurrentTssContext(r.ctx)
+}
+
+func (r *EvmRpc) GetCurrentTssContext(parent context.Context) (ecommon.Address, error) {
+	ctx, cancel := combineContexts(r.ctx, parent, 0)
+	defer cancel()
+	return r.bridgeContract.Tss(&bind.CallOpts{Context: ctx})
 }
 
 func (r *EvmRpc) HaltFlagSet() (bool, error) {
@@ -1852,7 +2062,11 @@ func (r *EvmRpc) ContractDeploymentHeight() (uint64, error) {
 }
 
 func (r *EvmRpc) TransactionByHash(hash ecommon.Hash) (*etypes.Transaction, bool, error) {
-	ctx, cancel, err := r.callContext(evmCallTimeout)
+	return r.TransactionByHashContext(r.ctx, hash)
+}
+
+func (r *EvmRpc) TransactionByHashContext(parent context.Context, hash ecommon.Hash) (*etypes.Transaction, bool, error) {
+	ctx, cancel, err := r.callContextWithParent(parent, evmCallTimeout)
 	if err != nil {
 		return nil, false, err
 	}

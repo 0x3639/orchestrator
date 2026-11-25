@@ -3,6 +3,7 @@ package network
 import (
 	"bytes"
 	"cmp"
+	"context"
 	"crypto/ecdsa"
 	"encoding/base64"
 	"encoding/hex"
@@ -708,6 +709,14 @@ func (m *NetworksManager) ChangeTssEcdsaPubKeyZnn(pubKey, signature, newSignatur
 	return m.Znn().ChangeTssEcdsaPubKey(pubKey, signature, newSignature, keyPair)
 }
 
+func (m *NetworksManager) ChangeTssEcdsaPubKeyZnnContext(ctx context.Context, pubKey, signature, newSignature string, keyPair *wallet.KeyPair, allowSend func() bool) error {
+	return m.Znn().ChangeTssEcdsaPubKeyContext(ctx, pubKey, signature, newSignature, keyPair, allowSend)
+}
+
+func (m *NetworksManager) GetBridgeInfoContext(ctx context.Context) (*definition.BridgeInfoVariable, error) {
+	return m.Znn().GetBridgeInfoContext(ctx)
+}
+
 // SendUnwrapRequest registers event on Zenon, prepared and published as
 // UpdateWrapRequest does.
 func (m *NetworksManager) SendUnwrapRequest(event *events.UnwrapRequestEvm, keyPair *wallet.KeyPair, while WhileLive) error {
@@ -914,6 +923,16 @@ func (m *NetworksManager) Evm(chainId uint32) *evmNetwork {
 // either, the error wraps ErrNetworksChanged and names it, beside the report
 // for the networks of batch.
 func (m *NetworksManager) SetTssEcdsaPubKeyEvm(batch EvmBatch, oldKeySignatures, newKeySignatures [][]byte, newCompressedPubKey string, ecdsaPrivateKey *ecdsa.PrivateKey, evmAddress ecommon.Address) (bool, error) {
+	return m.SetTssEcdsaPubKeyEvmContext(context.Background(), batch, oldKeySignatures, newKeySignatures, newCompressedPubKey, ecdsaPrivateKey, evmAddress, nil)
+}
+
+func (m *NetworksManager) SetTssEcdsaPubKeyEvmContext(ctx context.Context, batch EvmBatch, oldKeySignatures, newKeySignatures [][]byte, newCompressedPubKey string, ecdsaPrivateKey *ecdsa.PrivateKey, evmAddress ecommon.Address, allowSend func() bool) (bool, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
 	targets, added, err := m.batchTargets(batch, oldKeySignatures, newKeySignatures)
 	if err != nil {
 		return false, err
@@ -933,9 +952,18 @@ func (m *NetworksManager) SetTssEcdsaPubKeyEvm(batch EvmBatch, oldKeySignatures,
 	// true means that all evm networks have the new tss
 	ok := true
 	for _, target := range targets {
+		if err := ctx.Err(); err != nil {
+			return false, err
+		}
+		if allowSend != nil && !allowSend() {
+			return false, context.Canceled
+		}
 		network, idx := target.network, target.index
-		tss, err := network.GetCurrentTss()
+		tss, err := network.GetCurrentTssContext(ctx)
 		if err != nil {
+			if ctx.Err() != nil {
+				return false, ctx.Err()
+			}
 			// A network whose key cannot be read has not been seen to
 			// have the new one.
 			m.logger.Debug(err)
@@ -948,8 +976,11 @@ func (m *NetworksManager) SetTssEcdsaPubKeyEvm(batch EvmBatch, oldKeySignatures,
 		}
 		m.logger.Debug("before getting change ecdsa pub key tx")
 		ok = false
-		tx, err := network.GetSetTssEcdsaPubKeyEvmTx(newTss, evmAddress, oldKeySignatures[idx], newKeySignatures[idx])
+		tx, err := network.GetSetTssEcdsaPubKeyEvmTxContext(ctx, newTss, evmAddress, oldKeySignatures[idx], newKeySignatures[idx])
 		if err != nil {
+			if ctx.Err() != nil {
+				return false, ctx.Err()
+			}
 			m.logger.Debug(err)
 			continue
 		}
@@ -958,13 +989,11 @@ func (m *NetworksManager) SetTssEcdsaPubKeyEvm(batch EvmBatch, oldKeySignatures,
 			m.logger.Debug(err)
 			continue
 		}
-		//r, s, v := tx.RawSignatureValues()
-		//m.logger.Debug("tx signature values:")
-		//m.logger.Debug("r: ", r.Bytes())
-		//m.logger.Debug("s: ", s.Bytes())
-		//m.logger.Debug("v: ", v.Bytes())
 		m.logger.Debug("before sending evm tx")
-		if err = network.SendTransaction(tx); err != nil {
+		if err = network.SendTransactionContext(ctx, tx, allowSend); err != nil {
+			if ctx.Err() != nil {
+				return false, ctx.Err()
+			}
 			m.logger.Error(err)
 			continue
 		}
@@ -972,11 +1001,14 @@ func (m *NetworksManager) SetTssEcdsaPubKeyEvm(batch EvmBatch, oldKeySignatures,
 	}
 	var unchanged []string
 	for _, network := range added {
+		if err := ctx.Err(); err != nil {
+			return false, err
+		}
 		if !m.hasNetwork(network) {
 			// Removed again since; it needs no key.
 			continue
 		}
-		if tss, err := network.GetCurrentTss(); err == nil && tss == newTss {
+		if tss, err := network.GetCurrentTssContext(ctx); err == nil && tss == newTss {
 			continue
 		}
 		unchanged = append(unchanged, fmt.Sprintf("EVM network %d", network.ChainId()))
@@ -988,6 +1020,16 @@ func (m *NetworksManager) SetTssEcdsaPubKeyEvm(batch EvmBatch, oldKeySignatures,
 }
 
 func (m *NetworksManager) CheckNewTssEcdsaPubKeyEvm(newCompressedPubKey string) (bool, error) {
+	return m.CheckNewTssEcdsaPubKeyEvmContext(context.Background(), newCompressedPubKey)
+}
+
+func (m *NetworksManager) CheckNewTssEcdsaPubKeyEvmContext(ctx context.Context, newCompressedPubKey string) (bool, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
 	newCompressedPubKeyBytes, err := base64.StdEncoding.DecodeString(newCompressedPubKey)
 	if err != nil {
 		m.logger.Debug(err)
@@ -1003,8 +1045,14 @@ func (m *NetworksManager) CheckNewTssEcdsaPubKeyEvm(newCompressedPubKey string) 
 	// true means that all evm networks have the new tss
 	ok := true
 	for _, network := range m.networks() {
-		tss, err := network.GetCurrentTss()
+		if err := ctx.Err(); err != nil {
+			return false, err
+		}
+		tss, err := network.GetCurrentTssContext(ctx)
 		if err != nil {
+			if ctx.Err() != nil {
+				return false, ctx.Err()
+			}
 			// A network whose key cannot be read has not been seen to
 			// have the new one.
 			m.logger.Debug(err)
@@ -1138,11 +1186,18 @@ func (m *NetworksManager) RecordConfirmedHalt(state *common.GlobalState) (bool, 
 // all active EVM networks for sender once an emergency has ended, preserving
 // any halt transaction still live in the EVM mempool.
 func (m *NetworksManager) ClearObsoleteHaltTx(sender ecommon.Address) {
+	m.ClearObsoleteHaltTxContext(context.Background(), sender)
+}
+
+func (m *NetworksManager) ClearObsoleteHaltTxContext(ctx context.Context, sender ecommon.Address) {
 	if sender == (ecommon.Address{}) {
 		return
 	}
 	for _, network := range m.networks() {
-		if err := network.EvmRpc().ClearObsoleteHaltTx(sender); err != nil {
+		if ctx != nil && ctx.Err() != nil {
+			return
+		}
+		if err := network.EvmRpc().ClearObsoleteHaltTxContext(ctx, sender); err != nil {
 			m.logger.Debugf("clear obsolete halt tx on chainId %d: %v", network.ChainId(), err)
 		}
 	}
@@ -1161,6 +1216,21 @@ func (m *NetworksManager) GetHaltMessages() (EvmBatch, [][]byte, error) {
 		ans = append(ans, msg)
 	}
 	return batch, ans, nil
+}
+
+// GetBatchCurrentTss reads the current on-chain TSS address for each EVM
+// network in batch, in batch order, so emergency halt signing can match each
+// chain's active key across a partial key rotation.
+func (m *NetworksManager) GetBatchCurrentTss(batch EvmBatch) ([]ecommon.Address, error) {
+	addrs := make([]ecommon.Address, len(batch.networks))
+	for i, network := range batch.networks {
+		addr, err := network.GetCurrentTss()
+		if err != nil {
+			return nil, err
+		}
+		addrs[i] = addr
+	}
+	return addrs, nil
 }
 
 func (m *NetworksManager) GetHaltEvmTxs(batch EvmBatch, signatures [][]byte, tss ecommon.Address) ([]*etypes.Transaction, error) {

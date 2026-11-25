@@ -1365,10 +1365,15 @@ func (rC *znnNetwork) interpretSendBlockDataAt(ctx context.Context, sendBlock *a
 		}
 		// If the key was changed to the param, we are no longer in keyGen. A
 		// key change that takes effect ends key generation on the bridge; if
-		// the bridge allows it again, a newer round has begun.
+		// the bridge allows it again, a newer round has begun. If this signer
+		// is actively publishing param.PubKey across Zenon and EVM, let that
+		// round finish EVM rotation, install and save the key, and transition
+		// to LiveState itself rather than aborting mid-round.
 		if bridgeInfo.CompressedTssECDSAPubKey == param.PubKey && !bridgeInfo.AllowKeyGen {
-			if err := rC.leaveKeyGen(); err != nil {
-				return err
+			if !rC.state.IsActiveKeyGenPubKey(param.PubKey) {
+				if err := rC.leaveKeyGen(); err != nil {
+					return err
+				}
 			}
 		}
 	case base64.StdEncoding.EncodeToString(definition.ABIBridge.Methods[definition.ChangeAdministratorMethodName].Id()):
@@ -1835,27 +1840,50 @@ func (rC *znnNetwork) recordUnwrapRegistration(ctx context.Context, param *defin
 					"and this long after the receive that does not show whether the transaction never existed or lies outside the endpoint's history",
 					param.TransactionHash.String(), param.LogIndex, rpcZnnEvent.ChainId)}
 			}
-			// Re-check source evidence AFTER coverage is established so a
-			// genuine source recorded by the scan or queue worker concurrently
-			// with verification cannot trigger a false emergency halt.
-			rechecked, recheckErr := rC.unwrapSource(ctx, param, rpcZnnEvent)
-			if recheckErr != nil {
-				return recheckErr
+			// Validate queued and persisted evidence together AFTER coverage is
+			// established so a genuine source moving from unconfirmedQueue ->
+			// persistent storage during verification cannot slip between checks
+			// and trigger a false emergency halt.
+			var eN *evmNetwork
+			if rC.networkManager != nil {
+				eN = rC.networkManager.LookupEvm(rpcZnnEvent.ChainId)
 			}
-			if err := ctx.Err(); err != nil {
-				return err
-			}
-			source = rechecked
-			if source == sourceUnknown {
-				// Recheck the unconfirmed queue after corroboration and source
-				// recheck so a matching event enqueued during secondary log
-				// queries is never missed while awaiting confirmation.
-				if rC.networkManager != nil {
-					if eN := rC.networkManager.LookupEvm(rpcZnnEvent.ChainId); eN != nil && eN.hasQueuedEvent(ecommon.Hash(rpcZnnEvent.TransactionHash), rpcZnnEvent.LogIndex) {
+			for attempt := 0; attempt < 2; attempt++ {
+				var seqBefore uint64
+				if eN != nil {
+					seqBefore = eN.confirmedSeq.Load()
+					if eN.hasQueuedEvent(ecommon.Hash(rpcZnnEvent.TransactionHash), rpcZnnEvent.LogIndex) {
 						return awaitsSourceRecord{errors.Errorf("unwrap request %s/%d on chainId %d has matching queued evidence awaiting confirmation",
 							param.TransactionHash.String(), param.LogIndex, rpcZnnEvent.ChainId)}
 					}
 				}
+				rechecked, recheckErr := rC.unwrapSource(ctx, param, rpcZnnEvent)
+				if recheckErr != nil {
+					return recheckErr
+				}
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+				source = rechecked
+				if source != sourceUnknown || eN == nil {
+					break
+				}
+				if eN.hasQueuedEvent(ecommon.Hash(rpcZnnEvent.TransactionHash), rpcZnnEvent.LogIndex) {
+					return awaitsSourceRecord{errors.Errorf("unwrap request %s/%d on chainId %d has matching queued evidence awaiting confirmation",
+						param.TransactionHash.String(), param.LogIndex, rpcZnnEvent.ChainId)}
+				}
+				if eN.confirmedSeq.Load() == seqBefore {
+					break
+				}
+				// A confirmation persisted to LevelDB and dequeued between the
+				// queue check and unwrapSource; retry once against the updated DB,
+				// or hold if confirmations keep racing.
+				if attempt == 1 {
+					return awaitsSourceRecord{errors.Errorf("unwrap request %s/%d on chainId %d awaits concurrent confirmation handoff",
+						param.TransactionHash.String(), param.LogIndex, rpcZnnEvent.ChainId)}
+				}
+			}
+			if source == sourceUnknown {
 				rC.logger.Errorf("late unwrap request %s/%d inside its redeem delay on chainId %d has no receipt and no recorded source event despite completed corroborated EVM scan coverage; escalating to emergency",
 					param.TransactionHash.String(), param.LogIndex, rpcZnnEvent.ChainId)
 			}
@@ -1926,6 +1954,9 @@ func (rC *znnNetwork) followKeyGenSetting(ctx context.Context) error {
 		return errors.New("missing bridge info")
 	}
 	if info.AllowKeyGen {
+		return nil
+	}
+	if rC.state.IsActiveKeyGenPubKey(info.CompressedTssECDSAPubKey) {
 		return nil
 	}
 	return rC.leaveKeyGen()
@@ -2398,6 +2429,14 @@ func (rC *znnNetwork) GetWrapTokenRequestById(id types.Hash) (*definition.WrapTo
 
 func (rC *znnNetwork) ChangeTssEcdsaPubKey(pubKey, signature, newSignature string, keyPair *wallet.KeyPair) error {
 	return rC.ZnnRpc().ChangeTssEcdsaPubKey(pubKey, signature, newSignature, keyPair)
+}
+
+func (rC *znnNetwork) ChangeTssEcdsaPubKeyContext(ctx context.Context, pubKey, signature, newSignature string, keyPair *wallet.KeyPair, allowSend func() bool) error {
+	return rC.ZnnRpc().ChangeTssEcdsaPubKeyContext(ctx, pubKey, signature, newSignature, keyPair, allowSend)
+}
+
+func (rC *znnNetwork) GetBridgeInfoContext(ctx context.Context) (*definition.BridgeInfoVariable, error) {
+	return rC.ZnnRpc().GetBridgeInfoContext(ctx)
 }
 
 func (rC *znnNetwork) GetPillarPublicKeys() (map[string]string, error) {

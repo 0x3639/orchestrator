@@ -2891,3 +2891,199 @@ func TestNetworksManagerStartIgnoresNetworkRemovedDuringInitialScan(t *testing.T
 		t.Fatal("NetworksManager.Start hung after runtime removal during initial scan")
 	}
 }
+
+func TestChangeTssDoesNotLeaveKeyGenWhileActiveRoundPublishes(t *testing.T) {
+	newPubKey := "Ak111111111111111111111111111111111111111111"
+	sender := types.ParseAddressPanic("z1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqsggv2f")
+
+	url := replayServerWithErrors(t, func(method string, params []json.RawMessage) (interface{}, *replayRPCError) {
+		switch method {
+		case "embedded.bridge.getBridgeInfo":
+			return &definition.BridgeInfoVariable{
+				CompressedTssECDSAPubKey: newPubKey,
+				AllowKeyGen:              false,
+			}, nil
+		default:
+			t.Errorf("unexpected method %s", method)
+			return nil, nil
+		}
+	})
+
+	b := newReplayBridge(t)
+	n, _ := replayNetwork(t, b, url, nil)
+	if err := n.state.SetState(common.KeyGenState); err != nil {
+		t.Fatal(err)
+	}
+	n.state.SetActiveKeyGenPubKey(newPubKey)
+
+	changeData := packBridgeCall(t, definition.ChangeTssECDSAPubKeyMethodName, newPubKey, "oldSig", "newSig")
+	if err := n.interpretSendBlockData(context.Background(), makeSendBlock(sender, changeData), liveReceive, true, receiveAccepted, 2, n.refreshSettings); err != nil {
+		t.Fatalf("ChangeTssECDSAPubKey with active round failed: %v", err)
+	}
+	if st, _ := n.state.GetState(); st != common.KeyGenState {
+		t.Fatalf("state = %s, want KeyGenState while active round is still finishing EVM rotation", common.StateToText(st))
+	}
+
+	// Once the active round clears its keygen publish marker (or for another key),
+	// ChangeTssECDSAPubKey leaves KeyGenState -> LiveState normally.
+	n.state.ClearActiveKeyGenPubKey(newPubKey)
+	if err := n.interpretSendBlockData(context.Background(), makeSendBlock(sender, changeData), liveReceive, true, receiveAccepted, 3, n.refreshSettings); err != nil {
+		t.Fatalf("ChangeTssECDSAPubKey after clearing active round failed: %v", err)
+	}
+	if st, _ := n.state.GetState(); st != common.LiveState {
+		t.Fatalf("state = %s, want LiveState when no active round owns %s", common.StateToText(st), newPubKey)
+	}
+}
+
+func TestLateUnknownUnwrapHandlesConcurrentQueueToDBConfirmationHandoff(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	b := newReplayBridge(t)
+	l := &lateNode{t: t, bridge: b}
+	l.ledger.Store(newReplayLedger(t, b, 5000))
+	l.redeemableIn.Store(30)
+
+	var eN *evmNetwork
+	var receiptCalls atomic.Int32
+	sourceLog := b.sourceLog(t, testRecipient)
+	sourceLog.BlockNumber = 180
+	sourceLog.BlockHash = ecommon.BigToHash(big.NewInt(190))
+
+	primaryURL := replayServerWithErrors(t, func(method string, params []json.RawMessage) (interface{}, *replayRPCError) {
+		switch method {
+		case "stats.syncInfo":
+			return nil, nil
+		case "embedded.bridge.getUnwrapTokenRequestByHashAndLog":
+			return withRedeemDelay(b.request, l.redeemableIn.Load()), nil
+		case "eth_syncing":
+			return false, nil
+		case "eth_blockNumber":
+			return hexutil.EncodeUint64(200), nil
+		case "eth_getBlockByNumber":
+			var number hexutil.Uint64
+			_ = json.Unmarshal(params[0], &number)
+			return map[string]interface{}{"number": number, "hash": ecommon.BigToHash(new(big.Int).SetUint64(uint64(number) + 10))}, nil
+		case "eth_getTransactionReceipt":
+			// On the post-coverage unwrapSource recheck (2nd receipt lookup), simulate
+			// the confirmation worker persisting the event to LevelDB, incrementing
+			// confirmedSeq, and dequeuing it RIGHT as the receipt lookup returns nil!
+			if receiptCalls.Add(1) == 2 {
+				ev := &events.UnwrapRequestEvm{
+					ChainId:         1,
+					TransactionHash: ecommon.Hash(b.request.TransactionHash),
+					LogIndex:        b.request.LogIndex,
+					BlockNumber:     sourceLog.BlockNumber,
+					BlockHash:       sourceLog.BlockHash,
+					Token:           ecommon.HexToAddress(b.request.TokenAddress),
+					To:              b.request.ToAddress.String(),
+					Amount:          new(big.Int).Set(b.request.Amount),
+				}
+				_, _ = eN.eventsStore().AddUnwrapRequestIfMissing(*ev)
+				_ = eN.recordConfirmedBlock(ev)
+				eN.confirmedSeq.Add(1)
+				_ = eN.dropQueuedEvent()
+			}
+			return nil, nil
+		case "eth_getLogs":
+			var q struct {
+				BlockHash *ecommon.Hash   `json:"blockHash"`
+				FromBlock *hexutil.Uint64 `json:"fromBlock"`
+				ToBlock   *hexutil.Uint64 `json:"toBlock"`
+			}
+			if len(params) >= 1 && json.Unmarshal(params[0], &q) == nil {
+				if (q.BlockHash != nil && *q.BlockHash == sourceLog.BlockHash) ||
+					(q.FromBlock != nil && q.ToBlock != nil && *q.FromBlock == *q.ToBlock && uint64(*q.FromBlock) == sourceLog.BlockNumber) {
+					return []etypes.Log{sourceLog}, nil
+				}
+			}
+			return []etypes.Log{}, nil
+		}
+		if result, ok := l.ledger.Load().answer(t, method, params); ok {
+			return result, nil
+		}
+		return nil, nil
+	})
+	secondaryURL := replayServerWithErrors(t, func(method string, params []json.RawMessage) (interface{}, *replayRPCError) {
+		switch method {
+		case "eth_syncing":
+			return false, nil
+		case "eth_blockNumber":
+			return hexutil.EncodeUint64(200), nil
+		case "eth_getBlockByNumber":
+			var number hexutil.Uint64
+			_ = json.Unmarshal(params[0], &number)
+			return map[string]interface{}{"number": number, "hash": ecommon.BigToHash(new(big.Int).SetUint64(uint64(number) + 10))}, nil
+		case "eth_getTransactionReceipt":
+			return nil, nil
+		case "eth_getLogs":
+			var q struct {
+				BlockHash *ecommon.Hash   `json:"blockHash"`
+				FromBlock *hexutil.Uint64 `json:"fromBlock"`
+				ToBlock   *hexutil.Uint64 `json:"toBlock"`
+			}
+			if len(params) >= 1 && json.Unmarshal(params[0], &q) == nil {
+				if (q.BlockHash != nil && *q.BlockHash == sourceLog.BlockHash) ||
+					(q.FromBlock != nil && q.ToBlock != nil && *q.FromBlock == *q.ToBlock && uint64(*q.FromBlock) == sourceLog.BlockNumber) {
+					return []etypes.Log{sourceLog}, nil
+				}
+			}
+			return []etypes.Log{}, nil
+		default:
+			return nil, nil
+		}
+	})
+
+	l.n, l.stores = replayNetwork(t, b, primaryURL, map[uint32]string{1: primaryURL})
+	evmClient, err := rpc.NewEvmRpcClient(config.BaseNetworkConfig{Urls: []string{primaryURL, secondaryURL}}, "eth", b.contract)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(evmClient.Stop)
+	l.n.rpcManager.RegisterEvmClient(1, evmClient)
+	l.n.SetConfirmationsToFinality(5)
+	l.at(5000, acceptedReceive)
+
+	params, err := config.NewEvmParams(&definition.NetworkInfo{NetworkClass: definition.EvmClass, Id: 1, Name: "eth", ContractAddress: b.contract.Hex()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	params.SetConfirmationsToFinality(5)
+	params.SetContractDeploymentHeight(1)
+	q, err := storage.CreateOrOpenQueue(definition.EvmClass, "handoff-queue-to-db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = q.Close() })
+	eN = &evmNetwork{
+		EvmParams:         params,
+		client:            evmClient,
+		dbManager:         l.stores,
+		store:             l.stores.EvmStorage(1),
+		unconfirmedQueue:  q,
+		queuedBlockCounts: make(map[uint64]int),
+		queuedTxKeys:      make(map[queuedUnwrapKey]int),
+		done:              make(chan struct{}),
+		syncTrigger:       make(chan struct{}, 1),
+		state:             l.n.state,
+		logger:            zap.NewNop().Sugar(),
+	}
+	// Seed a non-matching queued event so dropQueuedEvent() succeeds cleanly when
+	// the confirmation handoff occurs during the post-coverage unwrapSource check.
+	if err := eN.enqueueUnconfirmed(&events.UnwrapRequestEvm{
+		ChainId:         1,
+		TransactionHash: ecommon.HexToHash("0xbeef"),
+		LogIndex:        9,
+		BlockNumber:     199,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	eN.lastScannedThrough.Store(200)
+	eN.scanned.Store(true)
+	l.n.networkManager = &NetworksManager{znnNetwork: l.n, evmNetworks: []*evmNetwork{eN}, logger: zap.NewNop().Sugar()}
+
+	// Must detect the confirmedSeq handoff, re-read the newly persisted source,
+	// and match cleanly in LiveState (never falsely escalating to EmergencyState)!
+	if err := l.listen(); err != nil {
+		t.Fatalf("expected clean match across queue->DB confirmation handoff, got err: %v", err)
+	}
+	l.expect("handoff matched without emergency", common.LiveState, 2)
+}

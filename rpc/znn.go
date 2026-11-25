@@ -177,6 +177,45 @@ func (r *ZnnRpc) ChangeTssEcdsaPubKey(pubKey, signature, newSignature string, ke
 	return r.BroadcastTransaction(tx, keyPair)
 }
 
+// ChangeTssEcdsaPubKeyContext prepares and publishes a Zenon TSS rotation
+// block while honoring ctx cancellation and checking allowSend right before
+// broadcasting so an interrupted keygen round exits promptly without leaking a
+// stale rotation into an emergency.
+func (r *ZnnRpc) ChangeTssEcdsaPubKeyContext(ctx context.Context, pubKey, signature, newSignature string, keyPair *wallet.KeyPair, allowSend func() bool) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if allowSend != nil && !allowSend() {
+		return context.Canceled
+	}
+	tx := r.rpcClient.BridgeApi.ChangeTssECDSAPubKey(pubKey, signature, newSignature)
+	prepErrCh := make(chan error, 1)
+	go func() {
+		prepErrCh <- r.prepareTransaction(tx, keyPair)
+	}()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case err := <-prepErrCh:
+		if err != nil {
+			return err
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if allowSend != nil && !allowSend() {
+		return context.Canceled
+	}
+	if r.settingsClient != nil {
+		return r.settingsClient.CallContext(ctx, nil, "ledger.publishRawTransaction", tx)
+	}
+	return r.PublishTransaction(tx)
+}
+
 func (r *ZnnRpc) Halt(signature string, keyPair *wallet.KeyPair) error {
 	tx := r.rpcClient.BridgeApi.Halt(signature)
 	return r.BroadcastTransaction(tx, keyPair)

@@ -1626,3 +1626,245 @@ func TestAnySecondaryHasUnwrapLogChunkedRetainsPartialProgressOnTimeout(t *testi
 		t.Fatalf("lowestVerified = %d, want 91", lowest)
 	}
 }
+
+func TestHaltFillsFirstAvailableNonceBelowStrandedSetTssGap(t *testing.T) {
+	mock, url := newEvmTxMockServer(t)
+	mock.baseFee = big.NewInt(20_000_000_000)
+	mock.tipCap = big.NewInt(2_000_000_000)
+	mock.confirmedNonce = 5
+	mock.pendingNonce = 5
+
+	contract := ecommon.HexToAddress("0x6868686868686868686868686868686868686868")
+	key, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sender := crypto.PubkeyToAddress(key.PublicKey)
+
+	store := newMemPendingTxStore()
+	// Stranded setTss persisted at nonce 6 while confirmed == pending == 5.
+	if err := store.SavePendingEvmTx(sender, contract, evmTxKindSetTss, &common.PendingEvmTx{
+		Nonce:     6,
+		TxHash:    ecommon.HexToHash("0xdead"),
+		TipCap:    big.NewInt(2_000_000_000),
+		FeeCap:    big.NewInt(42_000_000_000),
+		IsDynamic: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	client, err := NewEvmRpcClient(config.BaseNetworkConfig{Urls: []string{url}}, "gap-halt", contract)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Stop()
+	client.SetChainID(1)
+	client.SetPendingTxStore(store)
+
+	haltTx, err := client.GetHaltTxEvm(sender, []byte{1, 2, 3}, &contract)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if haltTx.Nonce() != 5 {
+		t.Fatalf("halt nonce = %d, want 5 (must fill first available nonce below stranded setTss at 6)", haltTx.Nonce())
+	}
+}
+
+func TestLateRejectionFromOlderHaltAttemptDoesNotEraseNewerAcceptedHalt(t *testing.T) {
+	contract := ecommon.HexToAddress("0x6969696969696969696969696969696969696969")
+	newTss := ecommon.HexToAddress("0x6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a")
+	key, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sender := crypto.PubkeyToAddress(key.PublicKey)
+	signer := etypes.LatestSignerForChainID(big.NewInt(1))
+
+	store := newMemPendingTxStore()
+	var halt1Hash, halt2Hash ecommon.Hash
+	halt1InFlight := make(chan struct{})
+	releaseHalt1 := make(chan struct{})
+	var confirmedNonce, pendingNonce atomic.Uint64
+	confirmedNonce.Store(5)
+	pendingNonce.Store(5)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			ID     json.RawMessage   `json:"id"`
+			Method string            `json:"method"`
+			Params []json.RawMessage `json:"params"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		resp := map[string]interface{}{"jsonrpc": "2.0", "id": req.ID}
+		switch req.Method {
+		case "eth_chainId":
+			resp["result"] = hexutil.EncodeUint64(1)
+		case "eth_blockNumber":
+			resp["result"] = hexutil.EncodeUint64(100)
+		case "eth_getBalance":
+			resp["result"] = (*hexutil.Big)(new(big.Int).Mul(big.NewInt(10), big.NewInt(1e18)))
+		case "eth_getTransactionCount":
+			var tag string
+			if len(req.Params) >= 2 {
+				_ = json.Unmarshal(req.Params[1], &tag)
+			}
+			if tag == "pending" {
+				resp["result"] = hexutil.EncodeUint64(pendingNonce.Load())
+			} else {
+				resp["result"] = hexutil.EncodeUint64(confirmedNonce.Load())
+			}
+		case "eth_getBlockByNumber":
+			resp["result"] = map[string]interface{}{
+				"number":        hexutil.EncodeUint64(100),
+				"hash":          ecommon.HexToHash("0x11"),
+				"baseFeePerGas": (*hexutil.Big)(big.NewInt(20_000_000_000)),
+			}
+		case "eth_maxPriorityFeePerGas":
+			resp["result"] = (*hexutil.Big)(big.NewInt(2_000_000_000))
+		case "eth_estimateGas":
+			resp["result"] = hexutil.EncodeUint64(100_000)
+		case "eth_sendRawTransaction":
+			var raw hexutil.Bytes
+			_ = json.Unmarshal(req.Params[0], &raw)
+			var tx etypes.Transaction
+			_ = tx.UnmarshalBinary(raw)
+			if tx.Hash() == halt1Hash {
+				close(halt1InFlight)
+				<-releaseHalt1
+				resp["error"] = map[string]interface{}{"code": -32000, "message": "insufficient funds for gas * price + value"}
+			} else {
+				pendingNonce.Store(tx.Nonce() + 1)
+				resp["result"] = tx.Hash().Hex()
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	t.Cleanup(srv.Close)
+
+	client, err := NewEvmRpcClient(config.BaseNetworkConfig{Urls: []string{srv.URL}}, "concurrent-halt-rollback", contract)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Stop()
+	client.SetChainID(1)
+	client.SetPendingTxStore(store)
+
+	// 1. Submit initial setTss at nonce 5.
+	setTssTx, err := client.GetSetTssEcdsaPubKeyEvmTx(newTss, sender, []byte{4}, []byte{5}, &contract)
+	if err != nil {
+		t.Fatal(err)
+	}
+	signedSetTss, err := etypes.SignTx(setTssTx, signer, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := client.SendTransaction(signedSetTss); err != nil {
+		t.Fatal(err)
+	}
+
+	// 2. Start halt1 (superseding setTss at nonce 5), pause it in-flight.
+	halt1, err := client.GetHaltTxEvm(sender, []byte{1, 2, 3}, &contract)
+	if err != nil {
+		t.Fatal(err)
+	}
+	signedHalt1, err := etypes.SignTx(halt1, signer, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	halt1Hash = signedHalt1.Hash()
+	halt1Done := make(chan error, 1)
+	go func() { halt1Done <- client.SendTransaction(signedHalt1) }()
+	<-halt1InFlight
+
+	// 3. Build and send halt2 (bumped fees, same nonce 5) while halt1 is in-flight; halt2 succeeds.
+	halt2, err := client.GetHaltTxEvm(sender, []byte{1, 2, 3}, &contract)
+	if err != nil {
+		t.Fatal(err)
+	}
+	signedHalt2, err := etypes.SignTx(halt2, signer, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	halt2Hash = signedHalt2.Hash()
+	if err := client.SendTransaction(signedHalt2); err != nil {
+		t.Fatalf("halt2 send failed: %v", err)
+	}
+
+	// 4. Release halt1 so it returns a late definitive "insufficient funds" rejection.
+	close(releaseHalt1)
+	if err := <-halt1Done; err == nil {
+		t.Fatal("expected halt1 insufficient funds error")
+	}
+
+	// halt2 MUST remain recorded in durable storage and setTss MUST stay cleared!
+	gotHalt, err := store.LoadPendingEvmTx(sender, contract, evmTxKindHalt)
+	if err != nil || gotHalt == nil || gotHalt.TxHash != halt2Hash {
+		t.Fatalf("after late halt1 rejection, halt = (%+v, %v), want halt2 hash %s", gotHalt, err, halt2Hash)
+	}
+	if gotSetTss, err := store.LoadPendingEvmTx(sender, contract, evmTxKindSetTss); err != nil || gotSetTss != nil {
+		t.Fatalf("after late halt1 rejection, setTss = (%+v, %v), want nil", gotSetTss, err)
+	}
+}
+
+func TestAnySecondaryHasUnwrapLogChunkedAttemptDeadlineCoversLimiterWait(t *testing.T) {
+	contract := ecommon.HexToAddress("0x6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b")
+	txHash := ecommon.HexToHash("0x7777")
+
+	makeSrv := func() *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			var req struct {
+				ID     json.RawMessage `json:"id"`
+				Method string          `json:"method"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&req)
+			resp := map[string]interface{}{"jsonrpc": "2.0", "id": req.ID}
+			switch req.Method {
+			case "eth_blockNumber":
+				resp["result"] = hexutil.EncodeUint64(100)
+			case "eth_getLogs":
+				resp["result"] = []etypes.Log{}
+			default:
+				resp["result"] = hexutil.EncodeUint64(1)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(resp)
+		}))
+	}
+	primarySrv := makeSrv()
+	t.Cleanup(primarySrv.Close)
+	secondarySrv := makeSrv()
+	t.Cleanup(secondarySrv.Close)
+
+	// 1 req/s with burst 2: BlockNumber + chunk 1 consume both burst tokens;
+	// chunk 2 must wait ~1s for a permit, which exceeds the 80ms attempt budget.
+	client, err := NewEvmRpcClient(config.BaseNetworkConfig{
+		Urls:                 []string{primarySrv.URL, secondarySrv.URL},
+		FilterQuerySize:      5,
+		RpcRequestsPerSecond: 1,
+		RpcBurst:             2,
+	}, "limiter-budget", contract)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Stop()
+	client.txMu.Lock()
+	client.secondaryLogTimeout = 80 * time.Millisecond
+	client.txMu.Unlock()
+
+	start := time.Now()
+	found, lowest, complete, err := client.AnySecondaryHasUnwrapLogChunked(context.Background(), 1, 100, 100, txHash, 0, 10)
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("expected partial progress retention on limiter budget expiry, got err=%v", err)
+	}
+	if found || complete {
+		t.Fatalf("got (found=%v, complete=%v), want (false, false)", found, complete)
+	}
+	if lowest != 96 {
+		t.Fatalf("lowestVerified = %d, want 96 (chunk 1 [96..100] preserved)", lowest)
+	}
+	if elapsed > 400*time.Millisecond {
+		t.Fatalf("attempt took %s instead of honoring 80ms budget across limiter wait", elapsed)
+	}
+}

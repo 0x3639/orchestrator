@@ -76,6 +76,12 @@ type Node struct {
 	stopped chan struct{}
 	// Prevents concurrent use of instance directory
 	dataDirLock fileutil.Releaser
+	// pendingKeyGenPubKey retains a candidate TSS key across an active or
+	// preempted keygen rotation so EmergencyState can sign halt messages for
+	// every chain using that chain's observed active key (old or new).
+	pendingKeyGenPubKey string
+	// signMessagesHook is optional and used by tests to substitute BulkSign.
+	signMessagesHook func(pubKey string, messagesToSign [][]byte, msgsIndexes map[string]int) (*keysign.Response, error)
 }
 
 func NewNode(config *oconfig.Config, logger *zap.Logger) (_ *Node, initErr error) {
@@ -721,212 +727,11 @@ func (node *Node) processSignatures() {
 				continue
 			}
 
-			if !node.workerSleep(5 * time.Second) {
-				return
-			}
-			// we save the old pubKey because we will need it
-			oldKey := node.tssManager.GetPubKey()
-			node.logger.Debugf("Old pubKey: %s", oldKey)
-
-			// if len is 0, it means that we have not generated a key before and the administrator needs to set it manually
-			// otherwise, orchestrator will generate a signature using the new key and validate it
-			// it will then create a signature with the old key to send an account block that changes the key
-			// keyNotSet names the networks the bridge added during the round
-			// that do not hold the new key; the round does not change them.
-			var keyNotSet error
-			if len(oldKey) != 0 {
-				decompressedOldKey, errDecompress := common.DecompressPubKey(oldKey)
-				if errDecompress != nil {
-					node.logger.Debug(errDecompress)
-					continue
-				}
-				// Zenon checks the old-key signature against its own short form of
-				// such a key and rejects it, while the EVM networks would accept it.
-				if accepted, errZenon := common.ZenonAcceptsDecompressedPubKey(decompressedOldKey); errZenon != nil || !accepted {
-					node.logger.Errorf("Active pubKey %s has a leading zero coordinate byte that the Zenon bridge contract cannot verify; the administrator must set the key", oldKey)
-					if err := common.DeletePubKeyFile(node.config.TssConfig.BaseDir, keyGenResponse.PubKey); err != nil {
-						node.logger.Error(err)
-					}
-					continue
-				}
-
-				node.logger.Debug("Old key found")
-				znnTssNonce, err := node.networksManager.GetTssNonceZnn()
-				if err != nil {
-					node.logger.Error(err)
-					continue
-				}
-
-				// ZNN
-				msgsIndexes := make(map[string]int)
-				znnMessage, err := implementation.GetChangePubKeyMessage(definition.ChangeTssECDSAPubKeyMethodName, definition.NoMClass, 1, znnTssNonce, keyGenResponse.PubKey)
-				if err != nil {
-					node.logger.Debug(err)
-					continue
-				}
-				msgsIndexes[base64.StdEncoding.EncodeToString(znnMessage)] = 0
-				messagesToSign := make([][]byte, 0)
-				messagesToSign = append(messagesToSign, znnMessage)
-
-				// EVM messages
-				evmBatch, toSignMessagesEvm, err := node.networksManager.GetSetTssEcdsaPubKeysEvmMessages(keyGenResponse.PubKey)
-				if err != nil {
-					node.logger.Debug(err)
-					continue
-				}
-				for idx, msg := range toSignMessagesEvm {
-					messagesToSign = append(messagesToSign, msg)
-					msgsIndexes[base64.StdEncoding.EncodeToString(msg)] = idx + 1
-				}
-				node.logger.Debug("msg to sign after evm append: ", messagesToSign)
-				// New key sign of messages
-				// we will try to generate a signature using the new key secret shares and validate it
-				node.tssManager.SetPubKey(keyGenResponse.PubKey)
-
-				newKeySignResponse, err := node.signMessages(messagesToSign, msgsIndexes)
-				if err != nil {
-					// we set back the old key
-					node.tssManager.SetPubKey(oldKey)
-					node.logger.Debug(err)
-					node.logger.Debug(" Error after signing with the new generated key 1")
-					continue
-				} else if newKeySignResponse.Status != tcommon.Success {
-					node.tssManager.SetPubKey(oldKey)
-					node.logger.Debugf("keySignStatus: %d", newKeySignResponse.Status)
-					node.logger.Debug(" Error after signing with the new generated key 2")
-					continue
-				}
-
-				// Verify all signatures
-				znnNewKeySignature, newKeyFullSignatures, errValidate := node.validateSignatures(newKeySignResponse, decompressedKeyGenPubKey, messagesToSign)
-				if errValidate != nil {
-					node.logger.Info(errValidate.Error())
-					continue
-				}
-				node.logger.Debug("Signatures generated from the new key are valid!")
-
-				// Old key sign of messages
-				node.tssManager.SetPubKey(oldKey)
-
-				oldKeySignResponse, err := node.signMessages(messagesToSign, msgsIndexes)
-				if err != nil {
-					node.logger.Debug(err)
-					node.logger.Debug("Error when trying to sign evm msgs with the old key")
-					continue
-				} else if oldKeySignResponse.Status != tcommon.Success {
-					node.logger.Debugf("keySignStatus: %d", oldKeySignResponse.Status)
-					node.logger.Debug(" Error after signing with the old key 2")
-					continue
-				}
-
-				// Verify all signatures
-				znnOldKeySignature, oldKeyFullSignatures, errValidate := node.validateSignatures(oldKeySignResponse, decompressedOldKey, messagesToSign)
-				if errValidate != nil {
-					node.logger.Debug(errValidate)
-					continue
-				}
-				node.logger.Debug("Signatures generated from the old key are valid!")
-
-				var aborted bool
-				keyNotSet, aborted = node.publishKeyGenTss(evmBatch, keyGenResponse.PubKey, znnOldKeySignature, znnNewKeySignature, oldKeyFullSignatures, newKeyFullSignatures)
+			if !node.finishKeyGenRound(keyGenResponse, decompressedKeyGenPubKey) {
 				if node.workerStopping() {
 					return
 				}
-				if aborted {
-					continue
-				}
-			} else {
-				// We wait for the key to be set
-				var waiters sync.WaitGroup
-				waiters.Add(2)
-
-				go func() {
-					defer waiters.Done()
-					for node.keyGenActive() {
-						bridgeInfo, err := node.networksManager.GetBridgeInfo()
-						if err != nil {
-							node.logger.Debug(err)
-							if !node.sleepWhileKeyGen(10 * time.Second) {
-								return
-							}
-							continue
-						}
-						// The pubKey was changed
-						if bridgeInfo.CompressedTssECDSAPubKey == keyGenResponse.PubKey {
-							break
-						}
-						if !node.sleepWhileKeyGen(20 * time.Second) {
-							return
-						}
-					}
-				}()
-
-				go func() {
-					defer waiters.Done()
-					for node.keyGenActive() {
-						if changed, err := node.networksManager.CheckNewTssEcdsaPubKeyEvm(keyGenResponse.PubKey); err != nil {
-							node.logger.Debug(err)
-							if !node.sleepWhileKeyGen(10 * time.Second) {
-								return
-							}
-							continue
-						} else if changed {
-							break
-						}
-						if !node.sleepWhileKeyGen(20 * time.Second) {
-							return
-						}
-					}
-				}()
-
-				waiters.Wait()
-				if node.workerStopping() {
-					return
-				}
-				if !node.keyGenActive() {
-					continue
-				}
-			}
-
-			// The EVM sender or waiter can finish while the Zenon one still
-			// waits, and the bridge can add a network in between that it never
-			// looked at. Name every listed network not seen to hold the key.
-			if missing, err := node.networksManager.NetworksWithoutKey(keyGenResponse.PubKey); err != nil {
-				node.logger.Error(err)
-			} else if len(missing) != 0 {
-				notSeen := fmt.Errorf("EVM networks %v are not seen to hold the new key", missing)
-				if keyNotSet != nil {
-					notSeen = fmt.Errorf("%v; %w", keyNotSet, notSeen)
-				}
-				keyNotSet = notSeen
-			}
-			if keyNotSet != nil {
-				node.logger.Errorf("Set pubKey on the networks of the key change round; not on every EVM network: %v", keyNotSet)
-			} else {
-				node.logger.Info("Successfully set pubKey on all networks")
-			}
-			node.resetSignatures()
-
-			node.logger.Infof("ECDSA KeyGen Response here: %v", keyGenResponse)
-
-			node.config.TssConfig.PublicKey = keyGenResponse.PubKey
-			node.config.TssConfig.DecompressedPublicKey = decompressedKeyGenPubKey
-			node.tssManager.SetPubKey(keyGenResponse.PubKey)
-			if stateErr := node.state.SetState(common.LiveState); stateErr != nil {
-				node.logger.Info("Could not set state to live after key gen")
-				node.logger.Debug(stateErr)
-				common.RequestStop(node.stopChan)
-				return
-			}
-			// todo delete it?
-			//if len(oldKey) > 0 {
-			//	if delErr := common.DeletePubKeyFile(node.config.TssConfig.BaseDir, oldKey); delErr != nil {
-			//		node.logger.Debug(delErr)
-			//	}
-			//}
-
-			if err := node.SaveConfig(); err != nil {
-				node.logger.Info(err.Error())
+				continue
 			}
 		case common.LiveState:
 			if !node.workerSleep(10 * time.Second) {
@@ -1004,45 +809,19 @@ func (node *Node) processSignatures() {
 				node.logger.Debug(err)
 				continue
 			}
-			decompressedPubKey, err := common.DecompressPubKey(node.tssManager.GetPubKey())
-			if err != nil {
-				node.logger.Debug(err)
-				continue
-			}
-
-			msgsIndexes := make(map[string]int)
 			znnMessage, err := implementation.GetBasicMethodMessage("Halt", znnTssNonce, definition.NoMClass, 1)
 			if err != nil {
 				node.logger.Debug(err)
 				continue
 			}
-			msgsIndexes[base64.StdEncoding.EncodeToString(znnMessage)] = 0
-			messagesToSign := make([][]byte, 0)
-			messagesToSign = append(messagesToSign, znnMessage)
 
 			evmBatch, evmMessages, err := node.networksManager.GetHaltMessages()
 			if err != nil {
 				node.logger.Debug(err)
 				continue
 			}
-			for idx, msg := range evmMessages {
-				messagesToSign = append(messagesToSign, msg)
-				msgsIndexes[base64.StdEncoding.EncodeToString(msg)] = idx + 1
-			}
-			node.logger.Debug("msg to sign after evm append: ", messagesToSign)
 
-			keySignResponse, err := node.signMessages(messagesToSign, msgsIndexes)
-			if err != nil {
-				node.logger.Debug(err)
-				node.logger.Debug(" error after signing halt 1")
-				continue
-			} else if keySignResponse.Status != tcommon.Success {
-				node.logger.Debug(keySignResponse.Status)
-				node.logger.Debug("error after signing halt 2")
-				continue
-			}
-
-			znnSignature, evmFullSignatures, err := node.validateSignatures(keySignResponse, decompressedPubKey, messagesToSign)
+			znnSignature, evmFullSignatures, err := node.signEmergencyHaltMessages(znnMessage, evmBatch, evmMessages)
 			if err != nil {
 				node.logger.Debug(err)
 				continue
@@ -1828,6 +1607,30 @@ func (node *Node) reconcileHaltedState() {
 	}
 }
 
+func (node *Node) getPendingKeyGenPubKey() string {
+	node.lock.RLock()
+	defer node.lock.RUnlock()
+	return node.pendingKeyGenPubKey
+}
+
+func (node *Node) setPendingKeyGenPubKey(pubKey string) {
+	node.lock.Lock()
+	defer node.lock.Unlock()
+	node.pendingKeyGenPubKey = pubKey
+}
+
+func (node *Node) activeSigningPubKey() string {
+	if node.tssManager != nil {
+		if key := node.tssManager.GetPubKey(); key != "" {
+			return key
+		}
+	}
+	if node.config != nil {
+		return node.config.TssConfig.PublicKey
+	}
+	return ""
+}
+
 func (node *Node) keyGenActive() bool {
 	if node.workerStopping() || node.state.RestartRequired() {
 		return false
@@ -1836,34 +1639,282 @@ func (node *Node) keyGenActive() bool {
 	return err == nil && st == common.KeyGenState
 }
 
-func (node *Node) sleepWhileKeyGen(d time.Duration) bool {
-	const poll = 200 * time.Millisecond
-	deadline := time.Now().Add(d)
-	for {
-		if !node.keyGenActive() {
+// keyGenContext returns a context that cancels immediately when the node stops,
+// latches RestartRequired, or leaves KeyGenState (e.g. EmergencyState).
+func (node *Node) keyGenContext() (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithCancel(node.workers.context())
+	if !node.keyGenActive() {
+		cancel()
+		return ctx, cancel
+	}
+	go func() {
+		for {
+			changed := node.state.StateChanged()
+			if !node.keyGenActive() {
+				cancel()
+				return
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-changed:
+			}
+		}
+	}()
+	return ctx, cancel
+}
+
+func (node *Node) sleepWhileKeyGenCtx(ctx context.Context, d time.Duration) bool {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return node.keyGenActive()
+	}
+}
+
+func (node *Node) finishKeyGenRound(keyGenResponse *keygen.Response, decompressedKeyGenPubKey string) bool {
+	if !node.workerSleep(5 * time.Second) {
+		return false
+	}
+	// Coordinate with the bridge listener before any peer submits
+	// ChangeTssECDSAPubKey so Zenon accepting keyGenResponse.PubKey does not
+	// leave KeyGenState while EVM rotation and local key installation finish.
+	node.state.SetActiveKeyGenPubKey(keyGenResponse.PubKey)
+	defer node.state.ClearActiveKeyGenPubKey(keyGenResponse.PubKey)
+
+	// Retain the newly generated key across a preempted round so EmergencyState
+	// can sign halt messages for any chain that already rotated to it.
+	node.setPendingKeyGenPubKey(keyGenResponse.PubKey)
+
+	// we save the old pubKey because we will need it
+	oldKey := node.tssManager.GetPubKey()
+	node.logger.Debugf("Old pubKey: %s", oldKey)
+
+	// if len is 0, it means that we have not generated a key before and the administrator needs to set it manually
+	// otherwise, orchestrator will generate a signature using the new key and validate it
+	// it will then create a signature with the old key to send an account block that changes the key
+	// keyNotSet names the networks the bridge added during the round
+	// that do not hold the new key; the round does not change them.
+	var keyNotSet error
+	if len(oldKey) != 0 {
+		decompressedOldKey, errDecompress := common.DecompressPubKey(oldKey)
+		if errDecompress != nil {
+			node.logger.Debug(errDecompress)
 			return false
 		}
-		remaining := time.Until(deadline)
-		if remaining <= 0 {
-			return true
+		// Zenon checks the old-key signature against its own short form of
+		// such a key and rejects it, while the EVM networks would accept it.
+		if accepted, errZenon := common.ZenonAcceptsDecompressedPubKey(decompressedOldKey); errZenon != nil || !accepted {
+			node.logger.Errorf("Active pubKey %s has a leading zero coordinate byte that the Zenon bridge contract cannot verify; the administrator must set the key", oldKey)
+			if err := common.DeletePubKeyFile(node.config.TssConfig.BaseDir, keyGenResponse.PubKey); err != nil {
+				node.logger.Error(err)
+			}
+			return false
 		}
-		step := poll
-		if remaining < step {
-			step = remaining
+
+		node.logger.Debug("Old key found")
+		znnTssNonce, err := node.networksManager.GetTssNonceZnn()
+		if err != nil {
+			node.logger.Error(err)
+			return false
 		}
-		if !node.workerSleep(step) {
+
+		// ZNN
+		msgsIndexes := make(map[string]int)
+		znnMessage, err := implementation.GetChangePubKeyMessage(definition.ChangeTssECDSAPubKeyMethodName, definition.NoMClass, 1, znnTssNonce, keyGenResponse.PubKey)
+		if err != nil {
+			node.logger.Debug(err)
+			return false
+		}
+		msgsIndexes[base64.StdEncoding.EncodeToString(znnMessage)] = 0
+		messagesToSign := make([][]byte, 0)
+		messagesToSign = append(messagesToSign, znnMessage)
+
+		// EVM messages
+		evmBatch, toSignMessagesEvm, err := node.networksManager.GetSetTssEcdsaPubKeysEvmMessages(keyGenResponse.PubKey)
+		if err != nil {
+			node.logger.Debug(err)
+			return false
+		}
+		for idx, msg := range toSignMessagesEvm {
+			messagesToSign = append(messagesToSign, msg)
+			msgsIndexes[base64.StdEncoding.EncodeToString(msg)] = idx + 1
+		}
+		node.logger.Debug("msg to sign after evm append: ", messagesToSign)
+		// New key sign of messages
+		// we will try to generate a signature using the new key secret shares and validate it
+		node.tssManager.SetPubKey(keyGenResponse.PubKey)
+
+		newKeySignResponse, err := node.signMessages(messagesToSign, msgsIndexes)
+		if err != nil {
+			node.tssManager.SetPubKey(oldKey)
+			node.logger.Debug(err)
+			node.logger.Debug(" Error after signing with the new generated key 1")
+			return false
+		} else if newKeySignResponse.Status != tcommon.Success {
+			node.tssManager.SetPubKey(oldKey)
+			node.logger.Debugf("keySignStatus: %d", newKeySignResponse.Status)
+			node.logger.Debug(" Error after signing with the new generated key 2")
+			return false
+		}
+
+		// Verify all signatures
+		znnNewKeySignature, newKeyFullSignatures, errValidate := node.validateSignatures(newKeySignResponse, decompressedKeyGenPubKey, messagesToSign)
+		if errValidate != nil {
+			node.tssManager.SetPubKey(oldKey)
+			node.logger.Info(errValidate.Error())
+			return false
+		}
+		node.logger.Debug("Signatures generated from the new key are valid!")
+
+		// Old key sign of messages
+		node.tssManager.SetPubKey(oldKey)
+
+		oldKeySignResponse, err := node.signMessages(messagesToSign, msgsIndexes)
+		if err != nil {
+			node.logger.Debug(err)
+			node.logger.Debug("Error when trying to sign evm msgs with the old key")
+			return false
+		} else if oldKeySignResponse.Status != tcommon.Success {
+			node.logger.Debugf("keySignStatus: %d", oldKeySignResponse.Status)
+			node.logger.Debug(" Error after signing with the old key 2")
+			return false
+		}
+
+		// Verify all signatures
+		znnOldKeySignature, oldKeyFullSignatures, errValidate := node.validateSignatures(oldKeySignResponse, decompressedOldKey, messagesToSign)
+		if errValidate != nil {
+			node.logger.Debug(errValidate)
+			return false
+		}
+		node.logger.Debug("Signatures generated from the old key are valid!")
+
+		var aborted bool
+		keyNotSet, aborted = node.publishKeyGenTss(evmBatch, keyGenResponse.PubKey, znnOldKeySignature, znnNewKeySignature, oldKeyFullSignatures, newKeyFullSignatures)
+		if node.workerStopping() || aborted {
+			return false
+		}
+	} else {
+		if aborted := node.waitForKeyGenActivation(keyGenResponse.PubKey); node.workerStopping() || aborted {
 			return false
 		}
 	}
+
+	// The EVM sender or waiter can finish while the Zenon one still
+	// waits, and the bridge can add a network in between that it never
+	// looked at. Name every listed network not seen to hold the key.
+	if missing, err := node.networksManager.NetworksWithoutKey(keyGenResponse.PubKey); err != nil {
+		node.logger.Error(err)
+	} else if len(missing) != 0 {
+		notSeen := fmt.Errorf("EVM networks %v are not seen to hold the new key", missing)
+		if keyNotSet != nil {
+			notSeen = fmt.Errorf("%v; %w", keyNotSet, notSeen)
+		}
+		keyNotSet = notSeen
+	}
+	if keyNotSet != nil {
+		node.logger.Errorf("Set pubKey on the networks of the key change round; not on every EVM network: %v", keyNotSet)
+	} else {
+		node.logger.Info("Successfully set pubKey on all networks")
+	}
+	node.resetSignatures()
+
+	node.logger.Infof("ECDSA KeyGen Response here: %v", keyGenResponse)
+
+	node.config.TssConfig.PublicKey = keyGenResponse.PubKey
+	node.config.TssConfig.DecompressedPublicKey = decompressedKeyGenPubKey
+	node.tssManager.SetPubKey(keyGenResponse.PubKey)
+	if keyNotSet != nil && oldKey != "" {
+		// Retain oldKey as fallback if an added EVM network did not rotate yet.
+		node.setPendingKeyGenPubKey(oldKey)
+	} else {
+		node.setPendingKeyGenPubKey("")
+	}
+	node.state.ClearActiveKeyGenPubKey(keyGenResponse.PubKey)
+	if _, stateErr := node.state.SetStateIf(common.KeyGenState, common.LiveState); stateErr != nil {
+		node.logger.Info("Could not set state to live after key gen")
+		node.logger.Debug(stateErr)
+		common.RequestStop(node.stopChan)
+		return false
+	}
+	if err := node.SaveConfig(); err != nil {
+		node.logger.Info(err.Error())
+	}
+	return true
+}
+
+func (node *Node) waitForKeyGenActivation(newPubKey string) bool {
+	node.state.SetActiveKeyGenPubKey(newPubKey)
+	ctx, cancel := node.keyGenContext()
+	defer cancel()
+
+	var waiters sync.WaitGroup
+	waiters.Add(2)
+
+	go func() {
+		defer waiters.Done()
+		for node.keyGenActive() {
+			bridgeInfo, err := node.networksManager.GetBridgeInfoContext(ctx)
+			if err != nil {
+				if ctx.Err() != nil {
+					return
+				}
+				node.logger.Debug(err)
+				if !node.sleepWhileKeyGenCtx(ctx, 10*time.Second) {
+					return
+				}
+				continue
+			}
+			// The pubKey was changed
+			if bridgeInfo.CompressedTssECDSAPubKey == newPubKey {
+				break
+			}
+			if !node.sleepWhileKeyGenCtx(ctx, 20*time.Second) {
+				return
+			}
+		}
+	}()
+
+	go func() {
+		defer waiters.Done()
+		for node.keyGenActive() {
+			if changed, err := node.networksManager.CheckNewTssEcdsaPubKeyEvmContext(ctx, newPubKey); err != nil {
+				if ctx.Err() != nil {
+					return
+				}
+				node.logger.Debug(err)
+				if !node.sleepWhileKeyGenCtx(ctx, 10*time.Second) {
+					return
+				}
+				continue
+			} else if changed {
+				break
+			}
+			if !node.sleepWhileKeyGenCtx(ctx, 20*time.Second) {
+				return
+			}
+		}
+	}()
+
+	waiters.Wait()
+	return !node.keyGenActive()
 }
 
 // publishKeyGenTss submits the signed Zenon and EVM key-rotation transactions
 // until both chains reflect newPubKey or key generation loses ownership (e.g.
-// EmergencyState, HaltedState, RestartRequired, or node shutdown). Exiting
-// promptly when leaving KeyGenState ensures processSignatures can immediately
-// enter the emergency halt handler instead of blocking behind a stalled setTss.
+// EmergencyState, HaltedState, RestartRequired, or node shutdown). Propagating
+// a state-bound context through every RPC and rate-limiter wait ensures
+// processSignatures can enter EmergencyState immediately instead of blocking
+// behind a stalled setTss call.
 func (node *Node) publishKeyGenTss(evmBatch network.EvmBatch, newPubKey, znnOldKeySignature, znnNewKeySignature string, oldKeyFullSignatures, newKeyFullSignatures [][]byte) (keyNotSet error, aborted bool) {
-	node.networksManager.ClearObsoleteHaltTx(node.evmAddress)
+	node.state.SetActiveKeyGenPubKey(newPubKey)
+	ctx, cancel := node.keyGenContext()
+	defer cancel()
+	node.networksManager.ClearObsoleteHaltTxContext(ctx, node.evmAddress)
+
 	var senders sync.WaitGroup
 	senders.Add(2)
 	// we send the account block on the znn network
@@ -1874,10 +1925,13 @@ func (node *Node) publishKeyGenTss(evmBatch network.EvmBatch, newPubKey, znnOldK
 		for node.keyGenActive() {
 			index = (index + 1) % node.getParticipantsLength()
 			producerPubKey := base64.StdEncoding.EncodeToString(node.producerKeyPair.Public)
-			bridgeInfo, err := node.networksManager.GetBridgeInfo()
+			bridgeInfo, err := node.networksManager.GetBridgeInfoContext(ctx)
 			if err != nil {
+				if ctx.Err() != nil {
+					return
+				}
 				node.logger.Debug(err)
-				if !node.sleepWhileKeyGen(5 * time.Second) {
+				if !node.sleepWhileKeyGenCtx(ctx, 5*time.Second) {
 					return
 				}
 				continue
@@ -1891,10 +1945,13 @@ func (node *Node) publishKeyGenTss(evmBatch network.EvmBatch, newPubKey, znnOldK
 			}
 			if producerPubKey == node.getParticipant(index) {
 				node.logger.Debug("[sendZnnTx PubKey] this is me")
-				err = node.networksManager.ChangeTssEcdsaPubKeyZnn(newPubKey, znnOldKeySignature, znnNewKeySignature, node.producerKeyPair)
+				err = node.networksManager.ChangeTssEcdsaPubKeyZnnContext(ctx, newPubKey, znnOldKeySignature, znnNewKeySignature, node.producerKeyPair, node.keyGenActive)
 				if err != nil {
+					if ctx.Err() != nil {
+						return
+					}
 					node.logger.Debug(err)
-					if !node.sleepWhileKeyGen(5 * time.Second) {
+					if !node.sleepWhileKeyGenCtx(ctx, 5*time.Second) {
 						return
 					}
 					continue
@@ -1902,11 +1959,11 @@ func (node *Node) publishKeyGenTss(evmBatch network.EvmBatch, newPubKey, znnOldK
 				node.logger.Debug("[sendZnnTx PubKey] sent tx")
 				// we wait 2 momentums so that the send and receive block are inserted and the pubKey changes
 				// todo use constants
-				if !node.sleepWhileKeyGen(20 * time.Second) {
+				if !node.sleepWhileKeyGenCtx(ctx, 20*time.Second) {
 					return
 				}
 			}
-			if !node.sleepWhileKeyGen(20 * time.Second) {
+			if !node.sleepWhileKeyGenCtx(ctx, 20*time.Second) {
 				return
 			}
 		}
@@ -1920,7 +1977,10 @@ func (node *Node) publishKeyGenTss(evmBatch network.EvmBatch, newPubKey, znnOldK
 			producerPubKey := base64.StdEncoding.EncodeToString(node.producerKeyPair.Public)
 			if producerPubKey == node.getParticipant(index) {
 				node.logger.Debug("[send set tss ecdsa pub key evm tx] this is me")
-				changed, err := node.networksManager.SetTssEcdsaPubKeyEvm(evmBatch, oldKeyFullSignatures, newKeyFullSignatures, newPubKey, node.ecdsaPrivateKey, node.evmAddress)
+				changed, err := node.networksManager.SetTssEcdsaPubKeyEvmContext(ctx, evmBatch, oldKeyFullSignatures, newKeyFullSignatures, newPubKey, node.ecdsaPrivateKey, node.evmAddress, node.keyGenActive)
+				if ctx.Err() != nil {
+					return
+				}
 				// Read after senders.Wait.
 				keyNotSet = nil
 				if errors.Is(err, network.ErrNetworksChanged) {
@@ -1940,13 +2000,154 @@ func (node *Node) publishKeyGenTss(evmBatch network.EvmBatch, newPubKey, znnOldK
 				}
 			}
 			// todo use estimatedBlockTime / TimeToFinality
-			if !node.sleepWhileKeyGen(20 * time.Second) {
+			if !node.sleepWhileKeyGenCtx(ctx, 20*time.Second) {
 				return
 			}
 		}
 	}()
 	senders.Wait()
 	return keyNotSet, !node.keyGenActive()
+}
+
+func compressedPubKeyToEvmAddress(compressedB64 string) (ecommon.Address, error) {
+	raw, err := base64.StdEncoding.DecodeString(compressedB64)
+	if err != nil {
+		return ecommon.Address{}, err
+	}
+	pub, err := crypto.DecompressPubkey(raw)
+	if err != nil {
+		return ecommon.Address{}, err
+	}
+	return crypto.PubkeyToAddress(*pub), nil
+}
+
+// signEmergencyHaltMessages signs the Zenon and EVM halt messages using each
+// chain's observed active TSS key. When a key rotation was partially applied
+// before EmergencyState preempted it, Zenon and each EVM chain are grouped by
+// their observed on-chain key (old vs new) so every chain receives a valid
+// halt signature.
+func (node *Node) signEmergencyHaltMessages(znnMessage []byte, evmBatch network.EvmBatch, evmMessages [][]byte) (string, [][]byte, error) {
+	primaryKey := node.activeSigningPubKey()
+	if primaryKey == "" {
+		return "", nil, errors.New("missing active TSS public key for emergency halt")
+	}
+	secondaryKey := node.getPendingKeyGenPubKey()
+	if secondaryKey == primaryKey {
+		secondaryKey = ""
+	}
+
+	// Slot 0 is Zenon; slots 1..len(evmMessages) correspond to evmMessages[0..].
+	slotKeys := make([]string, 1+len(evmMessages))
+	for i := range slotKeys {
+		slotKeys[i] = primaryKey
+	}
+	if secondaryKey != "" {
+		secondaryEvmAddr, err := compressedPubKeyToEvmAddress(secondaryKey)
+		if err != nil {
+			return "", nil, fmt.Errorf("decode candidate TSS pubkey for emergency halt: %w", err)
+		}
+		bridgeInfo, err := node.networksManager.GetBridgeInfo()
+		if err != nil {
+			return "", nil, fmt.Errorf("read Zenon active TSS pubkey for emergency halt: %w", err)
+		}
+		if bridgeInfo != nil && bridgeInfo.CompressedTssECDSAPubKey == secondaryKey {
+			slotKeys[0] = secondaryKey
+		}
+		if len(evmMessages) > 0 {
+			evmAddrs, err := node.networksManager.GetBatchCurrentTss(evmBatch)
+			if err != nil {
+				return "", nil, fmt.Errorf("read EVM active TSS addresses for emergency halt: %w", err)
+			}
+			for i, addr := range evmAddrs {
+				if i < len(evmMessages) && addr == secondaryEvmAddr {
+					slotKeys[i+1] = secondaryKey
+				}
+			}
+		}
+	}
+
+	type haltMsgItem struct {
+		slot int
+		msg  []byte
+	}
+	groups := make(map[string][]haltMsgItem)
+	keyOrder := make([]string, 0, 2)
+	addItem := func(k string, slot int, msg []byte) {
+		if _, exists := groups[k]; !exists {
+			keyOrder = append(keyOrder, k)
+		}
+		groups[k] = append(groups[k], haltMsgItem{slot: slot, msg: msg})
+	}
+	addItem(slotKeys[0], 0, znnMessage)
+	for i, msg := range evmMessages {
+		addItem(slotKeys[i+1], i+1, msg)
+	}
+
+	var znnSignature string
+	evmFullSignatures := make([][]byte, len(evmMessages))
+
+	if node.tssManager != nil {
+		defer node.tssManager.SetPubKey(primaryKey)
+	}
+
+	for _, groupKey := range keyOrder {
+		items := groups[groupKey]
+		decompressed, err := common.DecompressPubKey(groupKey)
+		if err != nil {
+			return "", nil, err
+		}
+		msgs := make([][]byte, len(items))
+		idxMap := make(map[string]int, len(items))
+		for i, item := range items {
+			msgs[i] = item.msg
+			idxMap[base64.StdEncoding.EncodeToString(item.msg)] = i
+		}
+		var resp *keysign.Response
+		if node.signMessagesHook != nil {
+			resp, err = node.signMessagesHook(groupKey, msgs, idxMap)
+		} else {
+			if node.tssManager != nil {
+				node.tssManager.SetPubKey(groupKey)
+			}
+			resp, err = node.signMessages(msgs, idxMap)
+		}
+		if err != nil {
+			return "", nil, err
+		}
+		if resp == nil || resp.Status != tcommon.Success {
+			return "", nil, fmt.Errorf("emergency halt signing with key %s did not succeed", groupKey)
+		}
+		if len(resp.Signatures) != len(items) {
+			return "", nil, fmt.Errorf("emergency halt signing returned %d signatures for %d messages", len(resp.Signatures), len(items))
+		}
+		for i, sig := range resp.Signatures {
+			sigBytes, err := base64.StdEncoding.DecodeString(sig.Signature)
+			if err != nil {
+				return "", nil, err
+			}
+			recBytes, err := base64.StdEncoding.DecodeString(sig.RecoveryID)
+			if err != nil {
+				return "", nil, err
+			}
+			fullSigBytes := append(sigBytes, recBytes...)
+			fullSigB64 := base64.StdEncoding.EncodeToString(fullSigBytes)
+			ok, err := implementation.CheckECDSASignature(items[i].msg, decompressed, fullSigB64)
+			if err != nil {
+				return "", nil, err
+			}
+			if !ok {
+				return "", nil, errors.New("invalid signature when checking emergency halt ecdsa signature")
+			}
+			if items[i].slot == 0 {
+				znnSignature = fullSigB64
+			} else {
+				evmSig := append([]byte(nil), fullSigBytes...)
+				evmSig[len(evmSig)-1] += 27
+				evmFullSignatures[items[i].slot-1] = evmSig
+			}
+		}
+	}
+	return znnSignature, evmFullSignatures, nil
 }
 
 // activeKeyCanSign reports whether a key change signed with the active key

@@ -80,7 +80,11 @@ type evmNetwork struct {
 	queuedBlockCounts map[uint64]int
 	queuedTxKeys      map[queuedUnwrapKey]int
 	unknownQueued     int
-	unconfirmedQueue  *dque.DQue
+	// confirmedSeq increments after an event is persisted to LevelDB and BEFORE
+	// it is removed from unconfirmedQueue, allowing late-unwrap verification to
+	// detect a concurrent queue->DB handoff without missing the evidence.
+	confirmedSeq     atomic.Uint64
+	unconfirmedQueue *dque.DQue
 	dbManager         networkEventStores
 	rpcManager       *rpc.Manager
 	UrlsInfo         config.UrlsInfo
@@ -1353,6 +1357,9 @@ func (eN *evmNetwork) ProcessEvents() {
 				eN.requestStop()
 				return
 			}
+			// Mark persistence complete BEFORE removing from the queue so a
+			// concurrent reader checking queue + DB cannot fall into the gap.
+			eN.confirmedSeq.Add(1)
 			if !eN.dropQueuedEvent() {
 				return
 			}
@@ -1599,12 +1606,24 @@ func (eN *evmNetwork) GetCurrentTss() (ecommon.Address, error) {
 	return eN.EvmRpc().GetCurrentTss()
 }
 
+func (eN *evmNetwork) GetCurrentTssContext(ctx context.Context) (ecommon.Address, error) {
+	return eN.EvmRpc().GetCurrentTssContext(ctx)
+}
+
 func (eN *evmNetwork) GetSetTssEcdsaPubKeyEvmMessage(newAddress ecommon.Address) ([]byte, error) {
 	return eN.EvmRpc().GetSetTssEcdsaPubKeyEvmMessage(newAddress, eN.NetworkClass(), eN.ChainId(), eN.ContractAddress())
 }
 
 func (eN *evmNetwork) GetSetTssEcdsaPubKeyEvmTx(newTss, sender ecommon.Address, oldFullSignature, newFullSignature []byte) (*etypes.Transaction, error) {
 	return eN.EvmRpc().GetSetTssEcdsaPubKeyEvmTx(newTss, sender, oldFullSignature, newFullSignature, eN.ContractAddress())
+}
+
+func (eN *evmNetwork) GetSetTssEcdsaPubKeyEvmTxContext(ctx context.Context, newTss, sender ecommon.Address, oldFullSignature, newFullSignature []byte) (*etypes.Transaction, error) {
+	return eN.EvmRpc().GetSetTssEcdsaPubKeyEvmTxContext(ctx, newTss, sender, oldFullSignature, newFullSignature, eN.ContractAddress())
+}
+
+func (eN *evmNetwork) SendTransactionContext(ctx context.Context, tx *etypes.Transaction, allowSend func() bool) error {
+	return eN.EvmRpc().SendTransactionContext(ctx, tx, allowSend)
 }
 
 func (eN *evmNetwork) GetHaltEvmMessage() ([]byte, error) {

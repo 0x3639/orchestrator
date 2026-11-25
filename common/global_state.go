@@ -34,6 +34,8 @@ type GlobalState struct {
 	Health                *snapshot.Store
 	state                 *uint8
 	stateMu               sync.Mutex
+	stateChanged          chan struct{}
+	activeKeyGenPubKey    string
 	persistEmergency      func(uint8) error
 	emergencyWritePending bool
 	redeemIncidents       RedeemIncidentStore
@@ -97,6 +99,7 @@ func NewGlobalState(state *uint8) *GlobalState {
 func NewPersistentGlobalState(state *uint8, persistEmergency func(uint8) error) *GlobalState {
 	return &GlobalState{
 		persistEmergency:         persistEmergency,
+		stateChanged:             make(chan struct{}),
 		startupDone:              make(chan struct{}),
 		nodeReady:                make(chan struct{}),
 		state:                    state,
@@ -171,10 +174,59 @@ func (gs *GlobalState) effectiveStateLocked() uint8 {
 	return *gs.state
 }
 
+func (gs *GlobalState) notifyStateChangedLocked() {
+	if gs.stateChanged != nil {
+		close(gs.stateChanged)
+	}
+	gs.stateChanged = make(chan struct{})
+}
+
+// StateChanged returns a channel that is closed the next time the bridge state
+// or restart-required latch changes.
+func (gs *GlobalState) StateChanged() <-chan struct{} {
+	gs.stateMu.Lock()
+	defer gs.stateMu.Unlock()
+	if gs.stateChanged == nil {
+		gs.stateChanged = make(chan struct{})
+	}
+	return gs.stateChanged
+}
+
+// SetActiveKeyGenPubKey records the new TSS public key that an active keygen
+// publication round is currently rolling out across Zenon and EVM networks.
+func (gs *GlobalState) SetActiveKeyGenPubKey(pubKey string) {
+	gs.stateMu.Lock()
+	defer gs.stateMu.Unlock()
+	gs.activeKeyGenPubKey = pubKey
+}
+
+// ClearActiveKeyGenPubKey clears the active keygen publication key when it
+// matches pubKey (or unconditionally when pubKey is empty).
+func (gs *GlobalState) ClearActiveKeyGenPubKey(pubKey string) {
+	gs.stateMu.Lock()
+	defer gs.stateMu.Unlock()
+	if pubKey == "" || gs.activeKeyGenPubKey == pubKey {
+		gs.activeKeyGenPubKey = ""
+	}
+}
+
+// IsActiveKeyGenPubKey reports whether pubKey matches the keygen publication
+// round currently in progress so Zenon's acceptance of that key does not
+// prematurely leave KeyGenState before EVM rotation and local key installation.
+func (gs *GlobalState) IsActiveKeyGenPubKey(pubKey string) bool {
+	if pubKey == "" {
+		return false
+	}
+	gs.stateMu.Lock()
+	defer gs.stateMu.Unlock()
+	return gs.activeKeyGenPubKey == pubKey
+}
+
 func (gs *GlobalState) publishStateLocked(oldState uint8) {
 	current := StateToText(gs.effectiveStateLocked())
 	GlobalLogger.Infof("Old state: %s, New state: %s", StateToText(oldState), current)
 	gs.Health.SetBridgeState(current)
+	gs.notifyStateChangedLocked()
 }
 
 // HaltSigning moves a signer in LiveState, KeyGenState or ReSignState to
@@ -203,6 +255,7 @@ func (gs *GlobalState) RequireRestart() error {
 	gs.stateMu.Lock()
 	defer gs.stateMu.Unlock()
 	gs.restartRequired.Store(true)
+	gs.notifyStateChangedLocked()
 	switch gs.effectiveStateLocked() {
 	case LiveState, KeyGenState, ReSignState:
 		return gs.setStateLocked(HaltedState)
