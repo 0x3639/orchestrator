@@ -263,10 +263,42 @@ func TestSecureLocalStateManagerWrites0600AndAnchorsToOpenDir(t *testing.T) {
 		t.Fatalf("GetLocalState read decoy instead of anchored dir: got %+v", got)
 	}
 
-	// Symlink inside the anchored directory must be refused by GetLocalState.
-	if err := os.Remove(filepath.Join(movedDir, fileName)); err != nil {
+	// Production verification and rollback cleanup via TssManager must stay
+	// anchored to the open directory descriptor even after origDir is substituted.
+	tssMgr := &TssManager{
+		stateDir:    ownedDir,
+		keyShareDir: origDir,
+	}
+	// Put a symlinked decoy share in origDir that would fail pathname verification.
+	decoyTarget := filepath.Join(origDir, "decoy-target.json")
+	if err := os.WriteFile(decoyTarget, []byte(`{}`), 0600); err != nil {
 		t.Fatal(err)
 	}
+	_ = os.Remove(filepath.Join(origDir, fileName))
+	if err := os.Symlink(decoyTarget, filepath.Join(origDir, fileName)); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	if err := tssMgr.VerifyKeyShare(pubKey); err != nil {
+		t.Fatalf("VerifyKeyShare reopened substituted pathname instead of anchored dir: %v", err)
+	}
+
+	// Replace decoy symlink with a regular file in origDir and verify DeleteKeyShare
+	// deletes the share in movedDir (anchored dir) while leaving origDir untouched.
+	_ = os.Remove(filepath.Join(origDir, fileName))
+	if err := os.WriteFile(filepath.Join(origDir, fileName), []byte("decoy-keep"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := tssMgr.DeleteKeyShare(pubKey); err != nil {
+		t.Fatalf("DeleteKeyShare failed: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(movedDir, fileName)); !os.IsNotExist(err) {
+		t.Fatalf("expected anchored share in movedDir to be removed, stat err=%v", err)
+	}
+	if raw, err := os.ReadFile(filepath.Join(origDir, fileName)); err != nil || string(raw) != "decoy-keep" {
+		t.Fatalf("DeleteKeyShare touched substituted decoy dir instead of anchored dir: raw=%q err=%v", raw, err)
+	}
+
+	// Symlink inside the anchored directory must be refused by GetLocalState.
 	decoy := filepath.Join(movedDir, "other.json")
 	if err := os.WriteFile(decoy, []byte(`{}`), 0600); err != nil {
 		t.Fatal(err)

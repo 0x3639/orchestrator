@@ -327,6 +327,23 @@ func (d *OwnedDir) WriteFileAtomic(fileName string, data []byte, perm os.FileMod
 	return d.file.Sync()
 }
 
+// RemoveFile unlinks fileName inside the open directory descriptor after
+// verifying directory ownership and mode. Missing files return nil.
+func (d *OwnedDir) RemoveFile(fileName string) error {
+	if !isSafeDirEntryName(fileName) {
+		return fmt.Errorf("invalid file name %q", fileName)
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if err := d.verifyLocked(); err != nil {
+		return err
+	}
+	if err := unlinkAt(d.file, fileName); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return d.file.Sync()
+}
+
 // EnsureDataDir creates DataPath with owner-only permissions (0700) and
 // verifies the current user owns it through an open descriptor before any
 // credential-bearing file is touched.

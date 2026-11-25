@@ -680,7 +680,7 @@ func (node *Node) processSignatures() {
 				if keyGenThreshold > node.getParticipantsLength() {
 					node.logger.Info("KeyGen threshold was not met")
 					if keyGenResponse.Status == tcommon.Success {
-						if err := common.DeletePubKeyFile(node.config.TssConfig.BaseDir, keyGenResponse.PubKey); err != nil {
+						if err := node.tssManager.DeleteKeyShare(keyGenResponse.PubKey); err != nil {
 							node.logger.Error(err)
 						}
 					}
@@ -690,13 +690,7 @@ func (node *Node) processSignatures() {
 
 				// key gen was generated
 				if keyGenResponse.Status == tcommon.Success {
-					expectedFile, nameErr := common.GetPublicKeyFileName(keyGenResponse.PubKey)
-					if nameErr != nil {
-						node.logger.Errorf("fatal key share name failure after KeyGen: %v", nameErr)
-						common.RequestStop(node.stopChan)
-						return
-					}
-					if err := oconfig.SecureKeyShareFilesExpecting(node.config.TssConfig.BaseDir, expectedFile); err != nil {
+					if err := node.tssManager.VerifyKeyShare(keyGenResponse.PubKey); err != nil {
 						node.logger.Errorf("fatal key share security failure after KeyGen: %v", err)
 						common.RequestStop(node.stopChan)
 						return
@@ -733,7 +727,7 @@ func (node *Node) processSignatures() {
 			// the same key and generates a new one.
 			if accepted, errZenon := common.ZenonAcceptsDecompressedPubKey(decompressedKeyGenPubKey); errZenon != nil || !accepted {
 				node.logger.Infof("Generated pubKey %s cannot be set on the Zenon bridge contract (leading zero coordinate byte), generating a new key", keyGenResponse.PubKey)
-				if err := common.DeletePubKeyFile(node.config.TssConfig.BaseDir, keyGenResponse.PubKey); err != nil {
+				if err := node.tssManager.DeleteKeyShare(keyGenResponse.PubKey); err != nil {
 					node.logger.Error(err)
 				}
 				continue
@@ -762,7 +756,7 @@ func (node *Node) processSignatures() {
 				// such a key and rejects it, while the EVM networks would accept it.
 				if accepted, errZenon := common.ZenonAcceptsDecompressedPubKey(decompressedOldKey); errZenon != nil || !accepted {
 					node.logger.Errorf("Active pubKey %s has a leading zero coordinate byte that the Zenon bridge contract cannot verify; the administrator must set the key", oldKey)
-					if err := common.DeletePubKeyFile(node.config.TssConfig.BaseDir, keyGenResponse.PubKey); err != nil {
+					if err := node.tssManager.DeleteKeyShare(keyGenResponse.PubKey); err != nil {
 						node.logger.Error(err)
 					}
 					continue
@@ -1302,6 +1296,17 @@ func (node *Node) processSignatures() {
 // eligibility lookups during a ReSignState scan.
 var resignRetryDelay = time.Second
 
+// hasMoreWrapPages reports whether GetAllWrapTokenRequests may have further
+// pages after pageIndex. The Zenon RPC computes Count over all stored requests
+// and can emit a short or even empty List for a page before the end when
+// individual items are skipped.
+func hasMoreWrapPages(pageIndex, pageSize uint32, count, listLen int) bool {
+	if count > 0 {
+		return int(pageIndex+1)*int(pageSize) < count
+	}
+	return listLen > 0
+}
+
 // runReSignScan walks a stable snapshot of matching wraps for the active
 // ReSignState request, retrying wraps that were unfinalized at the start of
 // the scan and wraps whose EVM RedeemsInfo lookup transiently failed, without
@@ -1311,6 +1316,17 @@ func (node *Node) runReSignScan() bool {
 	const pageSize = uint32(100)
 
 	resignNetworkClass, resignChainId, resignGen := node.state.GetResignTarget()
+	// Snapshot the frontier momentum height at the start of the scan so wraps
+	// created after the scan began (entering via moving page boundaries) are
+	// excluded from this scan's membership.
+	var cutoffMomentum uint64
+	if mom, err := node.networksManager.Znn().GetFrontierMomentum(); err == nil && mom != nil {
+		cutoffMomentum = mom.Height
+	} else if h, err := node.state.GetFrontierMomentum(); err == nil {
+		cutoffMomentum = h
+	}
+
+	processedIDs := make(map[types.Hash]bool)
 	deferredUnfinalized := make(map[types.Hash]struct{})
 	retryEligibility := make(map[types.Hash]*definition.WrapTokenRequest)
 	staleResign := false
@@ -1334,10 +1350,10 @@ func (node *Node) runReSignScan() bool {
 			}
 			continue
 		}
-		if wrapRequests == nil || len(wrapRequests.List) == 0 {
+		if wrapRequests == nil {
 			break
 		}
-		node.logger.Debugf("len(wrapRequests.List): %d, pageIndex: %d", len(wrapRequests.List), pageIndex)
+		node.logger.Debugf("len(wrapRequests.List): %d, count: %d, pageIndex: %d", len(wrapRequests.List), wrapRequests.Count, pageIndex)
 		for _, wrap := range wrapRequests.List {
 			if !node.state.IsResignGenerationCurrent(resignGen) {
 				staleResign = true
@@ -1349,6 +1365,13 @@ func (node *Node) runReSignScan() bool {
 			if wrap.NetworkClass != resignNetworkClass || wrap.ChainId != resignChainId {
 				continue
 			}
+			if cutoffMomentum > 0 && wrap.CreationMomentumHeight > cutoffMomentum {
+				continue
+			}
+			if processedIDs[wrap.Id] {
+				continue
+			}
+			processedIDs[wrap.Id] = true
 			if wrap.ConfirmationsToFinality != 0 {
 				deferredUnfinalized[wrap.Id] = struct{}{}
 				continue
@@ -1366,6 +1389,9 @@ func (node *Node) runReSignScan() bool {
 			}
 		}
 		if staleResign {
+			break
+		}
+		if !hasMoreWrapPages(pageIndex, pageSize, wrapRequests.Count, len(wrapRequests.List)) {
 			break
 		}
 		pageIndex++
@@ -1420,7 +1446,7 @@ func (node *Node) runReSignScan() bool {
 				scanComplete = false
 				break
 			}
-			if wrapRequests == nil || len(wrapRequests.List) == 0 {
+			if wrapRequests == nil {
 				break
 			}
 			for _, wrap := range wrapRequests.List {
@@ -1451,11 +1477,20 @@ func (node *Node) runReSignScan() bool {
 			if staleResign {
 				break
 			}
+			if !hasMoreWrapPages(pageIndex, pageSize, wrapRequests.Count, len(wrapRequests.List)) {
+				break
+			}
 			pageIndex++
 		}
 		if scanComplete {
+			// A wrap omitted from a paginated scan (due to moving page
+			// boundaries or transient RPC skips) may still exist on Zenon.
+			// Confirm absence by ID before dropping it from the deferred set.
 			for id := range deferredUnfinalized {
-				if !seen[id] {
+				if seen[id] {
+					continue
+				}
+				if _, err := node.networksManager.GetWrapRequestByIdRPC(id); err != nil && err.Error() == constants.ErrDataNonExistent.Error() {
 					delete(deferredUnfinalized, id)
 				}
 			}

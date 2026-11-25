@@ -230,18 +230,8 @@ func (m *TssManager) KeyGen(algo messages.Algo) (*keygen.Response, error) {
 			return nil, err
 		}
 		if response.Status == tcommon.Success {
-			expectedFile, nameErr := common.GetPublicKeyFileName(response.PubKey)
-			if nameErr != nil {
-				return nil, fmt.Errorf("%w: invalid generated pubKey: %w", ErrKeyShareSecurity, nameErr)
-			}
-			var secErr error
-			if m.stateDir != nil {
-				secErr = m.stateDir.SecureKeyShareFiles(expectedFile)
-			} else {
-				secErr = oconfig.SecureKeyShareFilesExpecting(m.keyShareDir, expectedFile)
-			}
-			if secErr != nil {
-				return nil, fmt.Errorf("%w: %w", ErrKeyShareSecurity, secErr)
+			if secErr := m.VerifyKeyShare(response.PubKey); secErr != nil {
+				return nil, secErr
 			}
 		}
 
@@ -249,6 +239,40 @@ func (m *TssManager) KeyGen(algo messages.Algo) (*keygen.Response, error) {
 	} else {
 		return nil, errors.New("invalid algorithm")
 	}
+}
+
+// VerifyKeyShare checks ownership and exact 0600 permissions on all key share
+// files and verifies the share for pubKey exists, anchored to the manager's
+// open TSS directory descriptor when available.
+func (m *TssManager) VerifyKeyShare(pubKey string) error {
+	expectedFile, nameErr := common.GetPublicKeyFileName(pubKey)
+	if nameErr != nil {
+		return fmt.Errorf("%w: invalid generated pubKey: %w", ErrKeyShareSecurity, nameErr)
+	}
+	var secErr error
+	if m.stateDir != nil {
+		secErr = m.stateDir.SecureKeyShareFiles(expectedFile)
+	} else {
+		secErr = oconfig.SecureKeyShareFilesExpecting(m.keyShareDir, expectedFile)
+	}
+	if secErr != nil {
+		return fmt.Errorf("%w: %w", ErrKeyShareSecurity, secErr)
+	}
+	return nil
+}
+
+// DeleteKeyShare removes the key share file for pubKey through the manager's
+// open TSS directory descriptor so pathname substitution cannot redirect
+// rollback cleanup.
+func (m *TssManager) DeleteKeyShare(pubKey string) error {
+	fileName, err := common.GetPublicKeyFileName(pubKey)
+	if err != nil {
+		return err
+	}
+	if m.stateDir != nil {
+		return m.stateDir.RemoveFile(fileName)
+	}
+	return common.DeletePubKeyFile(m.keyShareDir, pubKey)
 }
 
 func (m *TssManager) SetPartyTimeout(partyTimeout time.Duration) {

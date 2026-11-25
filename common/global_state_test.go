@@ -3,6 +3,7 @@ package common
 import (
 	"sync"
 	"testing"
+	"time"
 )
 
 // A transition that depends on the current state compares and changes it in
@@ -377,24 +378,26 @@ func TestWhileResignGenerationIsSerializesWriteBoundary(t *testing.T) {
 	_, _, gen1 := gs.GetResignTarget()
 
 	entered := make(chan struct{})
-	release := make(chan struct{})
+	retargetAttempting := make(chan struct{})
 	retargetDone := make(chan struct{})
 
 	go func() {
 		<-entered
+		close(retargetAttempting)
 		_, _ = gs.ActivateResign(2, 56)
 		close(retargetDone)
 	}()
 
 	ran, err := gs.WhileResignGenerationIs(gen1, func() error {
 		close(entered)
-		// Retarget must block on stateMu while this write is in progress.
+		<-retargetAttempting
+		// Give the retarget goroutine time to reach gs.stateMu.Lock(); it must
+		// remain blocked while this write callback holds the lock.
 		select {
 		case <-retargetDone:
 			t.Error("retarget completed while WhileResignGenerationIs callback was still running")
-		default:
+		case <-time.After(30 * time.Millisecond):
 		}
-		close(release)
 		return nil
 	})
 	if err != nil || !ran {
@@ -410,5 +413,55 @@ func TestWhileResignGenerationIsSerializesWriteBoundary(t *testing.T) {
 	})
 	if err != nil || ran || staleRan {
 		t.Fatalf("stale generation ran write: ran=%v staleRan=%v err=%v", ran, staleRan, err)
+	}
+}
+
+func TestRedeemIncidentInterruptsAndResumesReSignWithFreshGeneration(t *testing.T) {
+	state := LiveState
+	gs := NewGlobalState(&state)
+	if err := gs.RestoreRedeemIncidents(&lossyIncidentStore{}); err != nil {
+		t.Fatal(err)
+	}
+	if activated, err := gs.ActivateResign(2, 56); err != nil || !activated || state != ReSignState {
+		t.Fatalf("ActivateResign: activated=%v err=%v state=%s", activated, err, StateToText(state))
+	}
+	_, _, gen1 := gs.GetResignTarget()
+
+	// Report a redeem incident during the active ReSignState scan.
+	if err := gs.ReportRedeemIncident(RedeemIncident{ChainID: 56}); err != nil {
+		t.Fatalf("ReportRedeemIncident failed: %v", err)
+	}
+	if got, _ := gs.GetState(); got != EmergencyState {
+		t.Fatalf("state during redeem incident = %s, want EmergencyState", StateToText(got))
+	}
+	if gs.IsResignGenerationCurrent(gen1) {
+		t.Fatal("gen1 must be invalidated when redeem incident interrupts ReSignState")
+	}
+
+	// Confirm the redeem halt -> HaltedState.
+	redeemGen := gs.RedeemHaltGeneration()
+	if completed, err := gs.CompleteEmergencyHalt(redeemGen, map[uint32]bool{56: true}); err != nil || !completed {
+		t.Fatalf("CompleteEmergencyHalt: completed=%v err=%v", completed, err)
+	}
+	if got, _ := gs.GetState(); got != HaltedState {
+		t.Fatalf("state after confirming redeem halt = %s, want HaltedState", StateToText(got))
+	}
+
+	// Unhalting must resume ReSignState with the same target and a fresh generation.
+	if changed, err := gs.SetStateIf(HaltedState, LiveState); err != nil || !changed {
+		t.Fatalf("unhalt failed: changed=%v err=%v", changed, err)
+	}
+	if got, _ := gs.GetState(); got != ReSignState {
+		t.Fatalf("state after unhalt = %s, want ReSignState", StateToText(got))
+	}
+	class, chain, gen2 := gs.GetResignTarget()
+	if class != 2 || chain != 56 {
+		t.Fatalf("resumed resign target = (%d, %d), want (2, 56)", class, chain)
+	}
+	if gen2 == gen1 {
+		t.Fatalf("expected fresh resign generation after redeem halt resume, still got %d", gen2)
+	}
+	if !gs.IsResignGenerationCurrent(gen2) {
+		t.Fatal("fresh generation gen2 must be current")
 	}
 }

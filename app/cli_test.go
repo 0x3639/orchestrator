@@ -1,10 +1,14 @@
 package app
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
+	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -32,6 +36,14 @@ func TestPprofRegisteredAndBeforeActionHonorsFlagsAndBindFailure(t *testing.T) {
 	nodeManager = nil
 	t.Cleanup(func() { nodeManager = prevManager })
 
+	var listenAttempts atomic.Int32
+	prevListen := pprofListenAndServe
+	pprofListenAndServe = func(addr string, handler http.Handler) error {
+		listenAttempts.Add(1)
+		return prevListen(addr, handler)
+	}
+	t.Cleanup(func() { pprofListenAndServe = prevListen })
+
 	type pprofErrEvent struct {
 		addr string
 		err  error
@@ -44,14 +56,17 @@ func TestPprofRegisteredAndBeforeActionHonorsFlagsAndBindFailure(t *testing.T) {
 	}
 	t.Cleanup(func() { onPprofError = prevOnErr })
 
-	// --pprof=false must NOT start profiling or fail port validation.
-	if err := runBeforeActionWithFlags("--pprof=false", "--pprof.port", "0"); err != nil {
+	// --pprof=false with a valid port must make zero listener attempts.
+	if err := runBeforeActionWithFlags("--pprof=false", "--pprof.addr", "127.0.0.1", "--pprof.port", "6060"); err != nil {
 		t.Fatalf("--pprof=false unexpectedly failed: %v", err)
 	}
-	select {
-	case ev := <-errCh:
-		t.Fatalf("--pprof=false unexpectedly started pprof on %s: %v", ev.addr, ev.err)
-	default:
+	// Yield so any accidentally spawned goroutine would run.
+	for i := 0; i < 5; i++ {
+		runtime.Gosched()
+	}
+	time.Sleep(25 * time.Millisecond)
+	if got := listenAttempts.Load(); got != 0 {
+		t.Fatalf("--pprof=false made %d listener attempts, want 0", got)
 	}
 
 	// Out-of-range ports (0 and >65535) must fail validation when --pprof is enabled.
@@ -60,10 +75,12 @@ func TestPprofRegisteredAndBeforeActionHonorsFlagsAndBindFailure(t *testing.T) {
 			t.Fatalf("--pprof --pprof.port %s: expected validation error", port)
 		}
 	}
+	if got := listenAttempts.Load(); got != 0 {
+		t.Fatalf("invalid ports made %d listener attempts, want 0", got)
+	}
 
-	// Occupy a real loopback port to force a genuine ListenAndServe bind failure
-	// while nodeManager is nil, using the CLI's real flag types, and assert both
-	// the configured address and that the bind failure was observed.
+	// Occupy a real loopback port to force a genuine EADDRINUSE bind failure
+	// while nodeManager is nil, using the CLI's real flag types.
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -82,11 +99,14 @@ func TestPprofRegisteredAndBeforeActionHonorsFlagsAndBindFailure(t *testing.T) {
 
 	select {
 	case ev := <-errCh:
+		if got := listenAttempts.Load(); got != 1 {
+			t.Fatalf("expected 1 listener attempt, got %d", got)
+		}
 		if ev.addr != wantAddr {
 			t.Fatalf("pprof bound address = %q, want %q", ev.addr, wantAddr)
 		}
-		if ev.err == nil {
-			t.Fatal("expected non-nil bind failure error")
+		if !errors.Is(ev.err, syscall.EADDRINUSE) {
+			t.Fatalf("expected EADDRINUSE bind failure, got %v", ev.err)
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatalf("timed out waiting for pprof bind failure on %s", wantAddr)

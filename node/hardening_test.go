@@ -435,14 +435,15 @@ func TestApplyUnwrapSignaturesPersistsToStoreAndRejectsMissingChain(t *testing.T
 }
 
 type wrapTestBridge struct {
-	mu       sync.Mutex
-	networks *embedded.NetworkInfoList
-	unsigned *embedded.WrapTokenRequestList
-	allWraps *embedded.WrapTokenRequestList
-	byID     map[types.Hash]*definition.WrapTokenRequest
-	onGetID  func(id types.Hash)
-	pages    atomic.Int32
-	onPage   func(page int32)
+	mu          sync.Mutex
+	networks    *embedded.NetworkInfoList
+	unsigned    *embedded.WrapTokenRequestList
+	allWraps    *embedded.WrapTokenRequestList
+	pageHandler func(pageIndex, pageSize uint32, call int32) *embedded.WrapTokenRequestList
+	byID        map[types.Hash]*definition.WrapTokenRequest
+	onGetID     func(id types.Hash)
+	pages       atomic.Int32
+	onPage      func(page int32)
 }
 
 func (b *wrapTestBridge) GetBridgeInfo() (*definition.BridgeInfoVariable, error) {
@@ -473,17 +474,22 @@ func (b *wrapTestBridge) GetAllUnsignedWrapTokenRequests(uint32, uint32) *embedd
 	return b.unsigned
 }
 
-func (b *wrapTestBridge) GetAllWrapTokenRequests(pageIndex, _ uint32) *embedded.WrapTokenRequestList {
+func (b *wrapTestBridge) GetAllWrapTokenRequests(pageIndex, pageSize uint32) *embedded.WrapTokenRequestList {
 	n := b.pages.Add(1)
 	if b.onPage != nil {
 		b.onPage(n)
 	}
 	b.mu.Lock()
-	defer b.mu.Unlock()
-	if pageIndex > 0 || b.allWraps == nil {
+	handler := b.pageHandler
+	allWraps := b.allWraps
+	b.mu.Unlock()
+	if handler != nil {
+		return handler(pageIndex, pageSize, n)
+	}
+	if pageIndex > 0 || allWraps == nil {
 		return &embedded.WrapTokenRequestList{}
 	}
-	return b.allWraps
+	return allWraps
 }
 
 func (b *wrapTestBridge) GetWrapTokenRequestById(id types.Hash) (*definition.WrapTokenRequest, error) {
@@ -947,8 +953,8 @@ func TestProcessReSignWrapWriteBoundaryDropsObsoleteFlagOnConcurrentHalt(t *test
 	var stateChanged sync.Once
 	var n *Node
 
-	// Trigger a halt right when RedeemsInfo returns, immediately before the
-	// atomic WhileResignGenerationIs + SetResignStatus write boundary.
+	// Trigger an actual halt right when RedeemsInfo returns, immediately before
+	// the atomic WhileResignGenerationIs + SetResignStatus write boundary.
 	evmSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var req struct {
 			ID     json.RawMessage `json:"id"`
@@ -957,7 +963,7 @@ func TestProcessReSignWrapWriteBoundaryDropsObsoleteFlagOnConcurrentHalt(t *test
 		_ = json.NewDecoder(r.Body).Decode(&req)
 		if req.Method == "eth_call" && n != nil {
 			stateChanged.Do(func() {
-				_, _ = n.state.DeactivateResign()
+				_, _ = n.state.HaltSigning()
 			})
 		}
 		w.Header().Set("Content-Type", "application/json")
@@ -997,8 +1003,128 @@ func TestProcessReSignWrapWriteBoundaryDropsObsoleteFlagOnConcurrentHalt(t *test
 	if retry || !stale || fatal {
 		t.Fatalf("processReSignWrap at write boundary = (retry=%v, stale=%v, fatal=%v), want (false, true, false)", retry, stale, fatal)
 	}
+	if st, _ := n.state.GetState(); st != common.HaltedState {
+		t.Fatalf("expected HaltedState after concurrent halt, got %s", common.StateToText(st))
+	}
 	if resign, err := n.dbManager.ZnnStorage().GetResignStatus(wrapID); err != nil || resign {
-		t.Fatalf("obsolete resign flag was written after deactivation: resign=%v err=%v", resign, err)
+		t.Fatalf("obsolete resign flag was written after concurrent halt: resign=%v err=%v", resign, err)
+	}
+}
+
+func TestReSignStateHandlesEmptyMiddlePageMidPassArrivalAndOmittedDeferredWrap(t *testing.T) {
+	prevDelay := resignRetryDelay
+	resignRetryDelay = 30 * time.Millisecond
+	t.Cleanup(func() { resignRetryDelay = prevDelay })
+
+	evmSrv := fakeEvmRpcServer(t)
+	defer evmSrv.Close()
+
+	page2WrapID := types.Hash{0xc1}
+	deferredID := types.Hash{0xc2}
+	midPassArrivalID := types.Hash{0xc3}
+
+	// Track retry scans of deferredID:
+	// - Scan 1 (initial): page 0 is EMPTY with Count=150; page 1 returns
+	//   page2WrapID (finalized, height 100), deferredID (unfinalized, height 100),
+	//   AND midPassArrivalID (arrived AFTER scan cutoff height 100, height 101!).
+	// - Scan 2 (retry 1): deferredID is temporarily OMITTED from pagination,
+	//   while GetWrapTokenRequestById still returns it -> must NOT be dropped!
+	// - Scan 3 (retry 2): deferredID reappears with ConfirmationsToFinality=0
+	//   -> must be marked for resigning and scan completes to LiveState!
+	var retryPass atomic.Int32
+	bridge := &wrapTestBridge{
+		networks: &embedded.NetworkInfoList{
+			Count: 1,
+			List: []*definition.NetworkInfo{{
+				NetworkClass:    definition.EvmClass,
+				Id:              1,
+				Name:            "Ethereum",
+				ContractAddress: "0x0000000000000000000000000000000000000001",
+			}},
+		},
+		byID: map[types.Hash]*definition.WrapTokenRequest{
+			deferredID: {NetworkClass: definition.EvmClass, ChainId: 1, Id: deferredID, Amount: big.NewInt(20), Fee: big.NewInt(1)},
+		},
+	}
+	bridge.pageHandler = func(pageIndex, _ uint32, _ int32) *embedded.WrapTokenRequestList {
+		if pageIndex == 0 {
+			pass := retryPass.Add(1)
+			if pass == 1 {
+				// Empty page 0 despite Count=150: scan must continue to page 1.
+				return &embedded.WrapTokenRequestList{Count: 150, List: []*embedded.WrapTokenRequest{}}
+			}
+			if pass == 2 {
+				// Retry pass 1: omit deferredID transiently while it still exists on Zenon.
+				return &embedded.WrapTokenRequestList{Count: 1, List: []*embedded.WrapTokenRequest{}}
+			}
+			// Retry pass 2: deferredID reappears finalized.
+			return &embedded.WrapTokenRequestList{
+				Count: 1,
+				List: []*embedded.WrapTokenRequest{{
+					WrapTokenRequest: &definition.WrapTokenRequest{
+						NetworkClass: definition.EvmClass, ChainId: 1, Id: deferredID,
+						Amount: big.NewInt(20), Fee: big.NewInt(1), CreationMomentumHeight: 100,
+					},
+					ConfirmationsToFinality: 0,
+				}},
+			}
+		}
+		if pageIndex == 1 && retryPass.Load() == 1 {
+			return &embedded.WrapTokenRequestList{
+				Count: 150,
+				List: []*embedded.WrapTokenRequest{
+					{
+						WrapTokenRequest: &definition.WrapTokenRequest{
+							NetworkClass: definition.EvmClass, ChainId: 1, Id: page2WrapID,
+							Amount: big.NewInt(10), Fee: big.NewInt(1), CreationMomentumHeight: 100,
+						},
+						ConfirmationsToFinality: 0,
+					},
+					{
+						WrapTokenRequest: &definition.WrapTokenRequest{
+							NetworkClass: definition.EvmClass, ChainId: 1, Id: deferredID,
+							Amount: big.NewInt(20), Fee: big.NewInt(1), CreationMomentumHeight: 100,
+						},
+						ConfirmationsToFinality: 2,
+					},
+					// Arrived after cutoff height 100 during the initial paginated scan.
+					{
+						WrapTokenRequest: &definition.WrapTokenRequest{
+							NetworkClass: definition.EvmClass, ChainId: 1, Id: midPassArrivalID,
+							Amount: big.NewInt(30), Fee: big.NewInt(1), CreationMomentumHeight: 101,
+						},
+						ConfirmationsToFinality: 5,
+					},
+				},
+			}
+		}
+		return &embedded.WrapTokenRequestList{}
+	}
+
+	n := wrapTestNodeWithEvm(t, common.LiveState, bridge, map[string]string{"Ethereum": evmSrv.URL})
+	if err := n.state.SetFrontierMomentum(100); err != nil {
+		t.Fatal(err)
+	}
+	if activated, err := n.state.ActivateResign(definition.EvmClass, 1); err != nil || !activated {
+		t.Fatalf("ActivateResign failed: activated=%v err=%v", activated, err)
+	}
+	n.state.CompleteStartup()
+
+	n.workers.start(n.processSignatures)
+	t.Cleanup(func() {
+		done := n.workers.shutdown()
+		<-done
+	})
+
+	eventually(t, "ReSignState to traverse empty page 0, exclude mid-pass arrival, keep omitted deferred wrap, and complete", func() bool {
+		st, _ := n.state.GetState()
+		r1, err1 := n.dbManager.ZnnStorage().GetResignStatus(page2WrapID)
+		r2, err2 := n.dbManager.ZnnStorage().GetResignStatus(deferredID)
+		return err1 == nil && err2 == nil && r1 && r2 && st == common.LiveState
+	})
+
+	if ev, err := n.dbManager.ZnnStorage().GetWrapRequestById(midPassArrivalID); err != nil || ev != nil {
+		t.Fatalf("mid-pass arrival beyond cutoff momentum should not have been included: ev=%+v err=%v", ev, err)
 	}
 }
 
