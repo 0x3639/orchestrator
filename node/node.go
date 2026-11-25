@@ -1,9 +1,11 @@
 package node
 
 import (
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -25,6 +27,7 @@ import (
 	"path"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -39,6 +42,7 @@ import (
 	"github.com/libp2p/go-libp2p-core/peer"
 	"github.com/pkg/errors"
 	"github.com/prometheus/tsdb/fileutil"
+	"github.com/zenon-network/go-zenon/chain/nom"
 	"github.com/zenon-network/go-zenon/common/types"
 	"github.com/zenon-network/go-zenon/rpc/api"
 	"github.com/zenon-network/go-zenon/rpc/api/embedded"
@@ -1588,12 +1592,31 @@ func wrapDefFinalizedAtMomentum(wrap *definition.WrapTokenRequest, frontierHeigh
 		frontierHeight-wrap.CreationMomentumHeight >= uint64(requiredConfirmations)
 }
 
-// readAnchoredWrapConfirmations reads OrchestratorInfo.ConfirmationsToFinality
-// bracketed by verified bridge account frontiers (pre == post) so the finality
-// threshold is bound to a single verified canonical bridge snapshot and cannot
-// lag behind an administrator threshold increase in a newer bridge block.
-func (node *Node) readAnchoredWrapConfirmations(anchor reSignChainAnchor, advanceFinality bool, resignGen uint64) (required uint32, nextAnchor reSignChainAnchor, consistent, stale, stop bool) {
+// isAcceptedReceiveBlock reports whether recv is a bridge contract receive
+// block whose VM execution succeeded (go-zenon vm/vm.go writes big-endian
+// uint64(1) on success and uint64(2) when execution failed and rolled back).
+func isAcceptedReceiveBlock(recv *api.AccountBlock) bool {
+	return recv != nil &&
+		recv.BlockType == nom.BlockTypeContractReceive &&
+		len(recv.Data) == 8 &&
+		binary.BigEndian.Uint64(recv.Data) == 1
+}
+
+type confirmedThresholdCache struct {
+	atBlock   *api.AccountBlock
+	threshold uint32
+}
+
+// readConfirmedWrapConfirmations derives OrchestratorInfo.ConfirmationsToFinality
+// exclusively from momentum-confirmed, accepted SetOrchestratorInfo receive blocks
+// on the canonical bridge account chain (never from the mutable account-pool
+// GetOrchestratorInfo RPC). When cache is non-nil and its block remains a
+// confirmed canonical ancestor, only newly confirmed bridge blocks above
+// cache.atBlock are scanned.
+func (node *Node) readConfirmedWrapConfirmations(anchor reSignChainAnchor, advanceFinality bool, cache *confirmedThresholdCache, resignGen uint64) (required uint32, nextAnchor reSignChainAnchor, consistent, stale, stop bool) {
+	setOrchID := definition.ABIBridge.Methods[definition.SetOrchestratorInfoMethodName].Id()
 	cur := anchor
+
 	for {
 		if node.workerStopping() {
 			return 0, reSignChainAnchor{}, false, false, true
@@ -1601,7 +1624,7 @@ func (node *Node) readAnchoredWrapConfirmations(anchor reSignChainAnchor, advanc
 		if !node.state.IsResignGenerationCurrent(resignGen) {
 			return 0, reSignChainAnchor{}, false, true, false
 		}
-		preAnchor, ok, retryCheck, stopCheck := node.checkZenonAnchorConsistent(cur, advanceFinality)
+		curAnchor, ok, retryCheck, stopCheck := node.checkZenonAnchorConsistent(cur, advanceFinality)
 		if stopCheck {
 			return 0, reSignChainAnchor{}, false, false, true
 		}
@@ -1614,22 +1637,193 @@ func (node *Node) readAnchoredWrapConfirmations(anchor reSignChainAnchor, advanc
 		if !ok {
 			return 0, reSignChainAnchor{}, false, false, false
 		}
-
-		ctx, cancel := context.WithTimeout(node.workers.context(), resignRPCTimeout)
-		info, err := node.networksManager.Znn().GetOrchestratorInfoContext(ctx)
-		cancel()
-		if node.workerStopping() {
-			return 0, reSignChainAnchor{}, false, false, true
-		}
-		if err != nil || info == nil {
-			node.logger.Debugf("failed to read orchestrator info during resign scan: %v", err)
+		if curAnchor.bridgeBlock == nil || curAnchor.bridgeBlock.Height == 0 {
 			if !node.workerSleep(resignRetryDelay) {
 				return 0, reSignChainAnchor{}, false, false, true
 			}
 			continue
 		}
 
-		postAnchor, ok, retryCheck, stopCheck := node.checkZenonAnchorConsistent(preAnchor, advanceFinality)
+		if cache != nil && cache.atBlock != nil && sameAccountBlockFrontier(cache.atBlock, curAnchor.bridgeBlock) {
+			return cache.threshold, curAnchor, true, false, false
+		}
+
+		minHeight := uint64(1)
+		haveCached := false
+		if cache != nil && cache.atBlock != nil && curAnchor.bridgeBlock.Height > cache.atBlock.Height {
+			ancCtx, ancCancel := context.WithTimeout(node.workers.context(), resignRPCTimeout)
+			blocks, err := node.networksManager.Znn().GetAccountBlocksByHeightContext(ancCtx, types.BridgeContract, cache.atBlock.Height, 1)
+			ancCancel()
+			if node.workerStopping() {
+				return 0, reSignChainAnchor{}, false, false, true
+			}
+			if err != nil {
+				node.logger.Debugf("failed to verify cached threshold anchor %d: %v", cache.atBlock.Height, err)
+				if !node.workerSleep(resignRetryDelay) {
+					return 0, reSignChainAnchor{}, false, false, true
+				}
+				continue
+			}
+			if blocks == nil || len(blocks.List) == 0 || blocks.List[0] == nil ||
+				!isConfirmedBridgeBlock(blocks.List[0]) || !sameAccountBlockFrontier(cache.atBlock, blocks.List[0]) {
+				return 0, reSignChainAnchor{}, false, false, false
+			}
+			minHeight = cache.atBlock.Height + 1
+			haveCached = true
+		}
+
+		var foundThreshold uint32
+		found := false
+		needRetry := false
+		rolledBack := false
+		expectedHash := curAnchor.bridgeBlock.Hash
+		hi := curAnchor.bridgeBlock.Height
+		for hi >= minHeight {
+			if node.workerStopping() {
+				return 0, reSignChainAnchor{}, false, false, true
+			}
+			if !node.state.IsResignGenerationCurrent(resignGen) {
+				return 0, reSignChainAnchor{}, false, true, false
+			}
+			lo := minHeight
+			if hi-minHeight+1 > api.RpcMaxCountSize {
+				lo = hi - api.RpcMaxCountSize + 1
+			}
+			count := hi - lo + 1
+
+			pageCtx, pageCancel := context.WithTimeout(node.workers.context(), resignRPCTimeout)
+			page, err := node.networksManager.Znn().GetAccountBlocksByHeightContext(pageCtx, types.BridgeContract, lo, count)
+			pageCancel()
+			if node.workerStopping() {
+				return 0, reSignChainAnchor{}, false, false, true
+			}
+			if err != nil {
+				node.logger.Debugf("failed to read confirmed bridge blocks [%d..%d] for finality threshold: %v", lo, hi, err)
+				needRetry = true
+				break
+			}
+			if page == nil || len(page.List) < int(count) {
+				needRetry = true
+				break
+			}
+
+			for i := int(count) - 1; i >= 0; i-- {
+				b := page.List[i]
+				expectedHeight := lo + uint64(i)
+				if b == nil || b.Height != expectedHeight || !isConfirmedBridgeBlock(b) {
+					needRetry = true
+					break
+				}
+				if b.Hash != expectedHash {
+					rolledBack = true
+					break
+				}
+				if expectedHeight == curAnchor.bridgeBlock.Height && !sameAccountBlockFrontier(curAnchor.bridgeBlock, b) {
+					rolledBack = true
+					break
+				}
+				expectedHash = b.PreviousHash
+				if !isAcceptedReceiveBlock(b) {
+					continue
+				}
+				// Fast filter when PairedAccountBlock is already present and
+				// matches the receive block's committed FromBlockHash.
+				if b.PairedAccountBlock != nil && b.PairedAccountBlock.Hash == b.FromBlockHash {
+					if b.PairedAccountBlock.ToAddress != types.BridgeContract ||
+						len(b.PairedAccountBlock.Data) < len(setOrchID) ||
+						!bytes.Equal(b.PairedAccountBlock.Data[:len(setOrchID)], setOrchID) {
+						continue
+					}
+				}
+
+				// Verify the SetOrchestratorInfo send + receive directly in
+				// momentumStore (GetAccountBlockByHash never reads accountPool).
+				sendCtx, sendCancel := context.WithTimeout(node.workers.context(), resignRPCTimeout)
+				send, err := node.networksManager.Znn().GetAccountBlockByHashContext(sendCtx, b.FromBlockHash)
+				sendCancel()
+				if node.workerStopping() {
+					return 0, reSignChainAnchor{}, false, false, true
+				}
+				if err != nil {
+					node.logger.Debugf("failed to verify SetOrchestratorInfo send %s in momentumStore: %v", b.FromBlockHash, err)
+					needRetry = true
+					break
+				}
+				if send == nil || send.Hash != b.FromBlockHash || !isConfirmedBridgeBlock(send) {
+					rolledBack = true
+					break
+				}
+				recv := send.PairedAccountBlock
+				if recv == nil || !isConfirmedBridgeBlock(recv) || !sameAccountBlockFrontier(b, recv) || !isAcceptedReceiveBlock(recv) {
+					rolledBack = true
+					break
+				}
+				if send.ToAddress != types.BridgeContract ||
+					len(send.Data) < len(setOrchID) ||
+					!bytes.Equal(send.Data[:len(setOrchID)], setOrchID) {
+					continue
+				}
+				param := new(definition.OrchestratorInfoParam)
+				if err := definition.ABIBridge.UnpackMethod(param, definition.SetOrchestratorInfoMethodName, send.Data); err != nil || param.ConfirmationsToFinality == 0 {
+					continue
+				}
+
+				// Verify the confirming momentum of this SetOrchestratorInfo
+				// receive block is canonical.
+				momCtx, momCancel := context.WithTimeout(node.workers.context(), resignRPCTimeout)
+				momList, err := node.networksManager.Znn().GetMomentumsByHeightContext(momCtx, b.ConfirmationDetail.MomentumHeight, 1)
+				momCancel()
+				if node.workerStopping() {
+					return 0, reSignChainAnchor{}, false, false, true
+				}
+				if err != nil {
+					needRetry = true
+					break
+				}
+				if momList == nil || len(momList.List) == 0 || momList.List[0] == nil || momList.List[0].Momentum == nil ||
+					momList.List[0].Height != b.ConfirmationDetail.MomentumHeight || momList.List[0].Hash != b.ConfirmationDetail.MomentumHash {
+					rolledBack = true
+					break
+				}
+
+				foundThreshold = param.ConfirmationsToFinality
+				found = true
+				break
+			}
+			if found || needRetry || rolledBack || lo == minHeight {
+				break
+			}
+			hi = lo - 1
+		}
+
+		if rolledBack {
+			return 0, reSignChainAnchor{}, false, false, false
+		}
+		if needRetry {
+			if !node.workerSleep(resignRetryDelay) {
+				return 0, reSignChainAnchor{}, false, false, true
+			}
+			continue
+		}
+		if !found {
+			if haveCached {
+				if expectedHash != cache.atBlock.Hash {
+					return 0, reSignChainAnchor{}, false, false, false
+				}
+				foundThreshold = cache.threshold
+				found = true
+			} else {
+				node.logger.Debugf("no confirmed SetOrchestratorInfo block found on bridge chain up to height %d; retrying", curAnchor.bridgeBlock.Height)
+				if !node.workerSleep(resignRetryDelay) {
+					return 0, reSignChainAnchor{}, false, false, true
+				}
+				continue
+			}
+		}
+
+		// Verify curAnchor survived the backward scan and check whether any
+		// newer confirmed bridge block landed in the meantime.
+		postAnchor, ok, retryCheck, stopCheck := node.checkZenonAnchorConsistent(curAnchor, advanceFinality)
 		if stopCheck {
 			return 0, reSignChainAnchor{}, false, false, true
 		}
@@ -1642,22 +1836,32 @@ func (node *Node) readAnchoredWrapConfirmations(anchor reSignChainAnchor, advanc
 		if !ok {
 			return 0, reSignChainAnchor{}, false, false, false
 		}
-		if !sameAccountBlockFrontier(preAnchor.bridgeBlock, postAnchor.bridgeBlock) ||
-			preAnchor.observedMom != postAnchor.observedMom ||
-			preAnchor.observedHash != postAnchor.observedHash {
+		if cache != nil {
+			cache.atBlock = curAnchor.bridgeBlock
+			cache.threshold = foundThreshold
+		}
+		if !sameAccountBlockFrontier(curAnchor.bridgeBlock, postAnchor.bridgeBlock) {
 			cur = postAnchor
 			continue
 		}
-		return info.ConfirmationsToFinality, postAnchor, true, false, false
+		return foundThreshold, postAnchor, true, false, false
 	}
 }
 
 // verifyWrapConfirmedInLedger verifies directly against Zenon's momentum-confirmed
 // ledger store (GetAccountBlockByHash reads exclusively from momentumStore, never
-// from the unconfirmed account pool) that wrapID has a confirmed send block and a
-// confirmed paired bridge receive block anchored in the canonical momentum chain
-// and canonical bridge account chain at or below anchor.
-func (node *Node) verifyWrapConfirmedInLedger(wrapID types.Hash, anchor reSignChainAnchor, resignGen uint64) (confirmed, stale, stop bool) {
+// from the unconfirmed account pool) that wrap has a confirmed WrapToken send
+// block whose paired bridge receive block succeeded (execution status == 1, not
+// rolled-back status == 2), matches wrap's fields and CreationMomentumHeight,
+// and is anchored in the canonical momentum chain and canonical bridge account
+// chain at or below anchor.
+func (node *Node) verifyWrapConfirmedInLedger(wrap *definition.WrapTokenRequest, anchor reSignChainAnchor, resignGen uint64) (confirmed, stale, stop bool) {
+	if wrap == nil || wrap.Amount == nil {
+		return false, false, false
+	}
+	wrapMethodID := definition.ABIBridge.Methods[definition.WrapTokenMethodName].Id()
+	wrapID := wrap.Id
+
 	for {
 		if node.workerStopping() {
 			return false, false, true
@@ -1678,11 +1882,31 @@ func (node *Node) verifyWrapConfirmedInLedger(wrapID types.Hash, anchor reSignCh
 			}
 			continue
 		}
-		if send == nil || send.Hash != wrapID || !isConfirmedBridgeBlock(send) {
+		if send == nil || send.Hash != wrapID || !nom.IsSendBlock(send.BlockType) ||
+			send.ToAddress != types.BridgeContract || !isConfirmedBridgeBlock(send) {
 			return false, false, false
 		}
 		recv := send.PairedAccountBlock
-		if recv == nil || recv.Address != types.BridgeContract || recv.FromBlockHash != wrapID || !isConfirmedBridgeBlock(recv) {
+		if recv == nil || recv.Address != types.BridgeContract || recv.FromBlockHash != wrapID ||
+			!isConfirmedBridgeBlock(recv) || !isAcceptedReceiveBlock(recv) {
+			return false, false, false
+		}
+
+		// Bind the staged wrap record to the confirmed successful WrapToken
+		// send block and receive execution.
+		if len(send.Data) < len(wrapMethodID) || !bytes.Equal(send.Data[:len(wrapMethodID)], wrapMethodID) {
+			return false, false, false
+		}
+		param := new(definition.WrapTokenParam)
+		if err := definition.ABIBridge.UnpackMethod(param, definition.WrapTokenMethodName, send.Data); err != nil {
+			return false, false, false
+		}
+		if param.NetworkClass != wrap.NetworkClass ||
+			param.ChainId != wrap.ChainId ||
+			!strings.EqualFold(param.ToAddress, wrap.ToAddress) ||
+			send.TokenStandard != wrap.TokenStandard ||
+			send.Amount == nil || send.Amount.Sign() <= 0 || send.Amount.Cmp(wrap.Amount) != 0 ||
+			recv.MomentumAcknowledged.Height != wrap.CreationMomentumHeight {
 			return false, false, false
 		}
 
@@ -1892,7 +2116,7 @@ func (node *Node) verifyStraddledWraps(wraps []*embedded.WrapTokenRequest, strad
 				cur.bridgeBlock = postAnchor.bridgeBlock
 				continue
 			}
-			ledgerConfirmed, staleLedger, stopLedger := node.verifyWrapConfirmedInLedger(w.Id, postAnchor, resignGen)
+			ledgerConfirmed, staleLedger, stopLedger := node.verifyWrapConfirmedInLedger(got.WrapTokenRequest, postAnchor, resignGen)
 			if staleLedger || stopLedger {
 				return reSignChainAnchor{}, false, staleLedger, stopLedger
 			}
@@ -2305,22 +2529,28 @@ func (node *Node) runReSignScan() bool {
 			stagedEligible = append(stagedEligible, wrap)
 		}
 
-		requiredConfirmations, nextAnchor, consistentInfo, staleInfo, stopInfo := node.readAnchoredWrapConfirmations(anchor, false, resignGen)
-		if stopInfo {
-			return false
-		}
-		if staleInfo {
-			node.logger.Debug("ReSignState target or state changed during scan; discarding staged resign batch")
-			return true
-		}
-		if !consistentInfo {
-			node.logger.Debug("Zenon frontier rolled back while reading finality threshold; restarting scan")
-			if !node.workerSleep(resignRetryDelay) {
+		thresholdCache := &confirmedThresholdCache{}
+		var requiredConfirmations uint32
+		if len(snapshot) > 0 {
+			var nextAnchor reSignChainAnchor
+			var consistentInfo, staleInfo, stopInfo bool
+			requiredConfirmations, nextAnchor, consistentInfo, staleInfo, stopInfo = node.readConfirmedWrapConfirmations(anchor, false, thresholdCache, resignGen)
+			if stopInfo {
 				return false
 			}
-			continue
+			if staleInfo {
+				node.logger.Debug("ReSignState target or state changed during scan; discarding staged resign batch")
+				return true
+			}
+			if !consistentInfo {
+				node.logger.Debug("Zenon frontier rolled back while reading confirmed finality threshold; restarting scan")
+				if !node.workerSleep(resignRetryDelay) {
+					return false
+				}
+				continue
+			}
+			anchor = nextAnchor
 		}
-		anchor = nextAnchor
 
 		for _, wrap := range snapshot {
 			if node.workerStopping() {
@@ -2445,11 +2675,10 @@ func (node *Node) runReSignScan() bool {
 					continue
 				}
 				// Verify the chain view that established finality survived the
-				// by-ID read AND bind OrchestratorInfo.ConfirmationsToFinality
-				// to a verified bridge snapshot (pre == post) so neither a
-				// transient finality spike nor a concurrent threshold raise can
-				// be missed.
-				reqConf, postAnchor, consistent, staleConf, stopConf := node.readAnchoredWrapConfirmations(preAnchor, true, resignGen)
+				// by-ID read AND read ConfirmationsToFinality from momentum-
+				// confirmed bridge state so neither a transient finality spike
+				// nor a pending account-pool threshold change can be accepted.
+				reqConf, postAnchor, consistent, staleConf, stopConf := node.readConfirmedWrapConfirmations(preAnchor, true, thresholdCache, resignGen)
 				if stopConf {
 					return false
 				}
@@ -2496,64 +2725,89 @@ func (node *Node) runReSignScan() bool {
 			continue
 		}
 
-		// Revalidate the snapshot, finality anchor, confirmation threshold
-		// (bound to a single verified momentum + confirmed bridge snapshot),
-		// and momentum-confirmed ledger membership of every staged wrap before
-		// publishing any staged flags.
-		reqConf, finalAnchor, consistent, staleConf, stopConf := node.readAnchoredWrapConfirmations(anchor, false, resignGen)
-		if stopConf {
-			return false
-		}
-		if staleConf {
-			staleResign = true
-		} else if !consistent {
-			node.logger.Debug("Zenon frontier rolled back before publishing resign batch; discarding staged batch and restarting")
-			rolledBack = true
-		} else {
-			for _, w := range stagedEligible {
-				if !wrapDefFinalizedAtMomentum(w, finalAnchor.finalityMom, reqConf) {
-					node.logger.Debugf("staged wrap %s is no longer finalized at verified momentum %d (required %d); discarding staged batch and restarting", w.Id, finalAnchor.finalityMom, reqConf)
-					rolledBack = true
-					break
-				}
-				ledgerConfirmed, staleLedger, stopLedger := node.verifyWrapConfirmedInLedger(w.Id, finalAnchor, resignGen)
-				if stopLedger {
+		// Revalidate the snapshot, finality anchor, momentum-confirmed
+		// confirmation threshold, and confirmed accepted WrapToken execution in
+		// momentumStore for every staged wrap, then re-read the confirmed
+		// threshold AFTER ledger verification so a threshold increase confirmed
+		// during the per-wrap ledger RPCs cannot be missed before publication.
+		if len(stagedEligible) == 0 {
+			for {
+				if node.workerStopping() {
 					return false
 				}
-				if staleLedger {
+				if !node.state.IsResignGenerationCurrent(resignGen) {
 					staleResign = true
 					break
 				}
-				if !ledgerConfirmed {
-					node.logger.Debugf("staged wrap %s is not confirmed in Zenon canonical ledger store; discarding staged batch and restarting", w.Id)
-					rolledBack = true
-					break
+				_, postConsistent, retryCheck, stopCheck := node.checkZenonAnchorConsistent(anchor, false)
+				if stopCheck {
+					return false
 				}
-			}
-			if !staleResign && !rolledBack && len(stagedEligible) > 0 {
-				for {
-					if node.workerStopping() {
+				if retryCheck {
+					if !node.workerSleep(resignRetryDelay) {
 						return false
 					}
-					if !node.state.IsResignGenerationCurrent(resignGen) {
+					continue
+				}
+				if !postConsistent {
+					node.logger.Debug("Zenon frontier rolled back before publishing empty resign batch; restarting")
+					rolledBack = true
+				}
+				break
+			}
+		} else {
+			reqConf, finalAnchor, consistent, staleConf, stopConf := node.readConfirmedWrapConfirmations(anchor, false, thresholdCache, resignGen)
+			if stopConf {
+				return false
+			}
+			if staleConf {
+				staleResign = true
+			} else if !consistent {
+				node.logger.Debug("Zenon frontier rolled back before publishing resign batch; discarding staged batch and restarting")
+				rolledBack = true
+			} else {
+				for _, w := range stagedEligible {
+					if !wrapDefFinalizedAtMomentum(w, finalAnchor.finalityMom, reqConf) {
+						node.logger.Debugf("staged wrap %s is no longer finalized at verified momentum %d (required %d); discarding staged batch and restarting", w.Id, finalAnchor.finalityMom, reqConf)
+						rolledBack = true
+						break
+					}
+					ledgerConfirmed, staleLedger, stopLedger := node.verifyWrapConfirmedInLedger(w, finalAnchor, resignGen)
+					if stopLedger {
+						return false
+					}
+					if staleLedger {
 						staleResign = true
 						break
 					}
-					_, postConsistent, retryCheck, stopCheck := node.checkZenonAnchorConsistent(finalAnchor, false)
-					if stopCheck {
+					if !ledgerConfirmed {
+						node.logger.Debugf("staged wrap %s failed confirmed accepted WrapToken ledger verification; discarding staged batch and restarting", w.Id)
+						rolledBack = true
+						break
+					}
+				}
+				if !staleResign && !rolledBack {
+					// Revalidate anchor consistency AND the current confirmed
+					// threshold after all per-wrap ledger RPCs so a confirmed
+					// threshold increase during ledger verification cannot slip past.
+					postReqConf, postAnchor, postConsistent, postStale, postStop := node.readConfirmedWrapConfirmations(finalAnchor, false, thresholdCache, resignGen)
+					if postStop {
 						return false
 					}
-					if retryCheck {
-						if !node.workerSleep(resignRetryDelay) {
-							return false
-						}
-						continue
-					}
-					if !postConsistent {
+					if postStale {
+						staleResign = true
+					} else if !postConsistent {
 						node.logger.Debug("Zenon frontier rolled back during pre-publish confirmed-ledger verification; discarding staged batch and restarting")
 						rolledBack = true
+					} else {
+						for _, w := range stagedEligible {
+							if !wrapDefFinalizedAtMomentum(w, postAnchor.finalityMom, postReqConf) {
+								node.logger.Debugf("staged wrap %s is no longer finalized after confirmed threshold update (momentum %d, required %d); discarding staged batch and restarting", w.Id, postAnchor.finalityMom, postReqConf)
+								rolledBack = true
+								break
+							}
+						}
 					}
-					break
 				}
 			}
 		}
