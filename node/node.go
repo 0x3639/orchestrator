@@ -677,10 +677,7 @@ func (node *Node) processSignatures() {
 			if !node.workerSleep(5 * time.Second) {
 				return
 			}
-			if node.keygenInterrupted() {
-				node.logger.Info("State left keyGen before rotation; aborting rotation and restoring active participants")
-				node.discardUnusedKeyGen(keyGenResponse)
-				node.restoreActiveKeyParticipants(true)
+			if node.abortRotationIfInterrupted("State left keyGen before rotation; aborting rotation, preserving generated share, and restoring active participants") {
 				continue
 			}
 			// we save the old pubKey because we will need it
@@ -2271,24 +2268,21 @@ type rotationPlan struct {
 // for a replacement key. It checks keygenInterrupted before each RPC/signing
 // boundary and before returning so an emergency halt is never delayed by
 // starting rotation senders, and uses a shared cleanup path to restore the
-// active key and pre-keygen whitelist on any pre-submission abort or error.
+// active key and pre-keygen whitelist on any pre-submission abort or error
+// while preserving the generated threshold share on disk in case peers already
+// authorized and submitted the rotation.
 func (node *Node) prepareKeyRotation(oldKey string, keyGenResponse *keygen.Response, decompressedKeyGenPubKey string, ops rotationPrepOps) (plan *rotationPlan, ready bool) {
-	discardGenerated := false
 	defer func() {
 		if !ready {
 			if ops.setActivePubKey != nil {
 				ops.setActivePubKey(oldKey)
-			}
-			if discardGenerated {
-				node.discardUnusedKeyGen(keyGenResponse)
 			}
 			node.restoreActiveKeyParticipants(true)
 		}
 	}()
 
 	if node.keygenInterrupted() {
-		node.logger.Info("State left keyGen before rotation preparation; aborting rotation")
-		discardGenerated = true
+		node.logger.Info("State left keyGen before rotation preparation; aborting rotation and preserving generated share")
 		return nil, false
 	}
 
@@ -2301,7 +2295,6 @@ func (node *Node) prepareKeyRotation(oldKey string, keyGenResponse *keygen.Respo
 	// such a key and rejects it, while the EVM networks would accept it.
 	if accepted, errZenon := common.ZenonAcceptsDecompressedPubKey(decompressedOldKey); errZenon != nil || !accepted {
 		node.logger.Errorf("Active pubKey %s has a leading zero coordinate byte that the Zenon bridge contract cannot verify; the administrator must set the key", oldKey)
-		discardGenerated = true
 		return nil, false
 	}
 
@@ -2312,8 +2305,7 @@ func (node *Node) prepareKeyRotation(oldKey string, keyGenResponse *keygen.Respo
 		return nil, false
 	}
 	if node.keygenInterrupted() {
-		node.logger.Info("State left keyGen after nonce lookup; aborting rotation")
-		discardGenerated = true
+		node.logger.Info("State left keyGen after nonce lookup; aborting rotation and preserving generated share")
 		return nil, false
 	}
 
@@ -2338,8 +2330,7 @@ func (node *Node) prepareKeyRotation(oldKey string, keyGenResponse *keygen.Respo
 		msgsIndexes[base64.StdEncoding.EncodeToString(msg)] = idx + 1
 	}
 	if node.keygenInterrupted() {
-		node.logger.Info("State left keyGen before new-key rotation signing; aborting rotation")
-		discardGenerated = true
+		node.logger.Info("State left keyGen before new-key rotation signing; aborting rotation and preserving generated share")
 		return nil, false
 	}
 	node.logger.Debug("msg to sign after evm append: ", messagesToSign)
@@ -2371,8 +2362,7 @@ func (node *Node) prepareKeyRotation(oldKey string, keyGenResponse *keygen.Respo
 	// signing does not trigger an unnecessary old-key rotation ceremony.
 	ops.setActivePubKey(oldKey)
 	if node.keygenInterrupted() {
-		node.logger.Info("State left keyGen before old-key rotation signing; aborting rotation")
-		discardGenerated = true
+		node.logger.Info("State left keyGen before old-key rotation signing; aborting rotation and preserving generated share")
 		return nil, false
 	}
 
@@ -2400,10 +2390,10 @@ func (node *Node) prepareKeyRotation(oldKey string, keyGenResponse *keygen.Respo
 
 	// Final check before launching rotation transaction senders so an emergency
 	// raised during old-key signing is handled immediately without waiting on
-	// rotation submission.
+	// rotation submission. Preserve the generated share on disk because peers
+	// may already hold both rotation signatures and submit the key change.
 	if node.keygenInterrupted() {
-		node.logger.Info("State left keyGen before submitting rotation transactions; aborting rotation")
-		discardGenerated = true
+		node.logger.Info("State left keyGen before submitting rotation transactions; aborting submission and preserving generated share")
 		return nil, false
 	}
 
@@ -2425,6 +2415,20 @@ func (node *Node) keygenInterrupted() bool {
 	}
 	state, err := node.state.GetState()
 	return err == nil && state != common.KeyGenState
+}
+
+// abortRotationIfInterrupted checks whether the node has left KeyGenState (or
+// entered an emergency halt) after key generation completed. When interrupted,
+// it restores the active key's participants and prunes temporary keygen
+// candidates from the whitelist while preserving any generated threshold share
+// file on disk in case other peers already activate the key on-chain.
+func (node *Node) abortRotationIfInterrupted(reason string) bool {
+	if !node.keygenInterrupted() {
+		return false
+	}
+	node.logger.Info(reason)
+	node.restoreActiveKeyParticipants(true)
+	return true
 }
 
 func (node *Node) discardUnusedKeyGen(resp *keygen.Response) {
@@ -2480,11 +2484,9 @@ func (node *Node) runKeyGenLoop(keyGenThresholdFn func() uint32, keyGenFn func()
 		keyGenResponse, err := keyGenFn()
 		// Recheck state immediately after KeyGen returns so an emergency halt
 		// or AllowKeyGen cancellation that arrived during the ceremony is never
-		// bypassed by entering rotation.
-		if node.keygenInterrupted() {
-			node.logger.Info("State left keyGen during ceremony; discarding keygen result and restoring active participants")
-			node.discardUnusedKeyGen(keyGenResponse)
-			node.restoreActiveKeyParticipants(true)
+		// bypassed by entering rotation. Preserve any generated threshold share
+		// on disk in case other committee members already activate it on-chain.
+		if node.abortRotationIfInterrupted("State left keyGen during ceremony; restoring active participants and preserving generated share") {
 			return nil
 		}
 		if err != nil {

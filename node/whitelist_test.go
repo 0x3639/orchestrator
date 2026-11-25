@@ -433,8 +433,8 @@ func TestKeyGenInterruptedByEmergencyAbortsRotationAndRestoresActiveSet(t *testi
 	if resp != nil {
 		t.Fatalf("expected interrupted keygen to abort rotation and return nil, got %+v", resp)
 	}
-	if _, err := os.Stat(generatedKeyFile); !os.IsNotExist(err) {
-		t.Fatalf("expected unused generated key file to be removed, stat err=%v", err)
+	if _, err := os.Stat(generatedKeyFile); err != nil {
+		t.Fatalf("expected generated threshold share preserved on disk for chain reconciliation, stat err=%v", err)
 	}
 	if !slices.Equal(n.config.TssConfig.LocalPubKeys, initialKeys) || !slices.Equal(updater.GetLocalPubKeys(), initialKeys) {
 		t.Fatalf("expected active LocalPubKeys restored: config=%v tss=%v", n.config.TssConfig.LocalPubKeys, updater.GetLocalPubKeys())
@@ -652,13 +652,13 @@ func TestPrepareKeyRotationAbortsOnEmergencyAndCleansUpPreSubmissionFailures(t *
 		if signCalls != 1 {
 			t.Fatalf("expected old-key signing to be skipped after emergency, signCalls=%d", signCalls)
 		}
-		if _, err := os.Stat(genFile); !os.IsNotExist(err) {
-			t.Fatalf("expected unused generated key file removed, stat err=%v", err)
+		if _, err := os.Stat(genFile); err != nil {
+			t.Fatalf("expected generated threshold share preserved on disk, stat err=%v", err)
 		}
 		assertCleanedUp(t, n, updater, selfID, activeB, activeC, tempD, *activePubKey)
 	})
 
-	t.Run("emergency during old-key signing aborts before sender dispatch", func(t *testing.T) {
+	t.Run("emergency during old-key signing aborts before sender dispatch and preserves share", func(t *testing.T) {
 		n, updater, state, selfID, activeB, activeC, tempD, genFile, activePubKey := newFixture(t)
 		signCalls := 0
 		plan, ok := n.prepareKeyRotation(oldKey, &keygen.Response{PubKey: newKey, Status: tcommon.Success}, decompressedNew, rotationPrepOps{
@@ -686,8 +686,32 @@ func TestPrepareKeyRotationAbortsOnEmergencyAndCleansUpPreSubmissionFailures(t *
 		if signCalls != 2 {
 			t.Fatalf("expected both signing calls before final abort, signCalls=%d", signCalls)
 		}
-		if _, err := os.Stat(genFile); !os.IsNotExist(err) {
-			t.Fatalf("expected unused generated key file removed, stat err=%v", err)
+		if _, err := os.Stat(genFile); err != nil {
+			t.Fatalf("expected generated threshold share preserved on disk after old-key signing, stat err=%v", err)
+		}
+		assertCleanedUp(t, n, updater, selfID, activeB, activeC, tempD, *activePubKey)
+	})
+
+	t.Run("emergency after successful keygen and before rotation prep preserves share and restores active whitelist", func(t *testing.T) {
+		n, updater, state, selfID, activeB, activeC, tempD, genFile, activePubKey := newFixture(t)
+		resp := n.runKeyGenLoop(
+			func() uint32 { return 3 },
+			func() (*keygen.Response, error) {
+				return &keygen.Response{PubKey: newKey, Status: tcommon.Success}, nil
+			},
+		)
+		if resp == nil || resp.PubKey != newKey {
+			t.Fatalf("expected successful keygen response before interruption, got %+v", resp)
+		}
+		// Emergency arrives during the post-keygen window before prepareKeyRotation runs.
+		if err := state.SetState(common.EmergencyState); err != nil {
+			t.Fatalf("SetState(EmergencyState): %v", err)
+		}
+		if !n.abortRotationIfInterrupted("State left keyGen before rotation") {
+			t.Fatalf("expected post-keygen interruption guard to abort rotation")
+		}
+		if _, err := os.Stat(genFile); err != nil {
+			t.Fatalf("expected generated threshold share preserved on disk after post-keygen abort, stat err=%v", err)
 		}
 		assertCleanedUp(t, n, updater, selfID, activeB, activeC, tempD, *activePubKey)
 	})

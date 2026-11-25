@@ -298,6 +298,7 @@ jobs:
         run: |
           python3 - <<'PY'
           from functools import lru_cache
+          import hashlib
           import json
           import os
           import re
@@ -594,39 +595,71 @@ jobs:
               draft_id = draft["id"]
               print(f"Created draft release {draft_id} for {release_tag} at {commit_sha}")
 
-          # 4. Upload all required assets to the draft, replacing any partial asset from an earlier attempt of the same commit.
-          existing_assets = {a["name"]: a for a in draft.get("assets", [])}
+          # 4. Remove any pre-existing assets on a resumed draft (including any
+          #    unexpected extra files), then upload the exact expected asset set
+          #    and record expected byte sizes and SHA-256 digests.
+          for stale in draft.get("assets", []):
+              asset_id = stale["id"]
+              del_status, del_data = api_req("DELETE", f"{api_base}/releases/assets/{asset_id}")
+              if del_status != 204:
+                  raise RuntimeError(
+                      f"failed to remove stale draft asset {stale.get('name')} ({asset_id}): HTTP {del_status}: {del_data}"
+                  )
           expected_sizes = {}
+          expected_digests = {}
           for fname in expected_files:
               fpath = os.path.join("build", fname)
               payload = open(fpath, "rb").read()
               expected_sizes[fname] = len(payload)
-              if fname in existing_assets:
-                  asset_id = existing_assets[fname]["id"]
-                  del_status, del_data = api_req("DELETE", f"{api_base}/releases/assets/{asset_id}")
-                  if del_status != 204:
-                      raise RuntimeError(f"failed to remove stale draft asset {fname} ({asset_id}): HTTP {del_status}: {del_data}")
+              expected_digests[fname] = f"sha256:{hashlib.sha256(payload).hexdigest()}"
               up_url = f"{upload_base}/releases/{draft_id}/assets?name={urllib.parse.quote(fname)}"
               up_status, up_data = api_req("POST", up_url, body=payload, content_type="application/octet-stream")
               if up_status != 201:
                   raise RuntimeError(f"failed to upload {fname} to draft {draft_id}: HTTP {up_status}: {up_data}")
-              print(f"Uploaded {fname} ({len(payload)} bytes) to draft {draft_id}")
+              print(f"Uploaded {fname} ({len(payload)} bytes, {expected_digests[fname]}) to draft {draft_id}")
 
-          # 5. Verify draft metadata and all expected assets before touching the git tag or publishing.
+          def verify_release_assets(release_obj, label):
+              raw_assets = release_obj.get("assets") or []
+              attached = {}
+              for asset in raw_assets:
+                  name = asset.get("name")
+                  if name in attached:
+                      raise RuntimeError(f"{label} contains duplicate asset name {name!r}")
+                  attached[name] = asset
+              if set(attached.keys()) != set(expected_files):
+                  raise RuntimeError(
+                      f"{label} asset set mismatch: got {sorted(attached.keys())}, want {sorted(expected_files)}"
+                  )
+              for fname in expected_files:
+                  asset = attached[fname]
+                  want_size = expected_sizes[fname]
+                  want_digest = expected_digests[fname]
+                  if (
+                      asset.get("state") != "uploaded"
+                      or asset.get("size") != want_size
+                      or asset.get("digest") != want_digest
+                  ):
+                      raise RuntimeError(
+                          f"{label} asset verification failed for {fname}: "
+                          f"got state={asset.get('state')!r} size={asset.get('size')!r} digest={asset.get('digest')!r}, "
+                          f"want state='uploaded' size={want_size} digest={want_digest!r}"
+                      )
+
+          # 5. Verify draft metadata and exact asset set + SHA-256 digests before touching the git tag or publishing.
           status, verified = api_req("GET", f"{api_base}/releases/{draft_id}")
           if status != 200:
               raise RuntimeError(f"failed to re-read draft {draft_id}: HTTP {status}: {verified}")
           if not verified.get("draft"):
               raise RuntimeError(f"release {draft_id} is unexpectedly already published")
+          if verified.get("tag_name") != release_tag:
+              raise RuntimeError(
+                  f"draft {draft_id} tag_name={verified.get('tag_name')!r} != {release_tag!r}"
+              )
           if verified.get("target_commitish") != commit_sha:
               raise RuntimeError(
                   f"draft {draft_id} target_commitish={verified.get('target_commitish')} != {commit_sha}"
               )
-          attached = {a["name"]: a for a in verified.get("assets", [])}
-          for fname, want_size in expected_sizes.items():
-              asset = attached.get(fname)
-              if not asset or asset.get("state") != "uploaded" or asset.get("size") != want_size:
-                  raise RuntimeError(f"draft asset verification failed for {fname}: got {asset}, want size {want_size}")
+          verify_release_assets(verified, f"draft {draft_id}")
 
           # 6. Require BOTH GitHub Immutable Releases (so published release assets
           #    and metadata cannot be modified) and an active bypass-free tag
@@ -641,20 +674,31 @@ jobs:
           #    mismatched tag.
           ensure_tag_points_to_commit(release_tag, commit_sha)
 
-          # 8. Atomically publish the verified draft against the protected, verified tag
-          #    and verify that GitHub marked the published release immutable.
+          # 8. Atomically publish the verified draft bound explicitly to the
+          #    protected, verified release_tag and commit_sha, and verify that
+          #    GitHub marked the published release immutable with the exact
+          #    expected tag and asset digests.
           status, pub = api_req(
               "PATCH",
               f"{api_base}/releases/{draft_id}",
-              {"draft": False, "target_commitish": commit_sha},
+              {"draft": False, "tag_name": release_tag, "target_commitish": commit_sha},
           )
           if status != 200 or pub.get("draft"):
               raise RuntimeError(f"failed to publish draft {draft_id}: HTTP {status}: {pub}")
+          if pub.get("tag_name") != release_tag:
+              raise RuntimeError(
+                  f"published release {draft_id} tag_name={pub.get('tag_name')!r} != {release_tag!r}"
+              )
+          if pub.get("target_commitish") != commit_sha:
+              raise RuntimeError(
+                  f"published release {draft_id} target_commitish={pub.get('target_commitish')!r} != {commit_sha!r}"
+              )
           if pub.get("immutable") is not True:
               raise RuntimeError(
                   f"published release {release_tag} ({draft_id}) is not immutable (immutable={pub.get('immutable')!r}); "
                   "enable GitHub Immutable Releases on this repository"
               )
+          verify_release_assets(pub, f"published release {release_tag} ({draft_id})")
 
           final_tag_sha = resolve_tag_commit(release_tag)
           if final_tag_sha != commit_sha:
