@@ -2252,6 +2252,10 @@ func (rC *znnNetwork) GetOrchestratorInfo() (*definition.OrchestratorInfo, error
 	return rC.ZnnRpc().GetOrchestratorInfo()
 }
 
+func (rC *znnNetwork) GetOrchestratorInfoContext(ctx context.Context) (*definition.OrchestratorInfo, error) {
+	return rC.ZnnRpc().GetOrchestratorInfoContext(ctx)
+}
+
 func (rC *znnNetwork) IsSynced() bool {
 	syncInfo, err := rC.ZnnRpc().GetSyncInfo()
 	if err != nil {

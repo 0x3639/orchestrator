@@ -1513,6 +1513,50 @@ func sameAccountBlockFrontier(a, b *api.AccountBlock) bool {
 	return a.Height == b.Height && a.Hash == b.Hash
 }
 
+// wrapFinalizedAtMomentum mirrors go-zenon's BridgeApi.getConfirmationsToFinality
+// on an independently verified canonical momentum height so a transient finality
+// spike that rolled back before the post-read anchor check can never be accepted.
+func wrapFinalizedAtMomentum(wrap *embedded.WrapTokenRequest, frontierHeight uint64, requiredConfirmations uint32) bool {
+	if wrap == nil || wrap.WrapTokenRequest == nil || wrap.ConfirmationsToFinality != 0 {
+		return false
+	}
+	return frontierHeight >= wrap.CreationMomentumHeight &&
+		frontierHeight-wrap.CreationMomentumHeight >= uint64(requiredConfirmations)
+}
+
+func wrapDefFinalizedAtMomentum(wrap *definition.WrapTokenRequest, frontierHeight uint64, requiredConfirmations uint32) bool {
+	if wrap == nil {
+		return false
+	}
+	return frontierHeight >= wrap.CreationMomentumHeight &&
+		frontierHeight-wrap.CreationMomentumHeight >= uint64(requiredConfirmations)
+}
+
+func (node *Node) readRequiredWrapConfirmations(resignGen uint64) (required uint32, stale, stop bool) {
+	for {
+		if node.workerStopping() {
+			return 0, false, true
+		}
+		if !node.state.IsResignGenerationCurrent(resignGen) {
+			return 0, true, false
+		}
+		ctx, cancel := context.WithTimeout(node.workers.context(), resignRPCTimeout)
+		info, err := node.networksManager.Znn().GetOrchestratorInfoContext(ctx)
+		cancel()
+		if node.workerStopping() {
+			return 0, false, true
+		}
+		if err != nil || info == nil {
+			node.logger.Debugf("failed to read orchestrator info during resign scan: %v", err)
+			if !node.workerSleep(resignRetryDelay) {
+				return 0, false, true
+			}
+			continue
+		}
+		return info.ConfirmationsToFinality, false, false
+	}
+}
+
 // maxStrictFrontierRetries bounds how many times fetchAnchoredWrapPage retries
 // a single page when the bridge account advances canonically mid-RPC. Retrying
 // once immediately rejects an isolated transient-fork page whose replacement
@@ -1655,6 +1699,7 @@ func (node *Node) verifyStraddledWraps(wraps []*embedded.WrapTokenRequest, strad
 				cur.bridgeBlock = postAnchor.bridgeBlock
 			}
 			wraps[i] = got
+			delete(straddledIDs, w.Id)
 			break
 		}
 	}
@@ -1729,36 +1774,38 @@ func (node *Node) captureReSignSnapshot(resignNetworkClass, resignChainId uint32
 		cutoffMomentum := curAnchor.cutoffMomentum
 
 		// Probe page 0 bound to a consistent bridge account block. Small tables
-		// (<= pageSize) on a non-straddling frontier complete atomically in one RPC.
-		probe, nextAnchor, probeStraddled, rolledBack, stale, stop := node.fetchAnchoredWrapPage(0, pageSize, curAnchor, resignGen)
-		if stale || stop {
-			return nil, reSignChainAnchor{}, stale, stop
-		}
-		if rolledBack {
-			node.logger.Debug("Zenon frontier rolled back during ReSignState probe; restarting snapshot")
-			if !node.workerSleep(resignRetryDelay) {
-				return nil, reSignChainAnchor{}, false, true
-			}
-			continue
-		}
-		curAnchor = nextAnchor
-		node.logger.Debugf("len(wrapRequests.List): %d, count: %d, pageIndex: 0", len(probe.List), probe.Count)
-
-		if probe.Count == 0 && probeStraddled {
-			// Confirm an empty table on a second read so a wrap added during
-			// the straddling probe cannot be skipped.
+		// (<= pageSize) and empty tables complete atomically only on a verified
+		// non-straddling bridge snapshot (preAcct == postAcct).
+		var probe *embedded.WrapTokenRequestList
+		var probeStraddled bool
+		var rolledBack bool
+		for {
+			var nextAnchor reSignChainAnchor
 			probe, nextAnchor, probeStraddled, rolledBack, stale, stop = node.fetchAnchoredWrapPage(0, pageSize, curAnchor, resignGen)
 			if stale || stop {
 				return nil, reSignChainAnchor{}, stale, stop
 			}
 			if rolledBack {
-				node.logger.Debug("Zenon frontier rolled back during ReSignState probe confirmation; restarting snapshot")
+				node.logger.Debug("Zenon frontier rolled back during ReSignState probe; restarting snapshot")
+				break
+			}
+			curAnchor = nextAnchor
+			node.logger.Debugf("len(wrapRequests.List): %d, count: %d, pageIndex: 0", len(probe.List), probe.Count)
+			if probe.Count == 0 && probeStraddled {
+				// Never accept an empty snapshot from a straddled read; wait for
+				// a verified non-straddling bridge snapshot or a non-empty page.
 				if !node.workerSleep(resignRetryDelay) {
 					return nil, reSignChainAnchor{}, false, true
 				}
 				continue
 			}
-			curAnchor = nextAnchor
+			break
+		}
+		if rolledBack {
+			if !node.workerSleep(resignRetryDelay) {
+				return nil, reSignChainAnchor{}, false, true
+			}
+			continue
 		}
 		if probe.Count == 0 {
 			return nil, curAnchor, false, false
@@ -1792,7 +1839,9 @@ func (node *Node) captureReSignSnapshot(resignNetworkClass, resignChainId uint32
 
 		// Walk contiguously from the oldest tail wrap (revIdx = 0) upward until
 		// index 0 or the first wrap with CreationMomentumHeight > cutoffMomentum
-		// confirmed on the current RPC.
+		// confirmed on a verified non-straddling bridge snapshot. Intermediate
+		// pages may straddle canonical forward bridge advances so pagination
+		// always makes progress off page 0 and adapts page size/growth.
 		maxPageSize := resignMaxPageSize
 		if maxPageSize < pageSize {
 			maxPageSize = pageSize
@@ -1805,8 +1854,6 @@ func (node *Node) captureReSignSnapshot(resignNetworkClass, resignChainId uint32
 		coveredByRevIdx := make(map[int]*embedded.WrapTokenRequest)
 		revIdxByID := make(map[types.Hash]int)
 		straddledIDs := make(map[types.Hash]struct{})
-		confirmedStraddledBoundaryRevIdx := -1
-		confirmedStraddledEndCount := -1
 		rolledBack = false
 
 		for {
@@ -1873,8 +1920,6 @@ func (node *Node) captureReSignSnapshot(resignNetworkClass, resignChainId uint32
 				clear(coveredByRevIdx)
 				clear(revIdxByID)
 				clear(straddledIDs)
-				confirmedStraddledBoundaryRevIdx = -1
-				confirmedStraddledEndCount = -1
 				doneFromTail = 0
 			}
 
@@ -1884,7 +1929,9 @@ func (node *Node) captureReSignSnapshot(resignNetworkClass, resignChainId uint32
 					coveredByRevIdx[revIdx] = wrap
 					revIdxByID[wrap.Id] = revIdx
 					if pageStraddled {
-						straddledIDs[wrap.Id] = struct{}{}
+						if wrap.CreationMomentumHeight <= cutoffMomentum {
+							straddledIDs[wrap.Id] = struct{}{}
+						}
 					} else {
 						delete(straddledIDs, wrap.Id)
 					}
@@ -1893,31 +1940,20 @@ func (node *Node) captureReSignSnapshot(resignNetworkClass, resignChainId uint32
 
 			r := 0
 			done := false
+			needBoundaryRetry := false
 			for {
 				wrap, ok := coveredByRevIdx[r]
 				if !ok {
 					break
 				}
 				if wrap.CreationMomentumHeight > cutoffMomentum {
-					// Only accept the > cutoffMomentum boundary at revIdx == r if it
-					// was observed on THIS RPC call. An earlier cached boundary row
-					// could be stale if a delayed receive took revIdx == r while an
-					// earlier gap was being filled. If the boundary page itself
-					// straddled a forward bridge advance, confirm it once more.
-					if len(wrapRequests.List) > 0 && r >= pageMinRevIdx && r <= pageMaxRevIdx {
-						if !pageStraddled || confirmedStraddledBoundaryRevIdx == r {
-							done = true
-						} else {
-							confirmedStraddledBoundaryRevIdx = r
-							for k, w := range coveredByRevIdx {
-								if k >= r {
-									delete(revIdxByID, w.Id)
-									delete(coveredByRevIdx, k)
-								}
-							}
-						}
+					// Accept the > cutoffMomentum boundary at revIdx == r only
+					// when observed on THIS RPC call tied to a verified
+					// non-straddling bridge snapshot (!pageStraddled).
+					if len(wrapRequests.List) > 0 && r >= pageMinRevIdx && r <= pageMaxRevIdx && !pageStraddled {
+						done = true
 					} else {
-						confirmedStraddledBoundaryRevIdx = -1
+						needBoundaryRetry = len(wrapRequests.List) > 0 && r >= pageMinRevIdx && r <= pageMaxRevIdx && pageStraddled
 						for k, w := range coveredByRevIdx {
 							if k >= r {
 								delete(revIdxByID, w.Id)
@@ -1930,39 +1966,57 @@ func (node *Node) captureReSignSnapshot(resignNetworkClass, resignChainId uint32
 				r++
 			}
 			if !done && r == actualCount {
-				// Contiguously covered all actualCount distinct wraps at the current Count.
-				if !pageStraddled || confirmedStraddledEndCount == actualCount {
+				// Accept full-table coverage only on a verified non-straddling
+				// bridge snapshot so a straddled read cannot omit a canonical wrap.
+				if !pageStraddled {
 					done = true
 				} else {
-					confirmedStraddledEndCount = actualCount
+					needBoundaryRetry = true
 				}
 			} else if !done && r > actualCount {
 				clear(coveredByRevIdx)
 				clear(revIdxByID)
 				clear(straddledIDs)
-				confirmedStraddledBoundaryRevIdx = -1
-				confirmedStraddledEndCount = -1
 				r = 0
 			}
-			if done {
+
+			if (done || needBoundaryRetry) && len(straddledIDs) > 0 && r > 0 {
 				collected := make([]*embedded.WrapTokenRequest, r)
 				for k := 0; k < r; k++ {
 					collected[k] = coveredByRevIdx[k]
 				}
-				if len(straddledIDs) > 0 {
-					verifiedAnchor, verified, staleVerify, stopVerify := node.verifyStraddledWraps(collected, straddledIDs, curAnchor, resignGen)
-					if staleVerify || stopVerify {
-						return nil, reSignChainAnchor{}, staleVerify, stopVerify
-					}
-					if !verified {
-						node.logger.Debug("Straddled wrap failed canonical ID verification during ReSignState scan; restarting snapshot")
-						rolledBack = true
-						break
-					}
-					curAnchor = verifiedAnchor
+				boundaryBlock := curAnchor.bridgeBlock
+				verifiedAnchor, verified, staleVerify, stopVerify := node.verifyStraddledWraps(collected, straddledIDs, curAnchor, resignGen)
+				if staleVerify || stopVerify {
+					return nil, reSignChainAnchor{}, staleVerify, stopVerify
 				}
-				for _, wrap := range collected {
-					recordWrap(wrap)
+				if !verified {
+					node.logger.Debug("Straddled wrap failed canonical ID verification during ReSignState scan; restarting snapshot")
+					rolledBack = true
+					break
+				}
+				for k := 0; k < r; k++ {
+					coveredByRevIdx[k] = collected[k]
+				}
+				curAnchor = verifiedAnchor
+				// If the bridge advanced during by-ID verification, re-confirm
+				// the boundary on a non-straddling snapshot >= verifiedAnchor so
+				// C ⊆ S_final and |C| == |S_final| both hold on the same snapshot.
+				if done && !sameAccountBlockFrontier(boundaryBlock, verifiedAnchor.bridgeBlock) {
+					done = false
+					needBoundaryRetry = true
+					for k, w := range coveredByRevIdx {
+						if k >= r {
+							delete(revIdxByID, w.Id)
+							delete(coveredByRevIdx, k)
+						}
+					}
+				}
+			}
+
+			if done {
+				for k := 0; k < r; k++ {
+					recordWrap(coveredByRevIdx[k])
 				}
 				snapshot := make([]*embedded.WrapTokenRequest, 0, len(snapshotOrder))
 				for _, id := range snapshotOrder {
@@ -1986,6 +2040,11 @@ func (node *Node) captureReSignSnapshot(resignNetworkClass, resignChainId uint32
 				// cap) cannot phase-lock the estimator.
 				if stalledReads&(stalledReads-1) == 0 {
 					estGrowth = actualDelta
+				}
+				if needBoundaryRetry {
+					if !node.workerSleep(resignRetryDelay) {
+						return nil, reSignChainAnchor{}, false, true
+					}
 				}
 			}
 		}
@@ -2033,6 +2092,15 @@ func (node *Node) runReSignScan() bool {
 			stagedEligible = append(stagedEligible, wrap)
 		}
 
+		requiredConfirmations, staleInfo, stopInfo := node.readRequiredWrapConfirmations(resignGen)
+		if stopInfo {
+			return false
+		}
+		if staleInfo {
+			node.logger.Debug("ReSignState target or state changed during scan; discarding staged resign batch")
+			return true
+		}
+
 		for _, wrap := range snapshot {
 			if node.workerStopping() {
 				return false
@@ -2041,7 +2109,7 @@ func (node *Node) runReSignScan() bool {
 				staleResign = true
 				break
 			}
-			if wrap.ConfirmationsToFinality != 0 {
+			if !wrapFinalizedAtMomentum(wrap, anchor.finalityMom, requiredConfirmations) {
 				deferredUnfinalized[wrap.Id] = struct{}{}
 				continue
 			}
@@ -2062,7 +2130,8 @@ func (node *Node) runReSignScan() bool {
 
 		// Retry only the wraps captured in this scan's snapshot: wraps that were
 		// unfinalized when the snapshot was taken (resolved directly by ID with
-		// finality preserved) and wraps whose eligibility lookup transiently failed.
+		// finality independently verified on the canonical momentum) and wraps
+		// whose eligibility lookup transiently failed.
 		rolledBack := false
 		for !staleResign && !rolledBack && (len(deferredUnfinalized) > 0 || len(retryEligibility) > 0) {
 			if node.workerStopping() {
@@ -2155,8 +2224,17 @@ func (node *Node) runReSignScan() bool {
 					continue
 				}
 				// Verify the chain view that established finality survived the
-				// by-ID read and advance anchor.finalityMom/finalityHash so the
-				// pre-publish check rejects any later rollback below it.
+				// by-ID read AND independently verify finality on postAnchor's
+				// canonical momentum height so a transient finality spike that
+				// rolled back before postAnchor cannot be accepted.
+				reqConf, staleConf, stopConf := node.readRequiredWrapConfirmations(resignGen)
+				if stopConf {
+					return false
+				}
+				if staleConf {
+					staleResign = true
+					break
+				}
 				postAnchor, consistent, retryCheck, stopCheck := node.checkZenonAnchorConsistent(preAnchor, true)
 				if stopCheck {
 					return false
@@ -2168,6 +2246,11 @@ func (node *Node) runReSignScan() bool {
 					node.logger.Debug("Zenon frontier rolled back while confirming deferred wrap finality; discarding staged batch and restarting")
 					rolledBack = true
 					break
+				}
+				if !wrapFinalizedAtMomentum(wrap, postAnchor.finalityMom, reqConf) {
+					node.logger.Debugf("deferred wrap %s reported finality from a view above verified momentum %d; keeping deferred", id, postAnchor.finalityMom)
+					anchor.bridgeBlock = postAnchor.bridgeBlock
+					continue
 				}
 				anchor = postAnchor
 				delete(deferredUnfinalized, id)
@@ -2198,9 +2281,8 @@ func (node *Node) runReSignScan() bool {
 			continue
 		}
 
-		// Revalidate the snapshot and finality anchor before publishing any
-		// staged flags so a Zenon rollback during finality or EVM eligibility
-		// retries discards the stale batch and restarts on the canonical chain.
+		// Revalidate the snapshot and finality anchor (plus current finality
+		// threshold for every staged wrap) before publishing any staged flags.
 		for {
 			if node.workerStopping() {
 				return false
@@ -2209,7 +2291,15 @@ func (node *Node) runReSignScan() bool {
 				staleResign = true
 				break
 			}
-			_, consistent, retryCheck, stopCheck := node.checkZenonAnchorConsistent(anchor, false)
+			reqConf, staleConf, stopConf := node.readRequiredWrapConfirmations(resignGen)
+			if stopConf {
+				return false
+			}
+			if staleConf {
+				staleResign = true
+				break
+			}
+			finalAnchor, consistent, retryCheck, stopCheck := node.checkZenonAnchorConsistent(anchor, false)
 			if stopCheck {
 				return false
 			}
@@ -2222,6 +2312,14 @@ func (node *Node) runReSignScan() bool {
 			if !consistent {
 				node.logger.Debug("Zenon frontier rolled back before publishing resign batch; discarding staged batch and restarting")
 				rolledBack = true
+				break
+			}
+			for _, w := range stagedEligible {
+				if !wrapDefFinalizedAtMomentum(w, finalAnchor.finalityMom, reqConf) {
+					node.logger.Debugf("staged wrap %s is no longer finalized at verified momentum %d; discarding staged batch and restarting", w.Id, finalAnchor.finalityMom)
+					rolledBack = true
+					break
+				}
 			}
 			break
 		}

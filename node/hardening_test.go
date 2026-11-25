@@ -38,6 +38,7 @@ import (
 	dbmanager "orchestrator/db/manager"
 	"orchestrator/health/snapshot"
 	"orchestrator/network"
+	"orchestrator/tss"
 )
 
 func generateTestSigningKey(t *testing.T) (*ecdsa.PrivateKey, string) {
@@ -458,6 +459,7 @@ type wrapTestBridge struct {
 	frontierMomCalls atomic.Int32
 	frontierMomFn    func(ctx context.Context, call int32) (*api.Momentum, error)
 	momByHeightFn    func(ctx context.Context, height uint64) (*api.MomentumList, error)
+	orchInfo         *definition.OrchestratorInfo
 }
 
 type wrapTestLedger struct {
@@ -540,6 +542,9 @@ func (b *wrapTestBridge) GetSecurityInfo() *definition.SecurityInfoVariable {
 }
 
 func (b *wrapTestBridge) GetOrchestratorInfo() *definition.OrchestratorInfo {
+	if b.orchInfo != nil {
+		return b.orchInfo
+	}
 	return &definition.OrchestratorInfo{WindowSize: 10, KeyGenThreshold: 1, ConfirmationsToFinality: 1, EstimatedMomentumTime: 1}
 }
 
@@ -651,6 +656,7 @@ func wrapTestNodeWithEvm(t *testing.T, state uint8, bridge *wrapTestBridge, evmU
 		logger:          zap.NewNop().Sugar(),
 		networksManager: networks,
 		dbManager:       stores,
+		tssManager:      &tss.TssManager{},
 		stopChan:        stop,
 		config:          &oconfig.Config{},
 	}
@@ -1505,7 +1511,10 @@ func TestReSignStateRetriesFailedFrontierRPCWithoutSkippingVisibleWrap(t *testin
 			if call == 1 {
 				return nil, errors.New("transient frontier rpc failure")
 			}
-			return testMomentum(100), nil
+			if call == 2 {
+				return testMomentum(100), nil
+			}
+			return testMomentum(101), nil
 		},
 	}
 
@@ -1616,8 +1625,11 @@ func TestReSignStateCapturesSameCutoffHeightArrivalBeforePassedOffset(t *testing
 				ContractAddress: "0x0000000000000000000000000000000000000001",
 			}},
 		},
-		frontierMomFn: func(_ context.Context, _ int32) (*api.Momentum, error) {
-			return testMomentum(100), nil
+		frontierMomFn: func(_ context.Context, call int32) (*api.Momentum, error) {
+			if call == 1 {
+				return testMomentum(100), nil
+			}
+			return testMomentum(101), nil
 		},
 		pageHandler: func(pageIndex, pageSize uint32, call int32) *embedded.WrapTokenRequestList {
 			tableMu.Lock()
@@ -1714,8 +1726,11 @@ func TestReSignStateTerminatesUnderSustainedArrivalsExceedingPageSize(t *testing
 						ContractAddress: "0x0000000000000000000000000000000000000001",
 					}},
 				},
-				frontierMomFn: func(_ context.Context, _ int32) (*api.Momentum, error) {
-					return testMomentum(100), nil
+				frontierMomFn: func(_ context.Context, call int32) (*api.Momentum, error) {
+					if call == 1 {
+						return testMomentum(100), nil
+					}
+					return testMomentum(101), nil
 				},
 				pageHandler: func(pageIndex, pageSize uint32, call int32) *embedded.WrapTokenRequestList {
 					tableMu.Lock()
@@ -1921,8 +1936,11 @@ func TestReSignStateTerminatesUnderAlternatingBurstsAtMaxPageSize(t *testing.T) 
 				ContractAddress: "0x0000000000000000000000000000000000000001",
 			}},
 		},
-		frontierMomFn: func(_ context.Context, _ int32) (*api.Momentum, error) {
-			return testMomentum(100), nil
+		frontierMomFn: func(_ context.Context, call int32) (*api.Momentum, error) {
+			if call == 1 {
+				return testMomentum(100), nil
+			}
+			return testMomentum(101), nil
 		},
 		pageHandler: func(pageIndex, pageSize uint32, call int32) *embedded.WrapTokenRequestList {
 			tableMu.Lock()
@@ -2648,6 +2666,7 @@ func TestReSignStateRejectsRollbackInvalidatingFinalityAfterAcceptance(t *testin
 	}
 
 	bridge := &wrapTestBridge{
+		orchInfo: &definition.OrchestratorInfo{WindowSize: 10, KeyGenThreshold: 1, ConfirmationsToFinality: 20, EstimatedMomentumTime: 1},
 		networks: &embedded.NetworkInfoList{
 			Count: 1,
 			List: []*definition.NetworkInfo{{
@@ -2747,6 +2766,100 @@ func TestReSignStateRejectsRollbackInvalidatingFinalityAfterAcceptance(t *testin
 	})
 }
 
+func TestReSignStateRejectsTransientFinalitySpikeRolledBackBeforePostCheck(t *testing.T) {
+	prevDelay := resignRetryDelay
+	resignRetryDelay = 20 * time.Millisecond
+	t.Cleanup(func() { resignRetryDelay = prevDelay })
+
+	evmSrv := fakeEvmRpcServer(t)
+	defer evmSrv.Close()
+
+	// Exact regression for Round 12 Finding 1:
+	// - OrchestratorInfo requires 20 confirmations to finality; wrap W has
+	//   CreationMomentumHeight = 99.
+	// - Both pre-read and post-read anchor checks see the SAME earlier momentum
+	//   105 (105 - 99 = 6 < 20).
+	// - During the by-ID RPC itself, Zenon transiently spiked to 119, returned
+	//   ConfirmationsToFinality = 0, and rolled back to 105 before the post-read
+	//   check ran.
+	// - Independent finality verification against verified momentum 105 must
+	//   keep W deferred (never staging/marking W or entering LiveState) until
+	//   momentum genuinely reaches 119 canonically.
+	wrapID := types.Hash{0x62}
+	var canonicalMom atomic.Uint64
+	canonicalMom.Store(105)
+	var byIDCalls atomic.Int32
+
+	makeWrap := func(confs uint64) *embedded.WrapTokenRequest {
+		return &embedded.WrapTokenRequest{
+			WrapTokenRequest: &definition.WrapTokenRequest{
+				NetworkClass: definition.EvmClass, ChainId: 1, Id: wrapID,
+				Amount: big.NewInt(10), Fee: big.NewInt(1), CreationMomentumHeight: 99,
+			},
+			ConfirmationsToFinality: confs,
+		}
+	}
+
+	bridge := &wrapTestBridge{
+		orchInfo: &definition.OrchestratorInfo{WindowSize: 10, KeyGenThreshold: 1, ConfirmationsToFinality: 20, EstimatedMomentumTime: 1},
+		networks: &embedded.NetworkInfoList{
+			Count: 1,
+			List: []*definition.NetworkInfo{{
+				NetworkClass: definition.EvmClass, Id: 1, Name: "Ethereum",
+				ContractAddress: "0x0000000000000000000000000000000000000001",
+			}},
+		},
+		frontierMomFn: func(_ context.Context, _ int32) (*api.Momentum, error) {
+			return testMomentum(canonicalMom.Load()), nil
+		},
+		pageHandler: func(pageIndex, pageSize uint32, _ int32) *embedded.WrapTokenRequestList {
+			return paginateZenonWraps([]*embedded.WrapTokenRequest{makeWrap(14)}, pageIndex, pageSize)
+		},
+		byIDHandler: func(_ context.Context, id types.Hash, call int32) (*embedded.WrapTokenRequest, error) {
+			if id != wrapID {
+				return nil, constants.ErrDataNonExistent
+			}
+			byIDCalls.Add(1)
+			// Return ConfirmationsToFinality = 0 on call 1 and 2 while the
+			// verified canonical momentum before AND after the RPC stays 105!
+			return makeWrap(0), nil
+		},
+	}
+
+	n := wrapTestNodeWithEvm(t, common.LiveState, bridge, map[string]string{"Ethereum": evmSrv.URL})
+	if activated, err := n.state.ActivateResign(definition.EvmClass, 1); err != nil || !activated {
+		t.Fatalf("ActivateResign failed: activated=%v err=%v", activated, err)
+	}
+	n.state.CompleteStartup()
+
+	n.workers.start(n.processSignatures)
+	t.Cleanup(func() {
+		done := n.workers.shutdown()
+		<-done
+	})
+
+	// Wait through multiple by-ID polls returning ConfirmationsToFinality = 0
+	// while verified momentum remains 105.
+	eventually(t, "worker to poll deferred wrap multiple times at momentum 105", func() bool {
+		return byIDCalls.Load() >= 3
+	})
+	if st, _ := n.state.GetState(); st != common.ReSignState {
+		t.Fatalf("state after transient finality spike = %d, want ReSignState (%d)", st, common.ReSignState)
+	}
+	if resign, err := n.dbManager.ZnnStorage().GetResignStatus(wrapID); err != nil || resign {
+		t.Fatalf("wrap finalized only on rolled-back spike must not be marked: resign=%v err=%v", resign, err)
+	}
+
+	// Now advance canonical momentum to 119 (119 - 99 = 20 >= 20): wrap becomes
+	// genuinely finalized on the verified chain view and completes cleanly.
+	canonicalMom.Store(119)
+	eventually(t, "ReSignState to mark wrap and enter LiveState once verified momentum reaches 119", func() bool {
+		st, _ := n.state.GetState()
+		r, err := n.dbManager.ZnnStorage().GetResignStatus(wrapID)
+		return err == nil && r && st == common.LiveState
+	})
+}
+
 func TestReSignStateProgressesUnderContinuousForwardBridgeActivity(t *testing.T) {
 	makeEntry := func(chainID uint32, id types.Hash, height uint64) *embedded.WrapTokenRequest {
 		return &embedded.WrapTokenRequest{
@@ -2758,7 +2871,7 @@ func TestReSignStateProgressesUnderContinuousForwardBridgeActivity(t *testing.T)
 		}
 	}
 
-	t.Run("unchanged wrap table with canonical bridge advance on every page read", func(t *testing.T) {
+	t.Run("unchanged wrap table progresses through intermediate advances then completes on verified boundary", func(t *testing.T) {
 		prevDelay := resignRetryDelay
 		prevPageSize := resignPageSize
 		resignRetryDelay = 20 * time.Millisecond
@@ -2793,6 +2906,9 @@ func TestReSignStateProgressesUnderContinuousForwardBridgeActivity(t *testing.T)
 		bridgeHeight.Store(10)
 		var momHeight atomic.Uint64
 		momHeight.Store(100)
+		var sawTailPageWhileAdvancing atomic.Bool
+		var advancing atomic.Bool
+		advancing.Store(true)
 
 		bridge := &wrapTestBridge{
 			networks: &embedded.NetworkInfoList{
@@ -2810,11 +2926,20 @@ func TestReSignStateProgressesUnderContinuousForwardBridgeActivity(t *testing.T)
 				h := bridgeHeight.Load()
 				return testAccountBlock(h, types.Hash{0xaa, byte(h >> 8), byte(h)}), nil
 			},
-			pageHandler: func(pageIndex, pageSize uint32, _ int32) *embedded.WrapTokenRequestList {
-				// Advance the canonical bridge account (and momentum) during
-				// EVERY single page read while keeping the wrap table unchanged.
-				bridgeHeight.Add(1)
-				momHeight.Add(1)
+			pageHandler: func(pageIndex, pageSize uint32, call int32) *embedded.WrapTokenRequestList {
+				// Advance the canonical bridge account on EVERY intermediate
+				// page read (probe page 0 and tail pages) so pagination MUST
+				// leave page 0 under forward growth; settle after call 8 so the
+				// terminating boundary is tied to a verified bridge snapshot.
+				if call <= 8 {
+					bridgeHeight.Add(1)
+					momHeight.Add(1)
+					if pageIndex > 0 {
+						sawTailPageWhileAdvancing.Store(true)
+					}
+				} else {
+					advancing.Store(false)
+				}
 				return paginateZenonWraps(table, pageIndex, pageSize)
 			},
 		}
@@ -2831,7 +2956,7 @@ func TestReSignStateProgressesUnderContinuousForwardBridgeActivity(t *testing.T)
 			<-done
 		})
 
-		eventually(t, "ReSignState to finish multi-page scan despite canonical bridge advance on every page read", func() bool {
+		eventually(t, "ReSignState to traverse tail pages under forward advances and finish on verified boundary", func() bool {
 			st, _ := n.state.GetState()
 			for _, id := range []types.Hash{w1, w2, w3, w4, w5} {
 				r, err := n.dbManager.ZnnStorage().GetResignStatus(id)
@@ -2841,12 +2966,122 @@ func TestReSignStateProgressesUnderContinuousForwardBridgeActivity(t *testing.T)
 			}
 			return st == common.LiveState
 		})
+		if !sawTailPageWhileAdvancing.Load() {
+			t.Fatal("pagination stayed stuck on page 0 while bridge account was advancing forward")
+		}
 		if pages := bridge.pages.Load(); pages > 50 {
 			t.Fatalf("expected bounded page reads under forward bridge activity, got %d", pages)
 		}
 	})
 
-	t.Run("sustained wrap arrivals with canonical bridge advance on every page read", func(t *testing.T) {
+	t.Run("rejects repeated straddled boundary omitting canonical wrap until verified boundary captures it", func(t *testing.T) {
+		prevDelay := resignRetryDelay
+		prevPageSize := resignPageSize
+		resignRetryDelay = 20 * time.Millisecond
+		resignPageSize = 2
+		t.Cleanup(func() {
+			resignRetryDelay = prevDelay
+			resignPageSize = prevPageSize
+		})
+
+		evmSrv := fakeEvmRpcServer(t)
+		defer evmSrv.Close()
+
+		// Exact regression for Round 12 Finding 2:
+		// Canonical bridge table has [ f1(101), w2(99), w1(99), missingWrap(98) ].
+		// Two consecutive straddled boundary reads (preAcct != postAcct) BOTH
+		// return the truncated/stale view [ f1(101), w2(99), w1(99) ] (omitting
+		// missingWrap) while all collected rows (w2, w1) DO exist by ID!
+		// The scanner must refuse to terminate on straddled boundary reads and
+		// wait for a verified non-straddling boundary read, which exposes and
+		// marks missingWrap before returning to LiveState.
+		f1 := types.Hash{0xf7}
+		w2 := types.Hash{0x7a}
+		w1 := types.Hash{0x7b}
+		missingWrap := types.Hash{0x7c}
+
+		incompleteView := []*embedded.WrapTokenRequest{
+			makeEntry(1, f1, 101),
+			makeEntry(1, w2, 99),
+			makeEntry(1, w1, 99),
+		}
+		canonicalView := []*embedded.WrapTokenRequest{
+			makeEntry(1, f1, 101),
+			makeEntry(1, w2, 99),
+			makeEntry(1, w1, 99),
+			makeEntry(1, missingWrap, 98),
+		}
+		sortZenonWraps(incompleteView)
+		sortZenonWraps(canonicalView)
+		canonicalByID := make(map[types.Hash]*embedded.WrapTokenRequest, len(canonicalView))
+		for _, w := range canonicalView {
+			canonicalByID[w.Id] = w
+		}
+
+		var bridgeHeight atomic.Uint64
+		bridgeHeight.Store(10)
+		var straddledBoundaryReads atomic.Int32
+
+		bridge := &wrapTestBridge{
+			networks: &embedded.NetworkInfoList{
+				Count: 1,
+				List: []*definition.NetworkInfo{{
+					NetworkClass: definition.EvmClass, Id: 1, Name: "Ethereum",
+					ContractAddress: "0x0000000000000000000000000000000000000001",
+				}},
+			},
+			byID: canonicalByID,
+			frontierMomFn: func(_ context.Context, _ int32) (*api.Momentum, error) {
+				return testMomentum(100), nil
+			},
+			frontierFn: func(_ context.Context, _ int32) (*api.AccountBlock, error) {
+				h := bridgeHeight.Load()
+				return testAccountBlock(h, types.Hash{0xaa, byte(h >> 8), byte(h)}), nil
+			},
+			pageHandler: func(pageIndex, pageSize uint32, call int32) *embedded.WrapTokenRequestList {
+				// First 8 page calls straddle a canonical forward advance and
+				// serve incompleteView (missing missingWrap), including multiple
+				// agreeing straddled boundary reads on page 0. Starting at call 9,
+				// the bridge frontier settles and serves canonicalView.
+				if call <= 8 {
+					bridgeHeight.Add(1)
+					if pageIndex == 0 {
+						straddledBoundaryReads.Add(1)
+					}
+					return paginateZenonWraps(incompleteView, pageIndex, pageSize)
+				}
+				return paginateZenonWraps(canonicalView, pageIndex, pageSize)
+			},
+		}
+
+		n := wrapTestNodeWithEvm(t, common.LiveState, bridge, map[string]string{"Ethereum": evmSrv.URL})
+		if activated, err := n.state.ActivateResign(definition.EvmClass, 1); err != nil || !activated {
+			t.Fatalf("ActivateResign failed: activated=%v err=%v", activated, err)
+		}
+		n.state.CompleteStartup()
+
+		n.workers.start(n.processSignatures)
+		t.Cleanup(func() {
+			done := n.workers.shutdown()
+			<-done
+		})
+
+		eventually(t, "ReSignState to reject straddled boundaries and mark missingWrap on verified boundary", func() bool {
+			st, _ := n.state.GetState()
+			for _, id := range []types.Hash{w2, w1, missingWrap} {
+				r, err := n.dbManager.ZnnStorage().GetResignStatus(id)
+				if err != nil || !r {
+					return false
+				}
+			}
+			return st == common.LiveState
+		})
+		if straddledBoundaryReads.Load() < 2 {
+			t.Fatalf("expected >= 2 straddled page-0 boundary reads before canonical verification, got %d", straddledBoundaryReads.Load())
+		}
+	})
+
+	t.Run("sustained wrap arrivals with canonical bridge advances during pagination", func(t *testing.T) {
 		prevDelay := resignRetryDelay
 		prevPageSize := resignPageSize
 		resignRetryDelay = 20 * time.Millisecond
@@ -2880,6 +3115,7 @@ func TestReSignStateProgressesUnderContinuousForwardBridgeActivity(t *testing.T)
 		bridgeHeight.Store(10)
 		var momHeight atomic.Uint64
 		momHeight.Store(100)
+		var sawTailPageWhileAdvancing atomic.Bool
 
 		bridge := &wrapTestBridge{
 			networks: &embedded.NetworkInfoList{
@@ -2899,18 +3135,23 @@ func TestReSignStateProgressesUnderContinuousForwardBridgeActivity(t *testing.T)
 			pageHandler: func(pageIndex, pageSize uint32, call int32) *embedded.WrapTokenRequestList {
 				tableMu.Lock()
 				defer tableMu.Unlock()
-				bridgeHeight.Add(1)
-				if call > 1 {
-					h := momHeight.Add(1)
-					for i := 0; i < 3; i++ {
-						futureSeq++
-						id := types.Hash{0xf8, byte(futureSeq >> 8), byte(futureSeq)}
-						futureIDs = append(futureIDs, id)
-						entry := makeEntry(1, id, h)
-						table = append(table, entry)
-						byID[id] = entry
+				if call <= 12 {
+					bridgeHeight.Add(1)
+					if pageIndex > 0 {
+						sawTailPageWhileAdvancing.Store(true)
 					}
-					sortZenonWraps(table)
+					if call > 1 {
+						h := momHeight.Add(1)
+						for i := 0; i < 3; i++ {
+							futureSeq++
+							id := types.Hash{0xf8, byte(futureSeq >> 8), byte(futureSeq)}
+							futureIDs = append(futureIDs, id)
+							entry := makeEntry(1, id, h)
+							table = append(table, entry)
+							byID[id] = entry
+						}
+						sortZenonWraps(table)
+					}
 				}
 				return paginateZenonWraps(table, pageIndex, pageSize)
 			},
@@ -2946,6 +3187,9 @@ func TestReSignStateProgressesUnderContinuousForwardBridgeActivity(t *testing.T)
 			}
 			return st == common.LiveState
 		})
+		if !sawTailPageWhileAdvancing.Load() {
+			t.Fatal("pagination did not advance past page 0 during sustained arrivals")
+		}
 		tableMu.Lock()
 		createdFuture := append([]types.Hash(nil), futureIDs...)
 		tableMu.Unlock()
@@ -3014,12 +3258,14 @@ func TestReSignStateProgressesUnderContinuousForwardBridgeActivity(t *testing.T)
 				h := bridgeHeight.Load()
 				return testAccountBlock(h, types.Hash{0xaa, byte(h >> 8), byte(h)}), nil
 			},
-			pageHandler: func(pageIndex, pageSize uint32, _ int32) *embedded.WrapTokenRequestList {
-				// Continuously advance bridge frontier on EVERY page read so
-				// attempt 1 returns straddled=true; inject orphanWrap on the
-				// second call to pageIndex==1 (attempt 1 of tail page 1) so
-				// verifyStraddledWraps must detect and reject it by ID.
-				bridgeHeight.Add(1)
+			pageHandler: func(pageIndex, pageSize uint32, call int32) *embedded.WrapTokenRequestList {
+				// Advance bridge frontier through the first scan (including
+				// attempt 1 of tail page 1, which serves orphanWrap as a
+				// straddled page), then settle after the restart so the
+				// canonical boundary verifies cleanly.
+				if call <= 6 {
+					bridgeHeight.Add(1)
+				}
 				if pageIndex == 1 && page1Calls.Add(1) == 2 {
 					return paginateZenonWraps(forkPage, pageIndex, pageSize)
 				}
