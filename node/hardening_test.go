@@ -2570,6 +2570,497 @@ func TestReSignStateRevalidatesAnchorAfterFinalityAndEligibilityWaitOnRollback(t
 	})
 }
 
+func TestReSignStateRejectsRollbackInvalidatingFinalityAfterAcceptance(t *testing.T) {
+	prevDelay := resignRetryDelay
+	resignRetryDelay = 20 * time.Millisecond
+	t.Cleanup(func() { resignRetryDelay = prevDelay })
+
+	// Exact regression for Round 11 Finding 1:
+	// - Snapshot is captured at cutoff momentum 100 (H100) and bridge block B10 (0x01).
+	// - Deferred wrap W (height 99) becomes final when Zenon reaches momentum 119.
+	// - While W's EVM RedeemsInfo check runs, Zenon rolls back from momentum 119
+	//   to momentum 105 while PRESERVING cutoff 100 (H100) and bridge block B10 (0x01),
+	//   making W unfinalized again (ConfirmationsToFinality = 14).
+	// - Pre-publish revalidation must reject the invalidated finality view, keep
+	//   the node in ReSignState without persisting W's re-sign flag, and only
+	//   mark W and return to LiveState once momentum reaches 119 canonically again.
+	wrapID := types.Hash{0x61}
+	var phase atomic.Int32 // 0 = cutoff 100, 1 = finalized at 119, 2 = rolled back to 105, 3 = finalized again at 119 (v2)
+	rolledBackObserved := make(chan struct{})
+	var closeRollbackOnce sync.Once
+	var postRollbackPageCalls atomic.Int32
+
+	evmSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			JSONRPC string          `json:"jsonrpc"`
+			ID      json.RawMessage `json:"id"`
+			Method  string          `json:"method"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		w.Header().Set("Content-Type", "application/json")
+		if req.Method == "eth_call" && phase.CompareAndSwap(1, 2) {
+			// Roll back 119 -> 105 right as W's EVM eligibility check succeeds,
+			// preserving cutoff 100 and bridge block B10.
+			closeRollbackOnce.Do(func() { close(rolledBackObserved) })
+		}
+		result := "0x" + strings.Repeat("00", 64)
+		if req.Method == "eth_chainId" {
+			result = "0x1"
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"jsonrpc": "2.0",
+			"id":      req.ID,
+			"result":  result,
+		})
+	}))
+	defer evmSrv.Close()
+
+	momHashFor := func(height uint64, p int32) types.Hash {
+		// Momentum 100 hash is IDENTICAL across all phases (preserved across rollback).
+		if height <= 105 {
+			return types.Hash{0xbb, byte(height >> 8), byte(height)}
+		}
+		if p >= 3 {
+			return types.Hash{0xcc, byte(height >> 8), byte(height)}
+		}
+		return types.Hash{0xbb, byte(height >> 8), byte(height)}
+	}
+	currentMomHeight := func(p int32) uint64 {
+		switch p {
+		case 0:
+			return 100
+		case 1:
+			return 119
+		case 2:
+			return 105
+		default:
+			return 119
+		}
+	}
+	makeWrap := func(confs uint64) *embedded.WrapTokenRequest {
+		return &embedded.WrapTokenRequest{
+			WrapTokenRequest: &definition.WrapTokenRequest{
+				NetworkClass: definition.EvmClass, ChainId: 1, Id: wrapID,
+				Amount: big.NewInt(10), Fee: big.NewInt(1), CreationMomentumHeight: 99,
+			},
+			ConfirmationsToFinality: confs,
+		}
+	}
+
+	bridge := &wrapTestBridge{
+		networks: &embedded.NetworkInfoList{
+			Count: 1,
+			List: []*definition.NetworkInfo{{
+				NetworkClass: definition.EvmClass, Id: 1, Name: "Ethereum",
+				ContractAddress: "0x0000000000000000000000000000000000000001",
+			}},
+		},
+		frontierMomFn: func(_ context.Context, _ int32) (*api.Momentum, error) {
+			p := phase.Load()
+			h := currentMomHeight(p)
+			return &api.Momentum{Momentum: &nom.Momentum{Height: h, Hash: momHashFor(h, p)}}, nil
+		},
+		momByHeightFn: func(_ context.Context, height uint64) (*api.MomentumList, error) {
+			p := phase.Load()
+			if height > currentMomHeight(p) {
+				return &api.MomentumList{Count: 0, List: []*api.Momentum{}}, nil
+			}
+			return &api.MomentumList{
+				Count: 1,
+				List:  []*api.Momentum{{Momentum: &nom.Momentum{Height: height, Hash: momHashFor(height, p)}}},
+			}, nil
+		},
+		// Bridge account block B10 (0x01) stays unchanged across the rollback.
+		frontierFn: func(_ context.Context, _ int32) (*api.AccountBlock, error) {
+			return testAccountBlock(10, types.Hash{0x01}), nil
+		},
+		acctByHeightFn: func(_ context.Context, height uint64) (*api.AccountBlockList, error) {
+			return &api.AccountBlockList{
+				Count: int(height),
+				List:  []*api.AccountBlock{testAccountBlock(height, types.Hash{0x01})},
+			}, nil
+		},
+		pageHandler: func(pageIndex, pageSize uint32, _ int32) *embedded.WrapTokenRequestList {
+			p := phase.Load()
+			if p == 0 {
+				// Advance to momentum 119 after the initial snapshot sees W unfinalized.
+				phase.CompareAndSwap(0, 1)
+				return paginateZenonWraps([]*embedded.WrapTokenRequest{makeWrap(2)}, pageIndex, pageSize)
+			}
+			if p == 2 {
+				postRollbackPageCalls.Add(1)
+				return paginateZenonWraps([]*embedded.WrapTokenRequest{makeWrap(14)}, pageIndex, pageSize)
+			}
+			return paginateZenonWraps([]*embedded.WrapTokenRequest{makeWrap(0)}, pageIndex, pageSize)
+		},
+		byIDHandler: func(_ context.Context, id types.Hash, _ int32) (*embedded.WrapTokenRequest, error) {
+			if id != wrapID {
+				return nil, constants.ErrDataNonExistent
+			}
+			p := phase.Load()
+			if p == 2 {
+				return makeWrap(14), nil
+			}
+			if p == 1 || p >= 3 {
+				return makeWrap(0), nil
+			}
+			return makeWrap(2), nil
+		},
+	}
+
+	n := wrapTestNodeWithEvm(t, common.LiveState, bridge, map[string]string{"Ethereum": evmSrv.URL})
+	if activated, err := n.state.ActivateResign(definition.EvmClass, 1); err != nil || !activated {
+		t.Fatalf("ActivateResign failed: activated=%v err=%v", activated, err)
+	}
+	n.state.CompleteStartup()
+
+	n.workers.start(n.processSignatures)
+	t.Cleanup(func() {
+		done := n.workers.shutdown()
+		<-done
+	})
+
+	select {
+	case <-rolledBackObserved:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for rollback after finality acceptance")
+	}
+
+	// Wait for the worker to detect the invalidated finality view and restart
+	// scanning at momentum 105, while proving it did NOT mark W or enter LiveState.
+	eventually(t, "ReSignState to reject invalidated finality and restart scan at height 105", func() bool {
+		return postRollbackPageCalls.Load() >= 1
+	})
+	if st, _ := n.state.GetState(); st != common.ReSignState {
+		t.Fatalf("state after finality rollback = %d, want ReSignState (%d)", st, common.ReSignState)
+	}
+	if resign, err := n.dbManager.ZnnStorage().GetResignStatus(wrapID); err != nil || resign {
+		t.Fatalf("unfinalized wrap after rollback should not have been marked: resign=%v err=%v", resign, err)
+	}
+
+	// Now advance canonically to momentum 119 (v2) so W genuinely finalizes.
+	phase.Store(3)
+	eventually(t, "ReSignState to mark wrap and return to LiveState once finalized canonically", func() bool {
+		st, _ := n.state.GetState()
+		r, err := n.dbManager.ZnnStorage().GetResignStatus(wrapID)
+		return err == nil && r && st == common.LiveState
+	})
+}
+
+func TestReSignStateProgressesUnderContinuousForwardBridgeActivity(t *testing.T) {
+	makeEntry := func(chainID uint32, id types.Hash, height uint64) *embedded.WrapTokenRequest {
+		return &embedded.WrapTokenRequest{
+			WrapTokenRequest: &definition.WrapTokenRequest{
+				NetworkClass: definition.EvmClass, ChainId: chainID, Id: id,
+				Amount: big.NewInt(10), Fee: big.NewInt(1), CreationMomentumHeight: height,
+			},
+			ConfirmationsToFinality: 0,
+		}
+	}
+
+	t.Run("unchanged wrap table with canonical bridge advance on every page read", func(t *testing.T) {
+		prevDelay := resignRetryDelay
+		prevPageSize := resignPageSize
+		resignRetryDelay = 20 * time.Millisecond
+		resignPageSize = 2
+		t.Cleanup(func() {
+			resignRetryDelay = prevDelay
+			resignPageSize = prevPageSize
+		})
+
+		evmSrv := fakeEvmRpcServer(t)
+		defer evmSrv.Close()
+
+		w1 := types.Hash{0x71}
+		w2 := types.Hash{0x72}
+		w3 := types.Hash{0x73}
+		w4 := types.Hash{0x74}
+		w5 := types.Hash{0x75}
+		table := []*embedded.WrapTokenRequest{
+			makeEntry(1, w1, 99),
+			makeEntry(1, w2, 99),
+			makeEntry(1, w3, 98),
+			makeEntry(1, w4, 98),
+			makeEntry(1, w5, 97),
+		}
+		sortZenonWraps(table)
+		byID := make(map[types.Hash]*embedded.WrapTokenRequest, len(table))
+		for _, w := range table {
+			byID[w.Id] = w
+		}
+
+		var bridgeHeight atomic.Uint64
+		bridgeHeight.Store(10)
+		var momHeight atomic.Uint64
+		momHeight.Store(100)
+
+		bridge := &wrapTestBridge{
+			networks: &embedded.NetworkInfoList{
+				Count: 1,
+				List: []*definition.NetworkInfo{{
+					NetworkClass: definition.EvmClass, Id: 1, Name: "Ethereum",
+					ContractAddress: "0x0000000000000000000000000000000000000001",
+				}},
+			},
+			byID: byID,
+			frontierMomFn: func(_ context.Context, _ int32) (*api.Momentum, error) {
+				return testMomentum(momHeight.Load()), nil
+			},
+			frontierFn: func(_ context.Context, _ int32) (*api.AccountBlock, error) {
+				h := bridgeHeight.Load()
+				return testAccountBlock(h, types.Hash{0xaa, byte(h >> 8), byte(h)}), nil
+			},
+			pageHandler: func(pageIndex, pageSize uint32, _ int32) *embedded.WrapTokenRequestList {
+				// Advance the canonical bridge account (and momentum) during
+				// EVERY single page read while keeping the wrap table unchanged.
+				bridgeHeight.Add(1)
+				momHeight.Add(1)
+				return paginateZenonWraps(table, pageIndex, pageSize)
+			},
+		}
+
+		n := wrapTestNodeWithEvm(t, common.LiveState, bridge, map[string]string{"Ethereum": evmSrv.URL})
+		if activated, err := n.state.ActivateResign(definition.EvmClass, 1); err != nil || !activated {
+			t.Fatalf("ActivateResign failed: activated=%v err=%v", activated, err)
+		}
+		n.state.CompleteStartup()
+
+		n.workers.start(n.processSignatures)
+		t.Cleanup(func() {
+			done := n.workers.shutdown()
+			<-done
+		})
+
+		eventually(t, "ReSignState to finish multi-page scan despite canonical bridge advance on every page read", func() bool {
+			st, _ := n.state.GetState()
+			for _, id := range []types.Hash{w1, w2, w3, w4, w5} {
+				r, err := n.dbManager.ZnnStorage().GetResignStatus(id)
+				if err != nil || !r {
+					return false
+				}
+			}
+			return st == common.LiveState
+		})
+		if pages := bridge.pages.Load(); pages > 50 {
+			t.Fatalf("expected bounded page reads under forward bridge activity, got %d", pages)
+		}
+	})
+
+	t.Run("sustained wrap arrivals with canonical bridge advance on every page read", func(t *testing.T) {
+		prevDelay := resignRetryDelay
+		prevPageSize := resignPageSize
+		resignRetryDelay = 20 * time.Millisecond
+		resignPageSize = 2
+		t.Cleanup(func() {
+			resignRetryDelay = prevDelay
+			resignPageSize = prevPageSize
+		})
+
+		evmSrv := fakeEvmRpcServer(t)
+		defer evmSrv.Close()
+
+		w4 := types.Hash{0x81}
+		w3 := types.Hash{0x82}
+		w2 := types.Hash{0x83}
+		w1 := types.Hash{0x84}
+		var tableMu sync.Mutex
+		table := []*embedded.WrapTokenRequest{
+			makeEntry(1, w4, 100),
+			makeEntry(1, w3, 99),
+			makeEntry(1, w2, 98),
+			makeEntry(1, w1, 97),
+		}
+		sortZenonWraps(table)
+		byID := map[types.Hash]*embedded.WrapTokenRequest{
+			w4: table[0], w3: table[1], w2: table[2], w1: table[3],
+		}
+		var futureSeq uint32
+		var futureIDs []types.Hash
+		var bridgeHeight atomic.Uint64
+		bridgeHeight.Store(10)
+		var momHeight atomic.Uint64
+		momHeight.Store(100)
+
+		bridge := &wrapTestBridge{
+			networks: &embedded.NetworkInfoList{
+				Count: 1,
+				List: []*definition.NetworkInfo{{
+					NetworkClass: definition.EvmClass, Id: 1, Name: "Ethereum",
+					ContractAddress: "0x0000000000000000000000000000000000000001",
+				}},
+			},
+			frontierMomFn: func(_ context.Context, _ int32) (*api.Momentum, error) {
+				return testMomentum(momHeight.Load()), nil
+			},
+			frontierFn: func(_ context.Context, _ int32) (*api.AccountBlock, error) {
+				h := bridgeHeight.Load()
+				return testAccountBlock(h, types.Hash{0xaa, byte(h >> 8), byte(h)}), nil
+			},
+			pageHandler: func(pageIndex, pageSize uint32, call int32) *embedded.WrapTokenRequestList {
+				tableMu.Lock()
+				defer tableMu.Unlock()
+				bridgeHeight.Add(1)
+				if call > 1 {
+					h := momHeight.Add(1)
+					for i := 0; i < 3; i++ {
+						futureSeq++
+						id := types.Hash{0xf8, byte(futureSeq >> 8), byte(futureSeq)}
+						futureIDs = append(futureIDs, id)
+						entry := makeEntry(1, id, h)
+						table = append(table, entry)
+						byID[id] = entry
+					}
+					sortZenonWraps(table)
+				}
+				return paginateZenonWraps(table, pageIndex, pageSize)
+			},
+			byIDHandler: func(_ context.Context, id types.Hash, _ int32) (*embedded.WrapTokenRequest, error) {
+				tableMu.Lock()
+				defer tableMu.Unlock()
+				if w, ok := byID[id]; ok {
+					return w, nil
+				}
+				return nil, constants.ErrDataNonExistent
+			},
+		}
+
+		n := wrapTestNodeWithEvm(t, common.LiveState, bridge, map[string]string{"Ethereum": evmSrv.URL})
+		if activated, err := n.state.ActivateResign(definition.EvmClass, 1); err != nil || !activated {
+			t.Fatalf("ActivateResign failed: activated=%v err=%v", activated, err)
+		}
+		n.state.CompleteStartup()
+
+		n.workers.start(n.processSignatures)
+		t.Cleanup(func() {
+			done := n.workers.shutdown()
+			<-done
+		})
+
+		eventually(t, "ReSignState to terminate under sustained arrivals plus canonical bridge frontier advances", func() bool {
+			st, _ := n.state.GetState()
+			for _, id := range []types.Hash{w4, w3, w2, w1} {
+				r, err := n.dbManager.ZnnStorage().GetResignStatus(id)
+				if err != nil || !r {
+					return false
+				}
+			}
+			return st == common.LiveState
+		})
+		tableMu.Lock()
+		createdFuture := append([]types.Hash(nil), futureIDs...)
+		tableMu.Unlock()
+		for _, id := range createdFuture {
+			if ev, err := n.dbManager.ZnnStorage().GetWrapRequestById(id); err != nil || ev != nil {
+				t.Fatalf("post-cutoff wrap %s should not have been stored: ev=%+v err=%v", id, ev, err)
+			}
+		}
+	})
+
+	t.Run("straddled orphan rejected by ID verification under continuous forward bridge activity", func(t *testing.T) {
+		prevDelay := resignRetryDelay
+		prevPageSize := resignPageSize
+		resignRetryDelay = 20 * time.Millisecond
+		resignPageSize = 2
+		t.Cleanup(func() {
+			resignRetryDelay = prevDelay
+			resignPageSize = prevPageSize
+		})
+
+		evmSrv := fakeEvmRpcServer(t)
+		defer evmSrv.Close()
+
+		f1 := types.Hash{0xf9}
+		w2 := types.Hash{0x91}
+		w1 := types.Hash{0x92}
+		orphanWrap := types.Hash{0x93}
+		canonicalWrap := types.Hash{0x94}
+
+		forkPage := []*embedded.WrapTokenRequest{
+			makeEntry(1, f1, 101),
+			makeEntry(1, w2, 99),
+			makeEntry(1, w1, 99),
+			makeEntry(1, orphanWrap, 98),
+		}
+		canonicalTable := []*embedded.WrapTokenRequest{
+			makeEntry(1, f1, 101),
+			makeEntry(1, w2, 99),
+			makeEntry(1, w1, 99),
+			makeEntry(1, canonicalWrap, 98),
+		}
+		sortZenonWraps(forkPage)
+		sortZenonWraps(canonicalTable)
+		canonicalByID := make(map[types.Hash]*embedded.WrapTokenRequest, len(canonicalTable))
+		for _, w := range canonicalTable {
+			canonicalByID[w.Id] = w
+		}
+
+		var bridgeHeight atomic.Uint64
+		bridgeHeight.Store(10)
+		var page1Calls atomic.Int32
+
+		bridge := &wrapTestBridge{
+			networks: &embedded.NetworkInfoList{
+				Count: 1,
+				List: []*definition.NetworkInfo{{
+					NetworkClass: definition.EvmClass, Id: 1, Name: "Ethereum",
+					ContractAddress: "0x0000000000000000000000000000000000000001",
+				}},
+			},
+			byID: canonicalByID,
+			frontierMomFn: func(_ context.Context, _ int32) (*api.Momentum, error) {
+				return testMomentum(100), nil
+			},
+			frontierFn: func(_ context.Context, _ int32) (*api.AccountBlock, error) {
+				h := bridgeHeight.Load()
+				return testAccountBlock(h, types.Hash{0xaa, byte(h >> 8), byte(h)}), nil
+			},
+			pageHandler: func(pageIndex, pageSize uint32, _ int32) *embedded.WrapTokenRequestList {
+				// Continuously advance bridge frontier on EVERY page read so
+				// attempt 1 returns straddled=true; inject orphanWrap on the
+				// second call to pageIndex==1 (attempt 1 of tail page 1) so
+				// verifyStraddledWraps must detect and reject it by ID.
+				bridgeHeight.Add(1)
+				if pageIndex == 1 && page1Calls.Add(1) == 2 {
+					return paginateZenonWraps(forkPage, pageIndex, pageSize)
+				}
+				return paginateZenonWraps(canonicalTable, pageIndex, pageSize)
+			},
+		}
+
+		n := wrapTestNodeWithEvm(t, common.LiveState, bridge, map[string]string{"Ethereum": evmSrv.URL})
+		if activated, err := n.state.ActivateResign(definition.EvmClass, 1); err != nil || !activated {
+			t.Fatalf("ActivateResign failed: activated=%v err=%v", activated, err)
+		}
+		n.state.CompleteStartup()
+
+		n.workers.start(n.processSignatures)
+		t.Cleanup(func() {
+			done := n.workers.shutdown()
+			<-done
+		})
+
+		eventually(t, "ReSignState to reject straddled orphan by ID and mark canonicalWrap", func() bool {
+			st, _ := n.state.GetState()
+			for _, id := range []types.Hash{w2, w1, canonicalWrap} {
+				r, err := n.dbManager.ZnnStorage().GetResignStatus(id)
+				if err != nil || !r {
+					return false
+				}
+			}
+			return st == common.LiveState
+		})
+		if page1Calls.Load() < 2 {
+			t.Fatalf("expected straddled attempt 1 to have served orphanWrap, page1Calls=%d", page1Calls.Load())
+		}
+		if resign, err := n.dbManager.ZnnStorage().GetResignStatus(orphanWrap); err != nil || resign {
+			t.Fatalf("straddled orphanWrap should not have been marked: resign=%v err=%v", resign, err)
+		}
+		if ev, err := n.dbManager.ZnnStorage().GetWrapRequestById(orphanWrap); err != nil || ev != nil {
+			t.Fatalf("straddled orphanWrap should not have been stored: ev=%+v err=%v", ev, err)
+		}
+	})
+}
+
 func TestReSignStateBoundsAndCancelsStalledDeferredWrapRPC(t *testing.T) {
 	prevDelay := resignRetryDelay
 	prevTimeout := resignRPCTimeout

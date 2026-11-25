@@ -1378,74 +1378,132 @@ func (node *Node) fetchCompleteWrapPage(pageIndex, pageSize uint32, resignGen ui
 	}
 }
 
-// checkZenonFrontierConsistent verifies that Zenon has NOT rolled back past
-// cutoffHeight/cutoffHash or past the previously observed bridge account block
-// prevAcct, while permitting arbitrary forward chain/account growth.
-func (node *Node) checkZenonFrontierConsistent(cutoffHeight uint64, cutoffHash types.Hash, prevAcct *api.AccountBlock) (curAcct *api.AccountBlock, consistent, retry, stop bool) {
+type reSignChainAnchor struct {
+	cutoffMomentum uint64
+	cutoffHash     types.Hash
+	finalityMom    uint64
+	finalityHash   types.Hash
+	bridgeBlock    *api.AccountBlock
+}
+
+// checkZenonAnchorConsistent verifies that Zenon has NOT rolled back past
+// anchor.cutoffMomentum/cutoffHash, past anchor.finalityMom/finalityHash (the
+// highest momentum view that established finality for any accepted wrap), or
+// past anchor.bridgeBlock, while permitting arbitrary forward chain/account
+// growth. When advanceFinality is true, next raises finalityMom/finalityHash to
+// the verified live frontier momentum.
+func (node *Node) checkZenonAnchorConsistent(anchor reSignChainAnchor, advanceFinality bool) (next reSignChainAnchor, consistent, retry, stop bool) {
 	if node.workerStopping() {
-		return nil, false, false, true
+		return reSignChainAnchor{}, false, false, true
+	}
+
+	momFrontCtx, momFrontCancel := context.WithTimeout(node.workers.context(), resignRPCTimeout)
+	curMom, err := node.networksManager.Znn().GetFrontierMomentumContext(momFrontCtx)
+	momFrontCancel()
+	if node.workerStopping() {
+		return reSignChainAnchor{}, false, false, true
+	}
+	if err != nil || curMom == nil || curMom.Momentum == nil || curMom.Height == 0 || curMom.Hash == types.ZeroHash {
+		node.logger.Debugf("failed to read frontier momentum during resign consistency check: %v", err)
+		return reSignChainAnchor{}, false, true, false
 	}
 
 	acctCtx, acctCancel := context.WithTimeout(node.workers.context(), resignRPCTimeout)
 	curAcct, err := node.networksManager.Znn().GetFrontierAccountBlockContext(acctCtx, types.BridgeContract)
 	acctCancel()
 	if node.workerStopping() {
-		return nil, false, false, true
+		return reSignChainAnchor{}, false, false, true
 	}
 	if err != nil {
 		node.logger.Debugf("failed to read bridge account frontier during resign consistency check: %v", err)
-		return nil, false, true, false
+		return reSignChainAnchor{}, false, true, false
 	}
 
-	momCtx, momCancel := context.WithTimeout(node.workers.context(), resignRPCTimeout)
-	momList, err := node.networksManager.Znn().GetMomentumsByHeightContext(momCtx, cutoffHeight, 1)
-	momCancel()
-	if node.workerStopping() {
-		return nil, false, false, true
+	highMom := anchor.finalityMom
+	highHash := anchor.finalityHash
+	if highMom < anchor.cutoffMomentum {
+		highMom = anchor.cutoffMomentum
+		highHash = anchor.cutoffHash
 	}
-	if err != nil {
-		node.logger.Debugf("failed to read momentum %d during resign consistency check: %v", cutoffHeight, err)
-		return nil, false, true, false
+	if curMom.Height < highMom {
+		return reSignChainAnchor{}, false, false, false
 	}
-	if momList == nil || len(momList.List) == 0 || momList.List[0] == nil || momList.List[0].Momentum == nil ||
-		momList.List[0].Height != cutoffHeight || momList.List[0].Hash != cutoffHash {
-		return nil, false, false, false
+	if curMom.Height == highMom && curMom.Hash != highHash {
+		return reSignChainAnchor{}, false, false, false
+	}
+	if curMom.Height == anchor.cutoffMomentum && curMom.Hash != anchor.cutoffHash {
+		return reSignChainAnchor{}, false, false, false
 	}
 
-	if prevAcct != nil && prevAcct.Height > 0 {
-		if curAcct == nil || curAcct.Height < prevAcct.Height {
-			return nil, false, false, false
-		}
-		if curAcct.Height == prevAcct.Height {
-			if curAcct.Hash != prevAcct.Hash {
-				return nil, false, false, false
-			}
-			return curAcct, true, false, false
-		}
-		// Bridge account grew forward: verify prevAcct is still the canonical
-		// ancestor at prevAcct.Height (rules out a rollback + forward re-extension).
-		ancCtx, ancCancel := context.WithTimeout(node.workers.context(), resignRPCTimeout)
-		blocks, err := node.networksManager.Znn().GetAccountBlocksByHeightContext(ancCtx, types.BridgeContract, prevAcct.Height, 1)
-		ancCancel()
+	if curMom.Height > anchor.cutoffMomentum {
+		momCtx, momCancel := context.WithTimeout(node.workers.context(), resignRPCTimeout)
+		momList, err := node.networksManager.Znn().GetMomentumsByHeightContext(momCtx, anchor.cutoffMomentum, 1)
+		momCancel()
 		if node.workerStopping() {
-			return nil, false, false, true
+			return reSignChainAnchor{}, false, false, true
 		}
 		if err != nil {
-			node.logger.Debugf("failed to verify bridge account ancestor %d during resign scan: %v", prevAcct.Height, err)
-			return nil, false, true, false
+			node.logger.Debugf("failed to read momentum %d during resign consistency check: %v", anchor.cutoffMomentum, err)
+			return reSignChainAnchor{}, false, true, false
 		}
-		if blocks == nil || len(blocks.List) == 0 || blocks.List[0] == nil ||
-			blocks.List[0].Height != prevAcct.Height || blocks.List[0].Hash != prevAcct.Hash {
-			return nil, false, false, false
+		if momList == nil || len(momList.List) == 0 || momList.List[0] == nil || momList.List[0].Momentum == nil ||
+			momList.List[0].Height != anchor.cutoffMomentum || momList.List[0].Hash != anchor.cutoffHash {
+			return reSignChainAnchor{}, false, false, false
 		}
 	}
-	return curAcct, true, false, false
-}
 
-type reSignChainAnchor struct {
-	cutoffMomentum uint64
-	cutoffHash     types.Hash
-	bridgeBlock    *api.AccountBlock
+	if highMom > anchor.cutoffMomentum && curMom.Height > highMom {
+		finCtx, finCancel := context.WithTimeout(node.workers.context(), resignRPCTimeout)
+		finList, err := node.networksManager.Znn().GetMomentumsByHeightContext(finCtx, highMom, 1)
+		finCancel()
+		if node.workerStopping() {
+			return reSignChainAnchor{}, false, false, true
+		}
+		if err != nil {
+			node.logger.Debugf("failed to verify finality momentum %d during resign consistency check: %v", highMom, err)
+			return reSignChainAnchor{}, false, true, false
+		}
+		if finList == nil || len(finList.List) == 0 || finList.List[0] == nil || finList.List[0].Momentum == nil ||
+			finList.List[0].Height != highMom || finList.List[0].Hash != highHash {
+			return reSignChainAnchor{}, false, false, false
+		}
+	}
+
+	if anchor.bridgeBlock != nil && anchor.bridgeBlock.Height > 0 {
+		if curAcct == nil || curAcct.Height < anchor.bridgeBlock.Height {
+			return reSignChainAnchor{}, false, false, false
+		}
+		if curAcct.Height == anchor.bridgeBlock.Height {
+			if curAcct.Hash != anchor.bridgeBlock.Hash {
+				return reSignChainAnchor{}, false, false, false
+			}
+		} else {
+			// Bridge account grew forward: verify anchor.bridgeBlock is still
+			// the canonical ancestor at its height (rules out rollback + re-extension).
+			ancCtx, ancCancel := context.WithTimeout(node.workers.context(), resignRPCTimeout)
+			blocks, err := node.networksManager.Znn().GetAccountBlocksByHeightContext(ancCtx, types.BridgeContract, anchor.bridgeBlock.Height, 1)
+			ancCancel()
+			if node.workerStopping() {
+				return reSignChainAnchor{}, false, false, true
+			}
+			if err != nil {
+				node.logger.Debugf("failed to verify bridge account ancestor %d during resign scan: %v", anchor.bridgeBlock.Height, err)
+				return reSignChainAnchor{}, false, true, false
+			}
+			if blocks == nil || len(blocks.List) == 0 || blocks.List[0] == nil ||
+				blocks.List[0].Height != anchor.bridgeBlock.Height || blocks.List[0].Hash != anchor.bridgeBlock.Hash {
+				return reSignChainAnchor{}, false, false, false
+			}
+		}
+	}
+
+	next = anchor
+	next.bridgeBlock = curAcct
+	if advanceFinality {
+		next.finalityMom = curMom.Height
+		next.finalityHash = curMom.Hash
+	}
+	return next, true, false, false
 }
 
 func sameAccountBlockFrontier(a, b *api.AccountBlock) bool {
@@ -1455,63 +1513,152 @@ func sameAccountBlockFrontier(a, b *api.AccountBlock) bool {
 	return a.Height == b.Height && a.Hash == b.Hash
 }
 
-// fetchAnchoredWrapPage reads pageIndex bound to a single canonical bridge
-// account frontier: preAcct (verified against anchorAcct) must match postAcct
-// immediately after the page RPC so rows from an intermediate rolled-back block
-// can never be cached. If the bridge account extended forward during the single
-// page RPC, only this page is retried while keeping all previously verified
-// pages; if Zenon rolled back, rolledBack is returned so the caller restarts.
-func (node *Node) fetchAnchoredWrapPage(pageIndex, pageSize uint32, cutoffHeight uint64, cutoffHash types.Hash, anchorAcct *api.AccountBlock, resignGen uint64) (page *embedded.WrapTokenRequestList, nextAnchor *api.AccountBlock, rolledBack, stale, stop bool) {
-	curAnchor := anchorAcct
+// maxStrictFrontierRetries bounds how many times fetchAnchoredWrapPage retries
+// a single page when the bridge account advances canonically mid-RPC. Retrying
+// once immediately rejects an isolated transient-fork page whose replacement
+// still descends from the previous anchor, while allowing forward-only bridge
+// activity to make progress by marking the returned page straddled for by-ID
+// and boundary verification.
+const maxStrictFrontierRetries = 1
+
+// fetchAnchoredWrapPage reads pageIndex while checking that Zenon did not roll
+// back anchor before or during the RPC. When the bridge account stays at the
+// same frontier (pre == post), straddled is false. If it advances canonically
+// during the RPC, the page is retried up to maxStrictFrontierRetries times;
+// under continuous forward-only bridge activity, the verified forward page is
+// returned with straddled=true so pagination continues making progress and the
+// caller verifies straddled rows by ID and reconfirms any straddling boundary.
+func (node *Node) fetchAnchoredWrapPage(pageIndex, pageSize uint32, anchor reSignChainAnchor, resignGen uint64) (page *embedded.WrapTokenRequestList, nextAnchor reSignChainAnchor, straddled, rolledBack, stale, stop bool) {
+	curAnchor := anchor
+	forwardAdvances := 0
 	for {
 		if node.workerStopping() {
-			return nil, nil, false, false, true
+			return nil, reSignChainAnchor{}, false, false, false, true
 		}
 		if !node.state.IsResignGenerationCurrent(resignGen) {
-			return nil, nil, false, true, false
+			return nil, reSignChainAnchor{}, false, false, true, false
 		}
 
-		preAcct, consistent, retryCheck, stopCheck := node.checkZenonFrontierConsistent(cutoffHeight, cutoffHash, curAnchor)
+		preAnchor, consistent, retryCheck, stopCheck := node.checkZenonAnchorConsistent(curAnchor, true)
 		if stopCheck {
-			return nil, nil, false, false, true
+			return nil, reSignChainAnchor{}, false, false, false, true
 		}
 		if retryCheck {
 			if !node.workerSleep(resignRetryDelay) {
-				return nil, nil, false, false, true
+				return nil, reSignChainAnchor{}, false, false, false, true
 			}
 			continue
 		}
 		if !consistent {
-			return nil, nil, true, false, false
+			return nil, reSignChainAnchor{}, false, true, false, false
 		}
 
 		wrapRequests, stale, stop := node.fetchCompleteWrapPage(pageIndex, pageSize, resignGen)
 		if stale || stop {
-			return nil, nil, false, stale, stop
+			return nil, reSignChainAnchor{}, false, false, stale, stop
 		}
 
-		postAcct, consistent, retryCheck, stopCheck := node.checkZenonFrontierConsistent(cutoffHeight, cutoffHash, preAcct)
+		postAnchor, consistent, retryCheck, stopCheck := node.checkZenonAnchorConsistent(preAnchor, true)
 		if stopCheck {
-			return nil, nil, false, false, true
+			return nil, reSignChainAnchor{}, false, false, false, true
 		}
 		if retryCheck {
 			if !node.workerSleep(resignRetryDelay) {
-				return nil, nil, false, false, true
+				return nil, reSignChainAnchor{}, false, false, false, true
 			}
 			continue
 		}
 		if !consistent {
-			return nil, nil, true, false, false
+			return nil, reSignChainAnchor{}, false, true, false, false
 		}
 
-		if sameAccountBlockFrontier(preAcct, postAcct) {
-			return wrapRequests, postAcct, false, false, false
+		if sameAccountBlockFrontier(preAnchor.bridgeBlock, postAnchor.bridgeBlock) {
+			return wrapRequests, postAnchor, false, false, false, false
 		}
-		// Bridge account advanced forward while this single page RPC was in
-		// flight: advance curAnchor to postAcct and retry just this page so we
-		// never cache rows from an intermediate block that may have rolled back.
-		curAnchor = postAcct
+		curAnchor = postAnchor
+		forwardAdvances++
+		if forwardAdvances > maxStrictFrontierRetries {
+			return wrapRequests, postAnchor, true, false, false, false
+		}
 	}
+}
+
+// verifyStraddledWraps confirms by ID that every <= cutoff wrap collected from
+// a straddling page still exists on the canonical Zenon chain with matching
+// metadata, updating finality from the verified read and rejecting orphaned rows.
+func (node *Node) verifyStraddledWraps(wraps []*embedded.WrapTokenRequest, straddledIDs map[types.Hash]struct{}, anchor reSignChainAnchor, resignGen uint64) (nextAnchor reSignChainAnchor, ok, stale, stop bool) {
+	cur := anchor
+	for i, w := range wraps {
+		if _, needsCheck := straddledIDs[w.Id]; !needsCheck {
+			continue
+		}
+		for {
+			if node.workerStopping() {
+				return reSignChainAnchor{}, false, false, true
+			}
+			if !node.state.IsResignGenerationCurrent(resignGen) {
+				return reSignChainAnchor{}, false, true, false
+			}
+
+			preAnchor, consistent, retryCheck, stopCheck := node.checkZenonAnchorConsistent(cur, true)
+			if stopCheck {
+				return reSignChainAnchor{}, false, false, true
+			}
+			if retryCheck {
+				if !node.workerSleep(resignRetryDelay) {
+					return reSignChainAnchor{}, false, false, true
+				}
+				continue
+			}
+			if !consistent {
+				return reSignChainAnchor{}, false, false, false
+			}
+
+			callCtx, cancel := context.WithTimeout(node.workers.context(), resignRPCTimeout)
+			got, err := node.networksManager.Znn().GetWrapTokenRequestByIdContext(callCtx, w.Id)
+			cancel()
+			if node.workerStopping() {
+				return reSignChainAnchor{}, false, false, true
+			}
+			if rpc.WrapNotFound(err) {
+				return reSignChainAnchor{}, false, false, false
+			}
+			if err != nil {
+				node.logger.Debugf("failed to verify straddled wrap %s by id: %v", w.Id, err)
+				if !node.workerSleep(resignRetryDelay) {
+					return reSignChainAnchor{}, false, false, true
+				}
+				continue
+			}
+			if got == nil || got.WrapTokenRequest == nil || got.Id != w.Id ||
+				got.CreationMomentumHeight != w.CreationMomentumHeight ||
+				got.NetworkClass != w.NetworkClass || got.ChainId != w.ChainId {
+				return reSignChainAnchor{}, false, false, false
+			}
+
+			postAnchor, consistent, retryCheck, stopCheck := node.checkZenonAnchorConsistent(preAnchor, true)
+			if stopCheck {
+				return reSignChainAnchor{}, false, false, true
+			}
+			if retryCheck {
+				if !node.workerSleep(resignRetryDelay) {
+					return reSignChainAnchor{}, false, false, true
+				}
+				continue
+			}
+			if !consistent {
+				return reSignChainAnchor{}, false, false, false
+			}
+			if got.ConfirmationsToFinality == 0 {
+				cur = postAnchor
+			} else {
+				cur.bridgeBlock = postAnchor.bridgeBlock
+			}
+			wraps[i] = got
+			break
+		}
+	}
+	return cur, true, false, false
 }
 
 // captureReSignSnapshot collects every wrap request matching
@@ -1536,9 +1683,7 @@ func (node *Node) captureReSignSnapshot(resignNetworkClass, resignChainId uint32
 		// Read a live Zenon frontier momentum (height + hash) and bridge account
 		// frontier as the canonical anchor for this scan. Never fall back to a
 		// stale cached height.
-		var cutoffMomentum uint64
-		var cutoffHash types.Hash
-		var anchorAcct *api.AccountBlock
+		var curAnchor reSignChainAnchor
 		for {
 			if node.workerStopping() {
 				return nil, reSignChainAnchor{}, false, true
@@ -1572,15 +1717,20 @@ func (node *Node) captureReSignSnapshot(resignNetworkClass, resignChainId uint32
 				}
 				continue
 			}
-			cutoffMomentum = mom.Height
-			cutoffHash = mom.Hash
-			anchorAcct = acct
+			curAnchor = reSignChainAnchor{
+				cutoffMomentum: mom.Height,
+				cutoffHash:     mom.Hash,
+				finalityMom:    mom.Height,
+				finalityHash:   mom.Hash,
+				bridgeBlock:    acct,
+			}
 			break
 		}
+		cutoffMomentum := curAnchor.cutoffMomentum
 
 		// Probe page 0 bound to a consistent bridge account block. Small tables
-		// (<= pageSize) complete atomically in a single verified RPC.
-		probe, nextAnchor, rolledBack, stale, stop := node.fetchAnchoredWrapPage(0, pageSize, cutoffMomentum, cutoffHash, anchorAcct, resignGen)
+		// (<= pageSize) on a non-straddling frontier complete atomically in one RPC.
+		probe, nextAnchor, probeStraddled, rolledBack, stale, stop := node.fetchAnchoredWrapPage(0, pageSize, curAnchor, resignGen)
 		if stale || stop {
 			return nil, reSignChainAnchor{}, stale, stop
 		}
@@ -1591,15 +1741,27 @@ func (node *Node) captureReSignSnapshot(resignNetworkClass, resignChainId uint32
 			}
 			continue
 		}
-		anchorAcct = nextAnchor
+		curAnchor = nextAnchor
 		node.logger.Debugf("len(wrapRequests.List): %d, count: %d, pageIndex: 0", len(probe.List), probe.Count)
 
+		if probe.Count == 0 && probeStraddled {
+			// Confirm an empty table on a second read so a wrap added during
+			// the straddling probe cannot be skipped.
+			probe, nextAnchor, probeStraddled, rolledBack, stale, stop = node.fetchAnchoredWrapPage(0, pageSize, curAnchor, resignGen)
+			if stale || stop {
+				return nil, reSignChainAnchor{}, stale, stop
+			}
+			if rolledBack {
+				node.logger.Debug("Zenon frontier rolled back during ReSignState probe confirmation; restarting snapshot")
+				if !node.workerSleep(resignRetryDelay) {
+					return nil, reSignChainAnchor{}, false, true
+				}
+				continue
+			}
+			curAnchor = nextAnchor
+		}
 		if probe.Count == 0 {
-			return nil, reSignChainAnchor{
-				cutoffMomentum: cutoffMomentum,
-				cutoffHash:     cutoffHash,
-				bridgeBlock:    anchorAcct,
-			}, false, false
+			return nil, curAnchor, false, false
 		}
 
 		snapshotByID := make(map[types.Hash]*embedded.WrapTokenRequest)
@@ -1617,7 +1779,7 @@ func (node *Node) captureReSignSnapshot(resignNetworkClass, resignChainId uint32
 			snapshotByID[wrap.Id] = wrap
 		}
 
-		if probe.Count <= int(pageSize) {
+		if probe.Count <= int(pageSize) && !probeStraddled {
 			for _, wrap := range probe.List {
 				recordWrap(wrap)
 			}
@@ -1625,11 +1787,7 @@ func (node *Node) captureReSignSnapshot(resignNetworkClass, resignChainId uint32
 			for _, id := range snapshotOrder {
 				snapshot = append(snapshot, snapshotByID[id])
 			}
-			return snapshot, reSignChainAnchor{
-				cutoffMomentum: cutoffMomentum,
-				cutoffHash:     cutoffHash,
-				bridgeBlock:    anchorAcct,
-			}, false, false
+			return snapshot, curAnchor, false, false
 		}
 
 		// Walk contiguously from the oldest tail wrap (revIdx = 0) upward until
@@ -1646,6 +1804,9 @@ func (node *Node) captureReSignSnapshot(resignNetworkClass, resignChainId uint32
 		stalledReads := 0
 		coveredByRevIdx := make(map[int]*embedded.WrapTokenRequest)
 		revIdxByID := make(map[types.Hash]int)
+		straddledIDs := make(map[types.Hash]struct{})
+		confirmedStraddledBoundaryRevIdx := -1
+		confirmedStraddledEndCount := -1
 		rolledBack = false
 
 		for {
@@ -1672,7 +1833,7 @@ func (node *Node) captureReSignSnapshot(resignNetworkClass, resignChainId uint32
 			}
 			pageIndex := uint32((wantEnd - 1) / int(curPageSize))
 
-			wrapRequests, nextAnchor, pageRolledBack, stale, stop := node.fetchAnchoredWrapPage(pageIndex, curPageSize, cutoffMomentum, cutoffHash, anchorAcct, resignGen)
+			wrapRequests, nextAnchor, pageStraddled, pageRolledBack, stale, stop := node.fetchAnchoredWrapPage(pageIndex, curPageSize, curAnchor, resignGen)
 			if stale || stop {
 				return nil, reSignChainAnchor{}, stale, stop
 			}
@@ -1681,7 +1842,7 @@ func (node *Node) captureReSignSnapshot(resignNetworkClass, resignChainId uint32
 				rolledBack = true
 				break
 			}
-			anchorAcct = nextAnchor
+			curAnchor = nextAnchor
 			node.logger.Debugf("len(wrapRequests.List): %d, count: %d, pageIndex: %d", len(wrapRequests.List), wrapRequests.Count, pageIndex)
 
 			actualCount := wrapRequests.Count
@@ -1711,6 +1872,9 @@ func (node *Node) captureReSignSnapshot(resignNetworkClass, resignChainId uint32
 				node.logger.Debug("Detected shifted wrap tail position during ReSignState scan; re-verifying tail")
 				clear(coveredByRevIdx)
 				clear(revIdxByID)
+				clear(straddledIDs)
+				confirmedStraddledBoundaryRevIdx = -1
+				confirmedStraddledEndCount = -1
 				doneFromTail = 0
 			}
 
@@ -1719,6 +1883,11 @@ func (node *Node) captureReSignSnapshot(resignNetworkClass, resignChainId uint32
 				if revIdx >= 0 {
 					coveredByRevIdx[revIdx] = wrap
 					revIdxByID[wrap.Id] = revIdx
+					if pageStraddled {
+						straddledIDs[wrap.Id] = struct{}{}
+					} else {
+						delete(straddledIDs, wrap.Id)
+					}
 				}
 			}
 
@@ -1733,14 +1902,22 @@ func (node *Node) captureReSignSnapshot(resignNetworkClass, resignChainId uint32
 					// Only accept the > cutoffMomentum boundary at revIdx == r if it
 					// was observed on THIS RPC call. An earlier cached boundary row
 					// could be stale if a delayed receive took revIdx == r while an
-					// earlier gap was being filled. Confirming the boundary at r now
-					// proves all r distinct <= cutoff wraps in [0..r-1] are complete.
+					// earlier gap was being filled. If the boundary page itself
+					// straddled a forward bridge advance, confirm it once more.
 					if len(wrapRequests.List) > 0 && r >= pageMinRevIdx && r <= pageMaxRevIdx {
-						for k := 0; k < r; k++ {
-							recordWrap(coveredByRevIdx[k])
+						if !pageStraddled || confirmedStraddledBoundaryRevIdx == r {
+							done = true
+						} else {
+							confirmedStraddledBoundaryRevIdx = r
+							for k, w := range coveredByRevIdx {
+								if k >= r {
+									delete(revIdxByID, w.Id)
+									delete(coveredByRevIdx, k)
+								}
+							}
 						}
-						done = true
 					} else {
+						confirmedStraddledBoundaryRevIdx = -1
 						for k, w := range coveredByRevIdx {
 							if k >= r {
 								delete(revIdxByID, w.Id)
@@ -1754,25 +1931,44 @@ func (node *Node) captureReSignSnapshot(resignNetworkClass, resignChainId uint32
 			}
 			if !done && r == actualCount {
 				// Contiguously covered all actualCount distinct wraps at the current Count.
-				for k := 0; k < actualCount; k++ {
-					recordWrap(coveredByRevIdx[k])
+				if !pageStraddled || confirmedStraddledEndCount == actualCount {
+					done = true
+				} else {
+					confirmedStraddledEndCount = actualCount
 				}
-				done = true
 			} else if !done && r > actualCount {
 				clear(coveredByRevIdx)
 				clear(revIdxByID)
+				clear(straddledIDs)
+				confirmedStraddledBoundaryRevIdx = -1
+				confirmedStraddledEndCount = -1
 				r = 0
 			}
 			if done {
+				collected := make([]*embedded.WrapTokenRequest, r)
+				for k := 0; k < r; k++ {
+					collected[k] = coveredByRevIdx[k]
+				}
+				if len(straddledIDs) > 0 {
+					verifiedAnchor, verified, staleVerify, stopVerify := node.verifyStraddledWraps(collected, straddledIDs, curAnchor, resignGen)
+					if staleVerify || stopVerify {
+						return nil, reSignChainAnchor{}, staleVerify, stopVerify
+					}
+					if !verified {
+						node.logger.Debug("Straddled wrap failed canonical ID verification during ReSignState scan; restarting snapshot")
+						rolledBack = true
+						break
+					}
+					curAnchor = verifiedAnchor
+				}
+				for _, wrap := range collected {
+					recordWrap(wrap)
+				}
 				snapshot := make([]*embedded.WrapTokenRequest, 0, len(snapshotOrder))
 				for _, id := range snapshotOrder {
 					snapshot = append(snapshot, snapshotByID[id])
 				}
-				return snapshot, reSignChainAnchor{
-					cutoffMomentum: cutoffMomentum,
-					cutoffHash:     cutoffHash,
-					bridgeBlock:    anchorAcct,
-				}, false, false
+				return snapshot, curAnchor, false, false
 			}
 			if r > doneFromTail {
 				stalledReads = 0
@@ -1908,6 +2104,19 @@ func (node *Node) runReSignScan() bool {
 					staleResign = true
 					break
 				}
+				preAnchor, consistent, retryCheck, stopCheck := node.checkZenonAnchorConsistent(anchor, true)
+				if stopCheck {
+					return false
+				}
+				if retryCheck {
+					continue
+				}
+				if !consistent {
+					node.logger.Debug("Zenon frontier rolled back before deferred wrap check; discarding staged batch and restarting")
+					rolledBack = true
+					break
+				}
+
 				callCtx, cancel := context.WithTimeout(node.workers.context(), resignRPCTimeout)
 				wrap, err := node.networksManager.Znn().GetWrapTokenRequestByIdContext(callCtx, id)
 				cancel()
@@ -1918,7 +2127,7 @@ func (node *Node) runReSignScan() bool {
 					// Before dropping a vanished wrap, verify Zenon did not roll
 					// back our snapshot anchor; a rollback requires restarting
 					// the scan so any replacement wrap is captured.
-					curAcct, consistent, retryCheck, stopCheck := node.checkZenonFrontierConsistent(anchor.cutoffMomentum, anchor.cutoffHash, anchor.bridgeBlock)
+					postAnchor, consistent, retryCheck, stopCheck := node.checkZenonAnchorConsistent(anchor, false)
 					if stopCheck {
 						return false
 					}
@@ -1930,7 +2139,7 @@ func (node *Node) runReSignScan() bool {
 						rolledBack = true
 						break
 					}
-					anchor.bridgeBlock = curAcct
+					anchor = postAnchor
 					delete(deferredUnfinalized, id)
 					continue
 				}
@@ -1942,8 +2151,25 @@ func (node *Node) runReSignScan() bool {
 					continue
 				}
 				if wrap.ConfirmationsToFinality != 0 {
+					anchor.bridgeBlock = preAnchor.bridgeBlock
 					continue
 				}
+				// Verify the chain view that established finality survived the
+				// by-ID read and advance anchor.finalityMom/finalityHash so the
+				// pre-publish check rejects any later rollback below it.
+				postAnchor, consistent, retryCheck, stopCheck := node.checkZenonAnchorConsistent(preAnchor, true)
+				if stopCheck {
+					return false
+				}
+				if retryCheck {
+					continue
+				}
+				if !consistent {
+					node.logger.Debug("Zenon frontier rolled back while confirming deferred wrap finality; discarding staged batch and restarting")
+					rolledBack = true
+					break
+				}
+				anchor = postAnchor
 				delete(deferredUnfinalized, id)
 				eligible, needRetry, stale, fatal := node.evaluateReSignWrap(wrap.WrapTokenRequest, resignGen)
 				if fatal {
@@ -1972,9 +2198,9 @@ func (node *Node) runReSignScan() bool {
 			continue
 		}
 
-		// Revalidate the snapshot anchor before publishing any staged flags so
-		// a Zenon rollback during finality or EVM eligibility retries discards
-		// the stale batch and restarts on the new canonical frontier.
+		// Revalidate the snapshot and finality anchor before publishing any
+		// staged flags so a Zenon rollback during finality or EVM eligibility
+		// retries discards the stale batch and restarts on the canonical chain.
 		for {
 			if node.workerStopping() {
 				return false
@@ -1983,7 +2209,7 @@ func (node *Node) runReSignScan() bool {
 				staleResign = true
 				break
 			}
-			_, consistent, retryCheck, stopCheck := node.checkZenonFrontierConsistent(anchor.cutoffMomentum, anchor.cutoffHash, anchor.bridgeBlock)
+			_, consistent, retryCheck, stopCheck := node.checkZenonAnchorConsistent(anchor, false)
 			if stopCheck {
 				return false
 			}
