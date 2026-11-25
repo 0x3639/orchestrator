@@ -63,10 +63,10 @@ type EvmRpc struct {
 	secondaryStopped bool
 
 	// pendingMu serializes durable pendingTxStore read/modify/write batches
-	// with in-memory pendingTx and pendingStack updates (never held across
+	// with in-memory pendingTx and nonceStack updates (never held across
 	// network RPCs).
-	pendingMu    sync.Mutex
-	pendingStack map[evmTxKey][]*pendingAttempt
+	pendingMu  sync.Mutex
+	nonceStack map[evmNonceKey][]*pendingAttempt
 	// txMu guards storageName, chainID, pendingTx, pendingTxStore, and
 	// sendTimeout, which track the latest unconfirmed halt or key-change
 	// transaction per (sender, contract, action) so retries reuse the same
@@ -86,6 +86,12 @@ type evmTxKey struct {
 	kind     string
 }
 
+type evmNonceKey struct {
+	sender   ecommon.Address
+	contract ecommon.Address
+	nonce    uint64
+}
+
 type pendingEvmTx struct {
 	nonce     uint64
 	txHash    ecommon.Hash
@@ -96,11 +102,11 @@ type pendingEvmTx struct {
 }
 
 type pendingAttempt struct {
-	txHash     ecommon.Hash
-	nonce      uint64
-	entry      *pendingEvmTx
-	superseded *supersededTx
-	rejected   bool
+	kind     string
+	txHash   ecommon.Hash
+	nonce    uint64
+	entry    *pendingEvmTx
+	rejected bool
 }
 
 type secondaryClient struct {
@@ -587,16 +593,19 @@ func toCommonPendingEvmTx(p *pendingEvmTx) *common.PendingEvmTx {
 	}
 }
 
-type supersededTx struct {
-	key   evmTxKey
-	entry *pendingEvmTx
+func otherEvmTxKind(kind string) string {
+	if kind == evmTxKindHalt {
+		return evmTxKindSetTss
+	}
+	return evmTxKindHalt
 }
 
 // recordPendingTxAttempt durably records tx's nonce and fee watermark BEFORE
 // broadcast so a process crash or dropped connection after node acceptance
-// cannot erase the watermark. When an emergency halt supersedes an unconfirmed
-// setTss at the same nonce, ownership is explicitly transferred in one atomic
-// fsynced batch (saving halt and deleting setTss together).
+// cannot erase the watermark. Both setTss and halt attempts for the same
+// (sender, contract, nonce) share one lineage stack under pendingMu so
+// cross-action superseding and overlapping rollbacks always restore the last
+// viable owner in a single atomic fsynced batch.
 func (r *EvmRpc) recordPendingTxAttempt(tx *etypes.Transaction) (*pendingAttempt, bool, error) {
 	key, ok := evmTxKeyFromTx(tx)
 	if !ok {
@@ -605,29 +614,23 @@ func (r *EvmRpc) recordPendingTxAttempt(tx *etypes.Transaction) (*pendingAttempt
 	r.pendingMu.Lock()
 	defer r.pendingMu.Unlock()
 
+	otherKey := evmTxKey{sender: key.sender, contract: key.contract, kind: otherEvmTxKind(key.kind)}
 	if _, err := r.loadPendingTxLocked(key); err != nil {
 		return nil, false, fmt.Errorf("load pending EVM tx record before broadcast: %w", err)
 	}
-	if key.kind == evmTxKindHalt {
-		if _, err := r.loadPendingTxLocked(evmTxKey{sender: key.sender, contract: key.contract, kind: evmTxKindSetTss}); err != nil {
-			return nil, false, fmt.Errorf("load superseded setTss record before broadcast: %w", err)
-		}
+	if _, err := r.loadPendingTxLocked(otherKey); err != nil {
+		return nil, false, fmt.Errorf("load competing EVM tx record before broadcast: %w", err)
 	}
+
 	r.txMu.Lock()
 	if r.pendingTx == nil {
 		r.pendingTx = make(map[evmTxKey]*pendingEvmTx)
 	}
 	prev := r.pendingTx[key]
 	prevSnapshot := clonePendingEvmTx(prev)
+	otherPrev := r.pendingTx[otherKey]
+	otherSnapshot := clonePendingEvmTx(otherPrev)
 	store := r.pendingTxStore
-
-	var superseded *supersededTx
-	if key.kind == evmTxKindHalt {
-		setTssKey := evmTxKey{sender: key.sender, contract: key.contract, kind: evmTxKindSetTss}
-		if other := r.pendingTx[setTssKey]; other != nil && other.nonce == tx.Nonce() {
-			superseded = &supersededTx{key: setTssKey, entry: clonePendingEvmTx(other)}
-		}
-	}
 
 	entry := &pendingEvmTx{
 		nonce:     tx.Nonce(),
@@ -651,17 +654,23 @@ func (r *EvmRpc) recordPendingTxAttempt(tx *etypes.Transaction) (*pendingAttempt
 			entry.feeCap = maxBigInt(prev.feeCap, entry.feeCap)
 		}
 	}
+	deleteOther := otherPrev != nil && otherPrev.nonce == entry.nonce
+	if deleteOther {
+		entry.gasPrice = maxBigInt(otherPrev.gasPrice, entry.gasPrice)
+		entry.tipCap = maxBigInt(otherPrev.tipCap, entry.tipCap)
+		entry.feeCap = maxBigInt(otherPrev.feeCap, entry.feeCap)
+	}
 	ops := []common.PendingEvmTxOp{{
 		Sender:   key.sender,
 		Contract: key.contract,
 		Kind:     key.kind,
 		Record:   toCommonPendingEvmTx(entry),
 	}}
-	if superseded != nil {
+	if deleteOther {
 		ops = append(ops, common.PendingEvmTxOp{
-			Sender:   superseded.key.sender,
-			Contract: superseded.key.contract,
-			Kind:     superseded.key.kind,
+			Sender:   otherKey.sender,
+			Contract: otherKey.contract,
+			Kind:     otherKey.kind,
 			Record:   nil,
 		})
 	}
@@ -674,40 +683,54 @@ func (r *EvmRpc) recordPendingTxAttempt(tx *etypes.Transaction) (*pendingAttempt
 		}
 	}
 
-	if r.pendingStack == nil {
-		r.pendingStack = make(map[evmTxKey][]*pendingAttempt)
+	nk := evmNonceKey{sender: key.sender, contract: key.contract, nonce: entry.nonce}
+	if r.nonceStack == nil {
+		r.nonceStack = make(map[evmNonceKey][]*pendingAttempt)
 	}
-	if len(r.pendingStack[key]) == 0 && prevSnapshot != nil {
-		r.pendingStack[key] = append(r.pendingStack[key], &pendingAttempt{
-			txHash: prevSnapshot.txHash,
-			nonce:  prevSnapshot.nonce,
-			entry:  prevSnapshot,
-		})
+	if len(r.nonceStack[nk]) == 0 {
+		if deleteOther && otherSnapshot != nil {
+			r.nonceStack[nk] = append(r.nonceStack[nk], &pendingAttempt{
+				kind:   otherKey.kind,
+				txHash: otherSnapshot.txHash,
+				nonce:  otherSnapshot.nonce,
+				entry:  otherSnapshot,
+			})
+		} else if prevSnapshot != nil && prevSnapshot.nonce == entry.nonce {
+			r.nonceStack[nk] = append(r.nonceStack[nk], &pendingAttempt{
+				kind:   key.kind,
+				txHash: prevSnapshot.txHash,
+				nonce:  prevSnapshot.nonce,
+				entry:  prevSnapshot,
+			})
+		}
 	}
 	attempt := &pendingAttempt{
-		txHash:     tx.Hash(),
-		nonce:      tx.Nonce(),
-		entry:      clonePendingEvmTx(entry),
-		superseded: superseded,
+		kind:   key.kind,
+		txHash: tx.Hash(),
+		nonce:  tx.Nonce(),
+		entry:  clonePendingEvmTx(entry),
 	}
-	r.pendingStack[key] = append(r.pendingStack[key], attempt)
+	r.nonceStack[nk] = append(r.nonceStack[nk], attempt)
 
 	r.txMu.Lock()
 	r.pendingTx[key] = entry
-	if superseded != nil {
-		delete(r.pendingTx, superseded.key)
+	if deleteOther {
+		delete(r.pendingTx, otherKey)
 	}
 	r.txMu.Unlock()
 	return attempt, true, nil
 }
 
 // reconcileSentTx updates or rolls back the pre-broadcast watermark based on
-// the broadcast outcome. Attempt lineage is tracked under pendingMu so:
-//   - An accepted attempt collapses older attempts/superseded records below it.
-//   - Ambiguous failures (EOF, timeouts, underpriced) stay viable.
-//   - Overlapping definitive rejections unwind through ALL trailing rejected
-//     attempts in one atomic batch, restoring the last viable owner (e.g. the
-//     original setTss) and never restoring a definitively rejected halt.
+// the broadcast outcome. Both setTss and halt attempts for a nonce share one
+// lineage stack under pendingMu so:
+//   - An accepted attempt collapses all older attempts below it.
+//   - Ambiguous failures (EOF, timeouts, underpriced) remain viable.
+//   - A rejected attempt that is no longer top of stack is marked rejected and
+//     never mutates durable storage while a newer owner is active.
+//   - When the top attempt is definitively rejected, ALL trailing rejected
+//     attempts across both actions unwind together in one atomic batch,
+//     restoring only the last viable owner (or clearing the nonce if none).
 func (r *EvmRpc) reconcileSentTx(tx *etypes.Transaction, attempt *pendingAttempt, sendErr error) {
 	if attempt == nil {
 		return
@@ -719,15 +742,12 @@ func (r *EvmRpc) reconcileSentTx(tx *etypes.Transaction, attempt *pendingAttempt
 	r.pendingMu.Lock()
 	defer r.pendingMu.Unlock()
 
-	stack := r.pendingStack[key]
+	nk := evmNonceKey{sender: key.sender, contract: key.contract, nonce: tx.Nonce()}
+	stack := r.nonceStack[nk]
 	if sendErr == nil {
-		// This attempt was accepted by the EVM node. Collapse any older
-		// attempts below it so later rejections from superseded attempts can
-		// never unwind past an accepted transaction.
 		for i, a := range stack {
 			if a == attempt {
-				a.superseded = nil
-				r.pendingStack[key] = stack[i:]
+				r.nonceStack[nk] = stack[i:]
 				break
 			}
 		}
@@ -750,7 +770,9 @@ func (r *EvmRpc) reconcileSentTx(tx *etypes.Transaction, attempt *pendingAttempt
 				return
 			}
 		}
-		delete(r.pendingStack, key)
+		if len(stack) > 0 && stack[len(stack)-1] == attempt {
+			delete(r.nonceStack, nk)
+		}
 		r.txMu.Lock()
 		if cur := r.pendingTx[key]; cur != nil && (cur.nonce < tx.Nonce() || (cur.nonce == tx.Nonce() && cur.txHash == tx.Hash())) {
 			delete(r.pendingTx, key)
@@ -764,45 +786,53 @@ func (r *EvmRpc) reconcileSentTx(tx *etypes.Transaction, attempt *pendingAttempt
 
 	attempt.rejected = true
 	if len(stack) == 0 || stack[len(stack)-1] != attempt {
-		// A newer viable attempt owns the top of the stack; leave attempt
-		// marked rejected so if the top attempt is later rejected too, unwind
-		// skips straight past this rejected attempt to the last viable owner.
 		return
 	}
 
-	// Unwind all trailing definitively rejected attempts and collect the
-	// earliest superseded record among them.
 	cut := len(stack)
-	var restoredSuperseded *supersededTx
 	for cut > 0 && stack[cut-1].rejected {
-		if stack[cut-1].superseded != nil {
-			restoredSuperseded = stack[cut-1].superseded
-		}
 		cut--
 	}
 	remaining := stack[:cut]
-	var surviving *pendingEvmTx
+	var surviving *pendingAttempt
 	if len(remaining) > 0 {
-		surviving = clonePendingEvmTx(remaining[len(remaining)-1].entry)
+		surviving = remaining[len(remaining)-1]
 	}
 
 	r.txMu.Lock()
 	store := r.pendingTxStore
 	r.txMu.Unlock()
 
-	ops := []common.PendingEvmTxOp{{
-		Sender:   key.sender,
-		Contract: key.contract,
-		Kind:     key.kind,
-		Record:   toCommonPendingEvmTx(surviving),
-	}}
-	if surviving == nil && restoredSuperseded != nil {
+	var ops []common.PendingEvmTxOp
+	if surviving == nil {
 		ops = append(ops, common.PendingEvmTxOp{
-			Sender:   restoredSuperseded.key.sender,
-			Contract: restoredSuperseded.key.contract,
-			Kind:     restoredSuperseded.key.kind,
-			Record:   toCommonPendingEvmTx(restoredSuperseded.entry),
+			Sender:   key.sender,
+			Contract: key.contract,
+			Kind:     key.kind,
+			Record:   nil,
 		})
+	} else if surviving.kind == key.kind {
+		ops = append(ops, common.PendingEvmTxOp{
+			Sender:   key.sender,
+			Contract: key.contract,
+			Kind:     key.kind,
+			Record:   toCommonPendingEvmTx(surviving.entry),
+		})
+	} else {
+		ops = append(ops,
+			common.PendingEvmTxOp{
+				Sender:   key.sender,
+				Contract: key.contract,
+				Kind:     key.kind,
+				Record:   nil,
+			},
+			common.PendingEvmTxOp{
+				Sender:   key.sender,
+				Contract: key.contract,
+				Kind:     surviving.kind,
+				Record:   toCommonPendingEvmTx(surviving.entry),
+			},
+		)
 	}
 	if store != nil {
 		if err := store.ApplyPendingEvmTxBatch(ops); err != nil {
@@ -811,18 +841,18 @@ func (r *EvmRpc) reconcileSentTx(tx *etypes.Transaction, attempt *pendingAttempt
 		}
 	}
 	if len(remaining) == 0 {
-		delete(r.pendingStack, key)
+		delete(r.nonceStack, nk)
 	} else {
-		r.pendingStack[key] = remaining
+		r.nonceStack[nk] = remaining
 	}
 	r.txMu.Lock()
-	if surviving != nil {
-		r.pendingTx[key] = surviving
+	if surviving == nil {
+		delete(r.pendingTx, key)
+	} else if surviving.kind == key.kind {
+		r.pendingTx[key] = clonePendingEvmTx(surviving.entry)
 	} else {
 		delete(r.pendingTx, key)
-		if restoredSuperseded != nil {
-			r.pendingTx[restoredSuperseded.key] = clonePendingEvmTx(restoredSuperseded.entry)
-		}
+		r.pendingTx[evmTxKey{sender: key.sender, contract: key.contract, kind: surviving.kind}] = clonePendingEvmTx(surviving.entry)
 	}
 	r.txMu.Unlock()
 }
@@ -892,8 +922,13 @@ func (r *EvmRpc) clearPendingTxIfMatchesLocked(key evmTxKey, expected *pendingEv
 	r.txMu.Lock()
 	cur = r.pendingTx[key]
 	if expected == nil || (cur != nil && cur.nonce == expected.nonce && cur.txHash == expected.txHash) {
+		if cur != nil {
+			nk := evmNonceKey{sender: key.sender, contract: key.contract, nonce: cur.nonce}
+			if st := r.nonceStack[nk]; len(st) > 0 && st[len(st)-1].kind == key.kind {
+				delete(r.nonceStack, nk)
+			}
+		}
 		delete(r.pendingTx, key)
-		delete(r.pendingStack, key)
 	}
 	r.txMu.Unlock()
 }
@@ -1309,11 +1344,15 @@ func (r *EvmRpc) GetHaltEvmMessageWithNonce(networkClass, chainId uint32, contra
 }
 
 func (r *EvmRpc) GetHaltTxEvm(sender ecommon.Address, signature []byte, contractAddress *ecommon.Address) (*etypes.Transaction, error) {
+	return r.GetHaltTxEvmContext(r.ctx, sender, signature, contractAddress)
+}
+
+func (r *EvmRpc) GetHaltTxEvmContext(ctx context.Context, sender ecommon.Address, signature []byte, contractAddress *ecommon.Address) (*etypes.Transaction, error) {
 	encodedData, err := common.EvmContractAbi.Pack("halt", signature)
 	if err != nil {
 		return nil, err
 	}
-	return r.buildContractTx(sender, contractAddress, evmTxKindHalt, encodedData, "halt evm tx")
+	return r.buildContractTxContext(ctx, sender, contractAddress, evmTxKindHalt, encodedData, "halt evm tx")
 }
 
 /// Rpc Calls
@@ -1819,6 +1858,19 @@ func (r *EvmRpc) AnySecondaryHasUnwrapLogChunked(parent context.Context, fromBlo
 	r.txMu.Unlock()
 	if budget <= 0 {
 		budget = secondaryLogAttemptTimeout
+		// At supported fractional RPC rates (e.g. 0.05 req/s = 20s per permit),
+		// allow at least one permit refill + RPC margin (bounded by
+		// evmFilterLogsTimeout) so every retry can advance at least one chunk.
+		if r.limit > 0 {
+			permitInterval := time.Duration(float64(time.Second) / float64(r.limit))
+			minForOneChunk := permitInterval + 5*time.Second
+			if minForOneChunk > evmFilterLogsTimeout {
+				minForOneChunk = evmFilterLogsTimeout
+			}
+			if minForOneChunk > budget {
+				budget = minForOneChunk
+			}
+		}
 	}
 	attemptCtx, cancel := context.WithTimeout(parent, budget)
 	defer cancel()
@@ -2122,7 +2174,13 @@ func (r *EvmRpc) GetCurrentTssContext(parent context.Context) (ecommon.Address, 
 }
 
 func (r *EvmRpc) HaltFlagSet() (bool, error) {
-	return r.bridgeContract.Halted(&bind.CallOpts{Context: r.ctx})
+	return r.HaltFlagSetContext(r.ctx)
+}
+
+func (r *EvmRpc) HaltFlagSetContext(parent context.Context) (bool, error) {
+	ctx, cancel := combineContexts(r.ctx, parent, 0)
+	defer cancel()
+	return r.bridgeContract.Halted(&bind.CallOpts{Context: ctx})
 }
 
 func (r *EvmRpc) IsHalted() (bool, error) {

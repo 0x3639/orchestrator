@@ -744,10 +744,11 @@ func TestSignEmergencyHaltMessagesGroupsByObservedActiveKeyOnPartialRotation(t *
 		t.Fatal(err)
 	}
 
-	znnSig, evmSigs, err := node.signEmergencyHaltMessages(znnMsg, newCompressed, evmBatch, evmMsgs, evmTssAddrs)
+	plan, err := node.signEmergencyHaltMessages(znnMsg, newCompressed, evmBatch, evmMsgs, evmTssAddrs)
 	if err != nil {
 		t.Fatalf("signEmergencyHaltMessages failed: %v", err)
 	}
+	znnSig, evmSigs := plan.znnSignature, plan.evmFullSignatures
 	if len(signedGroups) != 2 {
 		t.Fatalf("expected 2 signing groups (old + new), got %d", len(signedGroups))
 	}
@@ -955,10 +956,11 @@ func TestRestartRediscoversAlternateLocalTssKeyAndPartiesDuringSplitRotation(t *
 	if err != nil {
 		t.Fatal(err)
 	}
-	znnSig, evmSigs, err := restarted.signEmergencyHaltMessages(znnMsg, newCompressed, evmBatch, evmMsgs, evmTssAddrs)
+	plan, err := restarted.signEmergencyHaltMessages(znnMsg, newCompressed, evmBatch, evmMsgs, evmTssAddrs)
 	if err != nil {
 		t.Fatalf("signEmergencyHaltMessages after restart failed: %v", err)
 	}
+	znnSig, evmSigs := plan.znnSignature, plan.evmFullSignatures
 	if ok, err := implementation.CheckECDSASignature(znnMsg, newDecompressed, znnSig); err != nil || !ok {
 		t.Fatalf("restarted Zenon halt signature failed verification under newKey: ok=%v err=%v", ok, err)
 	}
@@ -1123,9 +1125,15 @@ func TestPublishEmergencyHaltAbortsAndResignsWhenRotationConfirms(t *testing.T) 
 				logger:          zap.NewNop().Sugar(),
 			}
 
+			plan := &emergencyHaltPlan{
+				znnSignature:      "AAAA",
+				znnParticipants:   []string{producerPubB64},
+				evmFullSignatures: [][]byte{make([]byte, 65)},
+				evmParticipants:   [][]string{{producerPubB64}},
+			}
 			done := make(chan bool, 1)
 			go func() {
-				done <- node.publishEmergencyHalt(evmBatch, "AAAA", [][]byte{make([]byte, 65)}, oldCompressed, 2, signedEvmTss, signedEvmNonces)
+				done <- node.publishEmergencyHalt(evmBatch, plan, oldCompressed, 2, signedEvmTss, signedEvmNonces)
 			}()
 
 			select {
@@ -1196,5 +1204,390 @@ func TestFinishKeyGenRoundPreemptsDuringInitialSleepWithoutSigning(t *testing.T)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("finishKeyGenRound blocked past EmergencyState during initial sleep")
+	}
+}
+
+func TestSignerHoldingOnlyOldShareHaltsEvmWithoutDivideByZeroOnSplitRotation(t *testing.T) {
+	oldKey, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	newKey, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldCompressed := base64.StdEncoding.EncodeToString(crypto.CompressPubkey(&oldKey.PublicKey))
+	newCompressed := base64.StdEncoding.EncodeToString(crypto.CompressPubkey(&newKey.PublicKey))
+	oldDecompressed, err := common.DecompressPubKey(oldCompressed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldAddr := crypto.PubkeyToAddress(oldKey.PublicKey)
+
+	// Only oldKey exists on disk (Zenon already rotated to newKey, which this node does not hold).
+	oldParty, oldPeerID := makeEd25519Party(t)
+	baseDir := t.TempDir()
+	writeLocalTssStateFile(t, baseDir, oldCompressed, []string{oldParty})
+
+	contract := ecommon.HexToAddress("0x5555555555555555555555555555555555555555")
+	zMock := &rotatingHaltZenon{
+		haltedTestZenon: haltedTestZenon{halted: true, evmContract: contract.Hex()},
+		compressedTss:   newCompressed,
+		tssNonce:        3,
+	}
+	znnSrv := server.NewServer()
+	if err := znnSrv.RegisterName("embedded.bridge", zMock); err != nil {
+		t.Fatal(err)
+	}
+	znnHTTP := httptest.NewServer(znnSrv.WebsocketHandler([]string{"*"}))
+	t.Cleanup(func() { znnSrv.Stop(); znnHTTP.Close() })
+
+	var evmHalted atomic.Bool
+	evmHTTP := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			ID     json.RawMessage   `json:"id"`
+			Method string            `json:"method"`
+			Params []json.RawMessage `json:"params"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		resp := map[string]interface{}{"jsonrpc": "2.0", "id": req.ID}
+		switch req.Method {
+		case "eth_chainId":
+			resp["result"] = hexutil.EncodeUint64(1)
+		case "eth_call":
+			var call struct {
+				Data  hexutil.Bytes `json:"data"`
+				Input hexutil.Bytes `json:"input"`
+			}
+			_ = json.Unmarshal(req.Params[0], &call)
+			sel := append(call.Data, call.Input...)
+			switch {
+			case len(sel) >= 4 && string(sel[:4]) == string(common.EvmContractAbi.Methods["tss"].ID):
+				resp["result"] = ecommon.BytesToHash(oldAddr.Bytes()).Hex()
+			case len(sel) >= 4 && string(sel[:4]) == string(common.EvmContractAbi.Methods["actionsNonce"].ID):
+				resp["result"] = ecommon.BigToHash(big.NewInt(5)).Hex()
+			default:
+				if evmHalted.Load() {
+					resp["result"] = "0x" + strings.Repeat("0", 63) + "1"
+				} else {
+					resp["result"] = "0x" + strings.Repeat("0", 64)
+				}
+			}
+		case "eth_blockNumber":
+			resp["result"] = hexutil.EncodeUint64(100)
+		case "eth_getBalance":
+			resp["result"] = (*hexutil.Big)(new(big.Int).Mul(big.NewInt(10), big.NewInt(1e18)))
+		case "eth_getTransactionCount":
+			resp["result"] = hexutil.EncodeUint64(1)
+		case "eth_getBlockByNumber":
+			resp["result"] = map[string]interface{}{"number": hexutil.EncodeUint64(100), "hash": ecommon.HexToHash("0x11")}
+		case "eth_gasPrice":
+			resp["result"] = (*hexutil.Big)(big.NewInt(10_000_000_000))
+		case "eth_estimateGas":
+			resp["result"] = hexutil.EncodeUint64(100_000)
+		case "eth_sendRawTransaction":
+			evmHalted.Store(true)
+			resp["result"] = ecommon.HexToHash("0xabc1").Hex()
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	t.Cleanup(evmHTTP.Close)
+
+	stopChan := make(chan os.Signal, 1)
+	stateVal := common.EmergencyState
+	gs := common.NewGlobalState(&stateVal)
+	t.Setenv("HOME", t.TempDir())
+	nm, err := network.NewNetworksManager(stopChan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dbMgr, err := manager.NewDbManager(stopChan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nets := map[string]config.BaseNetworkConfig{
+		common.ZenonNetworkName: {Urls: []string{"ws" + strings.TrimPrefix(znnHTTP.URL, "http")}},
+		"eth-halted-test":       {Urls: []string{evmHTTP.URL}},
+	}
+	if err := nm.Init(nets, dbMgr, gs, func(*common.BridgeMetadata) {}); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { nm.Stop() })
+
+	oldPartyBytes, _ := base64.StdEncoding.DecodeString(oldParty)
+	restarted := &Node{
+		config:          &config.Config{TssConfig: config.TssManagerConfig{BaseDir: baseDir}},
+		networksManager: nm,
+		dbManager:       dbMgr,
+		producerKeyPair: &wallet.KeyPair{Public: oldPartyBytes},
+		ecdsaPrivateKey: oldKey,
+		evmAddress:      oldAddr,
+		state:           gs,
+		stopChan:        stopChan,
+		logger:          zap.NewNop().Sugar(),
+		signMessagesHook: func(pubKey string, messagesToSign [][]byte, msgsIndexes map[string]int) (*keysign.Response, error) {
+			if pubKey != oldCompressed {
+				t.Fatalf("unexpected signing key %s (only oldKey is available locally)", pubKey)
+			}
+			sigs := make([]keysign.Signature, len(messagesToSign))
+			for i, msg := range messagesToSign {
+				rawSig, err := crypto.Sign(msg, oldKey)
+				if err != nil {
+					return nil, err
+				}
+				sigs[i] = keysign.Signature{
+					Msg:        base64.StdEncoding.EncodeToString(msg),
+					Signature:  base64.StdEncoding.EncodeToString(rawSig[:64]),
+					RecoveryID: base64.StdEncoding.EncodeToString(rawSig[64:]),
+				}
+			}
+			return &keysign.Response{Signatures: sigs, Status: tcommon.Success}, nil
+		},
+	}
+
+	if err := restarted.configurePubKey(); err != nil {
+		t.Fatalf("configurePubKey failed: %v", err)
+	}
+	// Zenon's newKey is absent on disk, so LocalPubKeys is empty, while oldPeerID is whitelisted.
+	if len(restarted.config.TssConfig.LocalPubKeys) != 0 {
+		t.Fatalf("expected empty LocalPubKeys when Zenon's key is missing locally, got %v", restarted.config.TssConfig.LocalPubKeys)
+	}
+	if !restarted.config.TssConfig.PubKeyWhitelist[oldPeerID] {
+		t.Fatalf("expected oldKey peerID %s in PubKeyWhitelist", oldPeerID)
+	}
+
+	znnMsg, err := implementation.GetBasicMethodMessage("Halt", 3, definition.NoMClass, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	evmBatch, evmMsgs, evmNonces, evmTssAddrs, err := nm.GetHaltMessagesWithState()
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := restarted.signEmergencyHaltMessages(znnMsg, newCompressed, evmBatch, evmMsgs, evmTssAddrs)
+	if err != nil {
+		t.Fatalf("signEmergencyHaltMessages failed: %v", err)
+	}
+	if plan.znnSignature != "" {
+		t.Fatalf("expected Zenon slot to be skipped when newKey is unavailable locally, got %q", plan.znnSignature)
+	}
+	rawEvmSig := append([]byte(nil), plan.evmFullSignatures[0]...)
+	rawEvmSig[64] -= 27
+	if ok, err := implementation.CheckECDSASignature(evmMsgs[0], oldDecompressed, base64.StdEncoding.EncodeToString(rawEvmSig)); err != nil || !ok {
+		t.Fatalf("EVM halt signature did not verify under oldKey: ok=%v err=%v", ok, err)
+	}
+
+	// Must publish EVM halt using oldKey's participants with ZERO divide-by-zero panic.
+	aborted := restarted.publishEmergencyHalt(evmBatch, plan, newCompressed, 3, evmTssAddrs, evmNonces)
+	if aborted {
+		t.Fatal("expected publishEmergencyHalt to complete cleanly once EVM halt was submitted")
+	}
+	if !evmHalted.Load() {
+		t.Fatal("expected EVM halt transaction to be submitted by old-share holder")
+	}
+}
+
+type blockingBridgeInfoZenon struct {
+	haltedTestZenon
+	holdMu     sync.Mutex
+	holdActive bool
+	entered    chan struct{}
+	enterOnce  sync.Once
+	release    chan struct{}
+}
+
+func (z *blockingBridgeInfoZenon) GetBridgeInfo() (*definition.BridgeInfoVariable, error) {
+	z.holdMu.Lock()
+	holding := z.holdActive
+	z.holdMu.Unlock()
+	if holding {
+		z.enterOnce.Do(func() { close(z.entered) })
+		<-z.release
+	}
+	return &definition.BridgeInfoVariable{
+		Administrator:            types.ZeroAddress,
+		CompressedTssECDSAPubKey: "old-znn-key",
+		TssNonce:                 1,
+	}, nil
+}
+
+func TestPublishEmergencyHaltCancelsHeldOpenZenonRpcWhenEvmDetectsStaleSignature(t *testing.T) {
+	oldKey, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	newKey, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldAddr := crypto.PubkeyToAddress(oldKey.PublicKey)
+	newAddr := crypto.PubkeyToAddress(newKey.PublicKey)
+	contract := ecommon.HexToAddress("0x6666666666666666666666666666666666666666")
+
+	zMock := &blockingBridgeInfoZenon{
+		haltedTestZenon: haltedTestZenon{evmContract: contract.Hex()},
+		entered:         make(chan struct{}),
+		release:         make(chan struct{}),
+	}
+	znnSrv := server.NewServer()
+	if err := znnSrv.RegisterName("embedded.bridge", zMock); err != nil {
+		t.Fatal(err)
+	}
+	znnHTTP := httptest.NewServer(znnSrv.WebsocketHandler([]string{"*"}))
+	t.Cleanup(func() {
+		close(zMock.release)
+		znnSrv.Stop()
+		znnHTTP.Close()
+	})
+
+	// EVM reports newAddr (rotated) immediately so SendHaltEvmWithExpectedContext returns ErrHaltSignaturesStale.
+	var evmMu sync.Mutex
+	curEvmTss := oldAddr
+	evmHTTP := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			ID     json.RawMessage   `json:"id"`
+			Method string            `json:"method"`
+			Params []json.RawMessage `json:"params"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		resp := map[string]interface{}{"jsonrpc": "2.0", "id": req.ID}
+		switch req.Method {
+		case "eth_chainId":
+			resp["result"] = hexutil.EncodeUint64(1)
+		case "eth_call":
+			var call struct {
+				Data  hexutil.Bytes `json:"data"`
+				Input hexutil.Bytes `json:"input"`
+			}
+			_ = json.Unmarshal(req.Params[0], &call)
+			sel := append(call.Data, call.Input...)
+			evmMu.Lock()
+			addr := curEvmTss
+			evmMu.Unlock()
+			switch {
+			case len(sel) >= 4 && string(sel[:4]) == string(common.EvmContractAbi.Methods["tss"].ID):
+				resp["result"] = ecommon.BytesToHash(addr.Bytes()).Hex()
+			case len(sel) >= 4 && string(sel[:4]) == string(common.EvmContractAbi.Methods["actionsNonce"].ID):
+				resp["result"] = ecommon.BigToHash(big.NewInt(5)).Hex()
+			default:
+				resp["result"] = "0x" + strings.Repeat("0", 64)
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	t.Cleanup(evmHTTP.Close)
+
+	stopChan := make(chan os.Signal, 1)
+	stateVal := common.EmergencyState
+	gs := common.NewGlobalState(&stateVal)
+	t.Setenv("HOME", t.TempDir())
+	nm, err := network.NewNetworksManager(stopChan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dbMgr, err := manager.NewDbManager(stopChan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nets := map[string]config.BaseNetworkConfig{
+		common.ZenonNetworkName: {Urls: []string{"ws" + strings.TrimPrefix(znnHTTP.URL, "http")}},
+		"eth-halted-test":       {Urls: []string{evmHTTP.URL}},
+	}
+	if err := nm.Init(nets, dbMgr, gs, func(*common.BridgeMetadata) {}); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { nm.Stop() })
+
+	evmBatch, _, signedEvmNonces, signedEvmTss, err := nm.GetHaltMessagesWithState()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Arm the held-open Zenon getBridgeInfo RPC AND rotate EVM's TSS address.
+	zMock.holdMu.Lock()
+	zMock.holdActive = true
+	zMock.holdMu.Unlock()
+	evmMu.Lock()
+	curEvmTss = newAddr
+	evmMu.Unlock()
+
+	producerPub := []byte("test-producer-pubkey-32-bytes!!!")
+	producerPubB64 := base64.StdEncoding.EncodeToString(producerPub)
+	node := &Node{
+		config:          &config.Config{TssConfig: config.TssManagerConfig{LocalPubKeys: []string{producerPubB64}}},
+		networksManager: nm,
+		dbManager:       dbMgr,
+		producerKeyPair: &wallet.KeyPair{Public: producerPub},
+		ecdsaPrivateKey: oldKey,
+		evmAddress:      oldAddr,
+		state:           gs,
+		stopChan:        stopChan,
+		logger:          zap.NewNop().Sugar(),
+	}
+	plan := &emergencyHaltPlan{
+		znnSignature:      "AAAA",
+		znnParticipants:   []string{producerPubB64},
+		evmFullSignatures: [][]byte{make([]byte, 65)},
+		evmParticipants:   [][]string{{producerPubB64}},
+	}
+
+	done := make(chan bool, 1)
+	go func() {
+		done <- node.publishEmergencyHalt(evmBatch, plan, "old-znn-key", 1, signedEvmTss, signedEvmNonces)
+	}()
+
+	select {
+	case aborted := <-done:
+		if !aborted {
+			t.Fatal("expected publishEmergencyHalt to return aborted=true")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("publishEmergencyHalt blocked on held-open Zenon getBridgeInfo after EVM detected stale signature")
+	}
+}
+
+func TestSignKeyGenMessagesContextPreemptsHeldCeremonyOnEmergencyState(t *testing.T) {
+	stopChan := make(chan os.Signal, 1)
+	stateVal := common.KeyGenState
+	gs := common.NewGlobalState(&stateVal)
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	defer close(release)
+
+	node := &Node{
+		state:    gs,
+		stopChan: stopChan,
+		logger:   zap.NewNop().Sugar(),
+		signMessagesHook: func(pubKey string, messagesToSign [][]byte, msgsIndexes map[string]int) (*keysign.Response, error) {
+			close(entered)
+			<-release
+			return &keysign.Response{Status: tcommon.Success}, nil
+		},
+	}
+
+	ctx, cancel := node.keyGenContext()
+	defer cancel()
+
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := node.signKeyGenMessagesContext(ctx, "newKey", "oldKey", [][]byte{{1}}, map[string]int{"AQ==": 0})
+		errCh <- err
+	}()
+
+	<-entered
+	if err := gs.SetState(common.EmergencyState); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case err := <-errCh:
+		if err == nil {
+			t.Fatal("expected context cancellation error when EmergencyState preempted signing ceremony")
+		}
+	case <-time.After(1 * time.Second):
+		t.Fatal("signKeyGenMessagesContext stayed blocked behind held signing ceremony after EmergencyState")
 	}
 }

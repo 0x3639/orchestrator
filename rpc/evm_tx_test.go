@@ -2093,3 +2093,158 @@ func TestAnySecondaryHasUnwrapLogChunkedReusesVerifiedHeadAtLowRateLimit(t *test
 		t.Fatalf("after attempt 2: blockNumberCalls=%d getLogsCalls=%d, want (1, 1)", blockNumberCalls.Load(), getLogsCalls.Load())
 	}
 }
+
+func TestCrossActionLineageNeverRestoresRejectedSetTssRetry(t *testing.T) {
+	contract := ecommon.HexToAddress("0x6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f")
+	newTss := ecommon.HexToAddress("0x7070707070707070707070707070707070707070")
+	key, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sender := crypto.PubkeyToAddress(key.PublicKey)
+	signer := etypes.LatestSignerForChainID(big.NewInt(1))
+
+	store := newMemPendingTxStore()
+	var setTssRetryHash, haltHash ecommon.Hash
+	setTssRetryEntered := make(chan struct{})
+	haltEntered := make(chan struct{})
+	releaseSetTssRetry := make(chan struct{})
+	releaseHalt := make(chan struct{})
+	var confirmedNonce, pendingNonce atomic.Uint64
+	confirmedNonce.Store(5)
+	pendingNonce.Store(5)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			ID     json.RawMessage   `json:"id"`
+			Method string            `json:"method"`
+			Params []json.RawMessage `json:"params"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		resp := map[string]interface{}{"jsonrpc": "2.0", "id": req.ID}
+		switch req.Method {
+		case "eth_chainId":
+			resp["result"] = hexutil.EncodeUint64(1)
+		case "eth_blockNumber":
+			resp["result"] = hexutil.EncodeUint64(100)
+		case "eth_getBalance":
+			resp["result"] = (*hexutil.Big)(new(big.Int).Mul(big.NewInt(10), big.NewInt(1e18)))
+		case "eth_getTransactionCount":
+			var tag string
+			if len(req.Params) >= 2 {
+				_ = json.Unmarshal(req.Params[1], &tag)
+			}
+			if tag == "pending" {
+				resp["result"] = hexutil.EncodeUint64(pendingNonce.Load())
+			} else {
+				resp["result"] = hexutil.EncodeUint64(confirmedNonce.Load())
+			}
+		case "eth_getBlockByNumber":
+			resp["result"] = map[string]interface{}{
+				"number":        hexutil.EncodeUint64(100),
+				"hash":          ecommon.HexToHash("0x11"),
+				"baseFeePerGas": (*hexutil.Big)(big.NewInt(20_000_000_000)),
+			}
+		case "eth_maxPriorityFeePerGas":
+			resp["result"] = (*hexutil.Big)(big.NewInt(2_000_000_000))
+		case "eth_estimateGas":
+			resp["result"] = hexutil.EncodeUint64(100_000)
+		case "eth_sendRawTransaction":
+			var raw hexutil.Bytes
+			_ = json.Unmarshal(req.Params[0], &raw)
+			var tx etypes.Transaction
+			_ = tx.UnmarshalBinary(raw)
+			switch tx.Hash() {
+			case setTssRetryHash:
+				close(setTssRetryEntered)
+				<-releaseSetTssRetry
+				resp["error"] = map[string]interface{}{"code": -32000, "message": "insufficient funds for gas * price + value"}
+			case haltHash:
+				close(haltEntered)
+				<-releaseHalt
+				resp["error"] = map[string]interface{}{"code": -32000, "message": "insufficient funds for gas * price + value"}
+			default:
+				pendingNonce.Store(tx.Nonce() + 1)
+				resp["result"] = tx.Hash().Hex()
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	t.Cleanup(srv.Close)
+
+	client, err := NewEvmRpcClient(config.BaseNetworkConfig{Urls: []string{srv.URL}}, "cross-action-lineage", contract)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Stop()
+	client.SetChainID(1)
+	client.SetPendingTxStore(store)
+
+	// 1. Accepted setTss1 at nonce 5.
+	setTss1, err := client.GetSetTssEcdsaPubKeyEvmTx(newTss, sender, []byte{4}, []byte{5}, &contract)
+	if err != nil {
+		t.Fatal(err)
+	}
+	signedSetTss1, err := etypes.SignTx(setTss1, signer, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := client.SendTransaction(signedSetTss1); err != nil {
+		t.Fatal(err)
+	}
+
+	// 2. Start setTss2 retry at nonce 5 and pause in-flight.
+	setTss2, err := client.GetSetTssEcdsaPubKeyEvmTx(newTss, sender, []byte{4}, []byte{5}, &contract)
+	if err != nil {
+		t.Fatal(err)
+	}
+	signedSetTss2, err := etypes.SignTx(setTss2, signer, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	setTssRetryHash = signedSetTss2.Hash()
+	setTss2Done := make(chan error, 1)
+	go func() { setTss2Done <- client.SendTransaction(signedSetTss2) }()
+	<-setTssRetryEntered
+
+	// 3. Emergency halt supersedes setTss2 at nonce 5 and pauses in-flight.
+	halt1, err := client.GetHaltTxEvm(sender, []byte{1, 2, 3}, &contract)
+	if err != nil {
+		t.Fatal(err)
+	}
+	signedHalt1, err := etypes.SignTx(halt1, signer, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	haltHash = signedHalt1.Hash()
+	halt1Done := make(chan error, 1)
+	go func() { halt1Done <- client.SendTransaction(signedHalt1) }()
+	<-haltEntered
+
+	// 4. Reject setTss2 FIRST while halt1 is pending: MUST NOT recreate a second owner!
+	close(releaseSetTssRetry)
+	if err := <-setTss2Done; err == nil {
+		t.Fatal("expected setTss2 rejection")
+	}
+	if gotSetTss, err := store.LoadPendingEvmTx(sender, contract, evmTxKindSetTss); err != nil || gotSetTss != nil {
+		t.Fatalf("while halt is pending, rejected setTss2 recreated second owner: (%+v, %v)", gotSetTss, err)
+	}
+	if gotHalt, err := store.LoadPendingEvmTx(sender, contract, evmTxKindHalt); err != nil || gotHalt == nil || gotHalt.TxHash != haltHash {
+		t.Fatalf("while halt is pending, halt owner lost: (%+v, %v)", gotHalt, err)
+	}
+
+	// 5. Reject halt1 SECOND: MUST restore accepted setTss1 (NOT rejected setTss2)!
+	close(releaseHalt)
+	if err := <-halt1Done; err == nil {
+		t.Fatal("expected halt1 rejection")
+	}
+	if gotHalt, err := store.LoadPendingEvmTx(sender, contract, evmTxKindHalt); err != nil || gotHalt != nil {
+		t.Fatalf("after halt1 rejection, halt = (%+v, %v), want nil", gotHalt, err)
+	}
+	gotSetTss, err := store.LoadPendingEvmTx(sender, contract, evmTxKindSetTss)
+	if err != nil || gotSetTss == nil || gotSetTss.TxHash != signedSetTss1.Hash() {
+		t.Fatalf("after halt1 rejection, setTss = (%+v, %v), want accepted setTss1 %s (not rejected setTss2 %s)",
+			gotSetTss, err, signedSetTss1.Hash(), setTssRetryHash)
+	}
+}

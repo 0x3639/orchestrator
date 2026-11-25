@@ -150,6 +150,21 @@ func (r *ZnnRpc) PublishTransaction(tx *nom.AccountBlock) error {
 	return r.rpcClient.LedgerApi.PublishRawTransaction(tx)
 }
 
+// PublishTransactionContext publishes tx using settingsClient so caller
+// cancellation aborts a stalled publish RPC promptly.
+func (r *ZnnRpc) PublishTransactionContext(ctx context.Context, tx *nom.AccountBlock) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if r.settingsClient != nil {
+		return r.settingsClient.CallContext(ctx, nil, "ledger.publishRawTransaction", tx)
+	}
+	return r.PublishTransaction(tx)
+}
+
 // PrepareWrapUpdate makes the signed block that adds signature to wrap
 // request id, proof of work included, without publishing it.
 func (r *ZnnRpc) PrepareWrapUpdate(id types.Hash, signature string, keyPair *wallet.KeyPair) (*nom.AccountBlock, error) {
@@ -229,6 +244,30 @@ func (r *ZnnRpc) PrepareHalt(signature string, keyPair *wallet.KeyPair) (*nom.Ac
 		return nil, err
 	}
 	return tx, nil
+}
+
+func (r *ZnnRpc) PrepareHaltContext(ctx context.Context, signature string, keyPair *wallet.KeyPair) (*nom.AccountBlock, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	type prepRes struct {
+		tx  *nom.AccountBlock
+		err error
+	}
+	ch := make(chan prepRes, 1)
+	go func() {
+		tx, err := r.PrepareHalt(signature, keyPair)
+		ch <- prepRes{tx: tx, err: err}
+	}()
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case res := <-ch:
+		return res.tx, res.err
+	}
 }
 
 /// RPC Calls

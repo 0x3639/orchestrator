@@ -1642,6 +1642,10 @@ func (eN *evmNetwork) GetHaltEvmTx(signature []byte, sender ecommon.Address) (*e
 	return eN.EvmRpc().GetHaltTxEvm(sender, signature, eN.ContractAddress())
 }
 
+func (eN *evmNetwork) GetHaltEvmTxContext(ctx context.Context, signature []byte, sender ecommon.Address) (*etypes.Transaction, error) {
+	return eN.EvmRpc().GetHaltTxEvmContext(ctx, sender, signature, eN.ContractAddress())
+}
+
 func (eN *evmNetwork) IsHalted() (bool, error) {
 	return eN.EvmRpc().IsHalted()
 }

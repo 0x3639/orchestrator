@@ -89,13 +89,16 @@ type znnNetwork struct {
 	// sourceUnknown unwrap inside its redeem delay, along with incremental
 	// secondary-endpoint log corroboration progress across retries so large
 	// block ranges never stall the bridge listener past its hold window.
-	unknownUnwrapMu            sync.Mutex
-	unknownUnwrapKey           string
-	unknownUnwrapHead          uint64
-	unknownUnwrapCorrobTarget  uint64
-	unknownUnwrapCorrobCursor  uint64
-	unknownUnwrapCorrobStarted bool
-	unknownUnwrapCorrobDone    bool
+	unknownUnwrapMu             sync.Mutex
+	unknownUnwrapKey            string
+	unknownUnwrapHead           uint64
+	unknownUnwrapHeadsOK        bool
+	unknownUnwrapReceiptOK      bool
+	unknownUnwrapCanonicalOK    bool
+	unknownUnwrapCorrobTarget   uint64
+	unknownUnwrapCorrobCursor   uint64
+	unknownUnwrapCorrobStarted  bool
+	unknownUnwrapCorrobDone     bool
 	// Tests may lower the per-attempt secondary log chunk budget.
 	secondaryLogMaxChunks int
 }
@@ -2732,6 +2735,9 @@ func (rC *znnNetwork) observeUnknownUnwrapHead(chainId uint32, txHash types.Hash
 	if rC.unknownUnwrapKey != key || head < rC.unknownUnwrapHead {
 		rC.unknownUnwrapKey = key
 		rC.unknownUnwrapHead = head
+		rC.unknownUnwrapHeadsOK = false
+		rC.unknownUnwrapReceiptOK = false
+		rC.unknownUnwrapCanonicalOK = false
 		rC.unknownUnwrapCorrobTarget = head
 		rC.unknownUnwrapCorrobCursor = 0
 		rC.unknownUnwrapCorrobStarted = false
@@ -2740,10 +2746,41 @@ func (rC *znnNetwork) observeUnknownUnwrapHead(chainId uint32, txHash types.Hash
 	return rC.unknownUnwrapHead
 }
 
+func (rC *znnNetwork) unknownUnwrapPrecheckState(chainId uint32, txHash types.Hash, logIndex uint32) (obsHead uint64, headsOK, receiptOK, canonicalOK bool) {
+	key := fmt.Sprintf("%d:%s:%d", chainId, txHash.String(), logIndex)
+	rC.unknownUnwrapMu.Lock()
+	defer rC.unknownUnwrapMu.Unlock()
+	if rC.unknownUnwrapKey != key {
+		return 0, false, false, false
+	}
+	return rC.unknownUnwrapHead, rC.unknownUnwrapHeadsOK, rC.unknownUnwrapReceiptOK, rC.unknownUnwrapCanonicalOK
+}
+
+func (rC *znnNetwork) markUnknownUnwrapPrecheck(chainId uint32, txHash types.Hash, logIndex uint32, obsHead uint64, headsOK, receiptOK, canonicalOK bool) {
+	key := fmt.Sprintf("%d:%s:%d", chainId, txHash.String(), logIndex)
+	rC.unknownUnwrapMu.Lock()
+	defer rC.unknownUnwrapMu.Unlock()
+	if rC.unknownUnwrapKey != key || rC.unknownUnwrapHead != obsHead {
+		return
+	}
+	if headsOK {
+		rC.unknownUnwrapHeadsOK = true
+	}
+	if receiptOK {
+		rC.unknownUnwrapReceiptOK = true
+	}
+	if canonicalOK {
+		rC.unknownUnwrapCanonicalOK = true
+	}
+}
+
 func (rC *znnNetwork) clearUnknownUnwrapObs() {
 	rC.unknownUnwrapMu.Lock()
 	rC.unknownUnwrapKey = ""
 	rC.unknownUnwrapHead = 0
+	rC.unknownUnwrapHeadsOK = false
+	rC.unknownUnwrapReceiptOK = false
+	rC.unknownUnwrapCanonicalOK = false
 	rC.unknownUnwrapCorrobTarget = 0
 	rC.unknownUnwrapCorrobCursor = 0
 	rC.unknownUnwrapCorrobStarted = false
@@ -2810,28 +2847,35 @@ func (rC *znnNetwork) lateUnknownUnwrapCovered(ctx context.Context, evm *rpc.Evm
 	if eN.hasQueuedEvent(ecommon.Hash(rpcZnnEvent.TransactionHash), rpcZnnEvent.LogIndex) {
 		return false
 	}
-	minHead, maxHead, err := evm.EndpointHeads()
-	if err != nil {
-		return false
-	}
 	depth := eN.ConfirmationsToFinality()
-	if maxHead-minHead > depth {
-		eN.requestCatchUpSync()
-		return false
-	}
-	hasReceipt, err := evm.AnySecondaryHasReceipt(ecommon.Hash(rpcZnnEvent.TransactionHash))
-	if err != nil || hasReceipt {
-		if hasReceipt {
-			eN.requestCatchUpSync()
+	obsHead, headsOK, receiptOK, canonicalOK := rC.unknownUnwrapPrecheckState(rpcZnnEvent.ChainId, rpcZnnEvent.TransactionHash, rpcZnnEvent.LogIndex)
+	if !headsOK {
+		minHead, maxHead, err := evm.EndpointHeads()
+		if err != nil {
+			return false
 		}
-		return false
+		if maxHead-minHead > depth {
+			eN.requestCatchUpSync()
+			return false
+		}
+		obsHead = rC.observeUnknownUnwrapHead(rpcZnnEvent.ChainId, rpcZnnEvent.TransactionHash, rpcZnnEvent.LogIndex, maxHead)
+		// Every configured endpoint must have reached obsHead so no secondary can
+		// silently clip eth_getLogs below the window being corroborated.
+		if minHead < obsHead {
+			eN.requestCatchUpSync()
+			return false
+		}
+		rC.markUnknownUnwrapPrecheck(rpcZnnEvent.ChainId, rpcZnnEvent.TransactionHash, rpcZnnEvent.LogIndex, obsHead, true, false, false)
 	}
-	obsHead := rC.observeUnknownUnwrapHead(rpcZnnEvent.ChainId, rpcZnnEvent.TransactionHash, rpcZnnEvent.LogIndex, maxHead)
-	// Every configured endpoint must have reached obsHead so no secondary can
-	// silently clip eth_getLogs below the window being corroborated.
-	if minHead < obsHead {
-		eN.requestCatchUpSync()
-		return false
+	if !receiptOK {
+		hasReceipt, err := evm.AnySecondaryHasReceipt(ecommon.Hash(rpcZnnEvent.TransactionHash))
+		if err != nil || hasReceipt {
+			if hasReceipt {
+				eN.requestCatchUpSync()
+			}
+			return false
+		}
+		rC.markUnknownUnwrapPrecheck(rpcZnnEvent.ChainId, rpcZnnEvent.TransactionHash, rpcZnnEvent.LogIndex, obsHead, false, true, false)
 	}
 	requiredHeight := obsHead - min(obsHead, depth)
 
@@ -2840,8 +2884,11 @@ func (rC *znnNetwork) lateUnknownUnwrapCovered(ctx context.Context, evm *rpc.Evm
 		eN.requestCatchUpSync()
 		return false
 	}
-	if _, err := evm.CanonicalHash(requiredHeight); err != nil {
-		return false
+	if !canonicalOK {
+		if _, err := evm.CanonicalHash(requiredHeight); err != nil {
+			return false
+		}
+		rC.markUnknownUnwrapPrecheck(rpcZnnEvent.ChainId, rpcZnnEvent.TransactionHash, rpcZnnEvent.LogIndex, obsHead, false, false, true)
 	}
 	// Corroborate absence of the source log across independent secondary
 	// endpoints in bounded batches, retaining verified progress across retries

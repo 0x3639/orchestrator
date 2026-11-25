@@ -3087,3 +3087,114 @@ func TestLateUnknownUnwrapHandlesConcurrentQueueToDBConfirmationHandoff(t *testi
 	}
 	l.expect("handoff matched without emergency", common.LiveState, 2)
 }
+
+func TestLateUnknownUnwrapLowRateLimitCachesPrechecksAndAdvancesLogCorroboration(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	b := newReplayBridge(t)
+	l := &lateNode{t: t, bridge: b}
+	l.ledger.Store(newReplayLedger(t, b, 5000))
+	l.redeemableIn.Store(30)
+
+	var secBlockNumCalls, secReceiptCalls, secHeaderCalls, secLogCalls atomic.Int32
+	primaryURL := replayServerWithErrors(t, func(method string, params []json.RawMessage) (interface{}, *replayRPCError) {
+		switch method {
+		case "stats.syncInfo":
+			return nil, nil
+		case "embedded.bridge.getUnwrapTokenRequestByHashAndLog":
+			return withRedeemDelay(b.request, l.redeemableIn.Load()), nil
+		case "eth_syncing":
+			return false, nil
+		case "eth_blockNumber":
+			return hexutil.EncodeUint64(20), nil
+		case "eth_getBlockByNumber":
+			var number hexutil.Uint64
+			_ = json.Unmarshal(params[0], &number)
+			return map[string]interface{}{"number": number, "hash": ecommon.BigToHash(new(big.Int).SetUint64(uint64(number) + 10))}, nil
+		case "eth_getTransactionReceipt":
+			return nil, nil
+		case "eth_getLogs":
+			return []etypes.Log{}, nil
+		}
+		if result, ok := l.ledger.Load().answer(t, method, params); ok {
+			return result, nil
+		}
+		return nil, nil
+	})
+	secondaryURL := replayServerWithErrors(t, func(method string, params []json.RawMessage) (interface{}, *replayRPCError) {
+		switch method {
+		case "eth_syncing":
+			return false, nil
+		case "eth_blockNumber":
+			secBlockNumCalls.Add(1)
+			return hexutil.EncodeUint64(20), nil
+		case "eth_getBlockByNumber":
+			secHeaderCalls.Add(1)
+			var number hexutil.Uint64
+			_ = json.Unmarshal(params[0], &number)
+			return map[string]interface{}{"number": number, "hash": ecommon.BigToHash(new(big.Int).SetUint64(uint64(number) + 10))}, nil
+		case "eth_getTransactionReceipt":
+			secReceiptCalls.Add(1)
+			return nil, nil
+		case "eth_getLogs":
+			secLogCalls.Add(1)
+			return []etypes.Log{}, nil
+		default:
+			return nil, nil
+		}
+	})
+
+	l.n, l.stores = replayNetwork(t, b, primaryURL, map[uint32]string{1: primaryURL})
+	// Rate-limited burst=1 secondary with FilterQuerySize=5 over blocks [1..20] (4 chunks)
+	// and 2 chunks per listener attempt -> 2 listener attempts total.
+	evmClient, err := rpc.NewEvmRpcClient(config.BaseNetworkConfig{
+		Urls:                 []string{primaryURL, secondaryURL},
+		FilterQuerySize:      5,
+		RpcRequestsPerSecond: 5,
+		RpcBurst:             1,
+	}, "eth", b.contract)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(evmClient.Stop)
+	l.n.rpcManager.RegisterEvmClient(1, evmClient)
+	l.n.SetConfirmationsToFinality(5)
+	l.n.secondaryLogMaxChunks = 2
+	l.at(5000, acceptedReceive)
+
+	params, err := config.NewEvmParams(&definition.NetworkInfo{NetworkClass: definition.EvmClass, Id: 1, Name: "eth", ContractAddress: b.contract.Hex()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	params.SetConfirmationsToFinality(5)
+	params.SetContractDeploymentHeight(1)
+	eN := &evmNetwork{
+		EvmParams: params,
+		client:    evmClient,
+		done:      make(chan struct{}),
+		state:     l.n.state,
+		logger:    zap.NewNop().Sugar(),
+	}
+	eN.lastScannedThrough.Store(20)
+	eN.scanned.Store(true)
+	l.n.networkManager = &NetworksManager{znnNetwork: l.n, evmNetworks: []*evmNetwork{eN}, logger: zap.NewNop().Sugar()}
+
+	// Attempt 1 runs prechecks once and completes chunks 1..2.
+	if err := l.listen(); err == nil {
+		t.Fatal("expected attempt 1 hold after first 2 chunks")
+	}
+	if secBlockNumCalls.Load() != 1 || secReceiptCalls.Load() != 1 || secHeaderCalls.Load() != 1 || secLogCalls.Load() != 2 {
+		t.Fatalf("after attempt 1: blockNum=%d receipt=%d header=%d logs=%d, want (1, 1, 1, 2)",
+			secBlockNumCalls.Load(), secReceiptCalls.Load(), secHeaderCalls.Load(), secLogCalls.Load())
+	}
+
+	// Attempt 2 MUST reuse cached prechecks (zero extra blockNum/receipt/header permits)
+	// and complete chunks 3..4 to escalate cleanly.
+	if err := l.listen(); err != nil {
+		t.Fatalf("attempt 2 failed to complete corroboration: %v", err)
+	}
+	if secBlockNumCalls.Load() != 1 || secReceiptCalls.Load() != 1 || secHeaderCalls.Load() != 1 || secLogCalls.Load() != 4 {
+		t.Fatalf("after attempt 2: blockNum=%d receipt=%d header=%d logs=%d, want (1, 1, 1, 4)",
+			secBlockNumCalls.Load(), secReceiptCalls.Load(), secHeaderCalls.Load(), secLogCalls.Load())
+	}
+	l.expect("low-rate cached prechecks escalated", common.EmergencyState, 2)
+}
