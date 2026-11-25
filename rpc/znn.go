@@ -263,6 +263,41 @@ func (r *ZnnRpc) GetWrapTokenRequestById(id types.Hash) (*definition.WrapTokenRe
 	return r.rpcClient.BridgeApi.GetWrapTokenRequestById(id)
 }
 
+// GetWrapTokenRequestByIdContext reads one wrap request by ID using a
+// context-bound connection and preserves ConfirmationsToFinality from the RPC
+// reply. A null reply decodes as (nil, nil); a reply missing
+// confirmationsToFinality or required wrap fields returns an error so an
+// unfinalized or malformed record is never treated as finalized.
+func (r *ZnnRpc) GetWrapTokenRequestByIdContext(ctx context.Context, id types.Hash) (*embedded.WrapTokenRequest, error) {
+	var raw json.RawMessage
+	if err := r.settingsClient.CallContext(ctx, &raw, "embedded.bridge.getWrapTokenRequestById", id); err != nil {
+		return nil, err
+	}
+	if len(raw) == 0 || string(raw) == "null" {
+		return nil, nil
+	}
+	var finality struct {
+		ConfirmationsToFinality *uint64 `json:"confirmationsToFinality"`
+	}
+	if err := json.Unmarshal(raw, &finality); err != nil {
+		return nil, err
+	}
+	if finality.ConfirmationsToFinality == nil {
+		return nil, errors.New("wrap request reply without confirmationsToFinality")
+	}
+	wrap, err := decodeRedeemWrap(raw)
+	if err != nil {
+		return nil, err
+	}
+	if wrap == nil {
+		return nil, nil
+	}
+	return &embedded.WrapTokenRequest{
+		WrapTokenRequest:        wrap,
+		ConfirmationsToFinality: *finality.ConfirmationsToFinality,
+	}, nil
+}
+
 // RedeemWrapRequestById is the source lookup of the redeem check. That check
 // repeats on a timer, so the read is bounded: an endpoint that accepts the
 // request and never answers must not stop the rechecks behind it. An unknown
@@ -308,6 +343,22 @@ func (r *ZnnRpc) UnwrapTokenRequestContext(ctx context.Context, txHash types.Has
 
 func (r *ZnnRpc) GetAllWrapTokenRequests(pageIndex, pageSize uint32) (*embedded.WrapTokenRequestList, error) {
 	return r.rpcClient.BridgeApi.GetAllWrapTokenRequests(pageIndex, pageSize)
+}
+
+func (r *ZnnRpc) GetAllWrapTokenRequestsContext(ctx context.Context, pageIndex, pageSize uint32) (*embedded.WrapTokenRequestList, error) {
+	var list *embedded.WrapTokenRequestList
+	if err := r.settingsClient.CallContext(ctx, &list, "embedded.bridge.getAllWrapTokenRequests", pageIndex, pageSize); err != nil {
+		return nil, err
+	}
+	return list, nil
+}
+
+func (r *ZnnRpc) GetFrontierAccountBlockContext(ctx context.Context, address types.Address) (*api.AccountBlock, error) {
+	var block *api.AccountBlock
+	if err := r.settingsClient.CallContext(ctx, &block, "ledger.getFrontierAccountBlock", address); err != nil {
+		return nil, err
+	}
+	return block, nil
 }
 
 func (r *ZnnRpc) GetAccountBlockByHash(hash types.Hash) (*api.AccountBlock, error) {

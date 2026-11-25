@@ -19,13 +19,21 @@ import (
 )
 
 var (
-	app                 = cli.NewApp()
-	nodeManager         *Manager
-	pprofListenAndServe = http.ListenAndServe
-	onPprofError        = func(address string, err error) {
+	app          = cli.NewApp()
+	nodeManager  *Manager
+	startPprof   = startPprofServer
+	onPprofError = func(address string, err error) {
 		common.GlobalLogger.Errorf("pprof server failed on %s: %v", address, err)
 	}
 )
+
+func startPprofServer(address string) {
+	go func() {
+		if err := http.ListenAndServe(address, nil); err != nil {
+			onPprofError(address, err)
+		}
+	}()
+}
 
 func Run() {
 	err := app.Run(os.Args)
@@ -79,12 +87,7 @@ func beforeAction(ctx *cli.Context) error {
 		}
 
 		address := net.JoinHostPort(listenHost, strconv.FormatUint(port, 10))
-
-		go func() {
-			if err := pprofListenAndServe(address, nil); err != nil {
-				onPprofError(address, err)
-			}
-		}()
+		startPprof(address)
 	}
 
 	return nil

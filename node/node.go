@@ -19,6 +19,7 @@ import (
 	"orchestrator/health/snapshot"
 	"orchestrator/metadata"
 	"orchestrator/network"
+	"orchestrator/rpc"
 	"orchestrator/tss"
 	"os"
 	"path"
@@ -39,6 +40,8 @@ import (
 	"github.com/pkg/errors"
 	"github.com/prometheus/tsdb/fileutil"
 	"github.com/zenon-network/go-zenon/common/types"
+	"github.com/zenon-network/go-zenon/rpc/api"
+	"github.com/zenon-network/go-zenon/rpc/api/embedded"
 	"github.com/zenon-network/go-zenon/vm/constants"
 	"github.com/zenon-network/go-zenon/vm/embedded/definition"
 	"github.com/zenon-network/go-zenon/vm/embedded/implementation"
@@ -1292,9 +1295,13 @@ func (node *Node) processSignatures() {
 	}
 }
 
-// resignRetryDelay paces retries for deferred unfinalized wraps and failed
-// eligibility lookups during a ReSignState scan.
+// resignRetryDelay paces retries for deferred unfinalized wraps, failed
+// eligibility lookups, and retried bridge-account snapshots during ReSignState.
 var resignRetryDelay = time.Second
+
+// resignRPCTimeout bounds each individual Zenon RPC read during a ReSignState
+// scan so a stalled endpoint cannot wedge the worker or block shutdown.
+var resignRPCTimeout = rpc.ZnnLedgerTimeout
 
 // hasMoreWrapPages reports whether GetAllWrapTokenRequests may have further
 // pages after pageIndex. The Zenon RPC computes Count over all stored requests
@@ -1307,34 +1314,143 @@ func hasMoreWrapPages(pageIndex, pageSize uint32, count, listLen int) bool {
 	return listLen > 0
 }
 
-// runReSignScan walks a stable snapshot of matching wraps for the active
-// ReSignState request, retrying wraps that were unfinalized at the start of
-// the scan and wraps whose EVM RedeemsInfo lookup transiently failed, without
-// letting newly arriving unfinalized wraps prolong the scan indefinitely.
-// Returns false if the worker is stopping or encountered a fatal storage error.
-func (node *Node) runReSignScan() bool {
+func sameAccountBlockFrontier(a, b *api.AccountBlock) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	return a.Height == b.Height && a.Hash == b.Hash
+}
+
+// captureReSignSnapshot reads all wrap requests matching (networkClass, chainId)
+// from a coherent Zenon bridge-account state by bracketing the paginated read
+// with ledger.getFrontierAccountBlock(types.BridgeContract). Any frontier RPC
+// failure or mid-scan bridge-account change (including new wraps added at the
+// same momentum height) discards the torn pass and retries rather than falling
+// back to a stale cached height.
+func (node *Node) captureReSignSnapshot(resignNetworkClass, resignChainId uint32, resignGen uint64) (wraps []*embedded.WrapTokenRequest, stale, stop bool) {
 	const pageSize = uint32(100)
 
+	for {
+		if node.workerStopping() {
+			return nil, false, true
+		}
+		if !node.state.IsResignGenerationCurrent(resignGen) {
+			return nil, true, false
+		}
+
+		startCtx, startCancel := context.WithTimeout(node.workers.context(), resignRPCTimeout)
+		startFrontier, err := node.networksManager.Znn().GetFrontierAccountBlockContext(startCtx, types.BridgeContract)
+		startCancel()
+		if node.workerStopping() {
+			return nil, false, true
+		}
+		if err != nil {
+			node.logger.Debugf("failed to read bridge account frontier before resign scan: %v", err)
+			if !node.workerSleep(resignRetryDelay) {
+				return nil, false, true
+			}
+			continue
+		}
+
+		seenIDs := make(map[types.Hash]struct{})
+		snapshot := make([]*embedded.WrapTokenRequest, 0)
+		pageIndex := uint32(0)
+		pageErr := false
+
+		for {
+			if node.workerStopping() {
+				return nil, false, true
+			}
+			if !node.state.IsResignGenerationCurrent(resignGen) {
+				return nil, true, false
+			}
+
+			pageCtx, pageCancel := context.WithTimeout(node.workers.context(), resignRPCTimeout)
+			wrapRequests, err := node.networksManager.Znn().GetAllWrapTokenRequestsContext(pageCtx, pageIndex, pageSize)
+			pageCancel()
+			if node.workerStopping() {
+				return nil, false, true
+			}
+			if err != nil {
+				node.logger.Debug(err)
+				pageErr = true
+				break
+			}
+			if wrapRequests == nil {
+				break
+			}
+			node.logger.Debugf("len(wrapRequests.List): %d, count: %d, pageIndex: %d", len(wrapRequests.List), wrapRequests.Count, pageIndex)
+			for _, wrap := range wrapRequests.List {
+				if wrap == nil || wrap.WrapTokenRequest == nil {
+					continue
+				}
+				if wrap.NetworkClass != resignNetworkClass || wrap.ChainId != resignChainId {
+					continue
+				}
+				if _, dup := seenIDs[wrap.Id]; dup {
+					continue
+				}
+				seenIDs[wrap.Id] = struct{}{}
+				snapshot = append(snapshot, wrap)
+			}
+			if !hasMoreWrapPages(pageIndex, pageSize, wrapRequests.Count, len(wrapRequests.List)) {
+				break
+			}
+			pageIndex++
+		}
+
+		if pageErr {
+			if !node.workerSleep(resignRetryDelay) {
+				return nil, false, true
+			}
+			continue
+		}
+		if !node.state.IsResignGenerationCurrent(resignGen) {
+			return nil, true, false
+		}
+
+		endCtx, endCancel := context.WithTimeout(node.workers.context(), resignRPCTimeout)
+		endFrontier, err := node.networksManager.Znn().GetFrontierAccountBlockContext(endCtx, types.BridgeContract)
+		endCancel()
+		if node.workerStopping() {
+			return nil, false, true
+		}
+		if err != nil {
+			node.logger.Debugf("failed to read bridge account frontier after resign scan: %v", err)
+			if !node.workerSleep(resignRetryDelay) {
+				return nil, false, true
+			}
+			continue
+		}
+		if !sameAccountBlockFrontier(startFrontier, endFrontier) {
+			node.logger.Debug("Bridge account frontier changed during ReSignState snapshot; retrying")
+			if !node.workerSleep(resignRetryDelay) {
+				return nil, false, true
+			}
+			continue
+		}
+		return snapshot, false, false
+	}
+}
+
+// runReSignScan walks a coherent bridge-account snapshot of matching wraps for
+// the active ReSignState request, resolving wraps that were unfinalized in the
+// snapshot via bounded, cancellable by-ID reads that preserve finality and
+// retrying wraps whose EVM RedeemsInfo lookup transiently failed.
+// Returns false if the worker is stopping or encountered a fatal storage error.
+func (node *Node) runReSignScan() bool {
 	resignNetworkClass, resignChainId, resignGen := node.state.GetResignTarget()
-	// Snapshot the frontier momentum height at the start of the scan so wraps
-	// created after the scan began (entering via moving page boundaries) are
-	// excluded from this scan's membership.
-	var cutoffMomentum uint64
-	if mom, err := node.networksManager.Znn().GetFrontierMomentum(); err == nil && mom != nil {
-		cutoffMomentum = mom.Height
-	} else if h, err := node.state.GetFrontierMomentum(); err == nil {
-		cutoffMomentum = h
+	node.logger.Debug("Parsing all the wraps in resign state")
+
+	snapshot, staleResign, stop := node.captureReSignSnapshot(resignNetworkClass, resignChainId, resignGen)
+	if stop {
+		return false
 	}
 
-	processedIDs := make(map[types.Hash]bool)
 	deferredUnfinalized := make(map[types.Hash]struct{})
 	retryEligibility := make(map[types.Hash]*definition.WrapTokenRequest)
-	staleResign := false
 
-	node.logger.Debug("Parsing all the wraps in resign state")
-	pageIndex := uint32(0)
-	for {
-		// Returning keeps ReSignState; the next start resumes the scan.
+	for _, wrap := range snapshot {
 		if node.workerStopping() {
 			return false
 		}
@@ -1342,63 +1458,26 @@ func (node *Node) runReSignScan() bool {
 			staleResign = true
 			break
 		}
-		wrapRequests, err := node.networksManager.Znn().GetAllWrapTokenRequests(pageIndex, pageSize)
-		if err != nil {
-			node.logger.Debug(err)
-			if !node.workerSleep(10 * time.Second) {
-				return false
-			}
+		if wrap.ConfirmationsToFinality != 0 {
+			deferredUnfinalized[wrap.Id] = struct{}{}
 			continue
 		}
-		if wrapRequests == nil {
+		needRetry, stale, fatal := node.processReSignWrap(wrap.WrapTokenRequest, resignGen)
+		if fatal {
+			return false
+		}
+		if stale {
+			staleResign = true
 			break
 		}
-		node.logger.Debugf("len(wrapRequests.List): %d, count: %d, pageIndex: %d", len(wrapRequests.List), wrapRequests.Count, pageIndex)
-		for _, wrap := range wrapRequests.List {
-			if !node.state.IsResignGenerationCurrent(resignGen) {
-				staleResign = true
-				break
-			}
-			if wrap == nil || wrap.WrapTokenRequest == nil {
-				continue
-			}
-			if wrap.NetworkClass != resignNetworkClass || wrap.ChainId != resignChainId {
-				continue
-			}
-			if cutoffMomentum > 0 && wrap.CreationMomentumHeight > cutoffMomentum {
-				continue
-			}
-			if processedIDs[wrap.Id] {
-				continue
-			}
-			processedIDs[wrap.Id] = true
-			if wrap.ConfirmationsToFinality != 0 {
-				deferredUnfinalized[wrap.Id] = struct{}{}
-				continue
-			}
-			needRetry, stale, fatal := node.processReSignWrap(wrap.WrapTokenRequest, resignGen)
-			if fatal {
-				return false
-			}
-			if stale {
-				staleResign = true
-				break
-			}
-			if needRetry {
-				retryEligibility[wrap.Id] = wrap.WrapTokenRequest
-			}
+		if needRetry {
+			retryEligibility[wrap.Id] = wrap.WrapTokenRequest
 		}
-		if staleResign {
-			break
-		}
-		if !hasMoreWrapPages(pageIndex, pageSize, wrapRequests.Count, len(wrapRequests.List)) {
-			break
-		}
-		pageIndex++
 	}
 
-	// Retry only the wraps captured in this scan's stable set: wraps that were
-	// unfinalized when the scan started and wraps whose eligibility lookup failed.
+	// Retry only the wraps captured in this scan's coherent snapshot: wraps
+	// that were unfinalized when the snapshot was taken (resolved directly by
+	// ID with finality preserved) and wraps whose eligibility lookup failed.
 	for !staleResign && (len(deferredUnfinalized) > 0 || len(retryEligibility) > 0) {
 		if node.workerStopping() {
 			return false
@@ -1428,71 +1507,46 @@ func (node *Node) runReSignScan() bool {
 			continue
 		}
 
-		seen := make(map[types.Hash]bool, len(deferredUnfinalized))
-		scanComplete := true
-		pageIndex = 0
-		for {
+		for id := range deferredUnfinalized {
 			if node.workerStopping() {
 				return false
 			}
 			if !node.state.IsResignGenerationCurrent(resignGen) {
 				staleResign = true
-				scanComplete = false
 				break
 			}
-			wrapRequests, err := node.networksManager.Znn().GetAllWrapTokenRequests(pageIndex, pageSize)
+			callCtx, cancel := context.WithTimeout(node.workers.context(), resignRPCTimeout)
+			wrap, err := node.networksManager.Znn().GetWrapTokenRequestByIdContext(callCtx, id)
+			cancel()
+			if node.workerStopping() {
+				return false
+			}
+			if rpc.WrapNotFound(err) {
+				// Confirmed absent on Zenon.
+				delete(deferredUnfinalized, id)
+				continue
+			}
 			if err != nil {
-				node.logger.Debug(err)
-				scanComplete = false
+				node.logger.Debugf("failed to read deferred wrap %s by id: %v", id, err)
+				continue
+			}
+			if wrap == nil || wrap.WrapTokenRequest == nil || wrap.Id != id {
+				continue
+			}
+			if wrap.ConfirmationsToFinality != 0 {
+				continue
+			}
+			delete(deferredUnfinalized, id)
+			needRetry, stale, fatal := node.processReSignWrap(wrap.WrapTokenRequest, resignGen)
+			if fatal {
+				return false
+			}
+			if stale {
+				staleResign = true
 				break
 			}
-			if wrapRequests == nil {
-				break
-			}
-			for _, wrap := range wrapRequests.List {
-				if wrap == nil || wrap.WrapTokenRequest == nil {
-					continue
-				}
-				if _, tracked := deferredUnfinalized[wrap.Id]; !tracked {
-					continue
-				}
-				seen[wrap.Id] = true
-				if wrap.ConfirmationsToFinality != 0 {
-					continue
-				}
-				delete(deferredUnfinalized, wrap.Id)
-				needRetry, stale, fatal := node.processReSignWrap(wrap.WrapTokenRequest, resignGen)
-				if fatal {
-					return false
-				}
-				if stale {
-					staleResign = true
-					scanComplete = false
-					break
-				}
-				if needRetry {
-					retryEligibility[wrap.Id] = wrap.WrapTokenRequest
-				}
-			}
-			if staleResign {
-				break
-			}
-			if !hasMoreWrapPages(pageIndex, pageSize, wrapRequests.Count, len(wrapRequests.List)) {
-				break
-			}
-			pageIndex++
-		}
-		if scanComplete {
-			// A wrap omitted from a paginated scan (due to moving page
-			// boundaries or transient RPC skips) may still exist on Zenon.
-			// Confirm absence by ID before dropping it from the deferred set.
-			for id := range deferredUnfinalized {
-				if seen[id] {
-					continue
-				}
-				if _, err := node.networksManager.GetWrapRequestByIdRPC(id); err != nil && err.Error() == constants.ErrDataNonExistent.Error() {
-					delete(deferredUnfinalized, id)
-				}
+			if needRetry {
+				retryEligibility[id] = wrap.WrapTokenRequest
 			}
 		}
 	}

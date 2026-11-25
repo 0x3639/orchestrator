@@ -9,7 +9,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/zenon-network/go-zenon/chain/nom"
 	"github.com/zenon-network/go-zenon/common/types"
+	"github.com/zenon-network/go-zenon/rpc/api"
 	"github.com/zenon-network/go-zenon/rpc/api/embedded"
 	"github.com/zenon-network/go-zenon/rpc/server"
 	"github.com/zenon-network/go-zenon/vm/constants"
@@ -80,6 +82,12 @@ func (b *startupBridge) GetWrapTokenRequestById(types.Hash) (*definition.WrapTok
 	return nil, errors.New("request unavailable")
 }
 
+type startupLedger struct{}
+
+func (*startupLedger) GetFrontierAccountBlock(types.Address) (*api.AccountBlock, error) {
+	return &api.AccountBlock{AccountBlock: nom.AccountBlock{Height: 1, Hash: types.Hash{1}, Amount: big.NewInt(0)}}, nil
+}
+
 // startupNode is a signer with the bridge above and no EVM network, in the
 // given state, whose startup is not complete.
 func startupNode(t *testing.T, state uint8) (*Node, *startupBridge) {
@@ -88,6 +96,9 @@ func startupNode(t *testing.T, state uint8) (*Node, *startupBridge) {
 	bridge := &startupBridge{}
 	srv := server.NewServer()
 	if err := srv.RegisterName("embedded.bridge", bridge); err != nil {
+		t.Fatal(err)
+	}
+	if err := srv.RegisterName("ledger", &startupLedger{}); err != nil {
 		t.Fatal(err)
 	}
 	endpoint := httptest.NewServer(srv)

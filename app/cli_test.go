@@ -6,7 +6,6 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
-	"runtime"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -36,13 +35,15 @@ func TestPprofRegisteredAndBeforeActionHonorsFlagsAndBindFailure(t *testing.T) {
 	nodeManager = nil
 	t.Cleanup(func() { nodeManager = prevManager })
 
-	var listenAttempts atomic.Int32
-	prevListen := pprofListenAndServe
-	pprofListenAndServe = func(addr string, handler http.Handler) error {
-		listenAttempts.Add(1)
-		return prevListen(addr, handler)
+	// startPprof is invoked synchronously inside beforeAction, so observing
+	// startup attempts does not depend on goroutine scheduling or sleeps.
+	var startAttempts atomic.Int32
+	prevStart := startPprof
+	startPprof = func(address string) {
+		startAttempts.Add(1)
+		prevStart(address)
 	}
-	t.Cleanup(func() { pprofListenAndServe = prevListen })
+	t.Cleanup(func() { startPprof = prevStart })
 
 	type pprofErrEvent struct {
 		addr string
@@ -56,17 +57,12 @@ func TestPprofRegisteredAndBeforeActionHonorsFlagsAndBindFailure(t *testing.T) {
 	}
 	t.Cleanup(func() { onPprofError = prevOnErr })
 
-	// --pprof=false with a valid port must make zero listener attempts.
+	// --pprof=false with a valid port must make zero listener startup attempts.
 	if err := runBeforeActionWithFlags("--pprof=false", "--pprof.addr", "127.0.0.1", "--pprof.port", "6060"); err != nil {
 		t.Fatalf("--pprof=false unexpectedly failed: %v", err)
 	}
-	// Yield so any accidentally spawned goroutine would run.
-	for i := 0; i < 5; i++ {
-		runtime.Gosched()
-	}
-	time.Sleep(25 * time.Millisecond)
-	if got := listenAttempts.Load(); got != 0 {
-		t.Fatalf("--pprof=false made %d listener attempts, want 0", got)
+	if got := startAttempts.Load(); got != 0 {
+		t.Fatalf("--pprof=false made %d listener startup attempts, want 0", got)
 	}
 
 	// Out-of-range ports (0 and >65535) must fail validation when --pprof is enabled.
@@ -75,8 +71,8 @@ func TestPprofRegisteredAndBeforeActionHonorsFlagsAndBindFailure(t *testing.T) {
 			t.Fatalf("--pprof --pprof.port %s: expected validation error", port)
 		}
 	}
-	if got := listenAttempts.Load(); got != 0 {
-		t.Fatalf("invalid ports made %d listener attempts, want 0", got)
+	if got := startAttempts.Load(); got != 0 {
+		t.Fatalf("invalid ports made %d listener startup attempts, want 0", got)
 	}
 
 	// Occupy a real loopback port to force a genuine EADDRINUSE bind failure
@@ -96,12 +92,12 @@ func TestPprofRegisteredAndBeforeActionHonorsFlagsAndBindFailure(t *testing.T) {
 	); err != nil {
 		t.Fatalf("beforeAction failed: %v", err)
 	}
+	if got := startAttempts.Load(); got != 1 {
+		t.Fatalf("expected 1 synchronous listener startup attempt, got %d", got)
+	}
 
 	select {
 	case ev := <-errCh:
-		if got := listenAttempts.Load(); got != 1 {
-			t.Fatalf("expected 1 listener attempt, got %d", got)
-		}
 		if ev.addr != wantAddr {
 			t.Fatalf("pprof bound address = %q, want %q", ev.addr, wantAddr)
 		}

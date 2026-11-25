@@ -8,6 +8,7 @@ import (
 	"github.com/HyperCore-Team/go-tss/keygen"
 	"github.com/HyperCore-Team/go-tss/keysign"
 	"github.com/HyperCore-Team/go-tss/messages"
+	tstorage "github.com/HyperCore-Team/go-tss/storage"
 	"github.com/HyperCore-Team/go-tss/tss"
 	ic "github.com/libp2p/go-libp2p-core/crypto"
 	"github.com/libp2p/go-libp2p-core/peer"
@@ -47,6 +48,7 @@ type TssManager struct {
 	preParamsFn func() error
 	keygenFn    func(keygen.Request) (keygen.Response, error)
 	partyConfig func() tcommon.TssConfig
+	bulkSignFn  func(key string, msgs [][]byte, algo messages.Algo, signers []string, version string) (*keysign.Response, error)
 }
 
 func NewTssManager(conf oconfig.TssManagerConfig, privateKey string) (_ *TssManager, retErr error) {
@@ -170,6 +172,9 @@ func (m *TssManager) BulkSign(messagesBytes [][]byte, algo messages.Algo) (*keys
 }
 
 func (m *TssManager) bulkSignWithKey(key string, messagesBytes [][]byte, algo messages.Algo, signers []string, version string) (*keysign.Response, error) {
+	if m.bulkSignFn != nil {
+		return m.bulkSignFn(key, messagesBytes, algo, slices.Clone(signers), version)
+	}
 	var keySignReq keysign.Request
 	messagesStr := make([]string, len(messagesBytes))
 	for idx, msg := range messagesBytes {
@@ -239,6 +244,21 @@ func (m *TssManager) KeyGen(algo messages.Algo) (*keygen.Response, error) {
 	} else {
 		return nil, errors.New("invalid algorithm")
 	}
+}
+
+// readLocalState reads the key share for pubKey through the manager's anchored
+// open TSS directory descriptor so directory substitution cannot redirect or
+// break signing reads.
+func (m *TssManager) readLocalState(pubKey string, algo messages.Algo) (tstorage.KeygenLocalState, error) {
+	if m.stateDir != nil {
+		return newSecureLocalStateManager(m.stateDir).GetLocalState(pubKey, algo)
+	}
+	ownedDir, err := oconfig.OpenOwnedDir(m.keyShareDir)
+	if err != nil {
+		return tstorage.KeygenLocalState{}, err
+	}
+	defer ownedDir.Close()
+	return newSecureLocalStateManager(ownedDir).GetLocalState(pubKey, algo)
 }
 
 // VerifyKeyShare checks ownership and exact 0600 permissions on all key share

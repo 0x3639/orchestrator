@@ -1,6 +1,7 @@
 package common
 
 import (
+	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -377,26 +378,36 @@ func TestWhileResignGenerationIsSerializesWriteBoundary(t *testing.T) {
 	}
 	_, _, gen1 := gs.GetResignTarget()
 
-	entered := make(chan struct{})
-	retargetAttempting := make(chan struct{})
 	retargetDone := make(chan struct{})
 
-	go func() {
-		<-entered
-		close(retargetAttempting)
-		_, _ = gs.ActivateResign(2, 56)
-		close(retargetDone)
-	}()
-
 	ran, err := gs.WhileResignGenerationIs(gen1, func() error {
-		close(entered)
-		<-retargetAttempting
-		// Give the retarget goroutine time to reach gs.stateMu.Lock(); it must
-		// remain blocked while this write callback holds the lock.
+		// Assert directly that WhileResignGenerationIs holds stateMu during do.
+		if gs.stateMu.TryLock() {
+			gs.stateMu.Unlock()
+			t.Fatal("WhileResignGenerationIs did not hold stateMu during callback")
+		}
+
+		go func() {
+			_, _ = gs.ActivateResign(2, 56)
+			close(retargetDone)
+		}()
+
+		// ActivateResign acquires transferSendMu before blocking on stateMu.
+		// Once transferSendMu.TryLock() fails, ActivateResign is deterministically
+		// inside its critical section waiting on the stateMu held by this callback.
+		deadline := time.Now().Add(5 * time.Second)
+		for gs.transferSendMu.TryLock() {
+			gs.transferSendMu.Unlock()
+			if time.Now().After(deadline) {
+				t.Fatal("timed out waiting for ActivateResign to acquire transferSendMu")
+			}
+			runtime.Gosched()
+		}
+
 		select {
 		case <-retargetDone:
-			t.Error("retarget completed while WhileResignGenerationIs callback was still running")
-		case <-time.After(30 * time.Millisecond):
+			t.Fatal("retarget completed while WhileResignGenerationIs callback held stateMu")
+		default:
 		}
 		return nil
 	})
@@ -413,6 +424,9 @@ func TestWhileResignGenerationIsSerializesWriteBoundary(t *testing.T) {
 	})
 	if err != nil || ran || staleRan {
 		t.Fatalf("stale generation ran write: ran=%v staleRan=%v err=%v", ran, staleRan, err)
+	}
+	if class, chain, gen2 := gs.GetResignTarget(); class != 2 || chain != 56 || gen2 == gen1 {
+		t.Fatalf("post-retarget target = (%d, %d, gen=%d), want (2, 56, !=%d)", class, chain, gen2, gen1)
 	}
 }
 

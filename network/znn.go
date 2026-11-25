@@ -2191,12 +2191,24 @@ func (rC *znnNetwork) GetAllWrapTokenRequests(pageIndex, pageSize uint32) (*embe
 	return rC.ZnnRpc().GetAllWrapTokenRequests(pageIndex, pageSize)
 }
 
+func (rC *znnNetwork) GetAllWrapTokenRequestsContext(ctx context.Context, pageIndex, pageSize uint32) (*embedded.WrapTokenRequestList, error) {
+	return rC.ZnnRpc().GetAllWrapTokenRequestsContext(ctx, pageIndex, pageSize)
+}
+
+func (rC *znnNetwork) GetFrontierAccountBlockContext(ctx context.Context, address types.Address) (*api.AccountBlock, error) {
+	return rC.ZnnRpc().GetFrontierAccountBlockContext(ctx, address)
+}
+
 func (rC *znnNetwork) GetUnwrapTokenRequestByHashAndLog(txHash types.Hash, logIndex uint32) (*definition.UnwrapTokenRequest, error) {
 	return rC.ZnnRpc().GetUnwrapTokenRequestByHashAndLog(txHash, logIndex)
 }
 
 func (rC *znnNetwork) GetWrapTokenRequestById(id types.Hash) (*definition.WrapTokenRequest, error) {
 	return rC.ZnnRpc().GetWrapTokenRequestById(id)
+}
+
+func (rC *znnNetwork) GetWrapTokenRequestByIdContext(ctx context.Context, id types.Hash) (*embedded.WrapTokenRequest, error) {
+	return rC.ZnnRpc().GetWrapTokenRequestByIdContext(ctx, id)
 }
 
 func (rC *znnNetwork) ChangeTssEcdsaPubKey(pubKey, signature, newSignature string, keyPair *wallet.KeyPair) error {

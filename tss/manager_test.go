@@ -1,19 +1,23 @@
 package tss
 
 import (
+	"bytes"
 	"crypto/ed25519"
 	"encoding/base64"
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 
 	tcommon "github.com/HyperCore-Team/go-tss/common"
 	"github.com/HyperCore-Team/go-tss/keygen"
+	"github.com/HyperCore-Team/go-tss/keysign"
 	"github.com/HyperCore-Team/go-tss/messages"
 	tstorage "github.com/HyperCore-Team/go-tss/storage"
 	gotss "github.com/HyperCore-Team/go-tss/tss"
 	"github.com/ethereum/go-ethereum/crypto"
+	"github.com/syndtr/goleveldb/leveldb"
 
 	"orchestrator/common"
 	oconfig "orchestrator/common/config"
@@ -307,5 +311,112 @@ func TestSecureLocalStateManagerWrites0600AndAnchorsToOpenDir(t *testing.T) {
 		if _, err := mgr.GetLocalState(pubKey, messages.ECDSAKEYSIGN); err == nil {
 			t.Fatal("expected GetLocalState to reject symlinked share")
 		}
+	}
+}
+
+func TestSignUnwrapPoolUsesAnchoredStateReaderAfterDirSubstitution(t *testing.T) {
+	priv, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	pubKey := base64.StdEncoding.EncodeToString(crypto.CompressPubkey(&priv.PublicKey))
+	fileName, err := common.GetPublicKeyFileName(pubKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	parent := t.TempDir()
+	origDir := filepath.Join(parent, "tss-orig")
+	ownedDir, err := oconfig.OpenOwnedDir(origDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ownedDir.Close()
+
+	anchoredParticipants := []string{"anchored-p1", "anchored-p2", "anchored-p3"}
+	if err := newSecureLocalStateManager(ownedDir).SaveLocalState(tstorage.KeygenLocalState{
+		PubKey:          pubKey,
+		LocalData:       []byte("anchored-share"),
+		ParticipantKeys: anchoredParticipants,
+		LocalPartyKey:   "anchored-p1",
+	}, messages.ECDSAKEYGEN); err != nil {
+		t.Fatalf("SaveLocalState failed: %v", err)
+	}
+
+	// Substitute origDir with a decoy directory containing a different share
+	// (and different participant_keys). With joinPartyVersion >= 0.14,
+	// SignUnwrapPool must still read ParticipantKeys from the anchored fd.
+	movedDir := filepath.Join(parent, "tss-moved")
+	if err := os.Rename(origDir, movedDir); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(origDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(origDir, fileName), []byte(`{"pub_key":"`+pubKey+`","participant_keys":["decoy-p1"]}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	votesDB, err := leveldb.OpenFile(filepath.Join(parent, "votes"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer votesDB.Close()
+
+	var observedSigners [][]string
+	var observedVersions []string
+	mgr := &TssManager{
+		stateDir:         ownedDir,
+		keyShareDir:      origDir,
+		unwrapVotes:      votesDB,
+		publicKey:        pubKey,
+		localPubKeys:     []string{"stale-local-key"},
+		joinPartyVersion: "0.14.0",
+		bulkSignFn: func(key string, msgs [][]byte, algo messages.Algo, signers []string, version string) (*keysign.Response, error) {
+			observedSigners = append(observedSigners, signers)
+			observedVersions = append(observedVersions, version)
+			sigs := make([]keysign.Signature, len(msgs))
+			for i, msg := range msgs {
+				raw, signErr := crypto.Sign(msg, priv)
+				if signErr != nil {
+					return nil, signErr
+				}
+				sigs[i] = keysign.Signature{
+					Msg:        base64.StdEncoding.EncodeToString(msg),
+					Signature:  base64.StdEncoding.EncodeToString(raw[:64]),
+					RecoveryID: base64.StdEncoding.EncodeToString(raw[64:65]),
+				}
+			}
+			return &keysign.Response{Status: tcommon.Success, Signatures: sigs}, nil
+		},
+	}
+
+	pool := [][]byte{bytes.Repeat([]byte{0xaa}, 32)}
+	resp, err := mgr.SignUnwrapPool(common.CeremonyWindow{Number: 1, Size: 100}, pool, func() error { return nil })
+	if err != nil {
+		t.Fatalf("SignUnwrapPool failed after directory substitution: %v", err)
+	}
+	if resp == nil || resp.Status != tcommon.Success || len(resp.Signatures) != 1 {
+		t.Fatalf("unexpected SignUnwrapPool response: %+v", resp)
+	}
+	if len(observedSigners) != 2 {
+		t.Fatalf("expected 2 signing rounds (agreement + pool), got %d", len(observedSigners))
+	}
+	for i := range observedSigners {
+		if !slices.Equal(observedSigners[i], anchoredParticipants) {
+			t.Fatalf("round %d signers = %v, want anchored %v", i, observedSigners[i], anchoredParticipants)
+		}
+		if observedVersions[i] != unwrapLeaderlessVersion {
+			t.Fatalf("round %d version = %q, want %q", i, observedVersions[i], unwrapLeaderlessVersion)
+		}
+	}
+
+	// Removing origDir entirely must also not break SignUnwrapPool while the
+	// anchored open descriptor still holds the original share.
+	if err := os.RemoveAll(origDir); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mgr.SignUnwrapPool(common.CeremonyWindow{Number: 2, Size: 100}, pool, func() error { return nil }); err != nil {
+		t.Fatalf("SignUnwrapPool failed when substituted pathname was removed: %v", err)
 	}
 }
