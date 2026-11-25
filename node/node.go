@@ -718,6 +718,10 @@ func (node *Node) processSignatures() {
 					// we take the first base64 char of the signature and transform it to its ascii value
 					turn := uint32(int(znnOldKeySignature[0]))
 					for {
+						if node.keygenInterrupted() {
+							node.logger.Info("State left keyGen during Zenon rotation sender; stopping rotation sender")
+							return
+						}
 						turn++
 						producerPubKey := base64.StdEncoding.EncodeToString(node.producerKeyPair.Public)
 						bridgeInfo, err := node.networksManager.GetBridgeInfo()
@@ -733,6 +737,10 @@ func (node *Node) processSignatures() {
 							break
 						}
 						if selected, ok := node.selectParticipant(turn); ok && producerPubKey == selected {
+							if node.keygenInterrupted() {
+								node.logger.Info("State left keyGen before Zenon rotation publish; aborting send")
+								return
+							}
 							node.logger.Debug("[sendZnnTx PubKey] this is me")
 							err = node.networksManager.ChangeTssEcdsaPubKeyZnn(keyGenResponse.PubKey, znnOldKeySignature, znnNewKeySignature, node.producerKeyPair)
 							if err != nil {
@@ -760,9 +768,17 @@ func (node *Node) processSignatures() {
 					defer senders.Done()
 					turn := uint32(int(znnOldKeySignature[0]))
 					for {
+						if node.keygenInterrupted() {
+							node.logger.Info("State left keyGen during EVM rotation sender; stopping rotation sender")
+							return
+						}
 						turn++
 						producerPubKey := base64.StdEncoding.EncodeToString(node.producerKeyPair.Public)
 						if selected, ok := node.selectParticipant(turn); ok && producerPubKey == selected {
+							if node.keygenInterrupted() {
+								node.logger.Info("State left keyGen before EVM rotation publish; aborting send")
+								return
+							}
 							node.logger.Debug("[send set tss ecdsa pub key evm tx] this is me")
 							changed, err := node.networksManager.SetTssEcdsaPubKeyEvm(evmBatch, oldKeyFullSignatures, newKeyFullSignatures, keyGenResponse.PubKey, node.ecdsaPrivateKey, node.evmAddress)
 							// Read after senders.Wait.
@@ -792,6 +808,16 @@ func (node *Node) processSignatures() {
 				senders.Wait()
 				if node.workerStopping() {
 					return
+				}
+				if node.keygenInterrupted() {
+					// If Zenon has not switched to the replacement key, restore the
+					// active key's participants and handle the interruption without
+					// prematurely committing newKey; the share remains on disk.
+					bridgeInfo, bErr := node.networksManager.GetBridgeInfo()
+					if bErr != nil || bridgeInfo == nil || bridgeInfo.CompressedTssECDSAPubKey != keyGenResponse.PubKey {
+						node.restoreActiveKeyParticipants(true)
+						continue
+					}
 				}
 			} else {
 				// We wait for the key to be set
@@ -2505,7 +2531,8 @@ func (node *Node) runKeyGenLoop(keyGenThresholdFn func() uint32, keyGenFn func()
 
 		if keyGenThreshold > node.getParticipantsLength() {
 			node.logger.Info("KeyGen threshold was not met")
-			node.discardUnusedKeyGen(keyGenResponse)
+			// Preserve any completed threshold share on disk in case peers that
+			// did not record the same blame activate it on-chain.
 			node.restoreActiveKeyParticipants(true)
 			return nil
 		}

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -11,6 +12,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -31,6 +33,7 @@ import (
 
 type fakeWhitelistBackend struct {
 	mu      sync.RWMutex
+	shared  bool
 	p2p     map[string]bool
 	party   map[string]bool
 	sig     map[string]bool
@@ -39,17 +42,19 @@ type fakeWhitelistBackend struct {
 
 func newSharedFakeWhitelistBackend(initial map[string]bool) *fakeWhitelistBackend {
 	return &fakeWhitelistBackend{
-		p2p:   initial,
-		party: initial,
-		sig:   initial,
+		shared: true,
+		p2p:    initial,
+		party:  initial,
+		sig:    initial,
 	}
 }
 
 func newSeparateFakeWhitelistBackend() *fakeWhitelistBackend {
 	return &fakeWhitelistBackend{
-		p2p:   make(map[string]bool),
-		party: make(map[string]bool),
-		sig:   make(map[string]bool),
+		shared: false,
+		p2p:    make(map[string]bool),
+		party:  make(map[string]bool),
+		sig:    make(map[string]bool),
 	}
 }
 
@@ -90,7 +95,7 @@ func (f *fakeWhitelistBackend) ReplaceWhitelist(peerIDs ...string) {
 			next[id] = true
 		}
 	}
-	if &f.p2p == &f.party {
+	if f.shared {
 		f.p2p = next
 		f.party = next
 		f.sig = next
@@ -344,12 +349,19 @@ func TestRealTssHandlersConcurrentWhitelistUpdates(t *testing.T) {
 		if err != nil {
 			t.Fatalf("open stream %s: %v", proto, err)
 		}
-		_ = s.SetReadDeadline(time.Now().Add(2 * time.Second))
+		if err := s.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+			_ = s.Close()
+			t.Fatalf("set read deadline on %s: %v", proto, err)
+		}
 		buf := make([]byte, 1)
 		_, readErr := s.Read(buf)
 		_ = s.Close()
 		if readErr == nil {
 			t.Fatalf("expected unwhitelisted stream on %s to be closed", proto)
+		}
+		var netErr net.Error
+		if errors.As(readErr, &netErr) && netErr.Timeout() {
+			t.Fatalf("unwhitelisted stream on %s timed out instead of being closed by handler: %v", proto, readErr)
 		}
 	}
 
@@ -358,26 +370,44 @@ func TestRealTssHandlersConcurrentWhitelistUpdates(t *testing.T) {
 	// any unsynchronized map access in go-tss stream handlers.
 	clientID := clientHost.ID().String()
 	stop := make(chan struct{})
+	start := make(chan struct{})
 	var wg sync.WaitGroup
+	var protoHits [4]atomic.Int32
 
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		for i := 0; i < 60; i++ {
+		<-start
+		deadline := time.Now().Add(10 * time.Second)
+		for i := 0; ; i++ {
 			mgr.AddWhitelistEntries(clientID)
 			_, _, _ = mgr.GetWhitelists()
 			mgr.DeleteWhitelistEntry(clientID)
 			mgr.ReplaceWhitelist(clientID)
 			mgr.DeleteWhitelistEntry(clientID)
+			if i >= 60 {
+				allHit := true
+				for idx := range protoHits {
+					if protoHits[idx].Load() == 0 {
+						allHit = false
+						break
+					}
+				}
+				if allHit || time.Now().After(deadline) {
+					break
+				}
+			}
 		}
 		close(stop)
 	}()
 
-	for _, proto := range protocols {
+	for idx, proto := range protocols {
+		idx := idx
 		proto := proto
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			<-start
 			for {
 				select {
 				case <-stop:
@@ -394,10 +424,17 @@ func TestRealTssHandlersConcurrentWhitelistUpdates(t *testing.T) {
 				_, _ = s.Write([]byte{0, 0, 0, 0})
 				_, _ = io.Copy(io.Discard, s)
 				_ = s.Close()
+				protoHits[idx].Add(1)
 			}
 		}()
 	}
+	close(start)
 	wg.Wait()
+	for idx, proto := range protocols {
+		if protoHits[idx].Load() == 0 {
+			t.Fatalf("protocol %s never completed a stream during concurrent whitelist mutations", proto)
+		}
+	}
 
 	// Self peer ID must still be present and client removed after final delete.
 	p2pWL, partyWL, sigWL := mgr.GetWhitelists()

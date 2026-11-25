@@ -129,8 +129,10 @@ jobs:
         run: |
           ORCHESTRATOR=$(grep Version metadata/version.go | awk -F '"' '{print $2}')
           # Artifact names may not contain '/', which branch names like fix/x do.
-          ARTIFACT_REF=$(printf '%s' "${{ github.ref_name }}" | tr '/' '-')
-          ARTIFACT_NAME="orchestrator-${ORCHESTRATOR}-${ARTIFACT_REF}-${{ github.sha }}"
+          # Read from $GITHUB_REF_NAME / $GITHUB_SHA env vars rather than interpolating
+          # expressions into shell source.
+          ARTIFACT_REF=$(printf '%s' "$GITHUB_REF_NAME" | tr -c 'A-Za-z0-9._-' '-')
+          ARTIFACT_NAME="orchestrator-${ORCHESTRATOR}-${ARTIFACT_REF}-${GITHUB_SHA}"
           echo "orchestrator_version=${ORCHESTRATOR}" >> "$GITHUB_OUTPUT"
           echo "artifact_name=${ARTIFACT_NAME}" >> "$GITHUB_OUTPUT"
       - name: Build and verify on Ubuntu 20.04 baseline (Go 1.27.4)
@@ -266,7 +268,13 @@ jobs:
           for f in orchestrator-linux-amd64.zip orchestrator-linux-arm64.zip SHA256CHECKSUMS.txt; do
             test -s "$f"
           done
-          sha256sum -c SHA256CHECKSUMS.txt
+          checksum_files=$(awk '{print $2}' SHA256CHECKSUMS.txt | sort)
+          expected_checksum_files=$(printf '%s\n' orchestrator-linux-amd64.zip orchestrator-linux-arm64.zip | sort)
+          if [ "$checksum_files" != "$expected_checksum_files" ]; then
+            echo "SHA256CHECKSUMS.txt entries mismatch: got '$checksum_files', want '$expected_checksum_files'" >&2
+            exit 1
+          fi
+          sha256sum -c --strict SHA256CHECKSUMS.txt
           tmpdir=$(mktemp -d)
           trap 'rm -rf "$tmpdir"' EXIT
           unzip -q orchestrator-linux-amd64.zip -d "$tmpdir"
@@ -448,6 +456,8 @@ jobs:
                           raise RuntimeError(
                               f"failed to read tag ruleset {summary['id']} (HTTP {detail_status}: {detail})"
                           )
+                      if detail.get("enforcement") != "active" or detail.get("target") != "tag":
+                          continue
                       ref_cond = (detail.get("conditions") or {}).get("ref_name") or {}
                       if not matches_ref_patterns(full_ref, ref_cond.get("include"), conservative_on_unknown=False):
                           continue
@@ -523,8 +533,50 @@ jobs:
                   )
               print(f"Verified existing git tag {tag} resolves to {expected_sha}")
 
+          # Load expected release payloads, sizes, and SHA-256 digests upfront so
+          # both same-commit published retries and draft/published verifications
+          # validate against the exact local build artifacts.
+          expected_payloads = {}
+          expected_sizes = {}
+          expected_digests = {}
+          for fname in expected_files:
+              fpath = os.path.join("build", fname)
+              payload = open(fpath, "rb").read()
+              expected_payloads[fname] = payload
+              expected_sizes[fname] = len(payload)
+              expected_digests[fname] = f"sha256:{hashlib.sha256(payload).hexdigest()}"
+
+          def verify_release_assets(release_obj, label):
+              raw_assets = release_obj.get("assets") or []
+              attached = {}
+              for asset in raw_assets:
+                  name = asset.get("name")
+                  if name in attached:
+                      raise RuntimeError(f"{label} contains duplicate asset name {name!r}")
+                  attached[name] = asset
+              if set(attached.keys()) != set(expected_files):
+                  raise RuntimeError(
+                      f"{label} asset set mismatch: got {sorted(attached.keys())}, want {sorted(expected_files)}"
+                  )
+              for fname in expected_files:
+                  asset = attached[fname]
+                  want_size = expected_sizes[fname]
+                  want_digest = expected_digests[fname]
+                  if (
+                      asset.get("state") != "uploaded"
+                      or asset.get("size") != want_size
+                      or asset.get("digest") != want_digest
+                  ):
+                      raise RuntimeError(
+                          f"{label} asset verification failed for {fname}: "
+                          f"got state={asset.get('state')!r} size={asset.get('size')!r} digest={asset.get('digest')!r}, "
+                          f"want state='uploaded' size={want_size} digest={want_digest!r}"
+                      )
+
           # 1. If a published (non-draft) release already exists for this tag, never overwrite it,
-          #    and refuse to report success if the existing release is mutable.
+          #    and refuse to report success if the existing release is mutable. On a same-commit
+          #    retry (e.g. after a dropped publish PATCH response), verify tag binding and all
+          #    published asset digests against the build artifacts before succeeding.
           status, published = api_req("GET", f"{api_base}/releases/tags/{urllib.parse.quote(release_tag, safe='')}")
           if status == 200:
               if published.get("immutable") is not True:
@@ -533,6 +585,12 @@ jobs:
                       "refusing to report success for a mutable release"
                   )
               tag_sha = resolve_tag_commit(release_tag)
+              if tag_sha == commit_sha:
+                  if published.get("tag_name") != release_tag:
+                      raise RuntimeError(
+                          f"existing published release tag_name={published.get('tag_name')!r} != {release_tag!r}"
+                      )
+                  verify_release_assets(published, f"existing immutable release {release_tag}")
               print(
                   f"::notice::Release {release_tag} is already published and immutable (tag SHA: {tag_sha}); "
                   "skipping upload to preserve immutable release assets. Bump metadata/version.go to publish a new release."
@@ -548,6 +606,13 @@ jobs:
                   f"git tag {release_tag} already resolves to {existing_tag_sha}, "
                   f"refusing to publish binaries built from {commit_sha}"
               )
+
+          # 2b. Verify repository immutability and tag-ruleset prerequisites BEFORE
+          #     creating or mutating any draft so missing configuration never leaves
+          #     an orphaned draft reserving this version. (Re-checked again right
+          #     before publication in step 6.)
+          require_immutable_releases_enabled()
+          require_tag_protection_ruleset(release_tag)
 
           # 3. Find an existing draft for this tag (or create one tied to commit_sha).
           drafts = []
@@ -596,8 +661,7 @@ jobs:
               print(f"Created draft release {draft_id} for {release_tag} at {commit_sha}")
 
           # 4. Remove any pre-existing assets on a resumed draft (including any
-          #    unexpected extra files), then upload the exact expected asset set
-          #    and record expected byte sizes and SHA-256 digests.
+          #    unexpected extra files), then upload the exact expected asset set.
           for stale in draft.get("assets", []):
               asset_id = stale["id"]
               del_status, del_data = api_req("DELETE", f"{api_base}/releases/assets/{asset_id}")
@@ -605,45 +669,13 @@ jobs:
                   raise RuntimeError(
                       f"failed to remove stale draft asset {stale.get('name')} ({asset_id}): HTTP {del_status}: {del_data}"
                   )
-          expected_sizes = {}
-          expected_digests = {}
           for fname in expected_files:
-              fpath = os.path.join("build", fname)
-              payload = open(fpath, "rb").read()
-              expected_sizes[fname] = len(payload)
-              expected_digests[fname] = f"sha256:{hashlib.sha256(payload).hexdigest()}"
+              payload = expected_payloads[fname]
               up_url = f"{upload_base}/releases/{draft_id}/assets?name={urllib.parse.quote(fname)}"
               up_status, up_data = api_req("POST", up_url, body=payload, content_type="application/octet-stream")
               if up_status != 201:
                   raise RuntimeError(f"failed to upload {fname} to draft {draft_id}: HTTP {up_status}: {up_data}")
               print(f"Uploaded {fname} ({len(payload)} bytes, {expected_digests[fname]}) to draft {draft_id}")
-
-          def verify_release_assets(release_obj, label):
-              raw_assets = release_obj.get("assets") or []
-              attached = {}
-              for asset in raw_assets:
-                  name = asset.get("name")
-                  if name in attached:
-                      raise RuntimeError(f"{label} contains duplicate asset name {name!r}")
-                  attached[name] = asset
-              if set(attached.keys()) != set(expected_files):
-                  raise RuntimeError(
-                      f"{label} asset set mismatch: got {sorted(attached.keys())}, want {sorted(expected_files)}"
-                  )
-              for fname in expected_files:
-                  asset = attached[fname]
-                  want_size = expected_sizes[fname]
-                  want_digest = expected_digests[fname]
-                  if (
-                      asset.get("state") != "uploaded"
-                      or asset.get("size") != want_size
-                      or asset.get("digest") != want_digest
-                  ):
-                      raise RuntimeError(
-                          f"{label} asset verification failed for {fname}: "
-                          f"got state={asset.get('state')!r} size={asset.get('size')!r} digest={asset.get('digest')!r}, "
-                          f"want state='uploaded' size={want_size} digest={want_digest!r}"
-                      )
 
           # 5. Verify draft metadata and exact asset set + SHA-256 digests before touching the git tag or publishing.
           status, verified = api_req("GET", f"{api_base}/releases/{draft_id}")

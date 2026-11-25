@@ -91,7 +91,38 @@ func (fsm *FileStateMgr) SaveLocalState(state KeygenLocalState, algo messages.Al
 	if err != nil {
 		return err
 	}
-	return ioutil.WriteFile(filePathName, buf, 0o655)
+	dir := filepath.Dir(filePathName)
+	tmpFile, err := os.CreateTemp(dir, ".localstate-*.tmp")
+	if err != nil {
+		return fmt.Errorf("fail to create temp localstate file: %w", err)
+	}
+	tmpPath := tmpFile.Name()
+	cleanup := true
+	defer func() {
+		if cleanup {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+	if err := tmpFile.Chmod(0o600); err != nil {
+		_ = tmpFile.Close()
+		return fmt.Errorf("fail to chmod temp localstate file: %w", err)
+	}
+	if _, err := tmpFile.Write(buf); err != nil {
+		_ = tmpFile.Close()
+		return fmt.Errorf("fail to write temp localstate file: %w", err)
+	}
+	if err := tmpFile.Sync(); err != nil {
+		_ = tmpFile.Close()
+		return fmt.Errorf("fail to sync temp localstate file: %w", err)
+	}
+	if err := tmpFile.Close(); err != nil {
+		return fmt.Errorf("fail to close temp localstate file: %w", err)
+	}
+	if err := os.Rename(tmpPath, filePathName); err != nil {
+		return fmt.Errorf("fail to rename temp localstate file: %w", err)
+	}
+	cleanup = false
+	return nil
 }
 
 // GetLocalState read the local state from file system

@@ -68,11 +68,11 @@ The orchestrator exits with a stop signal on several unrecoverable conditions an
 
 | Port | Protocol | Purpose |
 | --- | --- | --- |
-| `55055` | TCP, libp2p | TSS peer traffic. Must be reachable by the other signers; **firewall it to known Pillar signer IPs** rather than exposing it to the open internet. |
+| `55055` (default `TssConfig.Port`) | TCP, libp2p | TSS peer traffic. Must be reachable by the other signers; **firewall your configured `TssConfig.Port` (default `55055`) to known Pillar signer IPs** rather than exposing it to the open internet. |
 | `55000` | TCP, HTTP | [Health API](health-api.md). Loopback only by default. |
 
-:::caution Restrict TCP port 55055 to known Pillar IPs
-Until the embedded `HyperCore-Team/go-tss` dependency is upgraded off `go-libp2p v0.11.0` and `go-libp2p-kad-dht v0.10.0`, restrict inbound TCP port `55055` at the host or network firewall to known Pillar signer IP addresses so untrusted internet peers cannot reach the libp2p listener.
+:::caution Restrict your configured TSS port (default TCP 55055) to known Pillar IPs
+Until the embedded `HyperCore-Team/go-tss` dependency is upgraded off `go-libp2p v0.11.0` and `go-libp2p-kad-dht v0.10.0`, restrict inbound TCP traffic on your configured `TssConfig.Port` (default `55055`) at the host or network firewall to known Pillar signer IP addresses so untrusted internet peers cannot reach the libp2p listener.
 :::
 
 Check that nothing else holds the peer port before the first start:
