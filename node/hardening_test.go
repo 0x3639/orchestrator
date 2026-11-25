@@ -1938,6 +1938,119 @@ func TestReSignStateTerminatesUnderAlternatingBurstsAtMaxPageSize(t *testing.T) 
 	})
 }
 
+func TestReSignStateVerifiesCutoffBoundaryAgainstDelayedReceive(t *testing.T) {
+	prevDelay := resignRetryDelay
+	prevPageSize := resignPageSize
+	resignRetryDelay = 20 * time.Millisecond
+	resignPageSize = 2
+	t.Cleanup(func() {
+		resignRetryDelay = prevDelay
+		resignPageSize = prevPageSize
+	})
+
+	evmSrv := fakeEvmRpcServer(t)
+	defer evmSrv.Close()
+
+	makeEntry := func(id types.Hash, height uint64) *embedded.WrapTokenRequest {
+		return &embedded.WrapTokenRequest{
+			WrapTokenRequest: &definition.WrapTokenRequest{
+				NetworkClass: definition.EvmClass, ChainId: 1, Id: id,
+				Amount: big.NewInt(10), Fee: big.NewInt(1), CreationMomentumHeight: height,
+			},
+			ConfirmationsToFinality: 0,
+		}
+	}
+
+	// Exact sequence: cutoff=100, pageSize=2, three initial height-98 wraps:
+	//   [ w2(98, 0x01), w1(98, 0x02), w0(98, 0x03) ] (Count=3).
+	// - Call 1 (probe page 0): Count=3.
+	// - Call 2 (tail page 1): 2 future wraps f2(101), f1(101) arrive -> Count=5:
+	//     [ f2(101), f1(101), w2(98), w1(98), w0(98) ].
+	//   Page 1 returns [ w2(98), w1(98) ]... wait: to cache f1(101) at revIdx=3
+	//   FIRST before filling revIdx=1..2:
+	//   Add 3 future wraps f3,f2,f1(101) before Call 2 -> Count=6:
+	//     [ f3(101), f2(101), f1(101), w2(98), w1(98), w0(98) ].
+	//   Call 2 requests page 1 (indices [2,4)) -> returns [ f1(101) at revIdx=3, w2(98) at revIdx=2 ]!
+	// - Call 3 requests tail page (revIdx=0) -> returns [ w0(98) at revIdx=0 ] (gap at revIdx=1, or 1..2).
+	// - Before Call 4 fills the last gap below revIdx=3, a delayed height-99 receive
+	//   delayed99(99, 0x01) arrives and takes revIdx=3, pushing f1(101) to revIdx=4!
+	// The worker must NOT trust the stale cached f1(101) at revIdx=3; it must
+	// re-verify the cutoff boundary, discover delayed99, and mark all 4 wraps.
+	w2 := types.Hash{0x11}
+	w1 := types.Hash{0x12}
+	w0 := types.Hash{0x13}
+	delayed99 := types.Hash{0x14}
+	f1 := types.Hash{0xf1}
+	f2 := types.Hash{0xf2}
+	f3 := types.Hash{0xf3}
+
+	var tableMu sync.Mutex
+	table := []*embedded.WrapTokenRequest{
+		makeEntry(w2, 98),
+		makeEntry(w1, 98),
+		makeEntry(w0, 98),
+	}
+	sortZenonWraps(table)
+
+	bridge := &wrapTestBridge{
+		networks: &embedded.NetworkInfoList{
+			Count: 1,
+			List: []*definition.NetworkInfo{{
+				NetworkClass: definition.EvmClass, Id: 1, Name: "Ethereum",
+				ContractAddress: "0x0000000000000000000000000000000000000001",
+			}},
+		},
+		frontierMomFn: func(_ context.Context, _ int32) (*api.Momentum, error) {
+			return testMomentum(100), nil
+		},
+		pageHandler: func(pageIndex, pageSize uint32, call int32) *embedded.WrapTokenRequestList {
+			tableMu.Lock()
+			defer tableMu.Unlock()
+			switch call {
+			case 2:
+				// Shift so page 1 returns f1(101) at revIdx=3 (and w2 at revIdx=2),
+				// leaving revIdx=0,1 unread while f1(101) is cached at revIdx=3.
+				table = append(table, makeEntry(f3, 101), makeEntry(f2, 101), makeEntry(f1, 101))
+				sortZenonWraps(table)
+			case 4:
+				// Before the gap below revIdx=3 is filled, delayed99 arrives at
+				// height 99, taking revIdx=3 and pushing f1(101) to revIdx=4.
+				table = append(table, makeEntry(delayed99, 99))
+				sortZenonWraps(table)
+			}
+			return paginateZenonWraps(table, pageIndex, pageSize)
+		},
+	}
+
+	n := wrapTestNodeWithEvm(t, common.LiveState, bridge, map[string]string{"Ethereum": evmSrv.URL})
+	if activated, err := n.state.ActivateResign(definition.EvmClass, 1); err != nil || !activated {
+		t.Fatalf("ActivateResign failed: activated=%v err=%v", activated, err)
+	}
+	n.state.CompleteStartup()
+
+	n.workers.start(n.processSignatures)
+	t.Cleanup(func() {
+		done := n.workers.shutdown()
+		<-done
+	})
+
+	eventually(t, "ReSignState to re-verify cutoff boundary and mark delayed height-99 wrap", func() bool {
+		st, _ := n.state.GetState()
+		for _, id := range []types.Hash{w2, w1, w0, delayed99} {
+			r, err := n.dbManager.ZnnStorage().GetResignStatus(id)
+			if err != nil || !r {
+				return false
+			}
+		}
+		return st == common.LiveState
+	})
+	for _, id := range []types.Hash{f1, f2, f3} {
+		if ev, err := n.dbManager.ZnnStorage().GetWrapRequestById(id); err != nil || ev != nil {
+			t.Fatalf("future wrap %s should not have been stored: ev=%+v err=%v", id, ev, err)
+		}
+	}
+}
+
 func TestReSignStateBoundsAndCancelsStalledDeferredWrapRPC(t *testing.T) {
 	prevDelay := resignRetryDelay
 	prevTimeout := resignRPCTimeout

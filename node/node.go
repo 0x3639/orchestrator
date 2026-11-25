@@ -1492,7 +1492,8 @@ func (node *Node) captureReSignSnapshot(resignNetworkClass, resignChainId uint32
 
 		doneFromTail := 0
 		for {
-			if _, ok := coveredByRevIdx[doneFromTail]; !ok {
+			wrap, ok := coveredByRevIdx[doneFromTail]
+			if !ok || wrap.CreationMomentumHeight > cutoffMomentum {
 				break
 			}
 			doneFromTail++
@@ -1520,6 +1521,8 @@ func (node *Node) captureReSignSnapshot(resignNetworkClass, resignChainId uint32
 		estCount = actualCount
 
 		startIdx := int(pageIndex) * int(curPageSize)
+		pageMinRevIdx := actualCount - (startIdx + len(wrapRequests.List))
+		pageMaxRevIdx := actualCount - 1 - startIdx
 		tailShifted := false
 		for i, wrap := range wrapRequests.List {
 			revIdx := actualCount - 1 - (startIdx + i)
@@ -1555,21 +1558,38 @@ func (node *Node) captureReSignSnapshot(resignNetworkClass, resignChainId uint32
 				break
 			}
 			if wrap.CreationMomentumHeight > cutoffMomentum {
-				// Reached the > cutoffMomentum boundary contiguously from revIdx 0.
-				for k := 0; k < r; k++ {
-					recordWrap(coveredByRevIdx[k])
+				// Only accept the > cutoffMomentum boundary at revIdx == r if it
+				// was observed on THIS RPC call. An earlier cached boundary row
+				// could be stale if a delayed receive took revIdx == r while an
+				// earlier gap was being filled. Confirming the boundary at r now
+				// proves all r distinct <= cutoff wraps in [0..r-1] are complete.
+				if len(wrapRequests.List) > 0 && r >= pageMinRevIdx && r <= pageMaxRevIdx {
+					for k := 0; k < r; k++ {
+						recordWrap(coveredByRevIdx[k])
+					}
+					done = true
+				} else {
+					for k, w := range coveredByRevIdx {
+						if k >= r {
+							delete(revIdxByID, w.Id)
+							delete(coveredByRevIdx, k)
+						}
+					}
 				}
-				done = true
 				break
 			}
 			r++
 		}
-		if !done && r >= actualCount {
-			// Contiguously covered revIdx 0..actualCount-1 all the way to index 0.
+		if !done && r == actualCount {
+			// Contiguously covered all actualCount distinct wraps at the current Count.
 			for k := 0; k < actualCount; k++ {
 				recordWrap(coveredByRevIdx[k])
 			}
 			done = true
+		} else if !done && r > actualCount {
+			clear(coveredByRevIdx)
+			clear(revIdxByID)
+			r = 0
 		}
 		if done {
 			snapshot := make([]*embedded.WrapTokenRequest, 0, len(snapshotOrder))
