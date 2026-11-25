@@ -3673,5 +3673,61 @@ func TestLateUnknownUnwrapCorrobCursorPersistsAcrossRestartAndResetsOnReorg(t *t
 		_ = ldb2.Close()
 		t.Fatalf("after reorg across restart, secondary started at toBlock=%v, want 20", reorgEnds)
 	}
+
+	// Process 4: if the configured secondary endpoint changes across restart
+	// (even with the same canonical hash), persisted cursor MUST be invalidated
+	// so the newly configured secondary scans from block 20 too.
+	altSecondaryURL := makeEvm(true)
+	evm4, err := rpc.NewEvmRpcClient(config.BaseNetworkConfig{
+		Urls:            []string{primaryURL, altSecondaryURL},
+		FilterQuerySize: 5,
+	}, "eth", contract)
+	if err != nil {
+		_ = ldb2.Close()
+		t.Fatal(err)
+	}
+	t.Cleanup(evm4.Stop)
+	params4, err := config.NewEvmParams(&definition.NetworkInfo{
+		NetworkClass:    definition.EvmClass,
+		Id:              1,
+		Name:            "eth",
+		ContractAddress: contract.Hex(),
+	})
+	if err != nil {
+		_ = ldb2.Close()
+		t.Fatal(err)
+	}
+	params4.SetConfirmationsToFinality(5)
+	params4.SetContractDeploymentHeight(1)
+	stateVal4 := common.LiveState
+	eN4 := &evmNetwork{
+		EvmParams: params4,
+		client:    evm4,
+		done:      make(chan struct{}),
+		state:     common.NewGlobalState(&stateVal4),
+		logger:    zap.NewNop().Sugar(),
+	}
+	eN4.lastScannedThrough.Store(20)
+	eN4.scanned.Store(true)
+	znn4 := &znnNetwork{
+		logger:                zap.NewNop().Sugar(),
+		corrobStore:           wrap.NewUnwrapCorrobStore(ldb2),
+		secondaryLogMaxChunks: 2,
+	}
+	znn4.networkManager = &NetworksManager{znnNetwork: znn4, evmNetworks: []*evmNetwork{eN4}, logger: zap.NewNop().Sugar()}
+	mu.Lock()
+	beforeSwap := len(seenSecondaryEnds)
+	mu.Unlock()
+	if znn4.lateUnknownUnwrapCovered(context.Background(), evm4, req) {
+		_ = ldb2.Close()
+		t.Fatal("expected changed secondary URL to invalidate persisted cursor and rescan from head")
+	}
+	mu.Lock()
+	swapEnds := append([]uint64(nil), seenSecondaryEnds[beforeSwap:]...)
+	mu.Unlock()
+	if len(swapEnds) == 0 || swapEnds[0] != 20 {
+		_ = ldb2.Close()
+		t.Fatalf("after secondary URL swap across restart, secondary started at toBlock=%v, want 20", swapEnds)
+	}
 	_ = ldb2.Close()
 }

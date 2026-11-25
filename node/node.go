@@ -818,6 +818,11 @@ func (node *Node) processSignatures() {
 			if node.workerStopping() {
 				return
 			}
+			if plan.needsAllowlistRestart {
+				node.logger.Warn("Recovered bridge uses an active local TSS key whose peers were not whitelisted at startup; requesting clean restart to admit active peers")
+				common.RequestStop(node.stopChan)
+				return
+			}
 			if aborted {
 				continue // The next iteration decides from the state as it is now.
 			}
@@ -2175,11 +2180,12 @@ func scanLocalTssKeys(baseDir string) map[string]localTssKeyInfo {
 // left empty; hasFailedGroups indicates that at least one local key group
 // failed signing and must be retried once available groups are published.
 type emergencyHaltPlan struct {
-	znnSignature      string
-	znnParticipants   []string
-	evmFullSignatures [][]byte
-	evmParticipants   [][]string
-	hasFailedGroups   bool
+	znnSignature          string
+	znnParticipants       []string
+	evmFullSignatures     [][]byte
+	evmParticipants       [][]string
+	hasFailedGroups       bool
+	needsAllowlistRestart bool
 }
 
 // publishEmergencyHalt submits the signed Zenon and EVM halt transactions
@@ -2551,26 +2557,23 @@ func (node *Node) signEmergencyHaltMessages(znnMessage []byte, observedZnnKey st
 		}
 	}
 
-	type haltMsgItem struct {
+	type haltTarget struct {
 		slot int
+		key  string
 		msg  []byte
 	}
-	groups := make(map[string][]haltMsgItem)
-	keyOrder := make([]string, 0, len(byCompressed))
-	addItem := func(k string, slot int, msg []byte) {
+	targets := make([]haltTarget, 0, 1+len(evmMessages))
+	addTarget := func(k string, slot int, msg []byte) {
 		if k == "" || len(msg) == 0 {
 			return
 		}
-		if _, exists := groups[k]; !exists {
-			keyOrder = append(keyOrder, k)
-		}
-		groups[k] = append(groups[k], haltMsgItem{slot: slot, msg: msg})
+		targets = append(targets, haltTarget{slot: slot, key: k, msg: msg})
 	}
-	addItem(slotKeys[0], 0, znnMessage)
+	addTarget(slotKeys[0], 0, znnMessage)
 	for i, msg := range evmMessages {
-		addItem(slotKeys[i+1], i+1, msg)
+		addTarget(slotKeys[i+1], i+1, msg)
 	}
-	if len(keyOrder) == 0 {
+	if len(targets) == 0 {
 		return nil, errors.New("no local TSS key matches any bridge chain's active key")
 	}
 
@@ -2585,114 +2588,116 @@ func (node *Node) signEmergencyHaltMessages(znnMessage []byte, observedZnnKey st
 		origLocalPubKeys = append([]string(nil), node.tssManager.GetLocalPubKeys()...)
 	}
 
-	signedParties := make(map[string][]string, len(keyOrder))
+	// Sign each halt target (Zenon and each readable EVM chain) as its own
+	// single-message TSS ceremony so signers with different subsets of
+	// reachable EVM chains derive identical ceremony IDs and never split the
+	// signing quorum on Zenon or healthy EVM chains.
+	signedParties := make(map[string][]string, len(targets))
 	signedAny := false
-	var firstGroupErr error
-	for _, groupKey := range keyOrder {
-		items := groups[groupKey]
+	var firstTargetErr error
+	for _, target := range targets {
+		groupKey := target.key
 		decompressed, err := common.DecompressPubKey(groupKey)
 		if err != nil {
 			plan.hasFailedGroups = true
-			if firstGroupErr == nil {
-				firstGroupErr = err
+			if firstTargetErr == nil {
+				firstTargetErr = err
 			}
-			node.logger.Errorf("emergency halt signing group %s key decode failed: %v", groupKey, err)
+			node.logger.Errorf("emergency halt signing slot %d key %s decode failed: %v", target.slot, groupKey, err)
 			continue
 		}
 		var groupParties []string
 		if info, ok := byCompressed[groupKey]; ok && len(info.participantKeys) > 0 {
 			groupParties = append([]string(nil), info.participantKeys...)
+			if node.tssManager != nil && node.config != nil && len(node.config.TssConfig.PubKeyWhitelist) > 0 {
+				for _, pid := range info.peerIDs {
+					if !node.config.TssConfig.PubKeyWhitelist[pid] {
+						plan.needsAllowlistRestart = true
+						break
+					}
+				}
+			}
 		} else if len(origLocalPubKeys) > 0 {
 			groupParties = append([]string(nil), origLocalPubKeys...)
 		} else if len(configuredParties) > 0 {
 			groupParties = append([]string(nil), configuredParties...)
 		}
-		msgs := make([][]byte, len(items))
-		idxMap := make(map[string]int, len(items))
-		for i, item := range items {
-			msgs[i] = item.msg
-			idxMap[base64.StdEncoding.EncodeToString(item.msg)] = i
-		}
+		msgs := [][]byte{target.msg}
+		idxMap := map[string]int{base64.StdEncoding.EncodeToString(target.msg): 0}
 		var resp *keysign.Response
 		if node.signMessagesHook != nil {
 			resp, err = node.signMessagesHook(groupKey, msgs, idxMap)
 		} else {
 			resp, err = node.signMessagesWithKey(groupKey, groupParties, msgs, idxMap)
 		}
-		if err != nil || resp == nil || resp.Status != tcommon.Success || len(resp.Signatures) != len(items) {
+		if err != nil || resp == nil || resp.Status != tcommon.Success || len(resp.Signatures) != 1 {
 			if err == nil {
 				if resp == nil || resp.Status != tcommon.Success {
-					err = fmt.Errorf("emergency halt signing with key %s did not succeed", groupKey)
+					err = fmt.Errorf("emergency halt signing slot %d with key %s did not succeed", target.slot, groupKey)
 				} else {
-					err = fmt.Errorf("emergency halt signing returned %d signatures for %d messages", len(resp.Signatures), len(items))
+					err = fmt.Errorf("emergency halt signing slot %d returned %d signatures for 1 message", target.slot, len(resp.Signatures))
 				}
 			}
 			plan.hasFailedGroups = true
-			if firstGroupErr == nil {
-				firstGroupErr = err
+			if firstTargetErr == nil {
+				firstTargetErr = err
 			}
-			node.logger.Errorf("emergency halt signing group %s failed (continuing with remaining groups): %v", groupKey, err)
+			node.logger.Errorf("emergency halt signing slot %d (key %s) failed (continuing with remaining targets): %v", target.slot, groupKey, err)
 			continue
 		}
 
-		// Validate all signatures for this group before installing them into plan.
-		var groupZnnSig string
-		groupEvmSigs := make(map[int][]byte, len(items))
-		var validateErr error
-		for i, sig := range resp.Signatures {
-			sigBytes, err := base64.StdEncoding.DecodeString(sig.Signature)
-			if err != nil {
-				validateErr = err
-				break
-			}
-			recBytes, err := base64.StdEncoding.DecodeString(sig.RecoveryID)
-			if err != nil {
-				validateErr = err
-				break
-			}
-			fullSigBytes := append(sigBytes, recBytes...)
-			fullSigB64 := base64.StdEncoding.EncodeToString(fullSigBytes)
-			ok, err := implementation.CheckECDSASignature(items[i].msg, decompressed, fullSigB64)
-			if err != nil {
-				validateErr = err
-				break
-			}
-			if !ok {
-				validateErr = errors.New("invalid signature when checking emergency halt ecdsa signature")
-				break
-			}
-			if items[i].slot == 0 {
-				groupZnnSig = fullSigB64
-			} else {
-				evmSig := append([]byte(nil), fullSigBytes...)
-				evmSig[len(evmSig)-1] += 27
-				groupEvmSigs[items[i].slot-1] = evmSig
-			}
-		}
-		if validateErr != nil {
+		sig := resp.Signatures[0]
+		sigBytes, err := base64.StdEncoding.DecodeString(sig.Signature)
+		if err != nil {
 			plan.hasFailedGroups = true
-			if firstGroupErr == nil {
-				firstGroupErr = validateErr
+			if firstTargetErr == nil {
+				firstTargetErr = err
 			}
-			node.logger.Errorf("emergency halt signature validation for group %s failed (continuing with remaining groups): %v", groupKey, validateErr)
+			continue
+		}
+		recBytes, err := base64.StdEncoding.DecodeString(sig.RecoveryID)
+		if err != nil {
+			plan.hasFailedGroups = true
+			if firstTargetErr == nil {
+				firstTargetErr = err
+			}
+			continue
+		}
+		fullSigBytes := append(sigBytes, recBytes...)
+		fullSigB64 := base64.StdEncoding.EncodeToString(fullSigBytes)
+		ok, err := implementation.CheckECDSASignature(target.msg, decompressed, fullSigB64)
+		if err != nil || !ok {
+			if err == nil {
+				err = errors.New("invalid signature when checking emergency halt ecdsa signature")
+			}
+			plan.hasFailedGroups = true
+			if firstTargetErr == nil {
+				firstTargetErr = err
+			}
+			node.logger.Errorf("emergency halt signature validation for slot %d (key %s) failed: %v", target.slot, groupKey, err)
 			continue
 		}
 		if len(groupParties) > 0 {
 			signedParties[groupKey] = append([]string(nil), groupParties...)
 		}
-		if groupZnnSig != "" {
-			plan.znnSignature = groupZnnSig
+		if target.slot == 0 {
+			plan.znnSignature = fullSigB64
 			plan.znnParticipants = append([]string(nil), groupParties...)
-		}
-		for evmIdx, evmSig := range groupEvmSigs {
-			plan.evmFullSignatures[evmIdx] = evmSig
-			plan.evmParticipants[evmIdx] = append([]string(nil), groupParties...)
+		} else {
+			evmSig := append([]byte(nil), fullSigBytes...)
+			evmSig[len(evmSig)-1] += 27
+			plan.evmFullSignatures[target.slot-1] = evmSig
+			plan.evmParticipants[target.slot-1] = append([]string(nil), groupParties...)
 		}
 		signedAny = true
 	}
 	if !signedAny {
-		if firstGroupErr != nil {
-			return nil, firstGroupErr
+		if plan.needsAllowlistRestart {
+			node.logger.Warn("Recovered bridge uses an active local TSS key whose peers were not whitelisted at startup; requesting clean restart to admit active peers")
+			common.RequestStop(node.stopChan)
+		}
+		if firstTargetErr != nil {
+			return nil, firstTargetErr
 		}
 		return nil, errors.New("no emergency halt group could be signed")
 	}
@@ -3166,9 +3171,18 @@ func (node *Node) configurePubKey() error {
 			}
 		}
 		evmBatch := node.networksManager.EvmBatch()
-		for _, addr := range node.networksManager.GetActiveEvmTssAddresses(evmBatch) {
-			if info, ok := byAddr[addr]; ok {
-				allowActiveKey(info)
+		for attempt := 0; attempt < 3; attempt++ {
+			addrs, allReadable := node.networksManager.GetActiveEvmTssAddresses(evmBatch)
+			for _, addr := range addrs {
+				if info, ok := byAddr[addr]; ok {
+					allowActiveKey(info)
+				}
+			}
+			if allReadable || len(diskKeys) <= 1 {
+				break
+			}
+			if attempt < 2 {
+				time.Sleep(500 * time.Millisecond)
 			}
 		}
 	}

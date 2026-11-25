@@ -433,8 +433,10 @@ func (r *ZnnRpc) GetOrchestratorInfo() (*definition.OrchestratorInfo, error) {
 }
 
 func (r *ZnnRpc) GetOrchestratorInfoContext(ctx context.Context) (*definition.OrchestratorInfo, error) {
+	callCtx, cancel := context.WithTimeout(ctx, ZnnSettingsTimeout)
+	defer cancel()
 	var orchestratorInfo definition.OrchestratorInfo
-	if err := r.settingsClient.CallContext(ctx, &orchestratorInfo, "embedded.bridge.getOrchestratorInfo"); err != nil {
+	if err := r.settingsClient.CallContext(callCtx, &orchestratorInfo, "embedded.bridge.getOrchestratorInfo"); err != nil {
 		return nil, err
 	}
 	if orchestratorInfo.WindowSize == 0 || orchestratorInfo.KeyGenThreshold == 0 || orchestratorInfo.ConfirmationsToFinality == 0 || orchestratorInfo.EstimatedMomentumTime == 0 {
@@ -550,8 +552,10 @@ func (r *ZnnRpc) GetFrontierMomentum() (*api.Momentum, error) {
 }
 
 func (r *ZnnRpc) GetFrontierMomentumContext(ctx context.Context) (*api.Momentum, error) {
+	callCtx, cancel := context.WithTimeout(ctx, ZnnSettingsTimeout)
+	defer cancel()
 	var tip *api.Momentum
-	if err := r.settingsClient.CallContext(ctx, &tip, "ledger.getFrontierMomentum"); err != nil {
+	if err := r.settingsClient.CallContext(callCtx, &tip, "ledger.getFrontierMomentum"); err != nil {
 		return nil, err
 	}
 	return tip, nil
@@ -604,8 +608,10 @@ func (r *ZnnRpc) GetNetworkByClassAndIdContext(ctx context.Context, networkClass
 }
 
 func (r *ZnnRpc) GetMomentumsByHeightContext(ctx context.Context, height, count uint64) (*api.MomentumList, error) {
+	callCtx, cancel := context.WithTimeout(ctx, ZnnSettingsTimeout)
+	defer cancel()
 	var list *api.MomentumList
-	if err := r.settingsClient.CallContext(ctx, &list, "ledger.getMomentumsByHeight", height, count); err != nil {
+	if err := r.settingsClient.CallContext(callCtx, &list, "ledger.getMomentumsByHeight", height, count); err != nil {
 		return nil, err
 	}
 	return list, nil

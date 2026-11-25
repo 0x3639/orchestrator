@@ -1898,7 +1898,7 @@ func (rC *znnNetwork) recordUnwrapRegistration(ctx context.Context, param *defin
 					param.TransactionHash.String(), param.LogIndex, rpcZnnEvent.ChainId)
 			}
 		}
-		rC.clearUnknownUnwrapObs()
+		rC.clearUnknownUnwrapObsFor(rpcZnnEvent.ChainId, evm.BridgeAddress(), rpcZnnEvent.TransactionHash, rpcZnnEvent.LogIndex)
 		if source != sourceMatches {
 			rC.logger.Errorf("unwrap request %s/%d has no matching source event on chainId %d",
 				param.TransactionHash.String(), param.LogIndex, rpcZnnEvent.ChainId)
@@ -2822,6 +2822,14 @@ func (rC *znnNetwork) restorePersistedCorrobCursor(evm *rpc.EvmRpc, chainId uint
 	if saved == nil || saved.TargetHead == 0 || saved.CanonicalHash == (ecommon.Hash{}) {
 		return true
 	}
+	// Bind persisted progress to the exact secondary endpoint set that checked
+	// the range: if the configured secondaries changed across restart, rescan
+	// from head so a newly added secondary's logs are never skipped.
+	currentSecondaries := evm.SecondaryURLs()
+	if len(currentSecondaries) == 0 || !slices.Equal(saved.SecondaryURLs, currentSecondaries) {
+		_ = store.DeleteUnwrapCorrobCursor(chainId, contract, ecommon.Hash(txHash), logIndex)
+		return true
+	}
 	currentHash, err := evm.CanonicalHash(saved.TargetHead)
 	if err != nil {
 		return false
@@ -2907,6 +2915,13 @@ func (rC *znnNetwork) clearUnknownUnwrapObs() {
 	}
 }
 
+func (rC *znnNetwork) clearUnknownUnwrapObsFor(chainID uint32, contract ecommon.Address, txHash types.Hash, logIdx uint32) {
+	rC.clearUnknownUnwrapObs()
+	if store := rC.unwrapCorrobStore(); store != nil {
+		_ = store.DeleteUnwrapCorrobCursor(chainID, contract, ecommon.Hash(txHash), logIdx)
+	}
+}
+
 func (rC *znnNetwork) nextSecondaryCorrobWindow(chainId uint32, txHash types.Hash, logIndex uint32, target uint64) (resumeEnd uint64, done bool) {
 	key := fmt.Sprintf("%d:%s:%d", chainId, txHash.String(), logIndex)
 	rC.unknownUnwrapMu.Lock()
@@ -2930,7 +2945,7 @@ func (rC *znnNetwork) nextSecondaryCorrobWindow(chainId uint32, txHash types.Has
 	return rC.unknownUnwrapCorrobCursor - 1, false
 }
 
-func (rC *znnNetwork) recordSecondaryCorrobProgress(chainId uint32, contract ecommon.Address, txHash types.Hash, logIndex uint32, target, lowestVerified uint64, canonicalHash ecommon.Hash, complete bool) {
+func (rC *znnNetwork) recordSecondaryCorrobProgress(chainId uint32, contract ecommon.Address, txHash types.Hash, logIndex uint32, target, lowestVerified uint64, canonicalHash ecommon.Hash, secondaryURLs []string, complete bool) {
 	key := fmt.Sprintf("%d:%s:%d", chainId, txHash.String(), logIndex)
 	rC.unknownUnwrapMu.Lock()
 	if rC.unknownUnwrapKey != key || rC.unknownUnwrapCorrobTarget != target {
@@ -2946,7 +2961,7 @@ func (rC *znnNetwork) recordSecondaryCorrobProgress(chainId uint32, contract eco
 	rC.unknownUnwrapCorrobDone = complete
 	rC.unknownUnwrapMu.Unlock()
 
-	if canonicalHash != (ecommon.Hash{}) {
+	if canonicalHash != (ecommon.Hash{}) && len(secondaryURLs) > 0 {
 		if store := rC.unwrapCorrobStore(); store != nil {
 			if err := store.SaveUnwrapCorrobCursor(&common.UnwrapCorrobCursor{
 				ChainID:        chainId,
@@ -2955,6 +2970,7 @@ func (rC *znnNetwork) recordSecondaryCorrobProgress(chainId uint32, contract eco
 				LogIndex:       logIndex,
 				TargetHead:     target,
 				CanonicalHash:  canonicalHash,
+				SecondaryURLs:  append([]string(nil), secondaryURLs...),
 				LowestVerified: lowestVerified,
 				Done:           complete,
 			}); err != nil {
@@ -3051,7 +3067,7 @@ func (rC *znnNetwork) lateUnknownUnwrapCovered(ctx context.Context, evm *rpc.Evm
 			}
 			return false
 		}
-		rC.recordSecondaryCorrobProgress(rpcZnnEvent.ChainId, evm.BridgeAddress(), rpcZnnEvent.TransactionHash, rpcZnnEvent.LogIndex, obsHead, lowestVerified, canonicalHash, complete)
+		rC.recordSecondaryCorrobProgress(rpcZnnEvent.ChainId, evm.BridgeAddress(), rpcZnnEvent.TransactionHash, rpcZnnEvent.LogIndex, obsHead, lowestVerified, canonicalHash, evm.SecondaryURLs(), complete)
 		if !complete {
 			return false
 		}
@@ -3072,7 +3088,7 @@ func (rC *znnNetwork) lateUnknownUnwrapCovered(ctx context.Context, evm *rpc.Evm
 		return false
 	}
 	if canonicalHash != (ecommon.Hash{}) && currentHash != canonicalHash {
-		rC.clearUnknownUnwrapObs()
+		rC.clearUnknownUnwrapObsFor(rpcZnnEvent.ChainId, evm.BridgeAddress(), rpcZnnEvent.TransactionHash, rpcZnnEvent.LogIndex)
 		eN.requestCatchUpSync()
 		return false
 	}

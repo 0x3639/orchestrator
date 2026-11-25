@@ -1764,6 +1764,27 @@ func (r *EvmRpc) HasIndependentSecondary() bool {
 	return false
 }
 
+// SecondaryURLs returns the sorted unique list of configured independent
+// secondary endpoint URLs (excluding the primary endpoint) so persisted
+// corroboration progress is invalidated whenever the secondary set changes.
+func (r *EvmRpc) SecondaryURLs() []string {
+	primaryURL := r.Urls.GetCurrentUrl()
+	seen := make(map[string]struct{}, len(r.Urls.Urls))
+	out := make([]string, 0, len(r.Urls.Urls))
+	for idx, u := range r.Urls.Urls {
+		if uint32(idx) == r.Urls.CurrentUrlIndex || u == primaryURL {
+			continue
+		}
+		if _, ok := seen[u]; ok {
+			continue
+		}
+		seen[u] = struct{}{}
+		out = append(out, u)
+	}
+	sort.Strings(out)
+	return out
+}
+
 // AnySecondaryHasUnwrapLogChunked corroborates absence of an Unwrapped source
 // log across every independent secondary endpoint for one bounded batch of
 // chunks walking backwards from resumeEnd toward fromBlock.

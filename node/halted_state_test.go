@@ -753,8 +753,12 @@ func TestSignEmergencyHaltMessagesGroupsByObservedActiveKeyOnPartialRotation(t *
 		t.Fatalf("signEmergencyHaltMessages failed: %v", err)
 	}
 	znnSig, evmSigs := plan.znnSignature, plan.evmFullSignatures
-	if len(signedGroups) != 2 {
-		t.Fatalf("expected 2 signing groups (old + new), got %d", len(signedGroups))
+	distinctKeys := make(map[string]struct{})
+	for _, k := range signedGroups {
+		distinctKeys[k] = struct{}{}
+	}
+	if len(signedGroups) != 3 || len(distinctKeys) != 2 {
+		t.Fatalf("expected 3 per-target ceremonies across 2 distinct keys (old + new), got %d calls across %d keys", len(signedGroups), len(distinctKeys))
 	}
 
 	// Zenon signature MUST verify under newKey!
@@ -3162,6 +3166,9 @@ func TestUnavailableEvmChainDuringHaltStateCollectionDoesNotBlockHealthyChains(t
 		stopChan:        stopChan,
 		logger:          zap.NewNop().Sugar(),
 		signMessagesHook: func(groupKey string, msgs [][]byte, _ map[string]int) (*keysign.Response, error) {
+			if len(msgs) != 1 {
+				t.Errorf("expected independent 1-message ceremony per halt target to prevent quorum splitting, got %d messages", len(msgs))
+			}
 			sigs := make([]keysign.Signature, len(msgs))
 			for i, msg := range msgs {
 				rawSig, err := crypto.Sign(msg, oldKey)

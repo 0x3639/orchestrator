@@ -1447,12 +1447,14 @@ func (m *NetworksManager) GetBatchCurrentTss(batch EvmBatch) ([]ecommon.Address,
 
 // GetActiveEvmTssAddresses reads the current on-chain TSS address for each
 // reachable EVM network in batch, skipping unreachable chains instead of
-// aborting the whole read.
-func (m *NetworksManager) GetActiveEvmTssAddresses(batch EvmBatch) []ecommon.Address {
+// aborting the whole read, and reports whether every chain in batch was read.
+func (m *NetworksManager) GetActiveEvmTssAddresses(batch EvmBatch) ([]ecommon.Address, bool) {
 	addrs := make([]ecommon.Address, 0, len(batch.networks))
+	allReadable := true
 	for _, network := range batch.networks {
 		addr, err := network.GetCurrentTss()
 		if err != nil {
+			allReadable = false
 			m.logger.Warnf("skipping unavailable EVM network %d while reading active TSS address: %v", network.ChainId(), err)
 			continue
 		}
@@ -1460,7 +1462,7 @@ func (m *NetworksManager) GetActiveEvmTssAddresses(batch EvmBatch) []ecommon.Add
 			addrs = append(addrs, addr)
 		}
 	}
-	return addrs
+	return addrs, allReadable
 }
 
 func (m *NetworksManager) GetHaltEvmTxs(batch EvmBatch, signatures [][]byte, tss ecommon.Address) ([]*etypes.Transaction, error) {

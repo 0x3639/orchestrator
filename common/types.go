@@ -69,6 +69,7 @@ type UnwrapCorrobCursor struct {
 	LogIndex       uint32          `json:"logIndex"`
 	TargetHead     uint64          `json:"targetHead"`
 	CanonicalHash  ecommon.Hash    `json:"canonicalHash"`
+	SecondaryURLs  []string        `json:"secondaryUrls,omitempty"`
 	LowestVerified uint64          `json:"lowestVerified"`
 	Done           bool            `json:"done"`
 }
