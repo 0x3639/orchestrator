@@ -1055,7 +1055,7 @@ func (r *EvmRpc) clearPendingTxIfMatches(key evmTxKey, expected *pendingEvmTx) {
 	r.clearPendingTxIfMatchesLocked(key, expected)
 }
 
-func (r *EvmRpc) clearPendingTxIfMatchesLocked(key evmTxKey, expected *pendingEvmTx) bool {
+func (r *EvmRpc) clearPendingTxIfMatchesLocked(key evmTxKey, expected *pendingEvmTx) (bool, error) {
 	otherKey := evmTxKey{sender: key.sender, contract: key.contract, kind: otherEvmTxKind(key.kind)}
 	r.txMu.Lock()
 	cur := clonePendingEvmTx(r.pendingTx[key])
@@ -1063,7 +1063,7 @@ func (r *EvmRpc) clearPendingTxIfMatchesLocked(key evmTxKey, expected *pendingEv
 	store := r.pendingTxStore
 	if expected != nil && (cur == nil || cur.nonce != expected.nonce || cur.txHash != expected.txHash) {
 		r.txMu.Unlock()
-		return false
+		return false, nil
 	}
 	r.txMu.Unlock()
 
@@ -1106,12 +1106,12 @@ func (r *EvmRpc) clearPendingTxIfMatchesLocked(key evmTxKey, expected *pendingEv
 			}
 			if err := store.ApplyPendingEvmTxBatch(ops); err != nil {
 				r.logger.Errorf("failed to atomically clear stale pending EVM tx and restore surviving owner: %v", err)
-				return false
+				return false, err
 			}
 		} else {
 			if err := store.DeletePendingEvmTx(key.sender, key.contract, key.kind); err != nil {
 				r.logger.Errorf("failed to clear stale pending EVM tx record: %v", err)
-				return false
+				return false, err
 			}
 		}
 	}
@@ -1139,7 +1139,105 @@ func (r *EvmRpc) clearPendingTxIfMatchesLocked(key evmTxKey, expected *pendingEv
 		cleared = true
 	}
 	r.txMu.Unlock()
-	return cleared
+	return cleared, nil
+}
+
+// clearObsoleteHaltLocked atomically clears an obsolete halt reservation if it
+// still matches expected, prunes confirmed stacks below confirmedNonce first,
+// and commits both the halt deletion and any surviving unconfirmed rotation
+// uncovered across nonces <= expected.nonce in a single ApplyPendingEvmTxBatch.
+// Caller must hold r.pendingMu.
+func (r *EvmRpc) clearObsoleteHaltLocked(key evmTxKey, expected *pendingEvmTx, confirmedNonce uint64) error {
+	r.pruneConfirmedNonceStacksLocked(key.sender, key.contract, confirmedNonce)
+	if err := r.retryFailedRollbacksLocked(key.sender, key.contract); err != nil {
+		return err
+	}
+	otherKey := evmTxKey{sender: key.sender, contract: key.contract, kind: evmTxKindSetTss}
+	r.txMu.Lock()
+	cur := clonePendingEvmTx(r.pendingTx[key])
+	curOther := clonePendingEvmTx(r.pendingTx[otherKey])
+	store := r.pendingTxStore
+	r.txMu.Unlock()
+	if cur == nil || cur.nonce != expected.nonce || cur.txHash != expected.txHash {
+		return nil
+	}
+
+	type prunePlan struct {
+		nk  evmNonceKey
+		cut int
+	}
+	var plans []prunePlan
+	var bestSurvivingOther *pendingAttempt
+	for nk, st := range r.nonceStack {
+		if nk.sender != key.sender || nk.contract != key.contract || nk.nonce > cur.nonce {
+			continue
+		}
+		cut := len(st)
+		for cut > 0 && (st[cut-1].kind == evmTxKindHalt || st[cut-1].rejected) {
+			cut--
+		}
+		if cut == len(st) {
+			continue
+		}
+		plans = append(plans, prunePlan{nk: nk, cut: cut})
+		if cut > 0 {
+			if top := st[cut-1]; top.kind == evmTxKindSetTss && (bestSurvivingOther == nil || top.nonce > bestSurvivingOther.nonce) {
+				bestSurvivingOther = top
+			}
+		}
+	}
+
+	var restoreOther *pendingAttempt
+	if bestSurvivingOther != nil && (curOther == nil || curOther.nonce <= bestSurvivingOther.nonce) {
+		restoreOther = bestSurvivingOther
+	}
+
+	if store != nil {
+		if restoreOther != nil {
+			ops := []common.PendingEvmTxOp{
+				{
+					Sender:   key.sender,
+					Contract: key.contract,
+					Kind:     key.kind,
+					Record:   nil,
+				},
+				{
+					Sender:   otherKey.sender,
+					Contract: otherKey.contract,
+					Kind:     otherKey.kind,
+					Record:   toCommonPendingEvmTx(restoreOther.entry),
+				},
+			}
+			if err := store.ApplyPendingEvmTxBatch(ops); err != nil {
+				r.logger.Errorf("failed to atomically clear obsolete halt and restore surviving rotation: %v", err)
+				return err
+			}
+		} else {
+			if err := store.DeletePendingEvmTx(key.sender, key.contract, key.kind); err != nil {
+				r.logger.Errorf("failed to clear obsolete halt record: %v", err)
+				return err
+			}
+		}
+	}
+
+	for _, p := range plans {
+		if p.cut == 0 {
+			delete(r.nonceStack, p.nk)
+		} else {
+			r.nonceStack[p.nk] = r.nonceStack[p.nk][:p.cut]
+		}
+		delete(r.failedRollbacks, p.nk)
+	}
+	r.txMu.Lock()
+	delete(r.pendingTx, key)
+	if restoreOther != nil {
+		if r.pendingTx == nil {
+			r.pendingTx = make(map[evmTxKey]*pendingEvmTx)
+		}
+		r.pendingTx[otherKey] = clonePendingEvmTx(restoreOther.entry)
+	}
+	r.txMu.Unlock()
+	return nil
 }
 
 // ClearObsoleteHaltTx clears a persisted halt reservation once the emergency
@@ -1180,9 +1278,9 @@ func (r *EvmRpc) ClearObsoleteHaltTxContext(parent context.Context, sender ecomm
 	if rec.nonce < confirmedNonce {
 		r.pendingMu.Lock()
 		r.pruneConfirmedNonceStacksLocked(sender, r.bridgeAddress, confirmedNonce)
-		r.clearPendingTxIfMatchesLocked(key, rec)
+		_, clrErr := r.clearPendingTxIfMatchesLocked(key, rec)
 		r.pendingMu.Unlock()
-		return nil
+		return clrErr
 	}
 	pendingNonce, err := r.PendingNonceAtContext(parent, sender)
 	if err != nil {
@@ -1204,77 +1302,8 @@ func (r *EvmRpc) ClearObsoleteHaltTxContext(parent context.Context, sender ecomm
 		}
 	}
 	r.pendingMu.Lock()
-	if err := r.retryFailedRollbacksLocked(sender, r.bridgeAddress); err != nil {
-		r.pendingMu.Unlock()
-		return err
-	}
-	if r.clearPendingTxIfMatchesLocked(key, rec) {
-		// Only prune earlier dropped halt stacks when rec itself still owned
-		// key (a concurrent replacement at the same nonce keeps its stack),
-		// preserving and restoring any surviving competing-action attempt
-		// uncovered underneath before updating in-memory stacks.
-		otherKey := evmTxKey{sender: sender, contract: r.bridgeAddress, kind: evmTxKindSetTss}
-		type prunePlan struct {
-			nk  evmNonceKey
-			cut int
-		}
-		var plans []prunePlan
-		var bestSurvivingOther *pendingAttempt
-		for nk, st := range r.nonceStack {
-			if nk.sender != sender || nk.contract != r.bridgeAddress || nk.nonce > rec.nonce {
-				continue
-			}
-			cut := len(st)
-			for cut > 0 && (st[cut-1].kind == evmTxKindHalt || st[cut-1].rejected) {
-				cut--
-			}
-			if cut == len(st) {
-				continue
-			}
-			plans = append(plans, prunePlan{nk: nk, cut: cut})
-			if cut > 0 {
-				if top := st[cut-1]; top.kind == evmTxKindSetTss && (bestSurvivingOther == nil || top.nonce > bestSurvivingOther.nonce) {
-					bestSurvivingOther = top
-				}
-			}
-		}
-		if bestSurvivingOther != nil {
-			r.txMu.Lock()
-			curOther := clonePendingEvmTx(r.pendingTx[otherKey])
-			store := r.pendingTxStore
-			r.txMu.Unlock()
-			if curOther == nil || curOther.nonce <= bestSurvivingOther.nonce {
-				ops := []common.PendingEvmTxOp{{
-					Sender:   otherKey.sender,
-					Contract: otherKey.contract,
-					Kind:     otherKey.kind,
-					Record:   toCommonPendingEvmTx(bestSurvivingOther.entry),
-				}}
-				if store != nil {
-					if err := store.ApplyPendingEvmTxBatch(ops); err != nil {
-						r.pendingMu.Unlock()
-						return err
-					}
-				}
-				r.txMu.Lock()
-				if r.pendingTx == nil {
-					r.pendingTx = make(map[evmTxKey]*pendingEvmTx)
-				}
-				r.pendingTx[otherKey] = clonePendingEvmTx(bestSurvivingOther.entry)
-				r.txMu.Unlock()
-			}
-		}
-		for _, p := range plans {
-			if p.cut == 0 {
-				delete(r.nonceStack, p.nk)
-			} else {
-				r.nonceStack[p.nk] = r.nonceStack[p.nk][:p.cut]
-			}
-			delete(r.failedRollbacks, p.nk)
-		}
-	}
-	r.pendingMu.Unlock()
-	return nil
+	defer r.pendingMu.Unlock()
+	return r.clearObsoleteHaltLocked(key, rec, confirmedNonce)
 }
 
 func (r *EvmRpc) lookupPendingTx(key evmTxKey, confirmedNonce, pendingNonce uint64, havePending, otherOwnsLower bool) (*pendingEvmTx, error) {
