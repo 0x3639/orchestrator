@@ -1283,6 +1283,27 @@ func (m *NetworksManager) IsBatchNetworkHaltedContext(ctx context.Context, batch
 	return network.EvmRpc().HaltFlagSetContext(ctx)
 }
 
+// BatchNetworkTssContext returns the active TSS address for an unhalted EVM
+// network at idx in batch, or (zero, false, nil) if removed or already halted.
+func (m *NetworksManager) BatchNetworkTssContext(ctx context.Context, batch EvmBatch, idx int) (ecommon.Address, bool, error) {
+	if idx < 0 || idx >= len(batch.networks) {
+		return ecommon.Address{}, false, nil
+	}
+	network := batch.networks[idx]
+	if !m.hasNetwork(network) {
+		return ecommon.Address{}, false, nil
+	}
+	halted, err := network.EvmRpc().HaltFlagSetContext(ctx)
+	if err != nil || halted {
+		return ecommon.Address{}, false, err
+	}
+	tssAddr, err := network.GetCurrentTssContext(ctx)
+	if err != nil {
+		return ecommon.Address{}, false, err
+	}
+	return tssAddr, true, nil
+}
+
 // ErrHaltFlagsUnreadable is returned by RecordConfirmedHalt when a halt flag
 // could not be read. Nothing was recorded; the caller may try again.
 var ErrHaltFlagsUnreadable = errors.New("cannot read the bridge's halt flags")

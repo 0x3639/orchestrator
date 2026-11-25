@@ -3382,3 +3382,138 @@ func TestSubmitContextPassesDeadlineBoundContextToSend(t *testing.T) {
 		t.Fatal("submitContext did not pass a deadline-bound context to send")
 	}
 }
+
+func TestLateUnknownUnwrapFirstPassRevalidatesAnchorAfterMidPassShallowReorg(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	b := newReplayBridge(t)
+	l := &lateNode{t: t, bridge: b}
+	l.ledger.Store(newReplayLedger(t, b, 5000))
+	l.redeemableIn.Store(30)
+
+	var reorged atomic.Bool
+	var secLogCalls atomic.Int32
+	shallowLog := etypes.Log{
+		Address:     b.contract,
+		Topics:      []ecommon.Hash{common.EvmContractAbi.Events["Swapped"].ID},
+		BlockNumber: 18,
+		BlockHash:   ecommon.BigToHash(big.NewInt(18 + 888)),
+		TxHash:      ecommon.Hash(b.request.TransactionHash),
+		Index:       uint(b.request.LogIndex),
+	}
+	blockHashFor := func(num uint64) ecommon.Hash {
+		offset := uint64(10)
+		if reorged.Load() && num >= 18 {
+			offset = 888
+		}
+		return ecommon.BigToHash(new(big.Int).SetUint64(num + offset))
+	}
+	logsFor := func(params []json.RawMessage, isSecondary bool) []etypes.Log {
+		if isSecondary && secLogCalls.Add(1) == 1 {
+			// After the first chunk [16..20] has been read empty, trigger a
+			// shallow reorg on blocks 18..20 introducing the matching log at 18
+			// mid-pass (before chunks [1..15] finish in the same first pass).
+			reorged.Store(true)
+			return []etypes.Log{}
+		}
+		if !reorged.Load() || len(params) == 0 {
+			return []etypes.Log{}
+		}
+		var q struct {
+			FromBlock *hexutil.Uint64 `json:"fromBlock"`
+			ToBlock   *hexutil.Uint64 `json:"toBlock"`
+		}
+		if json.Unmarshal(params[0], &q) == nil && q.FromBlock != nil && q.ToBlock != nil {
+			if uint64(*q.FromBlock) <= 18 && uint64(*q.ToBlock) >= 18 {
+				return []etypes.Log{shallowLog}
+			}
+		}
+		return []etypes.Log{}
+	}
+
+	primaryURL := replayServerWithErrors(t, func(method string, params []json.RawMessage) (interface{}, *replayRPCError) {
+		switch method {
+		case "stats.syncInfo":
+			return nil, nil
+		case "embedded.bridge.getUnwrapTokenRequestByHashAndLog":
+			return withRedeemDelay(b.request, l.redeemableIn.Load()), nil
+		case "eth_syncing":
+			return false, nil
+		case "eth_blockNumber":
+			return hexutil.EncodeUint64(20), nil
+		case "eth_getBlockByNumber":
+			var number hexutil.Uint64
+			_ = json.Unmarshal(params[0], &number)
+			return map[string]interface{}{"number": number, "hash": blockHashFor(uint64(number))}, nil
+		case "eth_getTransactionReceipt":
+			return nil, nil
+		case "eth_getLogs":
+			return logsFor(params, false), nil
+		}
+		if result, ok := l.ledger.Load().answer(t, method, params); ok {
+			return result, nil
+		}
+		return nil, nil
+	})
+	secondaryURL := replayServerWithErrors(t, func(method string, params []json.RawMessage) (interface{}, *replayRPCError) {
+		switch method {
+		case "eth_syncing":
+			return false, nil
+		case "eth_blockNumber":
+			return hexutil.EncodeUint64(20), nil
+		case "eth_getBlockByNumber":
+			var number hexutil.Uint64
+			_ = json.Unmarshal(params[0], &number)
+			return map[string]interface{}{"number": number, "hash": blockHashFor(uint64(number))}, nil
+		case "eth_getTransactionReceipt":
+			return nil, nil
+		case "eth_getLogs":
+			return logsFor(params, true), nil
+		default:
+			return nil, nil
+		}
+	})
+
+	l.n, l.stores = replayNetwork(t, b, primaryURL, map[uint32]string{1: primaryURL})
+	evmClient, err := rpc.NewEvmRpcClient(config.BaseNetworkConfig{
+		Urls:            []string{primaryURL, secondaryURL},
+		FilterQuerySize: 5,
+	}, "eth", b.contract)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(evmClient.Stop)
+	l.n.rpcManager.RegisterEvmClient(1, evmClient)
+	l.n.SetConfirmationsToFinality(5)
+	l.n.secondaryLogMaxChunks = 10 // Entire [1..20] completes in a SINGLE first pass!
+	l.at(5000, acceptedReceive)
+
+	params, err := config.NewEvmParams(&definition.NetworkInfo{NetworkClass: definition.EvmClass, Id: 1, Name: "eth", ContractAddress: b.contract.Hex()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	params.SetConfirmationsToFinality(5)
+	params.SetContractDeploymentHeight(1)
+	eN := &evmNetwork{
+		EvmParams: params,
+		client:    evmClient,
+		done:      make(chan struct{}),
+		state:     l.n.state,
+		logger:    zap.NewNop().Sugar(),
+	}
+	eN.lastScannedThrough.Store(20)
+	eN.scanned.Store(true)
+	l.n.networkManager = &NetworksManager{znnNetwork: l.n, evmNetworks: []*evmNetwork{eN}, logger: zap.NewNop().Sugar()}
+
+	// First pass completes all 4 chunks after the mid-pass shallow reorg: MUST
+	// revalidate obsHead, detect hash mismatch, reset corroboration, and hold!
+	if err := l.listen(); err == nil {
+		t.Fatal("expected first pass to hold after mid-pass shallow reorg changed obsHead hash")
+	}
+	l.expect("after mid-pass shallow reorg", common.LiveState, 1)
+
+	// Second pass rescans from block 20 and finds the log at block 18.
+	if err := l.listen(); err == nil {
+		t.Fatal("expected second pass to find reorged source log at block 18 and hold")
+	}
+	l.expect("after rescan finds block 18 log", common.LiveState, 1)
+}

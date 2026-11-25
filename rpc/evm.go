@@ -852,49 +852,49 @@ func (r *EvmRpc) reconcileSentTx(tx *etypes.Transaction, attempt *pendingAttempt
 	curOther := clonePendingEvmTx(r.pendingTx[otherKey])
 	r.txMu.Unlock()
 
-	// Verify that key's durable/in-memory record still belongs to attempt
-	// before applying any rollback batch: a newer reservation (e.g. a higher
-	// nonce accepted while this older nonce was still in flight) must never be
-	// overwritten or deleted by a late rejection of an older nonce.
-	if curKey == nil || curKey.nonce != tx.Nonce() || curKey.txHash != tx.Hash() {
-		if len(remaining) == 0 {
-			delete(r.nonceStack, nk)
-		} else {
-			r.nonceStack[nk] = remaining
-		}
-		return
-	}
-
-	// Reconcile surviving ownership across nonces before deleting key's slot:
-	// if key.kind has no surviving attempt at tx.Nonce(), check whether an
-	// earlier accepted/viable attempt of key.kind still survives at another
-	// nonce (e.g. setTss(5) whose restore was deferred while setTss(6) ran).
+	// Reconcile surviving ownership across nonces and actions:
+	//   - If key's slot still belongs to attempt, restore the surviving owner
+	//     for key.kind (same nonce or highest-nonce fallback at another nonce),
+	//     and restore any surviving competing-action owner at tx.Nonce() unless
+	//     a higher-nonce reservation already occupies otherKey.
+	//   - If key's slot already moved on (e.g. a higher-nonce halt(6) is active
+	//     while older halt(5) rejects), preserve key's slot untouched while
+	//     still restoring any uncovered competing-action owner (e.g. accepted
+	//     setTss(5) beneath rejected halt(5)) if no newer reservation occupies
+	//     otherKey.
+	ownsKey := curKey != nil && curKey.nonce == tx.Nonce() && curKey.txHash == tx.Hash()
 	var keyReplacement *pendingAttempt
 	var otherReplacement *pendingAttempt
-	if surviving != nil && surviving.kind == key.kind {
-		keyReplacement = surviving
-	} else {
-		keyReplacement = r.findFallbackOwnerLocked(key.sender, key.contract, key.kind, tx.Nonce())
-		if surviving != nil && (curOther == nil || curOther.nonce <= surviving.nonce) {
-			otherReplacement = surviving
+	if ownsKey {
+		if surviving != nil && surviving.kind == key.kind {
+			keyReplacement = surviving
+		} else {
+			keyReplacement = r.findFallbackOwnerLocked(key.sender, key.contract, key.kind, tx.Nonce())
+			if surviving != nil && (curOther == nil || curOther.nonce <= surviving.nonce) {
+				otherReplacement = surviving
+			}
 		}
+	} else if surviving != nil && surviving.kind != key.kind && (curOther == nil || curOther.nonce <= surviving.nonce) {
+		otherReplacement = surviving
 	}
 
 	var ops []common.PendingEvmTxOp
-	if keyReplacement != nil {
-		ops = append(ops, common.PendingEvmTxOp{
-			Sender:   key.sender,
-			Contract: key.contract,
-			Kind:     key.kind,
-			Record:   toCommonPendingEvmTx(keyReplacement.entry),
-		})
-	} else {
-		ops = append(ops, common.PendingEvmTxOp{
-			Sender:   key.sender,
-			Contract: key.contract,
-			Kind:     key.kind,
-			Record:   nil,
-		})
+	if ownsKey {
+		if keyReplacement != nil {
+			ops = append(ops, common.PendingEvmTxOp{
+				Sender:   key.sender,
+				Contract: key.contract,
+				Kind:     key.kind,
+				Record:   toCommonPendingEvmTx(keyReplacement.entry),
+			})
+		} else {
+			ops = append(ops, common.PendingEvmTxOp{
+				Sender:   key.sender,
+				Contract: key.contract,
+				Kind:     key.kind,
+				Record:   nil,
+			})
+		}
 	}
 	if otherReplacement != nil {
 		ops = append(ops, common.PendingEvmTxOp{
@@ -904,7 +904,7 @@ func (r *EvmRpc) reconcileSentTx(tx *etypes.Transaction, attempt *pendingAttempt
 			Record:   toCommonPendingEvmTx(otherReplacement.entry),
 		})
 	}
-	if store != nil {
+	if len(ops) > 0 && store != nil {
 		if err := store.ApplyPendingEvmTxBatch(ops); err != nil {
 			r.logger.Errorf("failed to atomically roll back rejected pending EVM tx record: %v", err)
 			return
@@ -915,16 +915,20 @@ func (r *EvmRpc) reconcileSentTx(tx *etypes.Transaction, attempt *pendingAttempt
 	} else {
 		r.nonceStack[nk] = remaining
 	}
-	r.txMu.Lock()
-	if keyReplacement != nil {
-		r.pendingTx[key] = clonePendingEvmTx(keyReplacement.entry)
-	} else {
-		delete(r.pendingTx, key)
+	if len(ops) > 0 {
+		r.txMu.Lock()
+		if ownsKey {
+			if keyReplacement != nil {
+				r.pendingTx[key] = clonePendingEvmTx(keyReplacement.entry)
+			} else {
+				delete(r.pendingTx, key)
+			}
+		}
+		if otherReplacement != nil {
+			r.pendingTx[otherKey] = clonePendingEvmTx(otherReplacement.entry)
+		}
+		r.txMu.Unlock()
 	}
-	if otherReplacement != nil {
-		r.pendingTx[otherKey] = clonePendingEvmTx(otherReplacement.entry)
-	}
-	r.txMu.Unlock()
 }
 
 func (r *EvmRpc) loadPendingTx(key evmTxKey) (*pendingEvmTx, error) {

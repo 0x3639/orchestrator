@@ -2304,12 +2304,22 @@ func (node *Node) publishEmergencyHalt(evmBatch network.EvmBatch, plan *emergenc
 				case changed:
 					return
 				default:
-					if plan.hasFailedGroups && hasSignedEvm {
+					allSignedHalted, checkErr := node.allSignedEvmHalted(roundCtx, evmBatch, plan.evmFullSignatures)
+					if plan.hasFailedGroups && hasSignedEvm && checkErr == nil && allSignedHalted {
 						// When another local TSS group failed to sign, return
 						// as soon as every EVM chain that WAS signed has been
-						// halted (or after submitting its halt) so the failed
-						// group is retried promptly.
-						if allSignedHalted, checkErr := node.allSignedEvmHalted(roundCtx, evmBatch, plan.evmFullSignatures); checkErr == nil && allSignedHalted {
+						// halted so the failed group is retried promptly.
+						return
+					}
+					// After fresh signed targets have had their turn (either
+					// every signed EVM chain is halted, or this tick submitted
+					// a signed halt), check if any unhalted unsigned EVM chain
+					// rotated its active TSS key (e.g. becoming locally
+					// signable) and refresh the signing plan.
+					if (checkErr == nil && allSignedHalted) || anySubmittedTurn {
+						if node.anyUnsignedEvmKeyChanged(roundCtx, evmBatch, plan.evmFullSignatures, signedEvmTss) {
+							node.logger.Info("an unsigned EVM bridge rotated its TSS key during halt publishing; refreshing halt signing plan")
+							abortRound()
 							return
 						}
 					}
@@ -2331,9 +2341,6 @@ func (node *Node) publishEmergencyHalt(evmBatch network.EvmBatch, plan *emergenc
 }
 
 func (node *Node) allSignedEvmHalted(ctx context.Context, batch network.EvmBatch, sigs [][]byte) (bool, error) {
-	// Check via SendHaltEvmWithExpectedContext with nil signatures? No: inspect
-	// each signed network via NetworksManager.Networks() or batch indirectly.
-	// Using a nil-signature pass won't submit anything; check only signed slots.
 	for i, sig := range sigs {
 		if len(sig) == 0 {
 			continue
@@ -2344,6 +2351,22 @@ func (node *Node) allSignedEvmHalted(ctx context.Context, batch network.EvmBatch
 		}
 	}
 	return true, nil
+}
+
+func (node *Node) anyUnsignedEvmKeyChanged(ctx context.Context, batch network.EvmBatch, sigs [][]byte, expectedTss []ecommon.Address) bool {
+	for i, expected := range expectedTss {
+		if expected == (ecommon.Address{}) {
+			continue
+		}
+		if i < len(sigs) && len(sigs[i]) > 0 {
+			continue
+		}
+		curTss, active, err := node.networksManager.BatchNetworkTssContext(ctx, batch, i)
+		if err == nil && active && curTss != expected {
+			return true
+		}
+	}
+	return false
 }
 
 // signEmergencyHaltMessages signs the Zenon and EVM halt messages using each

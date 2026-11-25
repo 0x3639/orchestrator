@@ -2853,7 +2853,6 @@ func (rC *znnNetwork) lateUnknownUnwrapCovered(ctx context.Context, evm *rpc.Evm
 	}
 	depth := eN.ConfirmationsToFinality()
 	obsHead, headsOK, receiptOK, canonicalOK, canonicalHash := rC.unknownUnwrapPrecheckState(rpcZnnEvent.ChainId, rpcZnnEvent.TransactionHash, rpcZnnEvent.LogIndex)
-	usedCachedPrechecks := headsOK || receiptOK || canonicalOK
 	if !headsOK {
 		minHead, maxHead, err := evm.EndpointHeads()
 		if err != nil {
@@ -2917,36 +2916,32 @@ func (rC *znnNetwork) lateUnknownUnwrapCovered(ctx context.Context, evm *rpc.Evm
 			return false
 		}
 	}
-	// Whenever any cached precheck was reused across retries (so low-rate
-	// endpoints never starve log chunks), revalidate canonical hash agreement
-	// at obsHead (covering the full corroborated range, including any shallow
-	// reorg above requiredHeight), endpoint heads, and receipt absence before
-	// escalating. If the canonical hash changed (reorg), reset corroboration
-	// and re-verify.
-	if usedCachedPrechecks {
-		minHead, maxHead, err := evm.EndpointHeads()
-		if err != nil || minHead < obsHead || maxHead-minHead > depth {
-			if err == nil {
-				eN.requestCatchUpSync()
-			}
-			return false
-		}
-		currentHash, err := evm.CanonicalHash(obsHead)
-		if err != nil {
-			return false
-		}
-		if canonicalHash != (ecommon.Hash{}) && currentHash != canonicalHash {
-			rC.clearUnknownUnwrapObs()
+	// Always revalidate canonical hash agreement at obsHead (covering the full
+	// corroborated range, including any shallow reorg during a first or cached
+	// pass), endpoint heads, and receipt absence before escalating. If the
+	// canonical hash changed (reorg), reset corroboration and re-verify.
+	minHead, maxHead, err := evm.EndpointHeads()
+	if err != nil || minHead < obsHead || maxHead-minHead > depth {
+		if err == nil {
 			eN.requestCatchUpSync()
-			return false
 		}
-		hasReceipt, err := evm.AnySecondaryHasReceipt(ecommon.Hash(rpcZnnEvent.TransactionHash))
-		if err != nil || hasReceipt {
-			if hasReceipt {
-				eN.requestCatchUpSync()
-			}
-			return false
+		return false
+	}
+	currentHash, err := evm.CanonicalHash(obsHead)
+	if err != nil {
+		return false
+	}
+	if canonicalHash != (ecommon.Hash{}) && currentHash != canonicalHash {
+		rC.clearUnknownUnwrapObs()
+		eN.requestCatchUpSync()
+		return false
+	}
+	hasReceipt, err := evm.AnySecondaryHasReceipt(ecommon.Hash(rpcZnnEvent.TransactionHash))
+	if err != nil || hasReceipt {
+		if hasReceipt {
+			eN.requestCatchUpSync()
 		}
+		return false
 	}
 	// Recheck the queue after corroboration completes so a matching event
 	// enqueued while secondary queries ran is treated as pending evidence.
