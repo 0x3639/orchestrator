@@ -1970,3 +1970,84 @@ func TestAnySecondaryHasUnwrapLogChunkedReusesVerifiedHeadAtLowRateLimit(t *test
 		t.Fatalf("after attempt 2: blockNumberCalls=%d getLogsCalls=%d, want (1, 1)", blockNumberCalls.Load(), getLogsCalls.Load())
 	}
 }
+
+func TestAnySecondaryHasUnwrapLogChunkedShrinksRejectedLogRange(t *testing.T) {
+	contract := ecommon.HexToAddress("0x6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f")
+	txHash := ecommon.HexToHash("0x9999")
+
+	var rejectedWide atomic.Int32
+	var acceptedSmall atomic.Int32
+	makeSrv := func(enforceLimit bool) *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			var req struct {
+				ID     json.RawMessage   `json:"id"`
+				Method string            `json:"method"`
+				Params []json.RawMessage `json:"params"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&req)
+			resp := map[string]interface{}{"jsonrpc": "2.0", "id": req.ID}
+			switch req.Method {
+			case "eth_blockNumber":
+				resp["result"] = hexutil.EncodeUint64(20)
+			case "eth_getLogs":
+				var filter struct {
+					FromBlock hexutil.Uint64 `json:"fromBlock"`
+					ToBlock   hexutil.Uint64 `json:"toBlock"`
+				}
+				_ = json.Unmarshal(req.Params[0], &filter)
+				width := uint64(filter.ToBlock) - uint64(filter.FromBlock) + 1
+				if enforceLimit && width > 5 {
+					rejectedWide.Add(1)
+					resp["error"] = map[string]interface{}{
+						"code":    -32005,
+						"message": "query returned too many blocks: block range is too large",
+					}
+				} else {
+					if enforceLimit {
+						acceptedSmall.Add(1)
+					}
+					resp["result"] = []etypes.Log{}
+				}
+			default:
+				resp["result"] = hexutil.EncodeUint64(1)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(resp)
+		}))
+	}
+	primarySrv := makeSrv(false)
+	t.Cleanup(primarySrv.Close)
+	secondarySrv := makeSrv(true)
+	t.Cleanup(secondarySrv.Close)
+
+	// Configured FilterQuerySize is 20, but secondary only accepts <= 5 blocks.
+	client, err := NewEvmRpcClient(config.BaseNetworkConfig{
+		Urls:            []string{primarySrv.URL, secondarySrv.URL},
+		FilterQuerySize: 20,
+	}, "shrink-secondary-range", contract)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Stop()
+
+	found, lowest, complete, err := client.AnySecondaryHasUnwrapLogChunked(context.Background(), 1, 20, 20, txHash, 0, 10)
+	if err != nil {
+		t.Fatalf("AnySecondaryHasUnwrapLogChunked failed instead of shrinking rejected range: %v", err)
+	}
+	if found || !complete || lowest != 1 {
+		t.Fatalf("got (found=%v, lowest=%d, complete=%v), want (false, 1, true)", found, lowest, complete)
+	}
+	if rejectedWide.Load() == 0 || acceptedSmall.Load() == 0 {
+		t.Fatalf("expected wide rejection + small acceptance, got rejected=%d accepted=%d", rejectedWide.Load(), acceptedSmall.Load())
+	}
+
+	// Second call must reuse the cached reduced step (no additional wide rejections).
+	prevRejected := rejectedWide.Load()
+	found, lowest, complete, err = client.AnySecondaryHasUnwrapLogChunked(context.Background(), 1, 20, 20, txHash, 0, 10)
+	if err != nil || found || !complete || lowest != 1 {
+		t.Fatalf("second call got (found=%v, lowest=%d, complete=%v, err=%v), want (false, 1, true, nil)", found, lowest, complete, err)
+	}
+	if rejectedWide.Load() != prevRejected {
+		t.Fatalf("second call did not reuse cached smaller step: wide rejections increased from %d to %d", prevRejected, rejectedWide.Load())
+	}
+}

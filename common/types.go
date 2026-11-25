@@ -58,3 +58,24 @@ type PendingEvmTxStore interface {
 	SavePendingEvmTx(sender, contract ecommon.Address, kind string, rec *PendingEvmTx) error
 	DeletePendingEvmTx(sender, contract ecommon.Address, kind string) error
 }
+
+// UnwrapCorrobCursor persists incremental secondary-endpoint log corroboration
+// progress alongside its canonical anchor hash so long block ranges survive
+// receive-hold restarts and finish instead of restarting from the head.
+type UnwrapCorrobCursor struct {
+	ChainID        uint32          `json:"chainId"`
+	Contract       ecommon.Address `json:"contract"`
+	TxHash         ecommon.Hash    `json:"txHash"`
+	LogIndex       uint32          `json:"logIndex"`
+	TargetHead     uint64          `json:"targetHead"`
+	CanonicalHash  ecommon.Hash    `json:"canonicalHash"`
+	LowestVerified uint64          `json:"lowestVerified"`
+	Done           bool            `json:"done"`
+}
+
+// UnwrapCorrobStore persists UnwrapCorrobCursor records durably in the Zenon DB.
+type UnwrapCorrobStore interface {
+	LoadUnwrapCorrobCursor(chainID uint32, contract ecommon.Address, txHash ecommon.Hash, logIndex uint32) (*UnwrapCorrobCursor, error)
+	SaveUnwrapCorrobCursor(cur *UnwrapCorrobCursor) error
+	DeleteUnwrapCorrobCursor(chainID uint32, contract ecommon.Address, txHash ecommon.Hash, logIndex uint32) error
+}

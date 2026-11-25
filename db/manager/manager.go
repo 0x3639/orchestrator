@@ -20,6 +20,7 @@ type Manager struct {
 	znnStorage      db.ZnnStorage
 	redeemIncidents *wrap.RedeemIncidentStore
 	pendingEvmTxs   *wrap.PendingEvmTxStore
+	unwrapCorrob    *wrap.UnwrapCorrobStore
 	// key is the chainId of the network
 	evmMu      sync.RWMutex
 	evmStorage map[uint32]db.EvmStorage
@@ -50,6 +51,7 @@ func NewDbManager(stop chan os.Signal) (*Manager, error) {
 	newDbManager := &Manager{
 		redeemIncidents: redeemIncidents,
 		pendingEvmTxs:   wrap.NewPendingEvmTxStore(newZnnLdb),
+		unwrapCorrob:    wrap.NewUnwrapCorrobStore(newZnnLdb),
 		znnStorage:      znnStorage,
 		evmStorage:      make(map[uint32]db.EvmStorage),
 		evmClosers:      make(map[uint32]func() error),
@@ -67,6 +69,15 @@ func (m *Manager) PendingEvmTxStore(chainId uint32) common.PendingEvmTxStore {
 		return nil
 	}
 	return m.pendingEvmTxs.ForChain(chainId)
+}
+
+// UnwrapCorrobStore returns the durable store for late-unwrap secondary
+// corroboration cursors backed by the persistent Zenon LevelDB.
+func (m *Manager) UnwrapCorrobStore() common.UnwrapCorrobStore {
+	if m == nil || m.unwrapCorrob == nil {
+		return nil
+	}
+	return m.unwrapCorrob
 }
 
 func queueDirExists(name string) bool {

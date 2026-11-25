@@ -3,6 +3,7 @@ package node
 import (
 	"context"
 	"crypto/ed25519"
+	"crypto/rand"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -3018,5 +3019,416 @@ func TestSlowUnavailableChainDoesNotStarveLaterHealthyChainFirstBroadcast(t *tes
 	case <-done:
 	case <-time.After(2 * time.Second):
 		t.Fatal("publishEmergencyHalt did not exit after leaving EmergencyState")
+	}
+}
+
+type keygenCancelLedger struct {
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (l *keygenCancelLedger) GetFrontierMomentum() map[string]interface{} {
+	select {
+	case l.entered <- struct{}{}:
+	default:
+	}
+	<-l.release
+	return map[string]interface{}{"height": 100}
+}
+
+type keygenCancelBridge struct {
+	partialRotateZenon
+	pillarCalls *atomic.Int32
+}
+
+func (b *keygenCancelBridge) GetOrchestratorInfo() *definition.OrchestratorInfo {
+	if b.pillarCalls != nil {
+		b.pillarCalls.Add(1)
+	}
+	return b.partialRotateZenon.GetOrchestratorInfo()
+}
+
+func TestUnavailableEvmChainDuringHaltStateCollectionDoesNotBlockHealthyChains(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	oldKey, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldAddr := crypto.PubkeyToAddress(oldKey.PublicKey)
+	oldCompressed := base64.StdEncoding.EncodeToString(crypto.CompressPubkey(&oldKey.PublicKey))
+	c1Addr := ecommon.HexToAddress("0x1111111111111111111111111111111111111111")
+	c2Addr := ecommon.HexToAddress("0x2222222222222222222222222222222222222222")
+
+	zMock := &partialRotateZenon{
+		haltedTestZenon: haltedTestZenon{halted: false},
+		compressedTss:   oldCompressed,
+		evmContracts: []*definition.NetworkInfo{
+			{NetworkClass: definition.EvmClass, Id: 1, Name: "eth-healthy", ContractAddress: c1Addr.Hex()},
+			{NetworkClass: definition.EvmClass, Id: 2, Name: "eth-down", ContractAddress: c2Addr.Hex()},
+		},
+	}
+	znnSrv := server.NewServer()
+	if err := znnSrv.RegisterName("embedded.bridge", zMock); err != nil {
+		t.Fatal(err)
+	}
+	znnHTTP := httptest.NewServer(znnSrv.WebsocketHandler([]string{"*"}))
+	t.Cleanup(func() { znnSrv.Stop(); znnHTTP.Close() })
+
+	var chain2Down atomic.Bool
+	makeEvm := func(chainID uint64, down *atomic.Bool) *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			var req struct {
+				ID     json.RawMessage   `json:"id"`
+				Method string            `json:"method"`
+				Params []json.RawMessage `json:"params"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&req)
+			resp := map[string]interface{}{"jsonrpc": "2.0", "id": req.ID}
+			if down != nil && down.Load() {
+				resp["error"] = map[string]interface{}{"code": -32000, "message": "chain unavailable"}
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(resp)
+				return
+			}
+			switch req.Method {
+			case "eth_chainId":
+				resp["result"] = hexutil.EncodeUint64(chainID)
+			case "eth_call":
+				var call struct {
+					Data  hexutil.Bytes `json:"data"`
+					Input hexutil.Bytes `json:"input"`
+				}
+				_ = json.Unmarshal(req.Params[0], &call)
+				sel := append(call.Data, call.Input...)
+				switch {
+				case len(sel) >= 4 && string(sel[:4]) == string(common.EvmContractAbi.Methods["tss"].ID):
+					resp["result"] = ecommon.BytesToHash(oldAddr.Bytes()).Hex()
+				case len(sel) >= 4 && string(sel[:4]) == string(common.EvmContractAbi.Methods["actionsNonce"].ID):
+					resp["result"] = ecommon.BigToHash(big.NewInt(3)).Hex()
+				default:
+					resp["result"] = "0x" + strings.Repeat("0", 64)
+				}
+			default:
+				resp["result"] = "0x" + strings.Repeat("0", 64)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(resp)
+		}))
+	}
+	evm1 := makeEvm(1, nil)
+	t.Cleanup(evm1.Close)
+	evm2 := makeEvm(2, &chain2Down)
+	t.Cleanup(evm2.Close)
+
+	stopChan := make(chan os.Signal, 1)
+	stateVal := common.EmergencyState
+	gs := common.NewGlobalState(&stateVal)
+	nm, err := network.NewNetworksManager(stopChan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dbMgr, err := manager.NewDbManager(stopChan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nets := map[string]config.BaseNetworkConfig{
+		common.ZenonNetworkName: {Urls: []string{"ws" + strings.TrimPrefix(znnHTTP.URL, "http")}},
+		"eth-healthy":           {Urls: []string{evm1.URL}},
+		"eth-down":              {Urls: []string{evm2.URL}},
+	}
+	if err := nm.Init(nets, dbMgr, gs, func(*common.BridgeMetadata) {}); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { nm.Stop() })
+
+	// Chain 2 is ALREADY unavailable BEFORE GetHaltMessagesWithState runs.
+	chain2Down.Store(true)
+	evmBatch, evmMsgs, evmNonces, evmTssAddrs, err := nm.GetHaltMessagesWithState()
+	if err != nil {
+		t.Fatalf("GetHaltMessagesWithState failed when one chain was down: %v", err)
+	}
+	if len(evmMsgs) != 2 || len(evmMsgs[0]) == 0 || len(evmMsgs[1]) != 0 || evmNonces[0] == nil || evmTssAddrs[0] != oldAddr {
+		t.Fatalf("unexpected partial halt state: msgs=(%d,%d) nonces=(%v,%v) tss=(%s,%s)",
+			len(evmMsgs[0]), len(evmMsgs[1]), evmNonces[0], evmNonces[1], evmTssAddrs[0].Hex(), evmTssAddrs[1].Hex())
+	}
+
+	producerPub := []byte("test-producer-pubkey-32-bytes!!!")
+	producerPubB64 := base64.StdEncoding.EncodeToString(producerPub)
+	node := &Node{
+		config:          &config.Config{TssConfig: config.TssManagerConfig{PublicKey: oldCompressed, LocalPubKeys: []string{producerPubB64}}},
+		networksManager: nm,
+		dbManager:       dbMgr,
+		state:           gs,
+		stopChan:        stopChan,
+		logger:          zap.NewNop().Sugar(),
+		signMessagesHook: func(groupKey string, msgs [][]byte, _ map[string]int) (*keysign.Response, error) {
+			sigs := make([]keysign.Signature, len(msgs))
+			for i, msg := range msgs {
+				rawSig, err := crypto.Sign(msg, oldKey)
+				if err != nil {
+					return nil, err
+				}
+				sigs[i] = keysign.Signature{
+					Msg:        base64.StdEncoding.EncodeToString(msg),
+					Signature:  base64.StdEncoding.EncodeToString(rawSig[:64]),
+					RecoveryID: base64.StdEncoding.EncodeToString(rawSig[64:65]),
+				}
+			}
+			return &keysign.Response{Status: tcommon.Success, Signatures: sigs}, nil
+		},
+	}
+
+	plan, err := node.signEmergencyHaltMessages(crypto.Keccak256([]byte("znn-halt")), oldCompressed, evmBatch, evmMsgs, evmTssAddrs)
+	if err != nil {
+		t.Fatalf("signEmergencyHaltMessages failed with partial EVM state: %v", err)
+	}
+	if plan.znnSignature == "" || len(plan.evmFullSignatures[0]) == 0 || len(plan.evmFullSignatures[1]) != 0 {
+		t.Fatalf("unexpected plan signatures: znn=%v evm0=%d evm1=%d", plan.znnSignature != "", len(plan.evmFullSignatures[0]), len(plan.evmFullSignatures[1]))
+	}
+	if !plan.hasFailedGroups {
+		t.Fatal("expected hasFailedGroups=true so processSignatures retries unavailable chain 2")
+	}
+}
+
+func TestPrepareKeyGenParticipantsCancelsOnEmergencyStateWithoutPillarLookup(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	var pillarCalls atomic.Int32
+	frontierEntered := make(chan struct{}, 4)
+	releaseFrontier := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(releaseFrontier) }) }
+
+	c1Addr := ecommon.HexToAddress("0x5555555555555555555555555555555555555555")
+	zBridge := &keygenCancelBridge{
+		partialRotateZenon: partialRotateZenon{
+			evmContracts: []*definition.NetworkInfo{
+				{NetworkClass: definition.EvmClass, Id: 1, Name: "eth", ContractAddress: c1Addr.Hex()},
+			},
+		},
+		pillarCalls: &pillarCalls,
+	}
+	evm1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			ID     json.RawMessage `json:"id"`
+			Method string          `json:"method"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		resp := map[string]interface{}{"jsonrpc": "2.0", "id": req.ID, "result": "0x" + strings.Repeat("0", 64)}
+		if req.Method == "eth_chainId" {
+			resp["result"] = hexutil.EncodeUint64(1)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	t.Cleanup(evm1.Close)
+	zLedger := &keygenCancelLedger{
+		entered: frontierEntered,
+		release: releaseFrontier,
+	}
+	znnSrv := server.NewServer()
+	if err := znnSrv.RegisterName("embedded.bridge", zBridge); err != nil {
+		t.Fatal(err)
+	}
+	if err := znnSrv.RegisterName("ledger", zLedger); err != nil {
+		t.Fatal(err)
+	}
+	znnHTTP := httptest.NewServer(znnSrv.WebsocketHandler([]string{"*"}))
+	t.Cleanup(func() {
+		release()
+		znnSrv.Stop()
+		znnHTTP.Close()
+	})
+
+	stopChan := make(chan os.Signal, 1)
+	stateVal := common.KeyGenState
+	gs := common.NewGlobalState(&stateVal)
+	nm, err := network.NewNetworksManager(stopChan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dbMgr, err := manager.NewDbManager(stopChan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := nm.Init(map[string]config.BaseNetworkConfig{
+		common.ZenonNetworkName: {Urls: []string{"ws" + strings.TrimPrefix(znnHTTP.URL, "http")}},
+		"eth":                   {Urls: []string{evm1.URL}},
+	}, dbMgr, gs, func(*common.BridgeMetadata) {}); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { nm.Stop() })
+
+	// Reset counter after Init's startup orchestrator info read.
+	pillarCalls.Store(0)
+
+	node := &Node{
+		networksManager: nm,
+		state:           gs,
+		stopChan:        stopChan,
+		logger:          zap.NewNop().Sugar(),
+	}
+	done := make(chan bool, 1)
+	go func() {
+		_, ready, _ := node.prepareKeyGenParticipants()
+		done <- ready
+	}()
+	select {
+	case <-frontierEntered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for GetFrontierMomentumContext call")
+	}
+
+	// EmergencyState MUST cancel the stalled frontier RPC immediately and NEVER fall through to GetPillarPubKeys.
+	if err := gs.SetState(common.EmergencyState); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case ready := <-done:
+		if ready {
+			t.Fatal("prepareKeyGenParticipants reported ready=true after EmergencyState preemption")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("prepareKeyGenParticipants stayed blocked on stalled frontier RPC after EmergencyState")
+	}
+	if pillarCalls.Load() != 0 {
+		t.Fatalf("GetPillarPubKeys was called %d times after EmergencyState preemption, want 0", pillarCalls.Load())
+	}
+}
+
+func TestConfigurePubKeyDoesNotWhitelistRetiredHistoricalKeyPeers(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	baseDir := t.TempDir()
+
+	activeKey, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	activeAddr := crypto.PubkeyToAddress(activeKey.PublicKey)
+	activeCompressed := base64.StdEncoding.EncodeToString(crypto.CompressPubkey(&activeKey.PublicKey))
+
+	retiredKey, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	retiredCompressed := base64.StdEncoding.EncodeToString(crypto.CompressPubkey(&retiredKey.PublicKey))
+
+	makeEd25519Peer := func() (string, string) {
+		_, pub, err := ic.GenerateEd25519Key(rand.Reader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		raw, err := pub.Raw()
+		if err != nil {
+			t.Fatal(err)
+		}
+		pid, err := peer.IDFromPublicKey(pub)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return base64.StdEncoding.EncodeToString(raw), pid.String()
+	}
+	activePartyB64, activePeerID := makeEd25519Peer()
+	retiredPartyB64, retiredPeerID := makeEd25519Peer()
+
+	writeKeyFile := func(compressedB64 string, parties []string) {
+		raw, err := base64.StdEncoding.DecodeString(compressedB64)
+		if err != nil {
+			t.Fatal(err)
+		}
+		path := filepath.Join(baseDir, "localstate-"+hex.EncodeToString(raw)+".json")
+		payload, err := json.Marshal(map[string]interface{}{"participant_keys": parties})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, payload, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeKeyFile(activeCompressed, []string{activePartyB64})
+	writeKeyFile(retiredCompressed, []string{retiredPartyB64})
+
+	c1Addr := ecommon.HexToAddress("0x3333333333333333333333333333333333333333")
+	zMock := &partialRotateZenon{
+		compressedTss: activeCompressed,
+		evmContracts: []*definition.NetworkInfo{
+			{NetworkClass: definition.EvmClass, Id: 1, Name: "eth", ContractAddress: c1Addr.Hex()},
+		},
+	}
+	znnSrv := server.NewServer()
+	if err := znnSrv.RegisterName("embedded.bridge", zMock); err != nil {
+		t.Fatal(err)
+	}
+	znnHTTP := httptest.NewServer(znnSrv.WebsocketHandler([]string{"*"}))
+	t.Cleanup(func() { znnSrv.Stop(); znnHTTP.Close() })
+
+	evm1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			ID     json.RawMessage   `json:"id"`
+			Method string            `json:"method"`
+			Params []json.RawMessage `json:"params"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		resp := map[string]interface{}{"jsonrpc": "2.0", "id": req.ID}
+		switch req.Method {
+		case "eth_chainId":
+			resp["result"] = hexutil.EncodeUint64(1)
+		case "eth_call":
+			var call struct {
+				Data  hexutil.Bytes `json:"data"`
+				Input hexutil.Bytes `json:"input"`
+			}
+			_ = json.Unmarshal(req.Params[0], &call)
+			sel := append(call.Data, call.Input...)
+			if len(sel) >= 4 && string(sel[:4]) == string(common.EvmContractAbi.Methods["tss"].ID) {
+				resp["result"] = ecommon.BytesToHash(activeAddr.Bytes()).Hex()
+			} else {
+				resp["result"] = "0x" + strings.Repeat("0", 64)
+			}
+		default:
+			resp["result"] = "0x" + strings.Repeat("0", 64)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	t.Cleanup(evm1.Close)
+
+	stopChan := make(chan os.Signal, 1)
+	stateVal := common.LiveState
+	gs := common.NewGlobalState(&stateVal)
+	nm, err := network.NewNetworksManager(stopChan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dbMgr, err := manager.NewDbManager(stopChan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := nm.Init(map[string]config.BaseNetworkConfig{
+		common.ZenonNetworkName: {Urls: []string{"ws" + strings.TrimPrefix(znnHTTP.URL, "http")}},
+		"eth":                   {Urls: []string{evm1.URL}},
+	}, dbMgr, gs, func(*common.BridgeMetadata) {}); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { nm.Stop() })
+
+	node := &Node{
+		config: &config.Config{
+			TssConfig: config.TssManagerConfig{
+				BaseDir:         baseDir,
+				PublicKey:       activeCompressed,
+				PubKeyWhitelist: make(map[string]bool),
+			},
+		},
+		networksManager: nm,
+		logger:          zap.NewNop().Sugar(),
+	}
+	if err := node.configurePubKey(); err != nil {
+		t.Fatalf("configurePubKey: %v", err)
+	}
+	if !node.config.TssConfig.PubKeyWhitelist[activePeerID] {
+		t.Fatalf("active peer %s missing from PubKeyWhitelist", activePeerID)
+	}
+	if node.config.TssConfig.PubKeyWhitelist[retiredPeerID] {
+		t.Fatalf("retired historical peer %s was reauthorized in PubKeyWhitelist on restart", retiredPeerID)
 	}
 }

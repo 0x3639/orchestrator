@@ -25,6 +25,10 @@ const redeemHaltConfirmedPrefix byte = 9
 // nonce ownership survives runtime EVM network removal and re-addition.
 const pendingEvmTxPrefix byte = 10
 
+// Persisted incremental secondary-endpoint corroboration cursor for a held
+// late unknown unwrap, keyed by (chainId, contract, txHash, logIndex).
+const unwrapCorrobCursorPrefix byte = 11
+
 var (
 	wrapEventPrefix = []byte{0}
 

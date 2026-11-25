@@ -109,6 +109,7 @@ type secondaryClient struct {
 	client       *ethclient.Client
 	limiter      *rate.Limiter
 	verifiedHead uint64
+	logStep      uint64
 }
 
 func (s *secondaryClient) acquire(ctx context.Context) error {
@@ -1873,6 +1874,11 @@ func (r *EvmRpc) AnySecondaryHasUnwrapLogChunked(parent context.Context, fromBlo
 					return
 				}
 			}
+			epStep := step
+			if cached := r.getSecondaryLogStep(urls[idx]); cached > 0 && cached < epStep {
+				epStep = cached
+			}
+			chunksDone := 0
 			for end := resumeEnd; ; {
 				if attemptCtx.Err() != nil {
 					if parent.Err() != nil || !completedAny {
@@ -1881,9 +1887,10 @@ func (r *EvmRpc) AnySecondaryHasUnwrapLogChunked(parent context.Context, fromBlo
 					break
 				}
 				start := windowFrom
-				if end > windowFrom && end-windowFrom >= step {
-					start = end - step + 1
+				if end > windowFrom && end-windowFrom >= epStep {
+					start = end - epStep + 1
 				}
+				attemptWidth := end - start + 1
 				query := ethereum.FilterQuery{
 					FromBlock: new(big.Int).SetUint64(start),
 					ToBlock:   new(big.Int).SetUint64(end),
@@ -1905,6 +1912,25 @@ func (r *EvmRpc) AnySecondaryHasUnwrapLogChunked(parent context.Context, fromBlo
 					return nil
 				})
 				if err != nil {
+					// If the provider rejected the eth_getLogs block width or
+					// result size, shrink the secondary step (honoring any
+					// suggested range hint, otherwise halving down to 1 block)
+					// and retry the current range immediately.
+					if IsLogRangeLimitError(err) && attemptWidth > 1 {
+						hint, _ := SuggestedLogRange(err)
+						nextStep := hint
+						if nextStep == 0 || nextStep >= attemptWidth {
+							nextStep = attemptWidth / 2
+							if nextStep == 0 {
+								nextStep = 1
+							}
+						}
+						if nextStep < epStep {
+							epStep = nextStep
+							r.recordSecondaryLogStep(urls[idx], epStep)
+							continue
+						}
+					}
 					// If the per-attempt time budget expired (or the rate limiter
 					// rejected a permit exceeding the remaining attempt budget)
 					// after completing at least one chunk, retain partial progress
@@ -1916,8 +1942,9 @@ func (r *EvmRpc) AnySecondaryHasUnwrapLogChunked(parent context.Context, fromBlo
 					break
 				}
 				completedAny = true
+				chunksDone++
 				lowestVerified = start
-				if found || start == windowFrom {
+				if found || start == windowFrom || chunksDone >= maxChunks {
 					break
 				}
 				end = start - 1
@@ -2170,6 +2197,39 @@ func (r *EvmRpc) recordSecondaryVerifiedHead(url string, head uint64) {
 	}
 	if head > entry.verifiedHead {
 		entry.verifiedHead = head
+	}
+}
+
+func (r *EvmRpc) getSecondaryLogStep(url string) uint64 {
+	r.secondaryMu.Lock()
+	defer r.secondaryMu.Unlock()
+	if entry := r.secondary[url]; entry != nil {
+		return entry.logStep
+	}
+	return 0
+}
+
+func (r *EvmRpc) recordSecondaryLogStep(url string, step uint64) {
+	if step == 0 {
+		return
+	}
+	r.secondaryMu.Lock()
+	defer r.secondaryMu.Unlock()
+	if r.secondary == nil {
+		r.secondary = make(map[string]*secondaryClient)
+	}
+	entry := r.secondary[url]
+	if entry == nil {
+		entry = &secondaryClient{sem: make(chan struct{}, 1)}
+		if url == r.Urls.GetCurrentUrl() {
+			entry.limiter = r.limiter
+		} else if r.limit > 0 {
+			entry.limiter = rate.NewLimiter(r.limit, r.burst)
+		}
+		r.secondary[url] = entry
+	}
+	if entry.logStep == 0 || step < entry.logStep {
+		entry.logStep = step
 	}
 }
 

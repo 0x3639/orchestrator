@@ -554,51 +554,15 @@ func (node *Node) processSignatures() {
 					continue
 				}
 			}
-			mom, err := node.networksManager.Znn().GetFrontierMomentum()
+			participatingPubKeys, ready, err := node.prepareKeyGenParticipants()
 			if err != nil {
 				node.logger.Debug(err)
 				continue
 			}
-
-			keyGenWindow := keyGenWindowMomentums(node.tssManager.Config().PartyTimeout)
-			for mom.Height%keyGenWindow > 3 {
-				if !node.workerSleep(10 * time.Second) {
+			if !ready {
+				if node.workerStopping() {
 					return
 				}
-				// Keep the last good momentum on error: the loop condition
-				// dereferences mom, and a failed read returns nil.
-				next, err := node.networksManager.Znn().GetFrontierMomentum()
-				if err != nil {
-					node.logger.Debug(err)
-					continue
-				}
-				mom = next
-
-				if mom.Height%24 == 0 {
-					node.logger.Infof("%d momentums left before starting keygen", keyGenWindow-mom.Height%keyGenWindow)
-				}
-
-				// we query the state every 1 minute
-				if mom.Height%6 == 0 {
-					state, err := node.state.GetState()
-					if err != nil {
-						node.logger.Debug("currentState error while sleeping for key gen")
-						node.logger.Debug(err.Error())
-						continue
-					}
-					if state != common.KeyGenState {
-						node.logger.Info("State no longer keyGen so will exit key generation")
-						break
-					}
-				}
-			}
-			node.logger.Info("Starting keyGen")
-
-			// We start looking 24h of momentums behind the momentum height specified by the bridgeInfo.shouldKeyGenAt
-			// and select every pubKey that produced a momentum
-			participatingPubKeys, err := node.networksManager.GetPillarPubKeys()
-			if err != nil {
-				node.logger.Debug(err)
 				continue
 			}
 
@@ -1655,6 +1619,77 @@ func (node *Node) signKeyGenMessagesContext(ctx context.Context, pubKey, restore
 	}
 }
 
+// prepareKeyGenParticipants waits for the keygen momentum window and loads the
+// participating pillar keys under a state-bound KeyGenState context so an
+// EmergencyState or shutdown transition cancels stalled RPCs and exits
+// immediately instead of falling through to the 24-hour pillar history scan.
+func (node *Node) prepareKeyGenParticipants() (map[string]string, bool, error) {
+	ctx, cancel := node.keyGenContext()
+	defer cancel()
+
+	if !node.keyGenActive() {
+		return nil, false, nil
+	}
+	mom, err := node.networksManager.Znn().GetFrontierMomentumContext(ctx)
+	if err != nil {
+		if !node.keyGenActive() || ctx.Err() != nil {
+			return nil, false, nil
+		}
+		return nil, false, err
+	}
+	if mom == nil {
+		return nil, false, errors.New("missing Zenon frontier momentum")
+	}
+
+	keyGenWindow := keyGenWindowMomentums(node.tssManager.Config().PartyTimeout)
+	for mom.Height%keyGenWindow > 3 {
+		if !node.sleepWhileKeyGenCtx(ctx, 10*time.Second) {
+			node.logger.Info("State no longer keyGen so will exit key generation")
+			return nil, false, nil
+		}
+		next, err := node.networksManager.Znn().GetFrontierMomentumContext(ctx)
+		if err != nil {
+			if !node.keyGenActive() || ctx.Err() != nil {
+				node.logger.Info("State no longer keyGen so will exit key generation")
+				return nil, false, nil
+			}
+			node.logger.Debug(err)
+			continue
+		}
+		if next == nil {
+			continue
+		}
+		mom = next
+
+		if mom.Height%24 == 0 {
+			node.logger.Infof("%d momentums left before starting keygen", keyGenWindow-mom.Height%keyGenWindow)
+		}
+		if !node.keyGenActive() {
+			node.logger.Info("State no longer keyGen so will exit key generation")
+			return nil, false, nil
+		}
+	}
+	if !node.keyGenActive() {
+		node.logger.Info("State no longer keyGen so will exit key generation")
+		return nil, false, nil
+	}
+	node.logger.Info("Starting keyGen")
+
+	// We start looking 24h of momentums behind the momentum height specified by
+	// AllowKeyGenHeight and select every pubKey that produced a momentum.
+	participatingPubKeys, err := node.networksManager.GetPillarPubKeysContext(ctx)
+	if err != nil {
+		if !node.keyGenActive() || ctx.Err() != nil {
+			return nil, false, nil
+		}
+		return nil, false, err
+	}
+	if !node.keyGenActive() {
+		return nil, false, nil
+	}
+	return participatingPubKeys, true, nil
+}
+
 func (node *Node) finishKeyGenRound(keyGenResponse *keygen.Response, decompressedKeyGenPubKey string) bool {
 	// Coordinate with the bridge listener and establish a state-bound context
 	// BEFORE the initial wait, nonce reads, signing ceremonies, and final
@@ -1998,6 +2033,9 @@ func (node *Node) publishKeyGenTssContext(ctx context.Context, evmBatch network.
 			index = (index + 1) % node.getParticipantsLength()
 			producerPubKey := base64.StdEncoding.EncodeToString(node.producerKeyPair.Public)
 			if producerPubKey == node.getParticipant(index) {
+				// Reconcile any previously pending emergency halt that was
+				// evicted mid-rotation so setTss does not stay stranded at N+1.
+				node.networksManager.ClearObsoleteHaltTxContext(ctx, node.evmAddress)
 				node.logger.Debug("[send set tss ecdsa pub key evm tx] this is me")
 				changed, err := node.networksManager.SetTssEcdsaPubKeyEvmContext(ctx, evmBatch, oldKeyFullSignatures, newKeyFullSignatures, newPubKey, node.ecdsaPrivateKey, node.evmAddress, node.keyGenActive)
 				if ctx.Err() != nil {
@@ -2498,7 +2536,12 @@ func (node *Node) signEmergencyHaltMessages(znnMessage []byte, observedZnnKey st
 	} else if primaryKey != "" {
 		slotKeys[0] = primaryKey
 	}
+	hasUnreadableEvm := false
 	for i := range evmMessages {
+		if len(evmMessages[i]) == 0 {
+			hasUnreadableEvm = true
+			continue
+		}
 		if i < len(observedEvmTss) && observedEvmTss[i] != (ecommon.Address{}) {
 			if info, ok := byEvmAddr[observedEvmTss[i]]; ok {
 				slotKeys[i+1] = info.compressedPubKey
@@ -2515,7 +2558,7 @@ func (node *Node) signEmergencyHaltMessages(znnMessage []byte, observedZnnKey st
 	groups := make(map[string][]haltMsgItem)
 	keyOrder := make([]string, 0, len(byCompressed))
 	addItem := func(k string, slot int, msg []byte) {
-		if k == "" {
+		if k == "" || len(msg) == 0 {
 			return
 		}
 		if _, exists := groups[k]; !exists {
@@ -2534,6 +2577,7 @@ func (node *Node) signEmergencyHaltMessages(znnMessage []byte, observedZnnKey st
 	plan := &emergencyHaltPlan{
 		evmFullSignatures: make([][]byte, len(evmMessages)),
 		evmParticipants:   make([][]string, len(evmMessages)),
+		hasFailedGroups:   hasUnreadableEvm,
 	}
 
 	var origLocalPubKeys []string
@@ -3098,30 +3142,33 @@ func (node *Node) configurePubKey() error {
 	}
 	sort.Strings(node.config.TssConfig.LocalPubKeys)
 
-	// Pre-populate the allowlist with peer IDs from ALL local TSS key files
-	// BEFORE TssManager starts its libp2p stream handlers, so emergency halt
-	// signing never mutates live whitelist maps concurrently with peer reads.
+	// Rediscover any alternate local TSS key still active on a bridge (e.g.
+	// after a restart during a split key rotation) and pre-populate the
+	// allowlist ONLY with participants of keys currently active on Zenon or an
+	// EVM bridge — never retired historical key files left on disk.
 	diskKeys := scanLocalTssKeys(node.config.TssConfig.BaseDir)
-	for _, info := range diskKeys {
-		for _, pid := range info.peerIDs {
-			node.config.TssConfig.PubKeyWhitelist[pid] = true
-		}
-	}
-	// Rediscover any alternate local TSS key still active on an EVM chain
-	// (e.g. after a restart during a split key rotation).
 	if len(diskKeys) > 0 && node.networksManager != nil {
 		byAddr := make(map[ecommon.Address]localTssKeyInfo, len(diskKeys))
 		for _, info := range diskKeys {
 			byAddr[info.evmAddress] = info
 		}
-		evmBatch := node.networksManager.EvmBatch()
-		if evmAddrs, err := node.networksManager.GetBatchCurrentTss(evmBatch); err == nil {
-			for _, addr := range evmAddrs {
-				info, ok := byAddr[addr]
-				if !ok || info.compressedPubKey == node.config.TssConfig.PublicKey {
-					continue
-				}
+		allowActiveKey := func(info localTssKeyInfo) {
+			for _, pid := range info.peerIDs {
+				node.config.TssConfig.PubKeyWhitelist[pid] = true
+			}
+			if info.compressedPubKey != node.config.TssConfig.PublicKey {
 				node.setPendingKeyGenPubKey(info.compressedPubKey)
+			}
+		}
+		if bridgeInfo, err := node.networksManager.GetBridgeInfo(); err == nil && bridgeInfo != nil && bridgeInfo.CompressedTssECDSAPubKey != "" {
+			if info, ok := diskKeys[bridgeInfo.CompressedTssECDSAPubKey]; ok {
+				allowActiveKey(info)
+			}
+		}
+		evmBatch := node.networksManager.EvmBatch()
+		for _, addr := range node.networksManager.GetActiveEvmTssAddresses(evmBatch) {
+			if info, ok := byAddr[addr]; ok {
+				allowActiveKey(info)
 			}
 		}
 	}

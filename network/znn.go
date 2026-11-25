@@ -87,19 +87,25 @@ type znnNetwork struct {
 	administrator     string
 	// Tracks the earliest EVM chain head observed while holding a late
 	// sourceUnknown unwrap inside its redeem delay, along with incremental
-	// secondary-endpoint log corroboration progress across retries so large
-	// block ranges never stall the bridge listener past its hold window.
-	unknownUnwrapMu             sync.Mutex
-	unknownUnwrapKey            string
-	unknownUnwrapHead           uint64
-	unknownUnwrapHeadsOK        bool
-	unknownUnwrapReceiptOK      bool
-	unknownUnwrapCanonicalOK    bool
-	unknownUnwrapCanonicalHash  ecommon.Hash
-	unknownUnwrapCorrobTarget   uint64
-	unknownUnwrapCorrobCursor   uint64
-	unknownUnwrapCorrobStarted  bool
-	unknownUnwrapCorrobDone     bool
+	// secondary-endpoint log corroboration progress across retries and restarts
+	// so large block ranges never stall the bridge listener past its hold window.
+	unknownUnwrapMu            sync.Mutex
+	unknownUnwrapKey           string
+	unknownUnwrapChainID       uint32
+	unknownUnwrapContract      ecommon.Address
+	unknownUnwrapTxHash        ecommon.Hash
+	unknownUnwrapLogIdx        uint32
+	unknownUnwrapHead          uint64
+	unknownUnwrapHeadsOK       bool
+	unknownUnwrapReceiptOK     bool
+	unknownUnwrapCanonicalOK   bool
+	unknownUnwrapCanonicalHash ecommon.Hash
+	unknownUnwrapCorrobTarget  uint64
+	unknownUnwrapCorrobCursor  uint64
+	unknownUnwrapCorrobStarted bool
+	unknownUnwrapCorrobDone    bool
+	// Optional explicit override for durable corroboration cursor storage (used by tests).
+	corrobStore common.UnwrapCorrobStore
 	// Tests may lower the per-attempt secondary log chunk budget.
 	secondaryLogMaxChunks int
 }
@@ -2411,6 +2417,10 @@ func (rC *znnNetwork) GetFrontierMomentum() (*api.Momentum, error) {
 	return rC.ZnnRpc().GetFrontierMomentum()
 }
 
+func (rC *znnNetwork) GetFrontierMomentumContext(ctx context.Context) (*api.Momentum, error) {
+	return rC.ZnnRpc().GetFrontierMomentumContext(ctx)
+}
+
 func (rC *znnNetwork) GetAllPillars() (*embedded.PillarInfoList, error) {
 	return rC.ZnnRpc().GetAllPillars()
 }
@@ -2445,6 +2455,10 @@ func (rC *znnNetwork) GetBridgeInfoContext(ctx context.Context) (*definition.Bri
 
 func (rC *znnNetwork) GetPillarPublicKeys() (map[string]string, error) {
 	return rC.ZnnRpc().GetPillarPublicKeys()
+}
+
+func (rC *znnNetwork) GetPillarPublicKeysContext(ctx context.Context) (map[string]string, error) {
+	return rC.ZnnRpc().GetPillarPublicKeysContext(ctx)
 }
 
 func (rC *znnNetwork) GetAllNetworks() ([]*definition.NetworkInfo, error) {
@@ -2729,12 +2743,40 @@ func (rC *znnNetwork) stopForContractChange(ctx context.Context, existingNet *ev
 	rC.stopBridgeListener(ctx, reason)
 }
 
-func (rC *znnNetwork) observeUnknownUnwrapHead(chainId uint32, txHash types.Hash, logIndex uint32, head uint64) uint64 {
+func (rC *znnNetwork) unwrapCorrobStore() common.UnwrapCorrobStore {
+	if rC.corrobStore != nil {
+		return rC.corrobStore
+	}
+	type provider interface {
+		UnwrapCorrobStore() common.UnwrapCorrobStore
+	}
+	if p, ok := rC.dbManager.(provider); ok {
+		return p.UnwrapCorrobStore()
+	}
+	return nil
+}
+
+func (rC *znnNetwork) observeUnknownUnwrapHead(chainId uint32, contract ecommon.Address, txHash types.Hash, logIndex uint32, head uint64) uint64 {
 	key := fmt.Sprintf("%d:%s:%d", chainId, txHash.String(), logIndex)
+	var staleChain uint32
+	var staleContract ecommon.Address
+	var staleTx ecommon.Hash
+	var staleLog uint32
+	deleteStale := false
 	rC.unknownUnwrapMu.Lock()
-	defer rC.unknownUnwrapMu.Unlock()
 	if rC.unknownUnwrapKey != key || head < rC.unknownUnwrapHead {
+		if rC.unknownUnwrapKey != "" {
+			staleChain = rC.unknownUnwrapChainID
+			staleContract = rC.unknownUnwrapContract
+			staleTx = rC.unknownUnwrapTxHash
+			staleLog = rC.unknownUnwrapLogIdx
+			deleteStale = true
+		}
 		rC.unknownUnwrapKey = key
+		rC.unknownUnwrapChainID = chainId
+		rC.unknownUnwrapContract = contract
+		rC.unknownUnwrapTxHash = ecommon.Hash(txHash)
+		rC.unknownUnwrapLogIdx = logIndex
 		rC.unknownUnwrapHead = head
 		rC.unknownUnwrapHeadsOK = false
 		rC.unknownUnwrapReceiptOK = false
@@ -2745,7 +2787,66 @@ func (rC *znnNetwork) observeUnknownUnwrapHead(chainId uint32, txHash types.Hash
 		rC.unknownUnwrapCorrobStarted = false
 		rC.unknownUnwrapCorrobDone = false
 	}
-	return rC.unknownUnwrapHead
+	res := rC.unknownUnwrapHead
+	rC.unknownUnwrapMu.Unlock()
+	if deleteStale {
+		if store := rC.unwrapCorrobStore(); store != nil {
+			_ = store.DeleteUnwrapCorrobCursor(staleChain, staleContract, staleTx, staleLog)
+		}
+	}
+	return res
+}
+
+// restorePersistedCorrobCursor loads any durable secondary-log corroboration
+// cursor for (chainId, contract, txHash, logIndex) when the in-memory state is
+// empty (e.g. after a receive-hold restart), validating its canonical anchor
+// hash before reusing progress. Returns false if a transient RPC error prevents
+// validating the anchor so persisted progress is never discarded prematurely.
+func (rC *znnNetwork) restorePersistedCorrobCursor(evm *rpc.EvmRpc, chainId uint32, contract ecommon.Address, txHash types.Hash, logIndex uint32) bool {
+	key := fmt.Sprintf("%d:%s:%d", chainId, txHash.String(), logIndex)
+	rC.unknownUnwrapMu.Lock()
+	alreadyLoaded := rC.unknownUnwrapKey == key && rC.unknownUnwrapContract == contract
+	rC.unknownUnwrapMu.Unlock()
+	if alreadyLoaded {
+		return true
+	}
+	store := rC.unwrapCorrobStore()
+	if store == nil {
+		return true
+	}
+	saved, err := store.LoadUnwrapCorrobCursor(chainId, contract, ecommon.Hash(txHash), logIndex)
+	if err != nil {
+		rC.logger.Debugf("load persisted unwrap corroboration cursor: %v", err)
+		return false
+	}
+	if saved == nil || saved.TargetHead == 0 || saved.CanonicalHash == (ecommon.Hash{}) {
+		return true
+	}
+	currentHash, err := evm.CanonicalHash(saved.TargetHead)
+	if err != nil {
+		return false
+	}
+	if currentHash != saved.CanonicalHash {
+		_ = store.DeleteUnwrapCorrobCursor(chainId, contract, ecommon.Hash(txHash), logIndex)
+		return true
+	}
+	rC.unknownUnwrapMu.Lock()
+	rC.unknownUnwrapKey = key
+	rC.unknownUnwrapChainID = chainId
+	rC.unknownUnwrapContract = contract
+	rC.unknownUnwrapTxHash = ecommon.Hash(txHash)
+	rC.unknownUnwrapLogIdx = logIndex
+	rC.unknownUnwrapHead = saved.TargetHead
+	rC.unknownUnwrapHeadsOK = false
+	rC.unknownUnwrapReceiptOK = false
+	rC.unknownUnwrapCanonicalOK = true
+	rC.unknownUnwrapCanonicalHash = saved.CanonicalHash
+	rC.unknownUnwrapCorrobTarget = saved.TargetHead
+	rC.unknownUnwrapCorrobCursor = saved.LowestVerified
+	rC.unknownUnwrapCorrobStarted = true
+	rC.unknownUnwrapCorrobDone = saved.Done
+	rC.unknownUnwrapMu.Unlock()
+	return true
 }
 
 func (rC *znnNetwork) unknownUnwrapPrecheckState(chainId uint32, txHash types.Hash, logIndex uint32) (obsHead uint64, headsOK, receiptOK, canonicalOK bool, canonicalHash ecommon.Hash) {
@@ -2779,7 +2880,16 @@ func (rC *znnNetwork) markUnknownUnwrapPrecheck(chainId uint32, txHash types.Has
 
 func (rC *znnNetwork) clearUnknownUnwrapObs() {
 	rC.unknownUnwrapMu.Lock()
+	hadKey := rC.unknownUnwrapKey != ""
+	chainID := rC.unknownUnwrapChainID
+	contract := rC.unknownUnwrapContract
+	txHash := rC.unknownUnwrapTxHash
+	logIdx := rC.unknownUnwrapLogIdx
 	rC.unknownUnwrapKey = ""
+	rC.unknownUnwrapChainID = 0
+	rC.unknownUnwrapContract = ecommon.Address{}
+	rC.unknownUnwrapTxHash = ecommon.Hash{}
+	rC.unknownUnwrapLogIdx = 0
 	rC.unknownUnwrapHead = 0
 	rC.unknownUnwrapHeadsOK = false
 	rC.unknownUnwrapReceiptOK = false
@@ -2790,6 +2900,11 @@ func (rC *znnNetwork) clearUnknownUnwrapObs() {
 	rC.unknownUnwrapCorrobStarted = false
 	rC.unknownUnwrapCorrobDone = false
 	rC.unknownUnwrapMu.Unlock()
+	if hadKey {
+		if store := rC.unwrapCorrobStore(); store != nil {
+			_ = store.DeleteUnwrapCorrobCursor(chainID, contract, txHash, logIdx)
+		}
+	}
 }
 
 func (rC *znnNetwork) nextSecondaryCorrobWindow(chainId uint32, txHash types.Hash, logIndex uint32, target uint64) (resumeEnd uint64, done bool) {
@@ -2815,16 +2930,38 @@ func (rC *znnNetwork) nextSecondaryCorrobWindow(chainId uint32, txHash types.Has
 	return rC.unknownUnwrapCorrobCursor - 1, false
 }
 
-func (rC *znnNetwork) recordSecondaryCorrobProgress(chainId uint32, txHash types.Hash, logIndex uint32, target, lowestVerified uint64, complete bool) {
+func (rC *znnNetwork) recordSecondaryCorrobProgress(chainId uint32, contract ecommon.Address, txHash types.Hash, logIndex uint32, target, lowestVerified uint64, canonicalHash ecommon.Hash, complete bool) {
 	key := fmt.Sprintf("%d:%s:%d", chainId, txHash.String(), logIndex)
 	rC.unknownUnwrapMu.Lock()
-	defer rC.unknownUnwrapMu.Unlock()
 	if rC.unknownUnwrapKey != key || rC.unknownUnwrapCorrobTarget != target {
+		rC.unknownUnwrapMu.Unlock()
 		return
 	}
+	rC.unknownUnwrapChainID = chainId
+	rC.unknownUnwrapContract = contract
+	rC.unknownUnwrapTxHash = ecommon.Hash(txHash)
+	rC.unknownUnwrapLogIdx = logIndex
 	rC.unknownUnwrapCorrobStarted = true
 	rC.unknownUnwrapCorrobCursor = lowestVerified
 	rC.unknownUnwrapCorrobDone = complete
+	rC.unknownUnwrapMu.Unlock()
+
+	if canonicalHash != (ecommon.Hash{}) {
+		if store := rC.unwrapCorrobStore(); store != nil {
+			if err := store.SaveUnwrapCorrobCursor(&common.UnwrapCorrobCursor{
+				ChainID:        chainId,
+				Contract:       contract,
+				TxHash:         ecommon.Hash(txHash),
+				LogIndex:       logIndex,
+				TargetHead:     target,
+				CanonicalHash:  canonicalHash,
+				LowestVerified: lowestVerified,
+				Done:           complete,
+			}); err != nil {
+				rC.logger.Debugf("persist unwrap corroboration cursor: %v", err)
+			}
+		}
+	}
 }
 
 // lateUnknownUnwrapCovered reports whether the local EVM network's completed
@@ -2851,6 +2988,9 @@ func (rC *znnNetwork) lateUnknownUnwrapCovered(ctx context.Context, evm *rpc.Evm
 	if eN.hasQueuedEvent(ecommon.Hash(rpcZnnEvent.TransactionHash), rpcZnnEvent.LogIndex) {
 		return false
 	}
+	if !rC.restorePersistedCorrobCursor(evm, rpcZnnEvent.ChainId, evm.BridgeAddress(), rpcZnnEvent.TransactionHash, rpcZnnEvent.LogIndex) {
+		return false
+	}
 	depth := eN.ConfirmationsToFinality()
 	obsHead, headsOK, receiptOK, canonicalOK, canonicalHash := rC.unknownUnwrapPrecheckState(rpcZnnEvent.ChainId, rpcZnnEvent.TransactionHash, rpcZnnEvent.LogIndex)
 	if !headsOK {
@@ -2862,7 +3002,7 @@ func (rC *znnNetwork) lateUnknownUnwrapCovered(ctx context.Context, evm *rpc.Evm
 			eN.requestCatchUpSync()
 			return false
 		}
-		obsHead = rC.observeUnknownUnwrapHead(rpcZnnEvent.ChainId, rpcZnnEvent.TransactionHash, rpcZnnEvent.LogIndex, maxHead)
+		obsHead = rC.observeUnknownUnwrapHead(rpcZnnEvent.ChainId, evm.BridgeAddress(), rpcZnnEvent.TransactionHash, rpcZnnEvent.LogIndex, maxHead)
 		// Every configured endpoint must have reached obsHead so no secondary can
 		// silently clip eth_getLogs below the window being corroborated.
 		if minHead < obsHead {
@@ -2898,7 +3038,7 @@ func (rC *znnNetwork) lateUnknownUnwrapCovered(ctx context.Context, evm *rpc.Evm
 	}
 	// Corroborate absence of the source log across independent secondary
 	// endpoints in bounded batches, retaining verified progress across retries
-	// so large ranges never block the bridge listener past its hold window.
+	// and restarts so large ranges never block the bridge listener indefinitely.
 	resumeEnd, corrobDone := rC.nextSecondaryCorrobWindow(rpcZnnEvent.ChainId, rpcZnnEvent.TransactionHash, rpcZnnEvent.LogIndex, obsHead)
 	if !corrobDone {
 		hasSecondaryLog, lowestVerified, complete, err := evm.AnySecondaryHasUnwrapLogChunked(
@@ -2911,7 +3051,7 @@ func (rC *znnNetwork) lateUnknownUnwrapCovered(ctx context.Context, evm *rpc.Evm
 			}
 			return false
 		}
-		rC.recordSecondaryCorrobProgress(rpcZnnEvent.ChainId, rpcZnnEvent.TransactionHash, rpcZnnEvent.LogIndex, obsHead, lowestVerified, complete)
+		rC.recordSecondaryCorrobProgress(rpcZnnEvent.ChainId, evm.BridgeAddress(), rpcZnnEvent.TransactionHash, rpcZnnEvent.LogIndex, obsHead, lowestVerified, canonicalHash, complete)
 		if !complete {
 			return false
 		}

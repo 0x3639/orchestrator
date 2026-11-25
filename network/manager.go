@@ -857,6 +857,10 @@ func (m *NetworksManager) GetPillarPubKeys() (map[string]string, error) {
 	return m.Znn().GetPillarPublicKeys()
 }
 
+func (m *NetworksManager) GetPillarPubKeysContext(ctx context.Context) (map[string]string, error) {
+	return m.Znn().GetPillarPublicKeysContext(ctx)
+}
+
 func (m *NetworksManager) WindowSize() uint64 {
 	return m.Znn().WindowSize()
 }
@@ -1399,25 +1403,29 @@ func (m *NetworksManager) GetHaltMessages() (EvmBatch, [][]byte, error) {
 }
 
 // GetHaltMessagesWithState returns the halt message, action nonce, and current
-// TSS address of every EVM network in batch order so halt signing and sending
-// can match each chain's active key and detect mid-emergency key/nonce changes.
+// TSS address of every readable EVM network in batch order so halt signing and
+// sending can match each chain's active key and detect mid-emergency key/nonce
+// changes. An individual unavailable EVM chain leaves its slot empty instead
+// of blocking Zenon and healthy EVM chains from halting immediately.
 func (m *NetworksManager) GetHaltMessagesWithState() (EvmBatch, [][]byte, []*big.Int, []ecommon.Address, error) {
 	batch := m.EvmBatch()
-	msgs := make([][]byte, 0, len(batch.networks))
-	nonces := make([]*big.Int, 0, len(batch.networks))
-	tssAddrs := make([]ecommon.Address, 0, len(batch.networks))
-	for _, network := range batch.networks {
+	msgs := make([][]byte, len(batch.networks))
+	nonces := make([]*big.Int, len(batch.networks))
+	tssAddrs := make([]ecommon.Address, len(batch.networks))
+	for i, network := range batch.networks {
 		tssAddr, err := network.GetCurrentTss()
 		if err != nil {
-			return EvmBatch{}, nil, nil, nil, err
+			m.logger.Warnf("skipping unavailable EVM network %d during emergency halt state collection (GetCurrentTss): %v", network.ChainId(), err)
+			continue
 		}
 		msg, nonce, err := network.GetHaltEvmMessageWithNonce()
 		if err != nil {
-			return EvmBatch{}, nil, nil, nil, err
+			m.logger.Warnf("skipping unavailable EVM network %d during emergency halt state collection (GetHaltEvmMessageWithNonce): %v", network.ChainId(), err)
+			continue
 		}
-		msgs = append(msgs, msg)
-		nonces = append(nonces, nonce)
-		tssAddrs = append(tssAddrs, tssAddr)
+		msgs[i] = msg
+		nonces[i] = nonce
+		tssAddrs[i] = tssAddr
 	}
 	return batch, msgs, nonces, tssAddrs, nil
 }
@@ -1435,6 +1443,24 @@ func (m *NetworksManager) GetBatchCurrentTss(batch EvmBatch) ([]ecommon.Address,
 		addrs[i] = addr
 	}
 	return addrs, nil
+}
+
+// GetActiveEvmTssAddresses reads the current on-chain TSS address for each
+// reachable EVM network in batch, skipping unreachable chains instead of
+// aborting the whole read.
+func (m *NetworksManager) GetActiveEvmTssAddresses(batch EvmBatch) []ecommon.Address {
+	addrs := make([]ecommon.Address, 0, len(batch.networks))
+	for _, network := range batch.networks {
+		addr, err := network.GetCurrentTss()
+		if err != nil {
+			m.logger.Warnf("skipping unavailable EVM network %d while reading active TSS address: %v", network.ChainId(), err)
+			continue
+		}
+		if addr != (ecommon.Address{}) {
+			addrs = append(addrs, addr)
+		}
+	}
+	return addrs
 }
 
 func (m *NetworksManager) GetHaltEvmTxs(batch EvmBatch, signatures [][]byte, tss ecommon.Address) ([]*etypes.Transaction, error) {

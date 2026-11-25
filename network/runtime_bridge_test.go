@@ -18,6 +18,7 @@ import (
 	"github.com/ethereum/go-ethereum/common/hexutil"
 	etypes "github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
+	"github.com/syndtr/goleveldb/leveldb"
 	zdb "github.com/zenon-network/go-zenon/common/db"
 	"github.com/zenon-network/go-zenon/chain/nom"
 	"github.com/zenon-network/go-zenon/common/types"
@@ -31,6 +32,7 @@ import (
 	"orchestrator/common/storage"
 	"orchestrator/db/manager"
 	"orchestrator/db/unwrap"
+	"orchestrator/db/wrap"
 	"orchestrator/health/snapshot"
 	"orchestrator/rpc"
 )
@@ -3516,4 +3518,160 @@ func TestLateUnknownUnwrapFirstPassRevalidatesAnchorAfterMidPassShallowReorg(t *
 		t.Fatal("expected second pass to find reorged source log at block 18 and hold")
 	}
 	l.expect("after rescan finds block 18 log", common.LiveState, 1)
+}
+
+func TestLateUnknownUnwrapCorrobCursorPersistsAcrossRestartAndResetsOnReorg(t *testing.T) {
+	contract := ecommon.HexToAddress("0x4444444444444444444444444444444444444444")
+	txHash := ecommon.HexToHash("0xabab000000000000000000000000000000000000000000000000000000000001")
+	logIdx := uint32(0)
+	req := &definition.UnwrapTokenRequest{
+		TransactionHash: types.Hash(txHash),
+		LogIndex:        logIdx,
+		ChainId:         1,
+	}
+
+	var headHash atomic.Value
+	headHash.Store(ecommon.HexToHash("0x1111111111111111111111111111111111111111111111111111111111111111"))
+	var seenSecondaryEnds []uint64
+	var mu sync.Mutex
+
+	makeEvm := func(trackLogs bool) string {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			var rpcReq struct {
+				ID     json.RawMessage   `json:"id"`
+				Method string            `json:"method"`
+				Params []json.RawMessage `json:"params"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&rpcReq)
+			resp := map[string]any{"jsonrpc": "2.0", "id": rpcReq.ID}
+			switch rpcReq.Method {
+			case "eth_chainId":
+				resp["result"] = "0x1"
+			case "eth_blockNumber":
+				resp["result"] = "0x14" // block 20
+			case "eth_getBlockByNumber":
+				resp["result"] = map[string]any{
+					"number": "0x14",
+					"hash":   headHash.Load().(ecommon.Hash).Hex(),
+				}
+			case "eth_getTransactionReceipt":
+				resp["result"] = nil
+			case "eth_getLogs":
+				if trackLogs {
+					var f struct {
+						ToBlock hexutil.Uint64 `json:"toBlock"`
+					}
+					_ = json.Unmarshal(rpcReq.Params[0], &f)
+					mu.Lock()
+					seenSecondaryEnds = append(seenSecondaryEnds, uint64(f.ToBlock))
+					mu.Unlock()
+				}
+				resp["result"] = []any{}
+			default:
+				resp["result"] = nil
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(resp)
+		}))
+		t.Cleanup(srv.Close)
+		return srv.URL
+	}
+	primaryURL := makeEvm(false)
+	secondaryURL := makeEvm(true)
+
+	dbDir := t.TempDir()
+	openNode := func(ldb *leveldb.DB) (*znnNetwork, *rpc.EvmRpc) {
+		evmClient, err := rpc.NewEvmRpcClient(config.BaseNetworkConfig{
+			Urls:            []string{primaryURL, secondaryURL},
+			FilterQuerySize: 5,
+		}, "eth", contract)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(evmClient.Stop)
+		params, err := config.NewEvmParams(&definition.NetworkInfo{
+			NetworkClass:    definition.EvmClass,
+			Id:              1,
+			Name:            "eth",
+			ContractAddress: contract.Hex(),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		params.SetConfirmationsToFinality(5)
+		params.SetContractDeploymentHeight(1)
+		stateVal := common.LiveState
+		eN := &evmNetwork{
+			EvmParams: params,
+			client:    evmClient,
+			done:      make(chan struct{}),
+			state:     common.NewGlobalState(&stateVal),
+			logger:    zap.NewNop().Sugar(),
+		}
+		eN.lastScannedThrough.Store(20)
+		eN.scanned.Store(true)
+		znn := &znnNetwork{
+			logger:                zap.NewNop().Sugar(),
+			corrobStore:           wrap.NewUnwrapCorrobStore(ldb),
+			secondaryLogMaxChunks: 2, // 2 chunks of 5 blocks = 10 blocks per call
+		}
+		znn.networkManager = &NetworksManager{znnNetwork: znn, evmNetworks: []*evmNetwork{eN}, logger: zap.NewNop().Sugar()}
+		return znn, evmClient
+	}
+
+	// Process 1: verifies blocks [11..20] (2 chunks of 5) and persists LowestVerified=11.
+	ldb1, err := leveldb.OpenFile(dbDir, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	znn1, evm1 := openNode(ldb1)
+	if znn1.lateUnknownUnwrapCovered(context.Background(), evm1, req) {
+		_ = ldb1.Close()
+		t.Fatal("expected first half-range pass to return false while blocks [1..10] remain")
+	}
+	if err := ldb1.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Process 2 (fresh in-memory state after restart): MUST resume at block 10 (NOT 20!)
+	// and complete corroboration cleanly in one pass.
+	ldb2, err := leveldb.OpenFile(dbDir, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	znn2, evm2 := openNode(ldb2)
+	mu.Lock()
+	beforeRestart := len(seenSecondaryEnds)
+	mu.Unlock()
+	if !znn2.lateUnknownUnwrapCovered(context.Background(), evm2, req) {
+		_ = ldb2.Close()
+		t.Fatal("expected second process to resume from persisted cursor [1..10] and complete corroboration")
+	}
+	mu.Lock()
+	afterEnds := append([]uint64(nil), seenSecondaryEnds[beforeRestart:]...)
+	mu.Unlock()
+	if len(afterEnds) == 0 || afterEnds[0] != 10 {
+		_ = ldb2.Close()
+		t.Fatalf("after restart, secondary resumed at toBlock=%v, want first toBlock=10 (not restarting at 20)", afterEnds)
+	}
+
+	// Process 3: if canonical hash at TargetHead changed (reorg) across restart,
+	// persisted cursor MUST be discarded and verification restarted from block 20.
+	headHash.Store(ecommon.HexToHash("0x2222222222222222222222222222222222222222222222222222222222222222"))
+	znn3, evm3 := openNode(ldb2)
+	mu.Lock()
+	beforeReorg := len(seenSecondaryEnds)
+	mu.Unlock()
+	if znn3.lateUnknownUnwrapCovered(context.Background(), evm3, req) {
+		_ = ldb2.Close()
+		t.Fatal("expected reorged anchor to invalidate persisted cursor and rescan from head")
+	}
+	mu.Lock()
+	reorgEnds := append([]uint64(nil), seenSecondaryEnds[beforeReorg:]...)
+	mu.Unlock()
+	if len(reorgEnds) == 0 || reorgEnds[0] != 20 {
+		_ = ldb2.Close()
+		t.Fatalf("after reorg across restart, secondary started at toBlock=%v, want 20", reorgEnds)
+	}
+	_ = ldb2.Close()
 }

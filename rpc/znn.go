@@ -603,10 +603,25 @@ func (r *ZnnRpc) GetNetworkByClassAndIdContext(ctx context.Context, networkClass
 	return network, nil
 }
 
+func (r *ZnnRpc) GetMomentumsByHeightContext(ctx context.Context, height, count uint64) (*api.MomentumList, error) {
+	var list *api.MomentumList
+	if err := r.settingsClient.CallContext(ctx, &list, "ledger.getMomentumsByHeight", height, count); err != nil {
+		return nil, err
+	}
+	return list, nil
+}
+
 func (r *ZnnRpc) GetPillarPublicKeys() (map[string]string, error) {
-	orchestratorInfo, err := r.GetOrchestratorInfo()
+	return r.GetPillarPublicKeysContext(context.Background())
+}
+
+func (r *ZnnRpc) GetPillarPublicKeysContext(ctx context.Context) (map[string]string, error) {
+	orchestratorInfo, err := r.GetOrchestratorInfoContext(ctx)
 	if err != nil {
 		return nil, err
+	}
+	if orchestratorInfo == nil {
+		return nil, errors.New("missing orchestrator info")
 	}
 	pubKeysMap := make(map[string]string)
 	right := orchestratorInfo.AllowKeyGenHeight
@@ -620,25 +635,31 @@ func (r *ZnnRpc) GetPillarPublicKeys() (map[string]string, error) {
 	}
 
 	for left < right {
-		count := uint64(math.Min(api.RpcMaxCountSize, float64(right-left)))
-		if mList, err := r.GetMomentumsByHeight(left, count); err != nil {
+		if err := ctx.Err(); err != nil {
 			return nil, err
-		} else {
-			for _, m := range mList.List {
-				if _, ok := pubKeysMap[base64.StdEncoding.EncodeToString(m.PublicKey)]; !ok {
-					pub, err := ic.UnmarshalEd25519PublicKey(m.PublicKey)
-					if err != nil {
-						return nil, err
-					}
-					peerId, err := peer.IDFromPublicKey(pub)
-					if err != nil {
-						return nil, err
-					}
-					pubKeysMap[base64.StdEncoding.EncodeToString(m.PublicKey)] = peerId.String()
-				}
-			}
-			left += count
 		}
+		count := uint64(math.Min(api.RpcMaxCountSize, float64(right-left)))
+		mList, err := r.GetMomentumsByHeightContext(ctx, left, count)
+		if err != nil {
+			return nil, err
+		}
+		if mList == nil {
+			return nil, errors.New("missing momentum list")
+		}
+		for _, m := range mList.List {
+			if _, ok := pubKeysMap[base64.StdEncoding.EncodeToString(m.PublicKey)]; !ok {
+				pub, err := ic.UnmarshalEd25519PublicKey(m.PublicKey)
+				if err != nil {
+					return nil, err
+				}
+				peerId, err := peer.IDFromPublicKey(pub)
+				if err != nil {
+					return nil, err
+				}
+				pubKeysMap[base64.StdEncoding.EncodeToString(m.PublicKey)] = peerId.String()
+			}
+		}
+		left += count
 	}
 
 	return pubKeysMap, nil
