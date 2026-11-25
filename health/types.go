@@ -1,6 +1,11 @@
 package health
 
-import "time"
+import (
+	"sync/atomic"
+	"time"
+
+	"golang.org/x/sync/singleflight"
+)
 
 // Request and Response structures
 type Request struct {
@@ -31,14 +36,24 @@ type StatusNetworkInfo struct {
 	NetworkSigningStatus
 }
 
+// ReceiveHoldStatus describes an unresolved bridge account listener hold.
+type ReceiveHoldStatus struct {
+	Height   uint64    `json:"height"`
+	Since    time.Time `json:"since"`
+	Attempts uint64    `json:"attempts"`
+}
+
 // Status struct
 type Status struct {
-	State            uint8                        `json:"state"`
-	StateName        string                       `json:"stateName"`
-	FrontierMomentum uint64                       `json:"frontierMomentum"`
-	Networks         map[string]StatusNetworkInfo `json:"networks"`
-	PeersLen         uint32                       `json:"peersLen"`
-	Peers            []string                     `json:"peers"`
+	State                  uint8                        `json:"state"`
+	StateName              string                       `json:"stateName"`
+	FrontierMomentum       uint64                       `json:"frontierMomentum"`
+	Networks               map[string]StatusNetworkInfo `json:"networks"`
+	PeersLen               uint32                       `json:"peersLen"`
+	Peers                  []string                     `json:"peers"`
+	ReceiveHold            *ReceiveHoldStatus           `json:"receiveHold,omitempty"`
+	PendingRedeemIncidents int                          `json:"pendingRedeemIncidents,omitempty"`
+	RedeemHaltPending      bool                         `json:"redeemHaltPending,omitempty"`
 }
 
 type BuildInfo struct {
@@ -55,36 +70,67 @@ type Identity struct {
 	EvmAddress    string `json:"evmAddress"`
 }
 
+// cachedStatus is published as one immutable value so a reader always sees a
+// status together with the time it was built.
+type cachedStatus struct {
+	status *Status
+	at     time.Time
+}
+
+// StatusResults caches the last getStatus result for delay seconds. Health
+// handlers run concurrently, so the cache entry is swapped atomically and
+// concurrent misses share a single refresh.
 type StatusResults struct {
-	statusResult *Status
-	lastResponse int64
-	delay        int64
+	current atomic.Pointer[cachedStatus]
+	refresh singleflight.Group
+	delay   time.Duration
+	now     func() time.Time
 }
 
 func NewCachedStatusResults(delay int64) *StatusResults {
 	return &StatusResults{
-		statusResult: nil,
-		lastResponse: 0,
-		delay:        delay, // seconds
+		delay: time.Duration(delay) * time.Second,
+		now:   time.Now,
 	}
 }
 
+// SetStatusResult publishes s. The cache keeps its own Status value; the
+// Networks map and Peers slice are shared and must not be changed afterwards.
 func (c *StatusResults) SetStatusResult(s Status) {
-	c.statusResult = &Status{
-		State:            s.State,
-		StateName:        s.StateName,
-		FrontierMomentum: s.FrontierMomentum,
-		Networks:         s.Networks,
-		PeersLen:         s.PeersLen,
-		Peers:            s.Peers,
-	}
-	c.lastResponse = time.Now().Unix()
+	stored := s
+	c.current.Store(&cachedStatus{status: &stored, at: c.now()})
 }
 
+// GetStatusResult returns the cached status while it is fresh, or nil.
 func (c *StatusResults) GetStatusResult() *Status {
-	currentTimestamp := time.Now().Unix()
-	if c.statusResult != nil && c.lastResponse+c.delay >= currentTimestamp {
-		return c.statusResult
+	entry := c.current.Load()
+	if entry == nil || c.now().Sub(entry.at) > c.delay {
+		return nil
 	}
-	return nil
+	return entry.status
+}
+
+// GetOrRefresh returns the cached status while it is fresh. Otherwise one
+// caller runs build and every concurrent caller waits for and shares its
+// result, including its error. Errors are not cached.
+func (c *StatusResults) GetOrRefresh(build func() (Status, error)) (*Status, error) {
+	if status := c.GetStatusResult(); status != nil {
+		return status, nil
+	}
+	result, err, _ := c.refresh.Do("status", func() (interface{}, error) {
+		// A refresh may have finished between the check above and this call.
+		if status := c.GetStatusResult(); status != nil {
+			return status, nil
+		}
+		status, err := build()
+		if err != nil {
+			return nil, err
+		}
+		c.SetStatusResult(status)
+		return c.current.Load().status, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return result.(*Status), nil
 }

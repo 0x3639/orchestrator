@@ -118,7 +118,7 @@ func startupNetwork(t *testing.T, ledger *startupLedger) *znnNetwork {
 func startupReceive(height byte) *api.AccountBlockMarshal {
 	return &api.AccountBlockMarshal{
 		AccountBlockMarshal: nom.AccountBlockMarshal{BlockType: nom.BlockTypeContractReceive, Height: uint64(height), Address: types.BridgeContract,
-			Hash: types.Hash{height}, FromBlockHash: types.Hash{height, 1}, Amount: "0"},
+			Hash: types.Hash{height}, FromBlockHash: types.Hash{height, 1}, Amount: "0", Data: acceptedReceive},
 		ConfirmationDetail: &api.AccountBlockConfirmationDetail{MomentumHeight: 100},
 	}
 }

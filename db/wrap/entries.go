@@ -3,11 +3,14 @@ package wrap
 import (
 	"encoding/binary"
 	"errors"
+	"fmt"
+	"math/big"
 	"github.com/syndtr/goleveldb/leveldb"
 	zcommon "github.com/zenon-network/go-zenon/common"
 	"github.com/zenon-network/go-zenon/common/types"
 	"orchestrator/common"
 	"orchestrator/common/events"
+	"orchestrator/db"
 )
 
 func getWrapEventPrefix() []byte {
@@ -18,101 +21,298 @@ func getWrapEventKey(id types.Hash) []byte {
 	return zcommon.JoinBytes(getWrapEventPrefix(), id.Bytes())
 }
 
+// AddWrapRequest stores a wrap request read from the bridge. A record that
+// exists keeps what this node wrote to it, its redeem status included. Only a
+// missing signature is filled in from the bridge's.
 func (es *eventStore) AddWrapRequest(event events.WrapRequestZnn) error {
-	if eventBytes, err := event.Serialize(); err != nil {
+	es.mu.Lock()
+	defer es.mu.Unlock()
+	data, err := es.DB.Get(getWrapEventKey(event.Id))
+	if errors.Is(err, leveldb.ErrNotFound) {
+		return es.putWrap(&event)
+	}
+	if err != nil {
 		es.SendSigInt()
 		return err
-	} else {
-		if err := es.DB.Put(getWrapEventKey(event.Id), eventBytes); err != nil {
+	}
+	// A repeated Zenon observation can supply a missing signature. Other
+	// signature changes go through the explicit update and resign paths.
+	if event.Signature != "" {
+		current, err := events.DeserializeWrapEventZnn(data)
+		if err != nil {
 			es.SendSigInt()
 			return err
 		}
+		if current.Signature == "" {
+			current.Signature = event.Signature
+			current.SentSignature = current.SentSignature || event.SentSignature
+			return es.putWrap(current)
+		}
 	}
 	return nil
+}
+
+// AddWrapRequestKeepingStatus stores a request read from the bridge and keeps
+// the redeem status of a record that exists. AddWrapRequest already does both.
+func (es *eventStore) AddWrapRequestKeepingStatus(event events.WrapRequestZnn) error {
+	return es.AddWrapRequest(event)
+}
+
+// AddWrapRequestIfMissing stores the request unless a record of it exists,
+// and reports whether it stored it. The read and the write are one operation
+// under the record lock.
+func (es *eventStore) AddWrapRequestIfMissing(event events.WrapRequestZnn) (bool, error) {
+	es.mu.Lock()
+	defer es.mu.Unlock()
+	_, err := es.DB.Get(getWrapEventKey(event.Id))
+	if errors.Is(err, leveldb.ErrNotFound) {
+		return true, es.putWrap(&event)
+	}
+	if err != nil {
+		es.SendSigInt()
+		return false, err
+	}
+	return false, nil
+}
+
+func (es *eventStore) putWrap(event *events.WrapRequestZnn) error {
+	data, err := event.Serialize()
+	if err == nil {
+		err = es.putDurable(getWrapEventKey(event.Id), data)
+	}
+	if err != nil {
+		es.SendSigInt()
+	}
+	return err
 }
 
 func (es *eventStore) GetWrapRequestById(id types.Hash) (*events.WrapRequestZnn, error) {
 	data, err := es.DB.Get(getWrapEventKey(id))
-	if err == leveldb.ErrNotFound {
+	if errors.Is(err, leveldb.ErrNotFound) {
 		return nil, nil
 	}
-	if err != nil {
-		es.SendSigInt()
-		return nil, err
+	if err == nil {
+		var event *events.WrapRequestZnn
+		event, err = es.decodeWrap(data)
+		if err == nil {
+			return event, nil
+		}
 	}
+	es.SendSigInt()
+	return nil, err
+}
 
+// Use the underlying Zenon row here so signature writes never copy an EVM log
+// observation into the legacy, unpositioned status field.
+func (es *eventStore) updateWrap(id types.Hash, update func(*events.WrapRequestZnn)) error {
+	es.mu.Lock()
+	defer es.mu.Unlock()
+	data, err := es.DB.Get(getWrapEventKey(id))
+	if err != nil {
+		if !errors.Is(err, leveldb.ErrNotFound) {
+			es.SendSigInt()
+		}
+		return err
+	}
 	event, err := events.DeserializeWrapEventZnn(data)
 	if err != nil {
 		es.SendSigInt()
-		return nil, err
+		return err
 	}
-	return event, nil
+	update(event)
+	return es.putWrap(event)
 }
 
 func (es *eventStore) SetWrapRequestStatus(id types.Hash, status uint32) error {
-	if event, err := es.GetWrapRequestById(id); err != nil {
-		es.SendSigInt()
-		return err
-	} else {
-		if event == nil {
-			return leveldb.ErrNotFound
-		}
-		event.RedeemStatus = status
-		if eventBytes, err := event.Serialize(); err != nil {
-			es.SendSigInt()
-			return err
-		} else {
-			if err := es.DB.Put(getWrapEventKey(event.Id), eventBytes); err != nil {
-				es.SendSigInt()
-				return err
-			}
-		}
-	}
-	return nil
+	return es.updateWrap(id, func(event *events.WrapRequestZnn) {
+		// Resign reconciliation starts from an unredeemed wrap and reads the
+		// contract without a log position. Preserve any known terminal status.
+		event.RedeemStatus = max(event.RedeemStatus, status)
+	})
 }
 
 func (es *eventStore) SetWrapRequestSignature(id types.Hash, signature string) error {
-	if event, err := es.GetWrapRequestById(id); err != nil {
-		es.SendSigInt()
-		return err
-	} else {
-		if event == nil {
-			return leveldb.ErrNotFound
-		}
-		event.Signature = signature
-		if eventBytes, err := event.Serialize(); err != nil {
-			es.SendSigInt()
-			return err
-		} else {
-			if err := es.DB.Put(getWrapEventKey(event.Id), eventBytes); err != nil {
-				es.SendSigInt()
-				return err
-			}
-		}
-	}
-	return nil
+	return es.updateWrap(id, func(event *events.WrapRequestZnn) { event.Signature = signature })
 }
 
 func (es *eventStore) SetWrapRequestSentSignature(id types.Hash, value bool) error {
-	if event, err := es.GetWrapRequestById(id); err != nil {
-		es.SendSigInt()
-		return err
-	} else {
-		if event == nil {
-			return leveldb.ErrNotFound
-		}
-		event.SentSignature = value
-		if eventBytes, err := event.Serialize(); err != nil {
+	return es.updateWrap(id, func(event *events.WrapRequestZnn) { event.SentSignature = value })
+}
+
+func wrapSigningPayloadEqual(a, b *events.WrapRequestZnn) bool {
+	if a == nil || b == nil {
+		return false
+	}
+	return a.NetworkClass == b.NetworkClass &&
+		a.ChainId == b.ChainId &&
+		a.ToAddress == b.ToAddress &&
+		a.TokenAddress == b.TokenAddress &&
+		(a.Amount == nil) == (b.Amount == nil) &&
+		(a.Amount == nil || a.Amount.Cmp(b.Amount) == 0) &&
+		(a.Fee == nil) == (b.Fee == nil) &&
+		(a.Fee == nil || a.Fee.Cmp(b.Fee) == 0)
+}
+
+func (es *eventStore) SaveSignedWrapRequest(expected events.WrapRequestZnn, signature string) (bool, error) {
+	es.mu.Lock()
+	defer es.mu.Unlock()
+	data, err := es.DB.Get(getWrapEventKey(expected.Id))
+	if err != nil {
+		if !errors.Is(err, leveldb.ErrNotFound) {
 			es.SendSigInt()
-			return err
-		} else {
-			if err := es.DB.Put(getWrapEventKey(event.Id), eventBytes); err != nil {
+		}
+		return false, err
+	}
+	event, err := events.DeserializeWrapEventZnn(data)
+	if err != nil {
+		es.SendSigInt()
+		return false, err
+	}
+	checked, err := es.withRedeemStatus(event)
+	if err != nil {
+		es.SendSigInt()
+		return false, err
+	}
+	var clearResign [4]byte
+	if checked.RedeemStatus != common.UnredeemedStatus {
+		// Wrap settled on EVM during signing: clear any pending resign marker
+		// without queuing a signature for submission.
+		if err := es.putBatchDurable(kvEntry{key: getResignedStatusKey(expected.Id), value: clearResign[:]}); err != nil {
+			es.SendSigInt()
+			return false, err
+		}
+		return false, nil
+	}
+	if !wrapSigningPayloadEqual(event, &expected) {
+		resignStatus, err := es.getResignStatusValue(expected.Id)
+		if err != nil {
+			return false, err
+		}
+		if resignStatus != resignStatusNone || event.Signature != "" {
+			// A resign marker is pending (e.g. PublishResignWraps installed a
+			// confirmed payload while TSS signing was in flight) or the row
+			// already holds a signature: do not attach a signature for a
+			// different payload or clear the resign marker.
+			return false, nil
+		}
+		// An unsigned local row with no resign marker can be stale relative to
+		// the finalized RPC payload that buildWrapSigningBatch signed; check
+		// settlement on the signed destination chain and update the row to the
+		// signed payload so the signature is not discarded forever.
+		if event.ChainId != expected.ChainId {
+			expectedCheck := expected
+			checkedExpected, checkErr := es.withRedeemStatus(&expectedCheck)
+			if checkErr != nil {
 				es.SendSigInt()
-				return err
+				return false, checkErr
+			}
+			if checkedExpected.RedeemStatus != common.UnredeemedStatus {
+				return false, nil
 			}
 		}
+		event.NetworkClass = expected.NetworkClass
+		event.ChainId = expected.ChainId
+		event.ToAddress = expected.ToAddress
+		event.TokenAddress = expected.TokenAddress
+		if expected.Amount != nil {
+			event.Amount = new(big.Int).Set(expected.Amount)
+		} else {
+			event.Amount = nil
+		}
+		if expected.Fee != nil {
+			event.Fee = new(big.Int).Set(expected.Fee)
+		} else {
+			event.Fee = nil
+		}
 	}
-	return nil
+	event.Signature = signature
+	event.SentSignature = false
+	serialized, err := event.Serialize()
+	if err != nil {
+		es.SendSigInt()
+		return false, err
+	}
+	if err := es.putBatchDurable(
+		kvEntry{key: getWrapEventKey(expected.Id), value: serialized},
+		kvEntry{key: getResignedStatusKey(expected.Id), value: clearResign[:]},
+	); err != nil {
+		es.SendSigInt()
+		return false, err
+	}
+	return true, nil
+}
+
+func (es *eventStore) MarkWrapRequestSignatureSent(id types.Hash, expectedSignature string) (bool, error) {
+	es.mu.Lock()
+	defer es.mu.Unlock()
+	data, err := es.DB.Get(getWrapEventKey(id))
+	if err != nil {
+		if !errors.Is(err, leveldb.ErrNotFound) {
+			es.SendSigInt()
+		}
+		return false, err
+	}
+	event, err := events.DeserializeWrapEventZnn(data)
+	if err != nil {
+		es.SendSigInt()
+		return false, err
+	}
+	if event.Signature != expectedSignature {
+		return false, nil
+	}
+	event.SentSignature = true
+	if err := es.putWrap(event); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// AcknowledgeWrapRequestSignature atomically applies an on-chain
+// UpdateWrapRequest confirmation under es.mu:
+//   - if no row exists yet, inserts wrap with Signature=signature and SentSignature=true,
+//   - if the row has no signature yet, fills Signature=signature and SentSignature=true,
+//   - if the row already holds signature, sets SentSignature=true,
+//   - if the row holds a different (newer) local signature, leaves it untouched.
+//
+// Any pending re-sign flag is always preserved (only SaveSignedWrapRequest
+// clears it when a replacement signature is stored).
+func (es *eventStore) AcknowledgeWrapRequestSignature(wrap events.WrapRequestZnn, signature string) error {
+	es.mu.Lock()
+	defer es.mu.Unlock()
+
+	data, err := es.DB.Get(getWrapEventKey(wrap.Id))
+	if errors.Is(err, leveldb.ErrNotFound) {
+		wrap.Signature = signature
+		wrap.SentSignature = true
+		return es.putWrap(&wrap)
+	}
+	if err != nil {
+		es.SendSigInt()
+		return err
+	}
+	current, err := events.DeserializeWrapEventZnn(data)
+	if err != nil {
+		es.SendSigInt()
+		return err
+	}
+	switch current.Signature {
+	case "":
+		if !wrapSigningPayloadEqual(current, &wrap) {
+			return nil
+		}
+		current.Signature = signature
+		current.SentSignature = true
+		return es.putWrap(current)
+	case signature:
+		if !current.SentSignature {
+			current.SentSignature = true
+			return es.putWrap(current)
+		}
+		return nil
+	default:
+		// Preserve a newer local signature and its SentSignature state.
+		return nil
+	}
 }
 
 func (es *eventStore) GetUnsentSignedWrapRequests() ([]*events.WrapRequestZnn, error) {
@@ -132,6 +332,7 @@ func (es *eventStore) GetUnsentSignedWrapRequests() ([]*events.WrapRequestZnn, e
 			continue
 		}
 
+		// Filtered on the row alone, before its redeem status is looked up.
 		event, err := events.DeserializeWrapEventZnn(iterator.Value())
 		if err != nil {
 			es.SendSigInt()
@@ -139,6 +340,10 @@ func (es *eventStore) GetUnsentSignedWrapRequests() ([]*events.WrapRequestZnn, e
 		}
 		if event.SentSignature || len(event.Signature) == 0 {
 			continue
+		}
+		if event, err = es.withRedeemStatus(event); err != nil {
+			es.SendSigInt()
+			return nil, err
 		}
 
 		result = append(result, event)
@@ -163,10 +368,13 @@ func (es *eventStore) GetResignableWrapRequests() ([]*events.WrapRequestZnn, err
 			continue
 		}
 
-		event, err := events.DeserializeWrapEventZnn(iterator.Value())
+		event, err := es.decodeWrap(iterator.Value())
 		if err != nil {
 			es.SendSigInt()
 			return nil, err
+		}
+		if event.RedeemStatus != common.UnredeemedStatus {
+			continue
 		}
 		resignable, err := es.GetResignStatus(event.Id)
 		if err != nil {
@@ -199,7 +407,7 @@ func (es *eventStore) GetUnredeemedWrapRequests() ([]*events.WrapRequestZnn, err
 			continue
 		}
 
-		event, err := events.DeserializeWrapEventZnn(iterator.Value())
+		event, err := es.decodeWrap(iterator.Value())
 		if err != nil {
 			es.SendSigInt()
 			return nil, err
@@ -230,7 +438,7 @@ func (es *eventStore) GetUnsignedWrapRequests() ([]*events.WrapRequestZnn, error
 			continue
 		}
 
-		event, err := events.DeserializeWrapEventZnn(iterator.Value())
+		event, err := es.decodeWrap(iterator.Value())
 		if err != nil {
 			es.SendSigInt()
 			return nil, err
@@ -303,6 +511,10 @@ func (es *eventStore) GetLastUpdateHeight() (uint64, error) {
 		es.SendSigInt()
 		return 0, err
 	}
+	if err := db.CheckFixedWidth("Zenon sync cursor lastUpdateHeight (key 0x01)", data, 8); err != nil {
+		es.SendSigInt()
+		return 0, err
+	}
 
 	return binary.LittleEndian.Uint64(data), nil
 }
@@ -321,36 +533,177 @@ func (es *eventStore) SetLastUpdateHeight(accBlHeight uint64) error {
 	return nil
 }
 
+const (
+	resignStatusNone      uint32 = 0
+	resignStatusLegacy    uint32 = 1
+	resignStatusPublished uint32 = 2
+)
+
 func getResignedStatusKey(id types.Hash) []byte {
 	return zcommon.JoinBytes(resignedStatusPrefix, id.Bytes())
 }
 
-func (es *eventStore) GetResignStatus(id types.Hash) (bool, error) {
+func (es *eventStore) getResignStatusValue(id types.Hash) (uint32, error) {
 	data, err := es.DB.Get(getResignedStatusKey(id))
 	if errors.Is(err, leveldb.ErrNotFound) {
-		return false, nil
+		return resignStatusNone, nil
 	}
-
 	if err != nil {
 		es.SendSigInt()
+		return resignStatusNone, err
+	}
+	if err := db.CheckFixedWidth(fmt.Sprintf("Zenon wrap resign status for %s (key 0x02)", id), data, 4); err != nil {
+		es.SendSigInt()
+		return resignStatusNone, err
+	}
+	return binary.LittleEndian.Uint32(data), nil
+}
+
+func (es *eventStore) GetResignStatus(id types.Hash) (bool, error) {
+	value, err := es.getResignStatusValue(id)
+	if err != nil {
 		return false, err
 	}
-	value := binary.LittleEndian.Uint32(data)
-	ans := false
-	if value > 0 {
-		ans = true
+	return value > resignStatusNone, nil
+}
+
+func (es *eventStore) IsPublishedResignWrap(id types.Hash) (bool, error) {
+	value, err := es.getResignStatusValue(id)
+	if err != nil {
+		return false, err
 	}
-	return ans, nil
+	return value >= resignStatusPublished, nil
 }
 
 func (es *eventStore) SetResignStatus(id types.Hash, status bool) error {
 	bytes := make([]byte, 4)
-	value := uint32(0)
 	if status {
-		value = 1
+		binary.LittleEndian.PutUint32(bytes, resignStatusLegacy)
 	}
-	binary.LittleEndian.PutUint32(bytes, value)
 	if err := es.DB.Put(getResignedStatusKey(id), bytes); err != nil {
+		es.SendSigInt()
+		return err
+	}
+	return nil
+}
+
+// PublishResignWraps atomically persists any missing wrap records, refreshes
+// existing unredeemed rows with the current wrap signing payload, and marks
+// them for re-signing in a single durable batch. Rows that have already moved
+// past UnredeemedStatus are skipped.
+func (es *eventStore) PublishResignWraps(wraps []events.WrapRequestZnn) error {
+	if len(wraps) == 0 {
+		return nil
+	}
+	es.mu.Lock()
+	defer es.mu.Unlock()
+
+	var resignTrue [4]byte
+	binary.LittleEndian.PutUint32(resignTrue[:], resignStatusPublished)
+
+	entries := make([]kvEntry, 0, len(wraps)*2)
+	seen := make(map[types.Hash]struct{}, len(wraps))
+	for _, wrap := range wraps {
+		if _, dup := seen[wrap.Id]; dup {
+			continue
+		}
+		seen[wrap.Id] = struct{}{}
+
+		key := getWrapEventKey(wrap.Id)
+		data, err := es.DB.Get(key)
+		if errors.Is(err, leveldb.ErrNotFound) {
+			// ApplyRedeemLog can record a finalized EVM outcome before the
+			// Zenon wrap row is stored. Check the separate redeem status record
+			// under es.mu so a known outcome is never marked for re-signing.
+			merged := wrap
+			checked, checkErr := es.withRedeemStatus(&merged)
+			if checkErr != nil {
+				es.SendSigInt()
+				return checkErr
+			}
+			if checked.RedeemStatus != common.UnredeemedStatus {
+				continue
+			}
+			serialized, serErr := wrap.Serialize()
+			if serErr != nil {
+				es.SendSigInt()
+				return serErr
+			}
+			entries = append(entries,
+				kvEntry{key: key, value: serialized},
+				kvEntry{key: getResignedStatusKey(wrap.Id), value: resignTrue[:]},
+			)
+			continue
+		}
+		if err != nil {
+			es.SendSigInt()
+			return err
+		}
+		existing, err := es.decodeWrap(data)
+		if err != nil {
+			es.SendSigInt()
+			return err
+		}
+		if existing.RedeemStatus != common.UnredeemedStatus {
+			continue
+		}
+		rawExisting, err := events.DeserializeWrapEventZnn(data)
+		if err != nil {
+			es.SendSigInt()
+			return err
+		}
+		if rawExisting.ChainId != wrap.ChainId {
+			// Check settlement against the incoming payload's canonical
+			// destination chain before migrating the row or publishing a
+			// resign marker.
+			incomingCheck := wrap
+			checkedIncoming, checkErr := es.withRedeemStatus(&incomingCheck)
+			if checkErr != nil {
+				es.SendSigInt()
+				return checkErr
+			}
+			if checkedIncoming.RedeemStatus != common.UnredeemedStatus {
+				continue
+			}
+		}
+		payloadChanged := !wrapSigningPayloadEqual(rawExisting, &wrap)
+		if payloadChanged || (existing.Signature == "" && wrap.Signature != "") {
+			rawExisting.NetworkClass = wrap.NetworkClass
+			rawExisting.ChainId = wrap.ChainId
+			rawExisting.ToAddress = wrap.ToAddress
+			rawExisting.TokenAddress = wrap.TokenAddress
+			if wrap.Amount != nil {
+				rawExisting.Amount = new(big.Int).Set(wrap.Amount)
+			} else {
+				rawExisting.Amount = nil
+			}
+			if wrap.Fee != nil {
+				rawExisting.Fee = new(big.Int).Set(wrap.Fee)
+			} else {
+				rawExisting.Fee = nil
+			}
+			if payloadChanged {
+				// Any cached signature on a stale local payload no longer
+				// matches the confirmed wrap digest.
+				rawExisting.Signature = wrap.Signature
+				rawExisting.SentSignature = wrap.Signature != ""
+			} else {
+				rawExisting.Signature = wrap.Signature
+				rawExisting.SentSignature = rawExisting.SentSignature || wrap.SentSignature
+			}
+			serialized, serErr := rawExisting.Serialize()
+			if serErr != nil {
+				es.SendSigInt()
+				return serErr
+			}
+			entries = append(entries, kvEntry{key: key, value: serialized})
+		}
+		entries = append(entries, kvEntry{key: getResignedStatusKey(wrap.Id), value: resignTrue[:]})
+	}
+	if len(entries) == 0 {
+		return nil
+	}
+	if err := es.putBatchDurable(entries...); err != nil {
 		es.SendSigInt()
 		return err
 	}

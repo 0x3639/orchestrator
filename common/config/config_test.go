@@ -435,3 +435,212 @@ func TestWriteConfigLeavesNoTempFiles(t *testing.T) {
 		t.Fatalf("expected only config.json, got %v", names)
 	}
 }
+
+func TestEnsureDataDirRejectsEmptySymlinkAndNormalizesMode(t *testing.T) {
+	if err := EnsureDataDir(""); err == nil {
+		t.Fatal("expected error for empty data dir")
+	}
+	if err := EnsureDataDir("   "); err == nil {
+		t.Fatal("expected error for whitespace data dir")
+	}
+
+	// Restrictive 0500 mode must be normalized to exact 0700.
+	dir := filepath.Join(t.TempDir(), "restricted")
+	if err := os.Mkdir(dir, 0500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0700) })
+	if err := os.Chmod(dir, 0500); err != nil {
+		t.Fatal(err)
+	}
+	if err := EnsureDataDir(dir); err != nil {
+		t.Fatalf("EnsureDataDir on 0500 dir failed: %v", err)
+	}
+	info, err := os.Stat(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != DataDirPerm {
+		t.Fatalf("mode = %04o, want %04o", info.Mode().Perm(), DataDirPerm)
+	}
+
+	// Symlinked directory (with or without trailing separator) must be rejected.
+	linkDir := filepath.Join(t.TempDir(), "link-dir")
+	if err := os.Symlink(dir, linkDir); err == nil {
+		if err := EnsureDataDir(linkDir); err == nil {
+			t.Fatal("expected error for symlinked data dir")
+		}
+		if err := EnsureDataDir(linkDir + string(os.PathSeparator)); err == nil {
+			t.Fatal("expected error for symlinked data dir with trailing separator")
+		}
+	}
+
+	// Special mode bits (e.g. sticky bit) on the directory must be cleared to exact 0700.
+	if err := os.Chmod(dir, DataDirPerm|os.ModeSticky); err == nil {
+		if err := EnsureDataDir(dir); err != nil {
+			t.Fatalf("EnsureDataDir with sticky bit failed: %v", err)
+		}
+		info, err := os.Stat(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.Mode()&fullPermMask != DataDirPerm {
+			t.Fatalf("dir mode after clearing sticky bit = %04o, want %04o", info.Mode()&fullPermMask, DataDirPerm)
+		}
+	}
+}
+
+func TestSecureKeyShareFilesTightensPermissionsAndRejectsUnsafeEntries(t *testing.T) {
+	if err := SecureKeyShareFiles(""); err == nil {
+		t.Fatal("expected error for empty baseDir")
+	}
+
+	dir := t.TempDir()
+	shareA := filepath.Join(dir, "localstate-aaaa.json")
+	shareB := filepath.Join(dir, "localstate-bbbb.json")
+	readOnlyShare := filepath.Join(dir, "localstate-cccc.json")
+	otherFile := filepath.Join(dir, "other.json")
+
+	if err := os.WriteFile(shareA, []byte(`{"participant_keys":["k1"]}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(shareA, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(shareB, []byte(`{}`), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(shareB, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(readOnlyShare, []byte(`{}`), 0400); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(readOnlyShare, 0400); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(otherFile, []byte(`{}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(otherFile, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := SecureKeyShareFiles(dir); err != nil {
+		t.Fatalf("SecureKeyShareFiles failed: %v", err)
+	}
+
+	for _, path := range []string{shareA, shareB, readOnlyShare} {
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.Mode().Perm() != KeyShareFilePerm {
+			t.Fatalf("%s mode = %04o, want %04o", path, info.Mode().Perm(), KeyShareFilePerm)
+		}
+	}
+	if info, err := os.Stat(otherFile); err != nil {
+		t.Fatal(err)
+	} else if info.Mode().Perm() != 0644 {
+		t.Fatalf("non-share file mode = %04o, want unchanged 0644", info.Mode().Perm())
+	}
+
+	// SecureKeyShareFilesExpecting verifies required file presence.
+	if err := SecureKeyShareFilesExpecting(dir, "localstate-aaaa.json"); err != nil {
+		t.Fatalf("expected present share to succeed: %v", err)
+	}
+	if err := SecureKeyShareFilesExpecting(dir, "localstate-missing.json"); err == nil {
+		t.Fatal("expected error when required key share file is missing")
+	}
+
+	// ReadKeyShareFile reads anchored to the directory descriptor.
+	raw, found, err := ReadKeyShareFile(dir, "localstate-aaaa.json")
+	if err != nil || !found || !strings.Contains(string(raw), "participant_keys") {
+		t.Fatalf("ReadKeyShareFile present: found=%v err=%v raw=%q", found, err, raw)
+	}
+	if _, found, err := ReadKeyShareFile(dir, "localstate-missing.json"); err != nil || found {
+		t.Fatalf("ReadKeyShareFile missing: found=%v err=%v", found, err)
+	}
+	if _, _, err := ReadKeyShareFile("", "localstate-aaaa.json"); err == nil {
+		t.Fatal("expected error for ReadKeyShareFile with empty baseDir")
+	}
+
+	// Symlinked key share must be rejected.
+	linkPath := filepath.Join(dir, "localstate-link.json")
+	if err := os.Symlink(otherFile, linkPath); err == nil {
+		if err := SecureKeyShareFiles(dir); err == nil {
+			t.Fatal("expected error for symlinked localstate file")
+		}
+		_ = os.Remove(linkPath)
+	}
+
+	// Special mode bits on a key share file must be cleared to exact 0600.
+	if err := os.Chmod(shareA, KeyShareFilePerm|os.ModeSticky); err == nil {
+		if err := SecureKeyShareFiles(dir); err != nil {
+			t.Fatalf("SecureKeyShareFiles with sticky bit failed: %v", err)
+		}
+		info, err := os.Stat(shareA)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.Mode()&fullPermMask != KeyShareFilePerm {
+			t.Fatalf("share mode after clearing sticky bit = %04o, want %04o", info.Mode()&fullPermMask, KeyShareFilePerm)
+		}
+	}
+
+	// Non-regular key share (directory) must be rejected.
+	subDir := filepath.Join(dir, "localstate-dir.json")
+	if err := os.Mkdir(subDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := SecureKeyShareFiles(dir); err == nil {
+		t.Fatal("expected error for directory named localstate-*.json")
+	}
+	_ = os.Remove(subDir)
+}
+
+func TestRedactErrorForURLMasksCredentialMatchingHost(t *testing.T) {
+	raw := "https://user:secretpass@secretpass.example:8545/v1"
+	got := RedactErrorForURL(errors.New("Get "+raw+": connection refused"), raw)
+	if strings.Contains(got, "secretpass") {
+		t.Fatalf("expected password matching host to be masked, got %q", got)
+	}
+	if !strings.Contains(got, "https://<redacted>@<redacted>.example:8545/<redacted>") {
+		t.Fatalf("unexpected redacted URL form: %q", got)
+	}
+
+	unrelatedRaw := "https://user:otherpass@rpc.example:8545/v1"
+	gotUnrelated := RedactErrorForURL(errors.New("Get "+unrelatedRaw+": connection refused"), unrelatedRaw)
+	if !strings.Contains(gotUnrelated, "https://<redacted>@rpc.example:8545/<redacted>") {
+		t.Fatalf("expected unrelated host to remain visible, got %q", gotUnrelated)
+	}
+}
+
+func TestLinkOwnedFileToCleansTempOnSameInode(t *testing.T) {
+	base := t.TempDir()
+	src, err := OpenOwnedDir(filepath.Join(base, "src"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer src.Close()
+	dst, err := OpenOwnedDir(filepath.Join(base, "dst"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dst.Close()
+
+	// Link twice: second link hits the same-inode POSIX rename no-op case and
+	// must still clean up its temporary link entry.
+	for i := 0; i < 2; i++ {
+		if err := src.LinkOwnedFileTo(dst, "tss.server.log", ConfigFilePerm); err != nil {
+			t.Fatalf("LinkOwnedFileTo attempt %d failed: %v", i+1, err)
+		}
+	}
+	entries, err := os.ReadDir(filepath.Join(base, "dst"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Name() != "tss.server.log" {
+		t.Fatalf("unexpected dst entries after same-inode relink: %v", entries)
+	}
+}

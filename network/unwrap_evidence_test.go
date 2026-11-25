@@ -61,6 +61,10 @@ func (p *unwrapProvider) set(receipt *etypes.Receipt, logs []etypes.Log, head ui
 	p.receipt, p.filtered, p.head = receipt, logs, head
 }
 
+func (p *unwrapProvider) ChainId() hexutil.Uint64 {
+	return 1
+}
+
 func (p *unwrapProvider) BlockNumber() hexutil.Uint64 {
 	p.mu.Lock()
 	defer p.mu.Unlock()

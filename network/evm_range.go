@@ -1,14 +1,9 @@
 package network
 
 import (
-	"errors"
-	"net/http"
-	"regexp"
-	"strconv"
-	"strings"
 	"sync"
 
-	gethrpc "github.com/ethereum/go-ethereum/rpc"
+	"orchestrator/rpc"
 )
 
 const (
@@ -20,83 +15,12 @@ const (
 	growAfterRanges = 50
 )
 
-// rangeLimitPhrases are fragments of the messages providers return when an
-// eth_getLogs window is wider, or its result larger, than their plan allows.
-// Require evidence about blocks or results. A generic limit error can mean
-// that the account has exhausted its request budget and should back off.
-var rangeLimitPhrases = []string{
-	"block range",
-	"ranges over",
-	"range is too large",
-	"range too large",
-	"too many blocks",
-	"response size",
-	"max block",
-	"blocks are not supported",
-	"log response",
-	"too many results",
-	"too many logs",
-}
-
-// Some providers give only a quantity, for example "limited to a 10,000
-// range". A quantity in requests per minute is a different kind of limit.
-var rangeQuantityRe = regexp.MustCompile(`\b(?:limited to|more than|up to|at most)\s+(?:a\s+)?[0-9][0-9,.]*[km]?[\s-]+(?:blocks?|range|results?|logs?)\b`)
-
-// Match per-query result limits without treating an exceeded request quota as
-// a reason to shrink the block window.
-var queryResultLimitRe = regexp.MustCompile(`\b(?:logs matched by (?:the )?query exceed(?:s|ed)? (?:the )?limit|query exceed(?:s|ed)? (?:the )?max(?:imum)? (?:results|logs))\b`)
-
-// suggestedRangeRe matches the "[0xfrom, 0xto]" hint some providers put in
-// their range-limit message, for example Alchemy's "Based on your
-// parameters, this block range should work: [0x106e0ed, 0x106e0f6]".
-var suggestedRangeRe = regexp.MustCompile(`\[\s*0x([0-9a-fA-F]+)\s*,\s*0x([0-9a-fA-F]+)\s*\]`)
-
-// suggestedRange extracts the width of the block range a provider says it
-// would accept, when its error message includes one.
 func suggestedRange(err error) (uint64, bool) {
-	if err == nil {
-		return 0, false
-	}
-	m := suggestedRangeRe.FindStringSubmatch(err.Error())
-	if m == nil {
-		return 0, false
-	}
-	from, err1 := strconv.ParseUint(m[1], 16, 64)
-	to, err2 := strconv.ParseUint(m[2], 16, 64)
-	if err1 != nil || err2 != nil || to < from {
-		return 0, false
-	}
-	return to - from + 1, true
+	return rpc.SuggestedLogRange(err)
 }
 
-// isRangeLimitError reports whether an eth_getLogs error looks like the
-// provider rejecting the query's width or result size, as opposed to a
-// transport failure, a rate limit or a routing problem.
 func isRangeLimitError(err error) bool {
-	if err == nil {
-		return false
-	}
-	var rpcErr gethrpc.Error
-	if errors.As(err, &rpcErr) && rpcErr.ErrorCode() == http.StatusTooManyRequests {
-		return false
-	}
-	var httpErr gethrpc.HTTPError
-	if errors.As(err, &httpErr) && httpErr.StatusCode == http.StatusTooManyRequests {
-		return false
-	}
-	msg := strings.ToLower(err.Error())
-	// Transient failures that happen to share a word with the phrases below.
-	for _, transient := range []string{"too many requests", "rate limit", "quota exceeded", "deadline exceeded", "context canceled", "timeout", "timed out"} {
-		if strings.Contains(msg, transient) {
-			return false
-		}
-	}
-	for _, phrase := range rangeLimitPhrases {
-		if strings.Contains(msg, phrase) {
-			return true
-		}
-	}
-	return rangeQuantityRe.MatchString(msg) || queryResultLimitRe.MatchString(msg)
+	return rpc.IsLogRangeLimitError(err)
 }
 
 // queryRangeAdapter narrows the sync's eth_getLogs window when the provider

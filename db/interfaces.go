@@ -20,7 +20,16 @@ type EvmStorage interface {
 	// keeps the source block and sender an existing record already holds.
 	AddRegisteredUnwrapRequest(events.UnwrapRequestEvm) error
 	UpdateUnwrapRequestBlockNumber(events.UnwrapRequestEvm) error
+	// FillUnwrapRequestBlock records the event's block, and its sender when
+	// the record has none, on an existing record that has no block. A
+	// record with a block, and a missing record, are left as they are.
+	FillUnwrapRequestBlock(events.UnwrapRequestEvm) error
 	HydrateUnsignedUnwrap(before, verified events.UnwrapRequestEvm) error
+	// SaveUnwrapSourceLocation records the block in which this node's scan
+	// found the source event of a transaction and log index.
+	// UnwrapSourceLocation returns it, and whether one is recorded.
+	SaveUnwrapSourceLocation(txHash ecommon.Hash, logIndex uint32, blockNumber uint64, blockHash ecommon.Hash) error
+	UnwrapSourceLocation(txHash ecommon.Hash, logIndex uint32) (uint64, ecommon.Hash, bool, error)
 	UnwrapAffiliatePolicy(ecommon.Hash) (common.AffiliatePolicy, bool, error)
 	PinUnwrapAffiliatePolicy(ecommon.Hash, common.AffiliatePolicy) error
 	GetUnwrapRequestByHashAndLog(ecommon.Hash, uint32) (*events.UnwrapRequestEvm, error)
@@ -43,6 +52,8 @@ type EvmStorage interface {
 	GetUnsentSignedUnwrapRequests() ([]*events.UnwrapRequestEvm, error)
 	SetUnsentUnwrapRequestAsUnsigned(ecommon.Hash, uint32) error
 
+	GetScanHeights(depth uint64) (through, redeem uint64, legacy bool, err error)
+	SetScanHeights(through, redeem uint64) error
 	GetLastUpdateHeight() (uint64, error)
 	SetLastUpdateHeight(uint64) error
 }
@@ -52,10 +63,34 @@ type ZnnStorage interface {
 	Snapshot() ZnnStorage
 	SendSigInt()
 
+	// AddWrapRequest stores a wrap request read from the bridge. A record
+	// that exists keeps what this node wrote to it, its redeem status
+	// included; only a missing signature is filled in from the bridge's.
 	AddWrapRequest(events.WrapRequestZnn) error
+	HasLegacyRedeemStatuses(chainID uint32) (bool, error)
+	ApplyRedeemLog(chainID uint32, id types.Hash, block uint64, index uint, status uint32) error
+	// AddWrapRequestKeepingStatus stores a request read from the bridge and
+	// keeps the redeem status an existing record already holds.
+	AddWrapRequestKeepingStatus(events.WrapRequestZnn) error
+	// AddWrapRequestIfMissing stores the request unless a record of it
+	// exists, and reports whether it stored it. The check and the write are
+	// one operation.
+	AddWrapRequestIfMissing(events.WrapRequestZnn) (bool, error)
 	SetWrapRequestStatus(types.Hash, uint32) error
 	SetWrapRequestSignature(types.Hash, string) error
 	SetWrapRequestSentSignature(types.Hash, bool) error
+	// SaveSignedWrapRequest atomically installs signature, clears SentSignature,
+	// and clears the re-sign flag in a single durable write only when the stored
+	// row is still unredeemed and its signing payload matches expected.
+	SaveSignedWrapRequest(events.WrapRequestZnn, string) (bool, error)
+	// MarkWrapRequestSignatureSent marks SentSignature=true only if the stored
+	// wrap request still holds expectedSignature, reporting whether it matched.
+	MarkWrapRequestSignatureSent(types.Hash, string) (bool, error)
+	// AcknowledgeWrapRequestSignature atomically records an on-chain signature
+	// update for wrap: stores the row as sent if missing, fills an empty
+	// signature, or marks a matching signature as sent, while preserving any
+	// newer local signature and any pending re-sign flag.
+	AcknowledgeWrapRequestSignature(events.WrapRequestZnn, string) error
 	GetWrapRequestById(types.Hash) (*events.WrapRequestZnn, error)
 	GetUnsentSignedWrapRequests() ([]*events.WrapRequestZnn, error)
 	GetUnredeemedWrapRequests() ([]*events.WrapRequestZnn, error)
@@ -71,5 +106,12 @@ type ZnnStorage interface {
 	SaveBridgeWatchFrom(uint64) error
 
 	GetResignStatus(types.Hash) (bool, error)
+	// IsPublishedResignWrap reports whether the wrap's resign marker was written
+	// by PublishResignWraps after finality verification (as opposed to a legacy
+	// pre-upgrade SetResignStatus flag).
+	IsPublishedResignWrap(types.Hash) (bool, error)
 	SetResignStatus(types.Hash, bool) error
+	// PublishResignWraps atomically stores any missing wrap rows and marks all
+	// still-unredeemed wraps in the batch for re-signing in one durable write.
+	PublishResignWraps([]events.WrapRequestZnn) error
 }

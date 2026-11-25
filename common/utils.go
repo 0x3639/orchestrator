@@ -5,7 +5,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"github.com/ethereum/go-ethereum/common"
-	"github.com/ethereum/go-ethereum/crypto/secp256k1"
+	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/pkg/errors"
 	"github.com/zenon-network/go-zenon/common/types"
 	"github.com/zenon-network/go-zenon/vm/constants"
@@ -124,15 +124,21 @@ func ZnnUnwrapToOrchestatorUnwrap(event *definition.UnwrapTokenRequest) events.U
 	}
 }
 
-func GetPublicKeyFilePath(dataDir, pubKey string) (string, error) {
+func GetPublicKeyFileName(pubKey string) (string, error) {
 	pubKeyBytes, err := base64.StdEncoding.DecodeString(pubKey)
 	if err != nil {
 		return "", err
 	}
 	pubKeyHex := hex.EncodeToString(pubKeyBytes)
-	fileName := fmt.Sprintf("localstate-%s.json", pubKeyHex)
-	path := filepath.Join(dataDir, fileName)
-	return path, nil
+	return fmt.Sprintf("localstate-%s.json", pubKeyHex), nil
+}
+
+func GetPublicKeyFilePath(dataDir, pubKey string) (string, error) {
+	fileName, err := GetPublicKeyFileName(pubKey)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dataDir, fileName), nil
 }
 
 func DeletePubKeyFile(dataDir, pubKey string) error {
@@ -164,17 +170,41 @@ func StateToText(state uint8) string {
 	return stateStr
 }
 
+// DecompressPubKey turns a base64 compressed secp256k1 key into the base64
+// 65-byte uncompressed form (0x04 || X || Y). Each coordinate is padded to 32
+// bytes, so the output length never depends on leading zero bytes.
 func DecompressPubKey(pubKey string) (string, error) {
 	pubKeyBytes, err := base64.StdEncoding.DecodeString(pubKey)
 	if err != nil {
-		return "", nil
-	} else if len(pubKeyBytes) != constants.CompressedECDSAPubKeyLength {
-		return "", nil
+		return "", fmt.Errorf("decode compressed pubKey: %w", err)
 	}
-	X, Y := secp256k1.DecompressPubkey(pubKeyBytes)
-	dPubKeyBytes := make([]byte, 1)
-	dPubKeyBytes[0] = 4
-	dPubKeyBytes = append(dPubKeyBytes, X.Bytes()...)
-	dPubKeyBytes = append(dPubKeyBytes, Y.Bytes()...)
+	if len(pubKeyBytes) != constants.CompressedECDSAPubKeyLength {
+		return "", fmt.Errorf("compressed pubKey is %d bytes, want %d", len(pubKeyBytes), constants.CompressedECDSAPubKeyLength)
+	}
+	key, err := crypto.DecompressPubkey(pubKeyBytes)
+	if err != nil {
+		return "", fmt.Errorf("decompress pubKey: %w", err)
+	}
+	dPubKeyBytes := crypto.FromECDSAPub(key)
+	if len(dPubKeyBytes) != constants.DecompressedECDSAPubKeyLength {
+		return "", fmt.Errorf("decompressed pubKey is %d bytes, want %d", len(dPubKeyBytes), constants.DecompressedECDSAPubKeyLength)
+	}
 	return base64.StdEncoding.EncodeToString(dPubKeyBytes), nil
+}
+
+// ZenonAcceptsDecompressedPubKey reports whether the Zenon bridge contract can
+// use this key. The embedded contract (go-zenon ChangeTssECDSAPubKey) builds
+// its decompressed key from X.Bytes() and Y.Bytes(), which drop leading zero
+// bytes, and then requires 65 bytes when it checks a signature. A key whose X
+// or Y starts with a zero byte can therefore never be set or used on Zenon.
+// decompressedPubKey is the output of DecompressPubKey.
+func ZenonAcceptsDecompressedPubKey(decompressedPubKey string) (bool, error) {
+	b, err := base64.StdEncoding.DecodeString(decompressedPubKey)
+	if err != nil {
+		return false, fmt.Errorf("decode decompressed pubKey: %w", err)
+	}
+	if len(b) != constants.DecompressedECDSAPubKeyLength {
+		return false, fmt.Errorf("decompressed pubKey is %d bytes, want %d", len(b), constants.DecompressedECDSAPubKeyLength)
+	}
+	return b[1] != 0 && b[33] != 0, nil
 }

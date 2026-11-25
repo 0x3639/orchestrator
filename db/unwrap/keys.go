@@ -9,4 +9,14 @@ var (
 
 	// Per-source affiliate decisions survive queue replay and restart.
 	affiliatePolicyPrefix = []byte{2}
+
+	// The block in which this node's scan found the source event of a
+	// transaction and log index, kept apart from the record of the request.
+	// Nothing that reads the other prefixes sees it.
+	sourceLocationPrefix = []byte{3}
+
+	// Bridge contract address bound to this EVM LevelDB directory so a
+	// same-name contract rotation isolates new scan cursors and work while
+	// retaining old evidence on disk.
+	contractAddressPrefix = []byte{4}
 )
