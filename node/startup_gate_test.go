@@ -9,7 +9,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/zenon-network/go-zenon/chain/nom"
 	"github.com/zenon-network/go-zenon/common/types"
+	"github.com/zenon-network/go-zenon/rpc/api"
 	"github.com/zenon-network/go-zenon/rpc/api/embedded"
 	"github.com/zenon-network/go-zenon/rpc/server"
 	"github.com/zenon-network/go-zenon/vm/constants"
@@ -72,12 +74,42 @@ func (b *startupBridge) GetAllNetworks(uint32, uint32) *embedded.NetworkInfoList
 
 func (b *startupBridge) GetAllWrapTokenRequests(uint32, uint32) *embedded.WrapTokenRequestList {
 	b.wrapPages.Add(1)
-	return &embedded.WrapTokenRequestList{}
+	return &embedded.WrapTokenRequestList{List: []*embedded.WrapTokenRequest{}}
 }
 
 func (b *startupBridge) GetWrapTokenRequestById(types.Hash) (*definition.WrapTokenRequest, error) {
 	b.wrapLookups.Add(1)
 	return nil, errors.New("request unavailable")
+}
+
+type startupLedger struct{}
+
+func (*startupLedger) GetFrontierAccountBlock(types.Address) (*api.AccountBlock, error) {
+	return &api.AccountBlock{
+		AccountBlock:       nom.AccountBlock{Height: 1, Hash: types.Hash{1}, Amount: big.NewInt(0)},
+		ConfirmationDetail: &api.AccountBlockConfirmationDetail{NumConfirmations: 1, MomentumHeight: 1, MomentumHash: types.Hash{1}},
+	}, nil
+}
+
+func (*startupLedger) GetAccountBlocksByHeight(_ types.Address, height, _ uint64) (*api.AccountBlockList, error) {
+	return &api.AccountBlockList{
+		Count: int(height),
+		List: []*api.AccountBlock{{
+			AccountBlock:       nom.AccountBlock{Height: height, Hash: types.Hash{byte(height)}, Amount: big.NewInt(0)},
+			ConfirmationDetail: &api.AccountBlockConfirmationDetail{NumConfirmations: 1, MomentumHeight: 1, MomentumHash: types.Hash{1}},
+		}},
+	}, nil
+}
+
+func (*startupLedger) GetFrontierMomentum() (*api.Momentum, error) {
+	return &api.Momentum{Momentum: &nom.Momentum{Height: 100, Hash: types.Hash{1}}}, nil
+}
+
+func (*startupLedger) GetMomentumsByHeight(height, _ uint64) (*api.MomentumList, error) {
+	return &api.MomentumList{
+		Count: 1,
+		List:  []*api.Momentum{{Momentum: &nom.Momentum{Height: height, Hash: types.Hash{1}}}},
+	}, nil
 }
 
 // startupNode is a signer with the bridge above and no EVM network, in the
@@ -88,6 +120,9 @@ func startupNode(t *testing.T, state uint8) (*Node, *startupBridge) {
 	bridge := &startupBridge{}
 	srv := server.NewServer()
 	if err := srv.RegisterName("embedded.bridge", bridge); err != nil {
+		t.Fatal(err)
+	}
+	if err := srv.RegisterName("ledger", &startupLedger{}); err != nil {
 		t.Fatal(err)
 	}
 	endpoint := httptest.NewServer(srv)

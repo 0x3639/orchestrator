@@ -902,24 +902,18 @@ func (rC *znnNetwork) interpretSendBlockData(ctx context.Context, sendBlock *api
 			rC.logger.Info("update request non existent")
 			break
 		} else {
-			// The record is added only if it is still missing: this node's
-			// scan of the destination chain may have written it, with a
-			// redeem, since the bridge was asked.
-			if added, err := rC.eventsStore().AddWrapRequestIfMissing(wrapEvent(request)); err != nil {
+			if param.Signature == request.Signature {
+				// Apply the on-chain confirmation atomically under the store
+				// lock so a concurrent SaveSignedWrapRequest or PublishResignWraps
+				// cannot have its newer signature overwritten or its pending
+				// re-sign flag cleared.
+				if err = rC.eventsStore().AcknowledgeWrapRequestSignature(wrapEvent(request), param.Signature); err != nil {
+					return err
+				}
+			} else if added, err := rC.eventsStore().AddWrapRequestIfMissing(wrapEvent(request)); err != nil {
 				return err
 			} else if added {
 				rC.logger.Info("request did not exist locally and was added")
-			}
-			if param.Signature == request.Signature {
-				if err = rC.SetResignStatus(request.Id, false); err != nil {
-					return err
-				}
-				if err = rC.eventsStore().SetWrapRequestSentSignature(request.Id, true); err != nil {
-					return err
-				}
-				if err = rC.SetWrapRequestSignature(request.Id, param.Signature); err != nil {
-					return err
-				}
 			}
 		}
 	case base64.StdEncoding.EncodeToString(definition.ABIBridge.Methods[definition.RedeemUnwrapMethodName].Id()):
@@ -1082,7 +1076,7 @@ func (rC *znnNetwork) interpretSendBlockData(ctx context.Context, sendBlock *api
 		if err := definition.ABIBridge.UnpackMethod(param, definition.SetNetworkMethodName, sendBlock.Data); err != nil {
 			return constants.ErrUnpackError
 		}
-		common.AdministratorLogger.Info("SetNetworkMethodName NetworkClass: %d, ChainId: %d, Name: %s, ContractAddress: %s, Metadata: %s",
+		common.AdministratorLogger.Infof("SetNetworkMethodName NetworkClass: %d, ChainId: %d, Name: %s, ContractAddress: %s, Metadata: %s",
 			param.NetworkClass, param.ChainId, param.Name, param.ContractAddress, param.Metadata)
 		network, err := rC.ZnnRpc().GetNetworkByClassAndId(param.NetworkClass, param.ChainId)
 		if err != nil {
@@ -1125,7 +1119,7 @@ func (rC *znnNetwork) interpretSendBlockData(ctx context.Context, sendBlock *api
 		if err := definition.ABIBridge.UnpackMethod(param, definition.RemoveNetworkMethodName, sendBlock.Data); err != nil {
 			return constants.ErrUnpackError
 		}
-		common.AdministratorLogger.Info("RemoveNetworkMethodName NetworkClass: %d, ChainId: %d, Name: %s, ContractAddress: %s, Metadata: %s",
+		common.AdministratorLogger.Infof("RemoveNetworkMethodName NetworkClass: %d, ChainId: %d, Name: %s, ContractAddress: %s, Metadata: %s",
 			param.NetworkClass, param.ChainId, param.Name, param.ContractAddress, param.Metadata)
 		network, err := rC.ZnnRpc().GetNetworkByClassAndId(param.NetworkClass, param.ChainId)
 		if err != nil {
@@ -1863,7 +1857,7 @@ func (rC *znnNetwork) startRuntimeEvmNetwork(network *definition.NetworkInfo) er
 		return errors.Errorf("missing RPC configuration for network %s (%d)", network.Name, network.Id)
 	}
 	ctx := rC.listenerCtx
-	client, err := rpc.NewEvmRpcClientContext(ctx, cfg, network.Name, ecommon.HexToAddress(network.ContractAddress))
+	client, err := rpc.NewEvmRpcClientForChainContext(ctx, cfg, network.Id, network.Name, ecommon.HexToAddress(network.ContractAddress))
 	if err != nil {
 		return err
 	}
@@ -2191,12 +2185,20 @@ func (rC *znnNetwork) GetAllWrapTokenRequests(pageIndex, pageSize uint32) (*embe
 	return rC.ZnnRpc().GetAllWrapTokenRequests(pageIndex, pageSize)
 }
 
+func (rC *znnNetwork) GetAllWrapTokenRequestsContext(ctx context.Context, pageIndex, pageSize uint32) (*embedded.WrapTokenRequestList, error) {
+	return rC.ZnnRpc().GetAllWrapTokenRequestsContext(ctx, pageIndex, pageSize)
+}
+
 func (rC *znnNetwork) GetUnwrapTokenRequestByHashAndLog(txHash types.Hash, logIndex uint32) (*definition.UnwrapTokenRequest, error) {
 	return rC.ZnnRpc().GetUnwrapTokenRequestByHashAndLog(txHash, logIndex)
 }
 
 func (rC *znnNetwork) GetWrapTokenRequestById(id types.Hash) (*definition.WrapTokenRequest, error) {
 	return rC.ZnnRpc().GetWrapTokenRequestById(id)
+}
+
+func (rC *znnNetwork) GetWrapTokenRequestByIdContext(ctx context.Context, id types.Hash) (*embedded.WrapTokenRequest, error) {
+	return rC.ZnnRpc().GetWrapTokenRequestByIdContext(ctx, id)
 }
 
 func (rC *znnNetwork) ChangeTssEcdsaPubKey(pubKey, signature, newSignature string, keyPair *wallet.KeyPair) error {
@@ -2305,12 +2307,42 @@ func (rC *znnNetwork) SetWrapRequestSentSignature(id types.Hash, sent bool) erro
 	return rC.eventsStore().SetWrapRequestSentSignature(id, sent)
 }
 
+func (rC *znnNetwork) SaveSignedWrapRequest(expected events.WrapRequestZnn, signature string) (bool, error) {
+	return rC.eventsStore().SaveSignedWrapRequest(expected, signature)
+}
+
+func (rC *znnNetwork) MarkWrapRequestSignatureSent(id types.Hash, expectedSignature string) (bool, error) {
+	return rC.eventsStore().MarkWrapRequestSignatureSent(id, expectedSignature)
+}
+
 func (rC *znnNetwork) SetResignStatus(id types.Hash, status bool) error {
 	return rC.eventsStore().SetResignStatus(id, status)
 }
 
+func (rC *znnNetwork) PublishResignWraps(wraps []*definition.WrapTokenRequest) error {
+	if len(wraps) == 0 {
+		return nil
+	}
+	eventsBatch := make([]events.WrapRequestZnn, 0, len(wraps))
+	for _, w := range wraps {
+		if w == nil {
+			continue
+		}
+		if w.Amount == nil || w.Fee == nil {
+			rC.logger.Warnf("skipping wrap request %s in resign publication: missing amount or fee", w.Id.String())
+			continue
+		}
+		eventsBatch = append(eventsBatch, wrapEvent(w))
+	}
+	return rC.eventsStore().PublishResignWraps(eventsBatch)
+}
+
 func (rC *znnNetwork) GetResignStatus(id types.Hash) (bool, error) {
 	return rC.eventsStore().GetResignStatus(id)
+}
+
+func (rC *znnNetwork) IsPublishedResignWrap(id types.Hash) (bool, error) {
+	return rC.eventsStore().IsPublishedResignWrap(id)
 }
 
 func (rC *znnNetwork) GetWrapEventById(id types.Hash) (*events.WrapRequestZnn, error) {

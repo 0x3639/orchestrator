@@ -6,6 +6,7 @@ import (
 	"github.com/ethereum/go-ethereum/crypto"
 	"orchestrator/common/bridge"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -67,6 +68,9 @@ const (
 
 	// Tss
 
+	// DefaultSignCeremonyPoolSize is the default maximum number of messages signed in a ceremony.
+	DefaultSignCeremonyPoolSize = 50
+
 	DefaultKeyGenVersion     = "0.13.0"
 	DefaultLeaderBlockHeight = 100
 )
@@ -74,8 +78,8 @@ const (
 var (
 	// Orchestrator
 
-	// SignCeremonyPoolSize Maximum number of messages signed in a ceremony
-	SignCeremonyPoolSize = 50
+	// signCeremonyPoolSize is the maximum number of messages signed in a ceremony.
+	signCeremonyPoolSize atomic.Int64
 
 	// EVM
 	EvmContractAbi, _                 = abi.JSON(strings.NewReader(bridge.BridgeMetaData.ABI))
@@ -103,3 +107,21 @@ var (
 	Topics = [][]common.Hash{{UnwrapSigHash, RegisteredRedeemSigHash, RedeemedSigHash, RevokedRedeemSigHash, HaltedSigHash, UnhaltedSigHash, PendingTokenInfoSigHash, SetTokenInfoSigHash,
 		PendingAdministratorSigHash, SetAdministratorSigHash, PendingTssSigHash, SetTssSigHash, PendingGuardiansSigHash, SetGuardiansSigHash}}
 )
+
+func init() {
+	signCeremonyPoolSize.Store(DefaultSignCeremonyPoolSize)
+}
+
+// GetSignCeremonyPoolSize returns the maximum number of messages signed in a ceremony.
+func GetSignCeremonyPoolSize() int {
+	return int(signCeremonyPoolSize.Load())
+}
+
+// SetSignCeremonyPoolSize updates the maximum number of messages signed in a ceremony.
+// Non-positive values are ignored.
+func SetSignCeremonyPoolSize(size int) {
+	if size <= 0 {
+		return
+	}
+	signCeremonyPoolSize.Store(int64(size))
+}

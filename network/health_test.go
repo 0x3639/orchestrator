@@ -109,6 +109,8 @@ func TestEvmSnapshotUsesCommittedRangesAndStoredWork(t *testing.T) {
 		}
 		var result any
 		switch req.Method {
+		case "eth_chainId":
+			result = "0x1"
 		case "eth_blockNumber":
 			result = "0x10"
 		case "eth_getLogs":

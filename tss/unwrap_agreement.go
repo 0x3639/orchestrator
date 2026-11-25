@@ -12,7 +12,6 @@ import (
 	"github.com/HyperCore-Team/go-tss/conversion"
 	"github.com/HyperCore-Team/go-tss/keysign"
 	"github.com/HyperCore-Team/go-tss/messages"
-	"github.com/HyperCore-Team/go-tss/storage"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/syndtr/goleveldb/leveldb"
 	"github.com/syndtr/goleveldb/leveldb/opt"
@@ -38,11 +37,7 @@ func (m *TssManager) SignUnwrapPool(ceremony common.CeremonyWindow, pool [][]byt
 	}
 	signers := m.GetLocalPubKeys()
 	if !legacy {
-		store, err := storage.NewFileStateMgr(m.keyShareDir)
-		if err != nil {
-			return nil, err
-		}
-		state, err := store.GetLocalState(key, messages.ECDSAKEYSIGN)
+		state, err := m.readLocalState(key, messages.ECDSAKEYSIGN)
 		if err != nil {
 			return nil, err
 		}

@@ -2,12 +2,13 @@ package tss
 
 import (
 	"encoding/base64"
+	"fmt"
 	tcommon "github.com/HyperCore-Team/go-tss/common"
 	"github.com/HyperCore-Team/go-tss/conversion"
 	"github.com/HyperCore-Team/go-tss/keygen"
 	"github.com/HyperCore-Team/go-tss/keysign"
 	"github.com/HyperCore-Team/go-tss/messages"
-	"github.com/HyperCore-Team/go-tss/storage"
+	tstorage "github.com/HyperCore-Team/go-tss/storage"
 	"github.com/HyperCore-Team/go-tss/tss"
 	ic "github.com/libp2p/go-libp2p-core/crypto"
 	"github.com/libp2p/go-libp2p-core/peer"
@@ -17,13 +18,16 @@ import (
 	"github.com/syndtr/goleveldb/leveldb"
 	"maps"
 	"orchestrator/common"
-	"orchestrator/common/config"
+	oconfig "orchestrator/common/config"
 	"os"
-	"path/filepath"
 	"slices"
 	"sync"
 	"time"
 )
+
+// ErrKeyShareSecurity indicates that TSS key share directory or file
+// ownership/permission hardening failed after key generation.
+var ErrKeyShareSecurity = errors.New("key share file security check failed")
 
 type whitelistBackend interface {
 	GetWhitelists() (map[string]bool, map[string]bool, map[string]bool)
@@ -37,6 +41,9 @@ type TssManager struct {
 	whitelistMu       sync.RWMutex
 	voteMu            sync.Mutex
 	unwrapVotes       *leveldb.DB
+	stateDir          *oconfig.OwnedDir
+	votesDir          *oconfig.OwnedDir
+	logsDir           *oconfig.OwnedDir
 	keyShareDir       string
 	server            *tss.TssServer
 	whitelistStore    whitelistBackend
@@ -48,29 +55,52 @@ type TssManager struct {
 	localPubKeys      []string
 	joinPartyVersion  string
 	leaderBlockHeight int64
+
+	// Test hooks; nil in production.
+	preParamsFn func() error
+	keygenFn    func(keygen.Request) (keygen.Response, error)
+	partyConfig func() tcommon.TssConfig
+	bulkSignFn  func(key string, msgs [][]byte, algo messages.Algo, signers []string, version string) (*keysign.Response, error)
 }
 
-func NewTssManager(conf config.TssManagerConfig, privateKey string) (*TssManager, error) {
+func NewTssManager(conf oconfig.TssManagerConfig, privateKey string) (_ *TssManager, retErr error) {
 	priKey, err := conversion.GetPriKey(privateKey)
 	if err != nil {
 		return nil, err
 	}
-	if _, err := os.Stat(conf.BaseDir); os.IsNotExist(err) {
-		err := os.MkdirAll(conf.BaseDir, os.ModePerm)
-		if err != nil {
-			return nil, err
+	stateDir, err := oconfig.OpenOwnedDir(conf.BaseDir)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		if retErr != nil {
+			_ = stateDir.Close()
+		}
+	}()
+	if err := stateDir.SecureKeyShareFiles(""); err != nil {
+		return nil, err
+	}
+	secureStateMgr := newSecureLocalStateManager(stateDir)
+	savedPeers, err := secureStateMgr.RetrieveP2PAddresses()
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		if errors.Is(err, errInvalidAddressBook) {
+			common.GlobalLogger.Warnf("ignoring malformed TSS address book cache and falling back to configured bootstrap peers: %v", err)
+			savedPeers = nil
+		} else {
+			return nil, fmt.Errorf("failed to read anchored TSS address book: %w", err)
 		}
 	}
 
 	var peerIDs []maddr.Multiaddr
+	if len(savedPeers) > 0 {
+		peerIDs = append(peerIDs, savedPeers...)
+	}
 	if len(conf.Bootstrap) > 0 {
 		multiAddr, err := maddr.NewMultiaddr(conf.Bootstrap)
 		if err != nil {
-			panic(err)
+			return nil, fmt.Errorf("invalid bootstrap multiaddr: %w", err)
 		}
-		peerIDs = []maddr.Multiaddr{multiAddr}
-	} else {
-		peerIDs = nil
+		peerIDs = append(peerIDs, multiAddr)
 	}
 
 	priv, err := ic.UnmarshalEd25519PrivateKey(priKey.Bytes())
@@ -101,8 +131,52 @@ func NewTssManager(conf config.TssManagerConfig, privateKey string) (*TssManager
 
 	common.GlobalLogger.Infof("peerId: %s\n", id.String())
 
-	votes, err := leveldb.OpenFile(filepath.Join(conf.BaseDir, "unwrap-pool-votes"), nil)
+	votesDir, err := stateDir.OpenSubDir("unwrap-pool-votes")
 	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		if retErr != nil {
+			_ = votesDir.Close()
+		}
+	}()
+	votesPath, err := votesDir.AnchoredPath()
+	if err != nil {
+		return nil, err
+	}
+	votes, err := leveldb.OpenFile(votesPath, nil)
+	if err != nil {
+		return nil, err
+	}
+	// Pass a durable, private 0700 subdirectory anchored to stateDir to go-tss's
+	// NewTss so go-tss never reads BaseDir/address_book.seed through its
+	// pathname-based FileStateMgr (saved peers were already read above through
+	// secureStateMgr), while hardlinking go-tss's log files to owned 0600 files
+	// in BaseDir so startup/runtime diagnostics remain durable at their expected
+	// paths even after startup failure or shutdown.
+	logsDir, err := stateDir.OpenSubDir("logs")
+	if err != nil {
+		votes.Close()
+		return nil, err
+	}
+	defer func() {
+		if retErr != nil {
+			_ = logsDir.Close()
+		}
+	}()
+	if err := logsDir.EnsureAbsent(addressBookFileName); err != nil {
+		votes.Close()
+		return nil, err
+	}
+	for _, logName := range []string{"tss.communication.log", "tss.party.log", "tss.server.log"} {
+		if err := stateDir.LinkOwnedFileTo(logsDir, logName, oconfig.ConfigFilePerm); err != nil {
+			votes.Close()
+			return nil, err
+		}
+	}
+	tssBaseDir, err := logsDir.AnchoredPath()
+	if err != nil {
+		votes.Close()
 		return nil, err
 	}
 	// Clone the configured whitelist so go-tss never shares the map reference
@@ -124,16 +198,24 @@ func NewTssManager(conf config.TssManagerConfig, privateKey string) (*TssManager
 		}
 
 		// we call pre params with nil because we want to recompute it when we key gen, at key signs it takes it from the pubKey file
-		server, err = tss.NewTss(peerIDs, conf.Port, priKey, "Zenon", conf.BaseDir, conf.BaseConfig, nil, "", algo, whitelist)
+		server, err = tss.NewTss(peerIDs, conf.Port, priKey, "Zenon", tssBaseDir, conf.BaseConfig, nil, "", algo, whitelist)
 	}()
 	wg.Wait()
 	if err != nil {
 		votes.Close()
 		return nil, err
 	}
+	if err := installSecureStateManager(server, secureStateMgr); err != nil {
+		server.Stop()
+		votes.Close()
+		return nil, err
+	}
 
 	return &TssManager{
 		unwrapVotes:       votes,
+		stateDir:          stateDir,
+		votesDir:          votesDir,
+		logsDir:           logsDir,
 		keyShareDir:       conf.BaseDir,
 		port:              conf.Port,
 		server:            server,
@@ -156,6 +238,15 @@ func (m *TssManager) Start() error {
 func (m *TssManager) Stop() {
 	m.server.Stop()
 	m.unwrapVotes.Close()
+	if m.votesDir != nil {
+		_ = m.votesDir.Close()
+	}
+	if m.logsDir != nil {
+		_ = m.logsDir.Close()
+	}
+	if m.stateDir != nil {
+		_ = m.stateDir.Close()
+	}
 }
 
 func (m *TssManager) BulkSign(messagesBytes [][]byte, algo messages.Algo) (*keysign.Response, error) {
@@ -170,17 +261,18 @@ func (m *TssManager) BulkSign(messagesBytes [][]byte, algo messages.Algo) (*keys
 // all holders of that key. Falls back to m.GetLocalPubKeys() when no localstate
 // entry is available.
 func (m *TssManager) signersForKey(key string) []string {
-	if key != "" && m.keyShareDir != "" {
-		if store, err := storage.NewFileStateMgr(m.keyShareDir); err == nil {
-			if state, err := store.GetLocalState(key, messages.ECDSAKEYSIGN); err == nil && len(state.ParticipantKeys) > 0 {
-				return slices.Clone(state.ParticipantKeys)
-			}
+	if key != "" && (m.stateDir != nil || m.keyShareDir != "") {
+		if state, err := m.readLocalState(key, messages.ECDSAKEYSIGN); err == nil && len(state.ParticipantKeys) > 0 {
+			return slices.Clone(state.ParticipantKeys)
 		}
 	}
 	return m.GetLocalPubKeys()
 }
 
 func (m *TssManager) bulkSignWithKey(key string, messagesBytes [][]byte, algo messages.Algo, signers []string, version string) (*keysign.Response, error) {
+	if m.bulkSignFn != nil {
+		return m.bulkSignFn(key, messagesBytes, algo, slices.Clone(signers), version)
+	}
 	var keySignReq keysign.Request
 	messagesStr := make([]string, len(messagesBytes))
 	for idx, msg := range messagesBytes {
@@ -208,7 +300,13 @@ func (m *TssManager) KeyGen(algo messages.Algo) (*keygen.Response, error) {
 
 	start := time.Now()
 	// we reset pre params so we always generate it before a keyGen
-	if errPrecompute := m.server.GeneratePreParams(); errPrecompute != nil {
+	var errPrecompute error
+	if m.preParamsFn != nil {
+		errPrecompute = m.preParamsFn()
+	} else {
+		errPrecompute = m.server.GeneratePreParams()
+	}
+	if errPrecompute != nil {
 		return nil, errPrecompute
 	}
 	elapsed := time.Since(start)
@@ -224,15 +322,75 @@ func (m *TssManager) KeyGen(algo messages.Algo) (*keygen.Response, error) {
 	var req keygen.Request
 	if algo == messages.ECDSAKEYGEN {
 		req = keygen.NewRequest(m.GetLocalPubKeys(), m.GetLeaderBlockHeight(), m.GetJoinPartyVersion(), algorithm)
-		response, err := m.server.Keygen(req)
+		var response keygen.Response
+		var err error
+		if m.keygenFn != nil {
+			response, err = m.keygenFn(req)
+		} else {
+			response, err = m.server.Keygen(req)
+		}
 		if err != nil {
 			return nil, err
+		}
+		if response.Status == tcommon.Success {
+			if secErr := m.VerifyKeyShare(response.PubKey); secErr != nil {
+				return nil, secErr
+			}
 		}
 
 		return &response, nil
 	} else {
 		return nil, errors.New("invalid algorithm")
 	}
+}
+
+// readLocalState reads the key share for pubKey through the manager's anchored
+// open TSS directory descriptor so directory substitution cannot redirect or
+// break signing reads.
+func (m *TssManager) readLocalState(pubKey string, algo messages.Algo) (tstorage.KeygenLocalState, error) {
+	if m.stateDir != nil {
+		return newSecureLocalStateManager(m.stateDir).GetLocalState(pubKey, algo)
+	}
+	ownedDir, err := oconfig.OpenOwnedDir(m.keyShareDir)
+	if err != nil {
+		return tstorage.KeygenLocalState{}, err
+	}
+	defer ownedDir.Close()
+	return newSecureLocalStateManager(ownedDir).GetLocalState(pubKey, algo)
+}
+
+// VerifyKeyShare checks ownership and exact 0600 permissions on all key share
+// files and verifies the share for pubKey exists, anchored to the manager's
+// open TSS directory descriptor when available.
+func (m *TssManager) VerifyKeyShare(pubKey string) error {
+	expectedFile, nameErr := common.GetPublicKeyFileName(pubKey)
+	if nameErr != nil {
+		return fmt.Errorf("%w: invalid generated pubKey: %w", ErrKeyShareSecurity, nameErr)
+	}
+	var secErr error
+	if m.stateDir != nil {
+		secErr = m.stateDir.SecureKeyShareFiles(expectedFile)
+	} else {
+		secErr = oconfig.SecureKeyShareFilesExpecting(m.keyShareDir, expectedFile)
+	}
+	if secErr != nil {
+		return fmt.Errorf("%w: %w", ErrKeyShareSecurity, secErr)
+	}
+	return nil
+}
+
+// DeleteKeyShare removes the key share file for pubKey through the manager's
+// open TSS directory descriptor so pathname substitution cannot redirect
+// rollback cleanup.
+func (m *TssManager) DeleteKeyShare(pubKey string) error {
+	fileName, err := common.GetPublicKeyFileName(pubKey)
+	if err != nil {
+		return err
+	}
+	if m.stateDir != nil {
+		return m.stateDir.RemoveFile(fileName)
+	}
+	return common.DeletePubKeyFile(m.keyShareDir, pubKey)
 }
 
 func (m *TssManager) SetPartyTimeout(partyTimeout time.Duration) {
@@ -282,6 +440,9 @@ func (m *TssManager) SetPubKey(pubKey string) {
 }
 
 func (m *TssManager) Config() tcommon.TssConfig {
+	if m.partyConfig != nil {
+		return m.partyConfig()
+	}
 	return m.server.Config()
 }
 

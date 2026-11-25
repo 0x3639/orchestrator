@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	sdk_rpc_client "github.com/MoonBaZZe/znn-sdk-go/rpc_client"
 	"github.com/MoonBaZZe/znn-sdk-go/zenon"
+	ecommon "github.com/ethereum/go-ethereum/common"
 	ic "github.com/libp2p/go-libp2p-core/crypto"
 	"github.com/libp2p/go-libp2p-core/peer"
 	"time"
@@ -263,6 +264,61 @@ func (r *ZnnRpc) GetWrapTokenRequestById(id types.Hash) (*definition.WrapTokenRe
 	return r.rpcClient.BridgeApi.GetWrapTokenRequestById(id)
 }
 
+func decodeWrapTokenRequestWithFinality(raw json.RawMessage) (*embedded.WrapTokenRequest, error) {
+	if len(raw) == 0 || string(raw) == "null" {
+		return nil, nil
+	}
+	var fields struct {
+		Id                      *types.Hash `json:"id"`
+		CreationMomentumHeight  *uint64     `json:"creationMomentumHeight"`
+		ConfirmationsToFinality *uint64     `json:"confirmationsToFinality"`
+	}
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		return nil, err
+	}
+	if fields.Id == nil || *fields.Id == types.ZeroHash {
+		return nil, errors.New("wrap request reply without a valid id")
+	}
+	if fields.CreationMomentumHeight == nil {
+		return nil, errors.New("wrap request reply without creationMomentumHeight")
+	}
+	if fields.ConfirmationsToFinality == nil {
+		return nil, errors.New("wrap request reply without confirmationsToFinality")
+	}
+	wrap, err := decodeRedeemWrap(raw)
+	if err != nil {
+		return nil, err
+	}
+	if wrap == nil {
+		return nil, nil
+	}
+	if wrap.NetworkClass == definition.EvmClass {
+		if !ecommon.IsHexAddress(wrap.ToAddress) {
+			return nil, errors.New("wrap request reply without a valid EVM toAddress")
+		}
+		if !ecommon.IsHexAddress(wrap.TokenAddress) {
+			return nil, errors.New("wrap request reply without a valid EVM tokenAddress")
+		}
+	}
+	return &embedded.WrapTokenRequest{
+		WrapTokenRequest:        wrap,
+		ConfirmationsToFinality: *fields.ConfirmationsToFinality,
+	}, nil
+}
+
+// GetWrapTokenRequestByIdContext reads one wrap request by ID using a
+// context-bound connection and preserves ConfirmationsToFinality from the RPC
+// reply. A null reply decodes as (nil, nil); a reply missing or nulling
+// confirmationsToFinality or required wrap fields returns an error so an
+// unfinalized or malformed record is never treated as finalized.
+func (r *ZnnRpc) GetWrapTokenRequestByIdContext(ctx context.Context, id types.Hash) (*embedded.WrapTokenRequest, error) {
+	var raw json.RawMessage
+	if err := r.settingsClient.CallContext(ctx, &raw, "embedded.bridge.getWrapTokenRequestById", id); err != nil {
+		return nil, err
+	}
+	return decodeWrapTokenRequestWithFinality(raw)
+}
+
 // RedeemWrapRequestById is the source lookup of the redeem check. That check
 // repeats on a timer, so the read is bounded: an endpoint that accepts the
 // request and never answers must not stop the rechecks behind it. An unknown
@@ -310,6 +366,52 @@ func (r *ZnnRpc) GetAllWrapTokenRequests(pageIndex, pageSize uint32) (*embedded.
 	return r.rpcClient.BridgeApi.GetAllWrapTokenRequests(pageIndex, pageSize)
 }
 
+// GetAllWrapTokenRequestsContext reads one page of wrap requests using a
+// context-bound connection with strict decoding: null pages, missing/negative
+// counts, null entries, and entries with omitted or null
+// confirmationsToFinality are rejected as errors.
+func (r *ZnnRpc) GetAllWrapTokenRequestsContext(ctx context.Context, pageIndex, pageSize uint32) (*embedded.WrapTokenRequestList, error) {
+	var raw json.RawMessage
+	if err := r.settingsClient.CallContext(ctx, &raw, "embedded.bridge.getAllWrapTokenRequests", pageIndex, pageSize); err != nil {
+		return nil, err
+	}
+	if len(raw) == 0 || string(raw) == "null" {
+		return nil, errors.New("missing Zenon wrap token request page")
+	}
+	var page struct {
+		Count *int            `json:"count"`
+		List  json.RawMessage `json:"list"`
+	}
+	if err := json.Unmarshal(raw, &page); err != nil {
+		return nil, err
+	}
+	if page.Count == nil || *page.Count < 0 {
+		return nil, errors.New("wrap token request page with missing or negative count")
+	}
+	if len(page.List) == 0 || string(page.List) == "null" {
+		return nil, errors.New("wrap token request page with missing or null list")
+	}
+	var rawItems []json.RawMessage
+	if err := json.Unmarshal(page.List, &rawItems); err != nil {
+		return nil, err
+	}
+	list := make([]*embedded.WrapTokenRequest, 0, len(rawItems))
+	for _, itemRaw := range rawItems {
+		wrap, err := decodeWrapTokenRequestWithFinality(itemRaw)
+		if err != nil {
+			return nil, err
+		}
+		if wrap == nil {
+			return nil, errors.New("wrap token request page contains null entry")
+		}
+		list = append(list, wrap)
+	}
+	return &embedded.WrapTokenRequestList{
+		Count: *page.Count,
+		List:  list,
+	}, nil
+}
+
 func (r *ZnnRpc) GetAccountBlockByHash(hash types.Hash) (*api.AccountBlock, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), ZnnLedgerTimeout)
 	defer cancel()
@@ -317,11 +419,17 @@ func (r *ZnnRpc) GetAccountBlockByHash(hash types.Hash) (*api.AccountBlock, erro
 }
 
 func (r *ZnnRpc) GetAccountBlockByHashContext(ctx context.Context, hash types.Hash) (*api.AccountBlock, error) {
-	var block *api.AccountBlock
-	if err := r.settingsClient.CallContext(ctx, &block, "ledger.getAccountBlockByHash", hash); err != nil {
+	// Decode via AccountBlockMarshal because go-zenon's AccountBlock.UnmarshalJSON
+	// checks block.PairedAccountBlock != nil instead of aux.PairedAccountBlock != nil,
+	// silently dropping PairedAccountBlock and TokenInfo on fresh structs.
+	var raw *api.AccountBlockMarshal
+	if err := r.settingsClient.CallContext(ctx, &raw, "ledger.getAccountBlockByHash", hash); err != nil {
 		return nil, err
 	}
-	return block, nil
+	if raw == nil {
+		return nil, nil
+	}
+	return raw.FromApiMarshalJson(), nil
 }
 
 func (r *ZnnRpc) GetAccountBlocksByHeight(address types.Address, height, count uint64) (*api.AccountBlockList, error) {

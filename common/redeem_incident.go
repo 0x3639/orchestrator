@@ -128,6 +128,12 @@ func (gs *GlobalState) beginRedeemHaltLocked() {
 	oldState := gs.effectiveStateLocked()
 	gs.redeemGeneration++
 	gs.redeemHaltPending.Store(gs.redeemGeneration)
+	if *gs.state == ReSignState {
+		// Preserve an interrupted re-sign request and invalidate any in-flight
+		// scan generation so unhalting resumes the same target cleanly.
+		gs.pendingResign = true
+		gs.resignGeneration++
+	}
 	// A config saved at any point during a redeem-only emergency can safely
 	// restart halted. Pending evidence restores the emergency until acknowledged.
 	if *gs.state != EmergencyState {
