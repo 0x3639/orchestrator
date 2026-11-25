@@ -32,6 +32,7 @@ type EvmRpc struct {
 	rpcClient   *ethclient.Client
 	Urls        config.UrlsInfo
 	networkName string
+	chainId     uint32
 
 	bridgeContract  *bridge.Bridge
 	bridgeAddress   ecommon.Address
@@ -67,11 +68,35 @@ type secondaryClient struct {
 	limiter *rate.Limiter
 }
 
+func verifyEvmChainID(parent context.Context, client *ethclient.Client, expectedChainId uint32, networkName, url string) error {
+	if expectedChainId == 0 {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(parent, evmCallTimeout)
+	defer cancel()
+	got, err := client.ChainID(ctx)
+	if err != nil {
+		return fmt.Errorf("network %s (%s): failed to verify eth_chainId: %w", networkName, config.RedactURL(url), err)
+	}
+	if got == nil || !got.IsUint64() || got.Uint64() != uint64(expectedChainId) {
+		return fmt.Errorf("network %s (%s): eth_chainId mismatch: endpoint serves chain %v, expected %d", networkName, config.RedactURL(url), got, expectedChainId)
+	}
+	return nil
+}
+
 func NewEvmRpcClient(networkConfig config.BaseNetworkConfig, networkName string, address ecommon.Address) (*EvmRpc, error) {
 	return NewEvmRpcClientContext(context.Background(), networkConfig, networkName, address)
 }
 
 func NewEvmRpcClientContext(parent context.Context, networkConfig config.BaseNetworkConfig, networkName string, address ecommon.Address) (*EvmRpc, error) {
+	return NewEvmRpcClientForChainContext(parent, networkConfig, 0, networkName, address)
+}
+
+func NewEvmRpcClientForChain(networkConfig config.BaseNetworkConfig, chainId uint32, networkName string, address ecommon.Address) (*EvmRpc, error) {
+	return NewEvmRpcClientForChainContext(context.Background(), networkConfig, chainId, networkName, address)
+}
+
+func NewEvmRpcClientForChainContext(parent context.Context, networkConfig config.BaseNetworkConfig, chainId uint32, networkName string, address ecommon.Address) (*EvmRpc, error) {
 	logger, errLog := common.CreateSugarLogger()
 	if errLog != nil {
 		return nil, errLog
@@ -89,6 +114,7 @@ func NewEvmRpcClientContext(parent context.Context, networkConfig config.BaseNet
 		return nil, err
 	}
 	var newRpcClient *ethclient.Client
+	var lastErr error
 	currentUrl := newUrls.GetCurrentUrl()
 	for {
 		if err := parent.Err(); err != nil {
@@ -96,12 +122,21 @@ func NewEvmRpcClientContext(parent context.Context, networkConfig config.BaseNet
 		}
 		newRpcClient, err = ethclient.DialContext(parent, currentUrl)
 		if err != nil {
+			lastErr = err
 			logger.Infof("Error when dialing %s, got: %s\n", config.RedactURL(currentUrl), config.RedactErrorForURL(err, currentUrl))
+		} else if err = verifyEvmChainID(parent, newRpcClient, chainId, networkName, currentUrl); err != nil {
+			lastErr = err
+			newRpcClient.Close()
+			newRpcClient = nil
+			logger.Warnf("%s", err.Error())
 		} else {
 			break
 		}
 		currentUrl = newUrls.NextUrl()
 		if len(currentUrl) == 0 {
+			if lastErr != nil {
+				return nil, fmt.Errorf("cannot connect to any url on evm (%s): %w", networkName, lastErr)
+			}
 			return nil, errors.New("cannot connect to any url on evm")
 		}
 	}
@@ -140,6 +175,7 @@ func NewEvmRpcClientContext(parent context.Context, networkConfig config.BaseNet
 		rpcClient:       newRpcClient,
 		Urls:            *newUrls,
 		networkName:     networkName,
+		chainId:         chainId,
 		bridgeContract:  newBridgeContract,
 		bridgeAddress:   address,
 		filterQuery:     newFilterQuery,
@@ -742,6 +778,10 @@ func (r *EvmRpc) callEndpoint(idx int, read func(context.Context, *ethclient.Cli
 	if entry.client == nil {
 		client, err := ethclient.DialContext(ctx, url)
 		if err != nil {
+			return err
+		}
+		if err := verifyEvmChainID(ctx, client, r.chainId, r.networkName, url); err != nil {
+			client.Close()
 			return err
 		}
 		entry.client = client

@@ -1848,15 +1848,204 @@ func (node *Node) readConfirmedWrapConfirmations(anchor reSignChainAnchor, advan
 	}
 }
 
+type confirmedTokenPair struct {
+	tokenAddress  string
+	feePercentage uint32
+	bridgeable    bool
+	minAmount     *big.Int
+}
+
+// resolveConfirmedTokenPairAtReceive walks backward along the confirmed,
+// PreviousHash-linked bridge account chain strictly below wrapRecv to find the
+// active TokenPair (TokenAddress, FeePercentage, Bridgeable, MinAmount) in
+// effect when wrapRecv executed WrapToken.
+func (node *Node) resolveConfirmedTokenPairAtReceive(networkClass, chainID uint32, tokenStandard types.ZenonTokenStandard, wrapRecv *api.AccountBlock, resignGen uint64) (pair confirmedTokenPair, found, stale, stop bool) {
+	if wrapRecv == nil || wrapRecv.Height <= 1 {
+		return confirmedTokenPair{}, false, false, false
+	}
+	setPairID := definition.ABIBridge.Methods[definition.SetTokenPairMethod].Id()
+	removePairID := definition.ABIBridge.Methods[definition.RemoveTokenPairMethodName].Id()
+	setNetID := definition.ABIBridge.Methods[definition.SetNetworkMethodName].Id()
+	removeNetID := definition.ABIBridge.Methods[definition.RemoveNetworkMethodName].Id()
+	isPairMethod := func(data []byte) bool {
+		return (len(data) >= len(setPairID) && bytes.Equal(data[:len(setPairID)], setPairID)) ||
+			(len(data) >= len(removePairID) && bytes.Equal(data[:len(removePairID)], removePairID)) ||
+			(len(data) >= len(setNetID) && bytes.Equal(data[:len(setNetID)], setNetID)) ||
+			(len(data) >= len(removeNetID) && bytes.Equal(data[:len(removeNetID)], removeNetID))
+	}
+
+	for {
+		if node.workerStopping() {
+			return confirmedTokenPair{}, false, false, true
+		}
+		if !node.state.IsResignGenerationCurrent(resignGen) {
+			return confirmedTokenPair{}, false, true, false
+		}
+
+		expectedHash := wrapRecv.PreviousHash
+		hi := wrapRecv.Height - 1
+		needRetry := false
+		rolledBack := false
+		for hi >= 1 {
+			if node.workerStopping() {
+				return confirmedTokenPair{}, false, false, true
+			}
+			if !node.state.IsResignGenerationCurrent(resignGen) {
+				return confirmedTokenPair{}, false, true, false
+			}
+			lo := uint64(1)
+			if hi > api.RpcMaxCountSize {
+				lo = hi - api.RpcMaxCountSize + 1
+			}
+			count := hi - lo + 1
+
+			pageCtx, pageCancel := context.WithTimeout(node.workers.context(), resignRPCTimeout)
+			page, err := node.networksManager.Znn().GetAccountBlocksByHeightContext(pageCtx, types.BridgeContract, lo, count)
+			pageCancel()
+			if node.workerStopping() {
+				return confirmedTokenPair{}, false, false, true
+			}
+			if err != nil {
+				node.logger.Debugf("failed to read bridge blocks [%d..%d] for token pair state: %v", lo, hi, err)
+				needRetry = true
+				break
+			}
+			if page == nil || len(page.List) < int(count) {
+				needRetry = true
+				break
+			}
+
+			for i := int(count) - 1; i >= 0; i-- {
+				b := page.List[i]
+				expectedHeight := lo + uint64(i)
+				if b == nil || b.Height != expectedHeight || !isConfirmedBridgeBlock(b) {
+					needRetry = true
+					break
+				}
+				if b.Hash != expectedHash {
+					rolledBack = true
+					break
+				}
+				expectedHash = b.PreviousHash
+				if !isAcceptedReceiveBlock(b) {
+					continue
+				}
+				if b.PairedAccountBlock != nil && b.PairedAccountBlock.Hash == b.FromBlockHash {
+					if b.PairedAccountBlock.ToAddress != types.BridgeContract || !isPairMethod(b.PairedAccountBlock.Data) {
+						continue
+					}
+				}
+
+				sendCtx, sendCancel := context.WithTimeout(node.workers.context(), resignRPCTimeout)
+				send, err := node.networksManager.Znn().GetAccountBlockByHashContext(sendCtx, b.FromBlockHash)
+				sendCancel()
+				if node.workerStopping() {
+					return confirmedTokenPair{}, false, false, true
+				}
+				if err != nil {
+					node.logger.Debugf("failed to verify token pair send %s in momentumStore: %v", b.FromBlockHash, err)
+					needRetry = true
+					break
+				}
+				if send == nil || send.Hash != b.FromBlockHash || !nom.IsSendBlock(send.BlockType) || !isConfirmedBridgeBlock(send) {
+					rolledBack = true
+					break
+				}
+				recv := send.PairedAccountBlock
+				if recv == nil || !isConfirmedBridgeBlock(recv) || !sameAccountBlockFrontier(b, recv) || !isAcceptedReceiveBlock(recv) {
+					rolledBack = true
+					break
+				}
+				if send.ToAddress != types.BridgeContract || !isPairMethod(send.Data) {
+					continue
+				}
+
+				momCtx, momCancel := context.WithTimeout(node.workers.context(), resignRPCTimeout)
+				momList, err := node.networksManager.Znn().GetMomentumsByHeightContext(momCtx, b.ConfirmationDetail.MomentumHeight, 1)
+				momCancel()
+				if node.workerStopping() {
+					return confirmedTokenPair{}, false, false, true
+				}
+				if err != nil {
+					needRetry = true
+					break
+				}
+				if momList == nil || len(momList.List) == 0 || momList.List[0] == nil || momList.List[0].Momentum == nil ||
+					momList.List[0].Height != b.ConfirmationDetail.MomentumHeight || momList.List[0].Hash != b.ConfirmationDetail.MomentumHash {
+					rolledBack = true
+					break
+				}
+
+				switch {
+				case len(send.Data) >= len(setPairID) && bytes.Equal(send.Data[:len(setPairID)], setPairID):
+					param := new(definition.TokenPairParam)
+					if err := definition.ABIBridge.UnpackMethod(param, definition.SetTokenPairMethod, send.Data); err != nil {
+						continue
+					}
+					if param.NetworkClass == networkClass && param.ChainId == chainID && param.TokenStandard == tokenStandard {
+						return confirmedTokenPair{
+							tokenAddress:  strings.ToLower(param.TokenAddress),
+							feePercentage: param.FeePercentage,
+							bridgeable:    param.Bridgeable,
+							minAmount:     param.MinAmount,
+						}, true, false, false
+					}
+				case len(send.Data) >= len(removePairID) && bytes.Equal(send.Data[:len(removePairID)], removePairID):
+					param := new(definition.TokenPairParam)
+					if err := definition.ABIBridge.UnpackMethod(param, definition.RemoveTokenPairMethodName, send.Data); err != nil {
+						continue
+					}
+					if param.NetworkClass == networkClass && param.ChainId == chainID && param.TokenStandard == tokenStandard {
+						return confirmedTokenPair{}, false, false, false
+					}
+				case len(send.Data) >= len(setNetID) && bytes.Equal(send.Data[:len(setNetID)], setNetID):
+					param := new(definition.NetworkInfoParam)
+					if err := definition.ABIBridge.UnpackMethod(param, definition.SetNetworkMethodName, send.Data); err != nil {
+						continue
+					}
+					if param.NetworkClass == networkClass && param.ChainId == chainID {
+						return confirmedTokenPair{}, false, false, false
+					}
+				case len(send.Data) >= len(removeNetID) && bytes.Equal(send.Data[:len(removeNetID)], removeNetID):
+					param := new(definition.NetworkInfoParam)
+					if err := definition.ABIBridge.UnpackMethod(param, definition.RemoveNetworkMethodName, send.Data); err != nil {
+						continue
+					}
+					if param.NetworkClass == networkClass && param.ChainId == chainID {
+						return confirmedTokenPair{}, false, false, false
+					}
+				}
+			}
+
+			if needRetry || rolledBack || lo == 1 {
+				break
+			}
+			hi = lo - 1
+		}
+
+		if rolledBack {
+			return confirmedTokenPair{}, false, false, false
+		}
+		if needRetry {
+			if !node.workerSleep(resignRetryDelay) {
+				return confirmedTokenPair{}, false, false, true
+			}
+			continue
+		}
+		return confirmedTokenPair{}, false, false, false
+	}
+}
+
 // verifyWrapConfirmedInLedger verifies directly against Zenon's momentum-confirmed
 // ledger store (GetAccountBlockByHash reads exclusively from momentumStore, never
 // from the unconfirmed account pool) that wrap has a confirmed WrapToken send
 // block whose paired bridge receive block succeeded (execution status == 1, not
-// rolled-back status == 2), matches wrap's fields and CreationMomentumHeight,
-// and is anchored in the canonical momentum chain and canonical bridge account
-// chain at or below anchor.
+// rolled-back status == 2), matches wrap's full signing payload (including
+// TokenAddress and Fee derived from confirmed SetTokenPair execution state at
+// recv.Height) and CreationMomentumHeight, and is anchored in the canonical
+// momentum chain and canonical bridge account chain at or below anchor.
 func (node *Node) verifyWrapConfirmedInLedger(wrap *definition.WrapTokenRequest, anchor reSignChainAnchor, resignGen uint64) (confirmed, stale, stop bool) {
-	if wrap == nil || wrap.Amount == nil {
+	if wrap == nil || wrap.Amount == nil || wrap.Fee == nil {
 		return false, false, false
 	}
 	wrapMethodID := definition.ABIBridge.Methods[definition.WrapTokenMethodName].Id()
@@ -1969,6 +2158,31 @@ func (node *Node) verifyWrapConfirmedInLedger(wrap *definition.WrapTokenRequest,
 				}
 			}
 		}
+
+		// Bind TokenAddress and Fee (both inputs to the wrap signing digest) to
+		// the confirmed TokenPair execution state active when recv executed.
+		pair, pairFound, pairStale, pairStop := node.resolveConfirmedTokenPairAtReceive(wrap.NetworkClass, wrap.ChainId, send.TokenStandard, recv, resignGen)
+		if pairStop {
+			return false, false, true
+		}
+		if pairStale {
+			return false, true, false
+		}
+		if !pairFound || !pair.bridgeable || (pair.minAmount != nil && send.Amount.Cmp(pair.minAmount) < 0) {
+			return false, false, false
+		}
+		if pair.feePercentage > constants.MaximumFee {
+			return false, false, false
+		}
+		expectedFee := new(big.Int).Mul(send.Amount, big.NewInt(int64(pair.feePercentage)))
+		expectedFee.Div(expectedFee, big.NewInt(int64(constants.MaximumFee)))
+		if !strings.EqualFold(wrap.TokenAddress, pair.tokenAddress) ||
+			wrap.Fee.Cmp(expectedFee) != 0 ||
+			wrap.Amount.Cmp(wrap.Fee) < 0 {
+			return false, false, false
+		}
+		wrap.ToAddress = strings.ToLower(param.ToAddress)
+		wrap.TokenAddress = pair.tokenAddress
 		return true, false, false
 	}
 }
@@ -2983,12 +3197,13 @@ func (node *Node) processSignaturesWrap(window uint64) (error, bool) {
 			continue
 		}
 
-		evmNetwork := node.networksManager.LookupEvm(event.ChainId)
+		evmNetwork := node.networksManager.LookupEvm(request.ChainId)
 		if evmNetwork == nil {
-			node.logger.Infof("EVM network %d is no longer listed by the bridge; skipping wrap %s", event.ChainId, event.Id.String())
+			node.logger.Infof("EVM network %d is no longer listed by the bridge; skipping wrap %s", request.ChainId, request.Id.String())
 			continue
 		}
-		msg, err := event.GetMessage(evmNetwork.ContractAddress())
+		signingEvent := common.ZnnWrapToOrchestratorWrap(request)
+		msg, err := signingEvent.GetMessage(evmNetwork.ContractAddress())
 		if err != nil {
 			node.logger.Debug(err)
 			// todo set status to skipped

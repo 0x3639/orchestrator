@@ -82,6 +82,8 @@ func TestShutdownDuringSetNetwork(t *testing.T) {
 					result = &api.Momentum{Momentum: &nom.Momentum{Height: 100, Hash: types.Hash{1}}}
 				case "embedded.bridge.getNetworkInfo":
 					result = info
+				case "eth_chainId":
+					result = fmt.Sprintf("0x%x", info.Id)
 				case "eth_syncing":
 					entered.Do(func() { close(checking) })
 					if pendingRead {

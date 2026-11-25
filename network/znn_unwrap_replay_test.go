@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/json"
+	"fmt"
 	"math/big"
 	"net/http"
 	"net/http/httptest"
@@ -150,8 +151,11 @@ type replayRPCError struct {
 	Message string `json:"message"`
 }
 
+var replayChainIDs sync.Map
+
 func replayServerWithErrors(t *testing.T, answer func(method string, params []json.RawMessage) (interface{}, *replayRPCError)) string {
 	t.Helper()
+	var serverURL atomic.Pointer[string]
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var call struct {
 			ID     json.RawMessage   `json:"id"`
@@ -164,6 +168,17 @@ func replayServerWithErrors(t *testing.T, answer func(method string, params []js
 		}
 		w.Header().Set("Content-Type", "application/json")
 		reply := map[string]interface{}{"jsonrpc": "2.0", "id": call.ID}
+		if call.Method == "eth_chainId" {
+			id := uint32(1)
+			if u := serverURL.Load(); u != nil {
+				if v, ok := replayChainIDs.Load(*u); ok {
+					id = v.(uint32)
+				}
+			}
+			reply["result"] = fmt.Sprintf("0x%x", id)
+			_ = json.NewEncoder(w).Encode(reply)
+			return
+		}
 		if result, rpcErr := answer(call.Method, call.Params); rpcErr != nil {
 			reply["error"] = rpcErr
 		} else {
@@ -171,7 +186,12 @@ func replayServerWithErrors(t *testing.T, answer func(method string, params []js
 		}
 		_ = json.NewEncoder(w).Encode(reply)
 	}))
-	t.Cleanup(server.Close)
+	u := server.URL
+	serverURL.Store(&u)
+	t.Cleanup(func() {
+		replayChainIDs.Delete(u)
+		server.Close()
+	})
 	return server.URL
 }
 
@@ -186,6 +206,7 @@ func replayNetwork(t *testing.T, b *replayBridge, znnURL string, evmURLs map[uin
 	}
 	stores := replayStores{znn: wrap.NewZnnStorage(zdb.NewMemDB(), stop), evm: map[uint32]db.EvmStorage{}, evmMu: new(sync.RWMutex)}
 	for id, url := range evmURLs {
+		replayChainIDs.Store(url, id)
 		if err := rpcs.AddEvmClient(config.BaseNetworkConfig{Urls: []string{url}}, id, "replay-test", b.contract); err != nil {
 			t.Fatal(err)
 		}

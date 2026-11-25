@@ -8,6 +8,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"math"
 	"math/big"
 	"net/http"
@@ -71,6 +72,12 @@ func signTestMsg(t *testing.T, priv *ecdsa.PrivateKey, msg []byte) keysign.Signa
 
 func fakeEvmRpcServer(t *testing.T) *httptest.Server {
 	t.Helper()
+	return fakeEvmRpcServerForChain(t, 1)
+}
+
+func fakeEvmRpcServerForChain(t *testing.T, chainID uint64) *httptest.Server {
+	t.Helper()
+	chainHex := fmt.Sprintf(`"0x%x"`, chainID)
 	// Answers eth_call (e.g. redeemsInfo) with 64 zero bytes (blockNumber=0, paramsHash=0).
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var req struct {
@@ -80,8 +87,11 @@ func fakeEvmRpcServer(t *testing.T) *httptest.Server {
 		_ = json.NewDecoder(r.Body).Decode(&req)
 		w.Header().Set("Content-Type", "application/json")
 		result := `"0x` + strings.Repeat("00", 64) + `"`
-		if req.Method == "eth_getCode" {
+		switch req.Method {
+		case "eth_getCode":
 			result = `"0x01"`
+		case "eth_chainId":
+			result = chainHex
 		}
 		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":` + string(req.ID) + `,"result":` + result + `}`))
 	}))
@@ -462,10 +472,12 @@ type wrapTestBridge struct {
 	momByHeightFn    func(ctx context.Context, height uint64) (*api.MomentumList, error)
 	blockByHashFn          func(ctx context.Context, hash types.Hash) (*api.AccountBlock, error)
 	confirmedThresholdAtFn func(height uint64) (uint32, bool)
+	confirmedTokenPairAtFn func(height uint64) (*definition.TokenPairParam, bool)
 	orchInfo               *definition.OrchestratorInfo
 	orchInfoCalls          atomic.Int32
 	orchInfoFn             func(call int32) *definition.OrchestratorInfo
 	lastServedWraps        map[types.Hash]*definition.WrapTokenRequest
+	lastVerifiedWrap       *definition.WrapTokenRequest
 	setOrchSends           map[types.Hash]*api.AccountBlock
 }
 
@@ -526,6 +538,117 @@ func testConfirmedSetOrchBlock(recv *api.AccountBlock, confs uint32) *api.Accoun
 	sendCopy.PairedAccountBlock = nil
 	recv.PairedAccountBlock = &sendCopy
 	return send
+}
+
+func testConfirmedSetTokenPairBlock(recv *api.AccountBlock, param *definition.TokenPairParam) *api.AccountBlock {
+	minAmt := param.MinAmount
+	if minAmt == nil {
+		minAmt = big.NewInt(0)
+	}
+	metadata := param.Metadata
+	if metadata == "" {
+		metadata = "{}"
+	}
+	redeemDelay := param.RedeemDelay
+	if redeemDelay == 0 {
+		redeemDelay = 1
+	}
+	data, err := definition.ABIBridge.PackMethod(
+		definition.SetTokenPairMethod,
+		param.NetworkClass,
+		param.ChainId,
+		param.TokenStandard,
+		param.TokenAddress,
+		param.Bridgeable,
+		param.Redeemable,
+		param.Owned,
+		minAmt,
+		param.FeePercentage,
+		redeemDelay,
+		metadata,
+	)
+	if err != nil {
+		panic(err)
+	}
+	var momByte byte
+	if recv.ConfirmationDetail != nil {
+		momByte = recv.ConfirmationDetail.MomentumHash[0]
+	}
+	var addrTail byte
+	if len(param.TokenAddress) > 0 {
+		addrTail = param.TokenAddress[len(param.TokenAddress)-1]
+	}
+	sendHash := types.Hash{
+		0x5f,
+		byte(recv.Height >> 8), byte(recv.Height),
+		byte(param.ChainId),
+		byte(param.FeePercentage >> 8), byte(param.FeePercentage),
+		recv.Hash[0], momByte, byte(len(param.TokenAddress)), addrTail,
+	}
+	recv.Address = types.BridgeContract
+	recv.BlockType = nom.BlockTypeContractReceive
+	recv.FromBlockHash = sendHash
+	recv.Data = testReceiveData(1)
+
+	recvCopy := *recv
+	recvCopy.PairedAccountBlock = nil
+
+	var confCopy *api.AccountBlockConfirmationDetail
+	if recv.ConfirmationDetail != nil {
+		c := *recv.ConfirmationDetail
+		confCopy = &c
+	}
+	send := &api.AccountBlock{
+		AccountBlock: nom.AccountBlock{
+			BlockType: nom.BlockTypeUserSend,
+			ToAddress: types.BridgeContract,
+			Hash:      sendHash,
+			Height:    1,
+			Amount:    big.NewInt(0),
+			Data:      data,
+		},
+		ConfirmationDetail: confCopy,
+		PairedAccountBlock: &recvCopy,
+	}
+	sendCopy := *send
+	sendCopy.PairedAccountBlock = nil
+	recv.PairedAccountBlock = &sendCopy
+	return send
+}
+
+func defaultTokenPairForWrap(w *definition.WrapTokenRequest) *definition.TokenPairParam {
+	if w == nil {
+		return &definition.TokenPairParam{
+			NetworkClass:  definition.EvmClass,
+			ChainId:       1,
+			TokenStandard: types.ZeroTokenStandard,
+			TokenAddress:  "",
+			Bridgeable:    true,
+			Redeemable:    true,
+			MinAmount:     big.NewInt(0),
+			FeePercentage: 1000,
+			RedeemDelay:   1,
+			Metadata:      "{}",
+		}
+	}
+	feePct := uint32(0)
+	if w.Amount != nil && w.Amount.Sign() > 0 && w.Fee != nil && w.Fee.Sign() > 0 {
+		num := new(big.Int).Mul(w.Fee, big.NewInt(int64(constants.MaximumFee)))
+		num.Add(num, new(big.Int).Sub(w.Amount, big.NewInt(1)))
+		feePct = uint32(new(big.Int).Div(num, w.Amount).Uint64())
+	}
+	return &definition.TokenPairParam{
+		NetworkClass:  w.NetworkClass,
+		ChainId:       w.ChainId,
+		TokenStandard: w.TokenStandard,
+		TokenAddress:  w.TokenAddress,
+		Bridgeable:    true,
+		Redeemable:    true,
+		MinAmount:     big.NewInt(0),
+		FeePercentage: feePct,
+		RedeemDelay:   1,
+		Metadata:      "{}",
+	}
 }
 
 func testConfirmedWrapBlocks(w *definition.WrapTokenRequest, recvHeight uint64, recvHash, recvPrevHash types.Hash, momHeight uint64, momHash types.Hash, accepted bool) *api.AccountBlock {
@@ -646,7 +769,7 @@ func (l *wrapTestLedger) GetFrontierAccountBlock(ctx context.Context, _ types.Ad
 	if fn != nil {
 		return fn(ctx, call)
 	}
-	return testAccountBlock(2, types.Hash{0xaa, 0, 2}), nil
+	return testAccountBlock(3, types.Hash{0xaa, 0, 3}), nil
 }
 
 func (l *wrapTestLedger) GetAccountBlocksByHeight(ctx context.Context, _ types.Address, height, count uint64) (*api.AccountBlockList, error) {
@@ -656,6 +779,8 @@ func (l *wrapTestLedger) GetAccountBlocksByHeight(ctx context.Context, _ types.A
 	l.bridge.mu.Lock()
 	fn := l.bridge.acctByHeightFn
 	threshFn := l.bridge.confirmedThresholdAtFn
+	pairFn := l.bridge.confirmedTokenPairAtFn
+	lastWrap := l.bridge.lastVerifiedWrap
 	defaultConfs := uint32(1)
 	if l.bridge.orchInfo != nil && l.bridge.orchInfo.ConfirmationsToFinality > 0 {
 		defaultConfs = l.bridge.orchInfo.ConfirmationsToFinality
@@ -693,6 +818,23 @@ func (l *wrapTestLedger) GetAccountBlocksByHeight(ctx context.Context, _ types.A
 				}
 				l.bridge.setOrchSends[send.Hash] = send
 				l.bridge.mu.Unlock()
+			} else {
+				var pairParam *definition.TokenPairParam
+				var hasPair bool
+				if pairFn != nil {
+					pairParam, hasPair = pairFn(h)
+				} else if h == 2 {
+					pairParam, hasPair = defaultTokenPairForWrap(lastWrap), true
+				}
+				if hasPair && pairParam != nil {
+					send := testConfirmedSetTokenPairBlock(blk, pairParam)
+					l.bridge.mu.Lock()
+					if l.bridge.setOrchSends == nil {
+						l.bridge.setOrchSends = make(map[types.Hash]*api.AccountBlock)
+					}
+					l.bridge.setOrchSends[send.Hash] = send
+					l.bridge.mu.Unlock()
+				}
 			}
 		}
 		list = append(list, blk)
@@ -714,6 +856,9 @@ func (l *wrapTestLedger) GetAccountBlockByHash(ctx context.Context, hash types.H
 	if servedWrap == nil && l.bridge.byID != nil && l.bridge.byID[hash] != nil {
 		servedWrap = l.bridge.byID[hash].WrapTokenRequest
 	}
+	if setOrchSend == nil && servedWrap != nil {
+		l.bridge.lastVerifiedWrap = servedWrap
+	}
 	l.bridge.mu.Unlock()
 	if setOrchSend != nil {
 		return setOrchSend, nil
@@ -725,9 +870,9 @@ func (l *wrapTestLedger) GetAccountBlockByHash(ctx context.Context, hash types.H
 		return nil, nil
 	}
 	// Default: derive a confirmed accepted WrapToken send + paired bridge
-	// receive block consistent with the fixture's height-2 bridge block and
-	// confirming momentum.
-	acctList, err := l.GetAccountBlocksByHeight(ctx, types.BridgeContract, 2, 1)
+	// receive block consistent with the fixture's height-3 bridge block and
+	// confirming momentum (height 1 = SetOrchestratorInfo, height 2 = SetTokenPair).
+	acctList, err := l.GetAccountBlocksByHeight(ctx, types.BridgeContract, 3, 1)
 	if err != nil || acctList == nil || len(acctList.List) == 0 || acctList.List[0] == nil {
 		return nil, err
 	}
@@ -738,7 +883,7 @@ func (l *wrapTestLedger) GetAccountBlockByHash(ctx context.Context, hash types.H
 		momHeight = recv.ConfirmationDetail.MomentumHeight
 		momHash = recv.ConfirmationDetail.MomentumHash
 	}
-	return testConfirmedWrapBlocks(servedWrap, 2, recv.Hash, recv.PreviousHash, momHeight, momHash, true), nil
+	return testConfirmedWrapBlocks(servedWrap, 3, recv.Hash, recv.PreviousHash, momHeight, momHash, true), nil
 }
 
 func (l *wrapTestLedger) GetFrontierMomentum(ctx context.Context) (*api.Momentum, error) {
@@ -1042,8 +1187,10 @@ func TestReSignStateRetriesDeferredSignedWrapAfterFinality(t *testing.T) {
 }
 
 func TestReSignStateIgnoresStaleScanAfterRetargetAndRespectsHaltedState(t *testing.T) {
-	evmSrv := fakeEvmRpcServer(t)
+	evmSrv := fakeEvmRpcServerForChain(t, 1)
 	defer evmSrv.Close()
+	bscSrv := fakeEvmRpcServerForChain(t, 2)
+	defer bscSrv.Close()
 
 	wrapChain1 := types.Hash{0x11}
 	wrapChain2 := types.Hash{0x22}
@@ -1095,7 +1242,7 @@ func TestReSignStateIgnoresStaleScanAfterRetargetAndRespectsHaltedState(t *testi
 
 	n := wrapTestNodeWithEvm(t, common.LiveState, bridge, map[string]string{
 		"Ethereum": evmSrv.URL,
-		"BSC":      evmSrv.URL,
+		"BSC":      bscSrv.URL,
 	})
 	if activated, err := n.state.ActivateResign(definition.EvmClass, 1); err != nil || !activated {
 		t.Fatalf("ActivateResign failed: activated=%v err=%v", activated, err)
@@ -1215,8 +1362,11 @@ func TestReSignStateStableSetIgnoresNewUnfinalizedWrapsAndRetriesFailedRedeemsIn
 			return
 		}
 		result := `"0x` + strings.Repeat("00", 64) + `"`
-		if req.Method == "eth_getCode" {
+		switch req.Method {
+		case "eth_getCode":
 			result = `"0x01"`
+		case "eth_chainId":
+			result = `"0x1"`
 		}
 		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":` + string(req.ID) + `,"result":` + result + `}`))
 	}))
@@ -1358,8 +1508,11 @@ func TestReSignStateCancellationRetargetAndHaltDiscardStagedWrapsAfterEligibilit
 			}
 			w.Header().Set("Content-Type", "application/json")
 			result := `"0x` + strings.Repeat("00", 64) + `"`
-			if req.Method == "eth_getCode" {
+			switch req.Method {
+			case "eth_getCode":
 				result = `"0x01"`
+			case "eth_chainId":
+				result = `"0x1"`
 			}
 			_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":` + string(req.ID) + `,"result":` + result + `}`))
 		}))
@@ -1432,12 +1585,17 @@ func TestReSignStateCancellationRetargetAndHaltDiscardStagedWrapsAfterEligibilit
 			}
 			w.Header().Set("Content-Type", "application/json")
 			result := `"0x` + strings.Repeat("00", 64) + `"`
-			if req.Method == "eth_getCode" {
+			switch req.Method {
+			case "eth_getCode":
 				result = `"0x01"`
+			case "eth_chainId":
+				result = `"0x1"`
 			}
 			_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":` + string(req.ID) + `,"result":` + result + `}`))
 		}))
 		defer evmSrv.Close()
+		bscSrv := fakeEvmRpcServerForChain(t, 2)
+		defer bscSrv.Close()
 
 		bridge := &wrapTestBridge{
 			networks: &embedded.NetworkInfoList{
@@ -1482,7 +1640,7 @@ func TestReSignStateCancellationRetargetAndHaltDiscardStagedWrapsAfterEligibilit
 		}
 		n = wrapTestNodeWithEvm(t, common.LiveState, bridge, map[string]string{
 			"Ethereum": evmSrv.URL,
-			"BSC":      evmSrv.URL,
+			"BSC":      bscSrv.URL,
 		})
 		if activated, err := n.state.ActivateResign(definition.EvmClass, 1); err != nil || !activated {
 			t.Fatalf("ActivateResign failed: activated=%v err=%v", activated, err)
@@ -1527,8 +1685,11 @@ func TestReSignStateCancellationRetargetAndHaltDiscardStagedWrapsAfterEligibilit
 			}
 			w.Header().Set("Content-Type", "application/json")
 			result := `"0x` + strings.Repeat("00", 64) + `"`
-			if req.Method == "eth_getCode" {
+			switch req.Method {
+			case "eth_getCode":
 				result = `"0x01"`
+			case "eth_chainId":
+				result = `"0x1"`
 			}
 			_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":` + string(req.ID) + `,"result":` + result + `}`))
 		}))
@@ -3888,7 +4049,7 @@ func TestReSignStateBindsConfirmationThresholdToPrePublishBridgeSnapshot(t *test
 				}
 				return testConfirmedWrapBlocks(
 					makeWrap(0).WrapTokenRequest,
-					2, types.Hash{0xaa, 0, 2}, types.Hash{0xaa, 0, 1},
+					3, types.Hash{0xaa, 0, 3}, types.Hash{0xaa, 0, 2},
 					1, testMomentum(1).Hash, true,
 				), nil
 			},
@@ -4364,7 +4525,7 @@ func TestReSignStateRequiresMomentumConfirmationForBridgeSnapshot(t *testing.T) 
 				}
 				return testConfirmedWrapBlocks(
 					makeEntry(hash).WrapTokenRequest,
-					2, types.Hash{0xaa, 0, 2}, types.Hash{0xaa, 0, 1},
+					3, types.Hash{0xaa, 0, 3}, types.Hash{0xaa, 0, 2},
 					1, testMomentum(1).Hash, true,
 				), nil
 			},
@@ -4449,13 +4610,13 @@ func TestReSignStateRequiresMomentumConfirmationForBridgeSnapshot(t *testing.T) 
 					// Confirmed paired BridgeContract receive with failed execution status (2).
 					return testConfirmedWrapBlocks(
 						makeEntry(failedWrap).WrapTokenRequest,
-						2, types.Hash{0xaa, 0, 2}, types.Hash{0xaa, 0, 1},
+						3, types.Hash{0xaa, 0, 3}, types.Hash{0xaa, 0, 2},
 						1, testMomentum(1).Hash, false,
 					), nil
 				}
 				return testConfirmedWrapBlocks(
 					makeEntry(hash).WrapTokenRequest,
-					2, types.Hash{0xaa, 0, 2}, types.Hash{0xaa, 0, 1},
+					3, types.Hash{0xaa, 0, 3}, types.Hash{0xaa, 0, 2},
 					1, testMomentum(1).Hash, true,
 				), nil
 			},
@@ -4486,6 +4647,254 @@ func TestReSignStateRequiresMomentumConfirmationForBridgeSnapshot(t *testing.T) 
 		}
 		if ev, err := n.dbManager.ZnnStorage().GetWrapRequestById(failedWrap); err != nil || ev != nil {
 			t.Fatalf("failedWrap with rolled-back receipt must not be stored: ev=%+v err=%v", ev, err)
+		}
+	})
+
+	t.Run("rejects wrap whose TokenAddress or Fee mismatches confirmed SetTokenPair state", func(t *testing.T) {
+		evmSrv := fakeEvmRpcServer(t)
+		defer evmSrv.Close()
+
+		// Exact regression for Round 17 Finding 1 (ledger check):
+		// Confirmed SetTokenPair at height 2 sets TokenAddress = canonicalToken
+		// and FeePercentage = 1000 (10%, so Amount=100 -> Fee=10).
+		// Page 0 (call 1) serves badWrap with a mismatched Fee (1 instead of 10)
+		// and wrong TokenAddress while its WrapToken send+receive are confirmed.
+		// verifyWrapConfirmedInLedger must derive TokenAddress and Fee from the
+		// confirmed SetTokenPair chain at recv.Height, reject badWrap, restart
+		// on goodWrap, and mark only goodWrap.
+		const (
+			canonicalToken = "0x0000000000000000000000000000000000001111"
+			spoofedToken   = "0x0000000000000000000000000000000000002222"
+		)
+		badWrap := types.Hash{0xc5}
+		goodWrap := types.Hash{0xc6}
+		makeBad := func() *embedded.WrapTokenRequest {
+			return &embedded.WrapTokenRequest{
+				WrapTokenRequest: &definition.WrapTokenRequest{
+					NetworkClass: definition.EvmClass, ChainId: 1, Id: badWrap,
+					ToAddress:              "0x000000000000000000000000000000000000beef",
+					TokenAddress:           spoofedToken,
+					Amount:                 big.NewInt(100),
+					Fee:                    big.NewInt(1),
+					CreationMomentumHeight: 99,
+				},
+				ConfirmationsToFinality: 0,
+			}
+		}
+		makeGood := func() *embedded.WrapTokenRequest {
+			return &embedded.WrapTokenRequest{
+				WrapTokenRequest: &definition.WrapTokenRequest{
+					NetworkClass: definition.EvmClass, ChainId: 1, Id: goodWrap,
+					ToAddress:              "0x000000000000000000000000000000000000beef",
+					TokenAddress:           canonicalToken,
+					Amount:                 big.NewInt(100),
+					Fee:                    big.NewInt(10),
+					CreationMomentumHeight: 99,
+				},
+				ConfirmationsToFinality: 0,
+			}
+		}
+
+		var badChecked atomic.Bool
+		bridge := &wrapTestBridge{
+			networks: &embedded.NetworkInfoList{
+				Count: 1,
+				List: []*definition.NetworkInfo{{
+					NetworkClass: definition.EvmClass, Id: 1, Name: "Ethereum",
+					ContractAddress: "0x0000000000000000000000000000000000000001",
+				}},
+			},
+			confirmedTokenPairAtFn: func(height uint64) (*definition.TokenPairParam, bool) {
+				if height != 2 {
+					return nil, false
+				}
+				return &definition.TokenPairParam{
+					NetworkClass:  definition.EvmClass,
+					ChainId:       1,
+					TokenStandard: types.ZeroTokenStandard,
+					TokenAddress:  canonicalToken,
+					Bridgeable:    true,
+					Redeemable:    true,
+					MinAmount:     big.NewInt(1),
+					FeePercentage: 1000, // 10% -> Fee = 10 on Amount = 100
+					RedeemDelay:   1,
+					Metadata:      "{}",
+				}, true
+			},
+			frontierMomFn: func(_ context.Context, _ int32) (*api.Momentum, error) {
+				return testMomentum(105), nil
+			},
+			frontierFn: func(_ context.Context, _ int32) (*api.AccountBlock, error) {
+				return testAccountBlock(10, types.Hash{0xaa, 0, 10}), nil
+			},
+			pageHandler: func(pageIndex, pageSize uint32, call int32) *embedded.WrapTokenRequestList {
+				if call == 1 {
+					return paginateZenonWraps([]*embedded.WrapTokenRequest{makeBad()}, pageIndex, pageSize)
+				}
+				return paginateZenonWraps([]*embedded.WrapTokenRequest{makeGood()}, pageIndex, pageSize)
+			},
+			blockByHashFn: func(_ context.Context, hash types.Hash) (*api.AccountBlock, error) {
+				if hash == badWrap {
+					badChecked.Store(true)
+					return testConfirmedWrapBlocks(
+						makeBad().WrapTokenRequest,
+						3, types.Hash{0xaa, 0, 3}, types.Hash{0xaa, 0, 2},
+						1, testMomentum(1).Hash, true,
+					), nil
+				}
+				return testConfirmedWrapBlocks(
+					makeGood().WrapTokenRequest,
+					3, types.Hash{0xaa, 0, 3}, types.Hash{0xaa, 0, 2},
+					1, testMomentum(1).Hash, true,
+				), nil
+			},
+		}
+
+		n := wrapTestNodeWithEvm(t, common.LiveState, bridge, map[string]string{"Ethereum": evmSrv.URL})
+		if activated, err := n.state.ActivateResign(definition.EvmClass, 1); err != nil || !activated {
+			t.Fatalf("ActivateResign failed: activated=%v err=%v", activated, err)
+		}
+		n.state.CompleteStartup()
+
+		n.workers.start(n.processSignatures)
+		t.Cleanup(func() {
+			done := n.workers.shutdown()
+			<-done
+		})
+
+		eventually(t, "ReSignState to reject wrap with mismatched TokenAddress/Fee and mark goodWrap", func() bool {
+			st, _ := n.state.GetState()
+			r, err := n.dbManager.ZnnStorage().GetResignStatus(goodWrap)
+			return err == nil && r && st == common.LiveState
+		})
+		if !badChecked.Load() {
+			t.Fatal("expected pre-publish confirmed-ledger verification to inspect badWrap")
+		}
+		if resign, err := n.dbManager.ZnnStorage().GetResignStatus(badWrap); err != nil || resign {
+			t.Fatalf("badWrap mismatching confirmed SetTokenPair must not be marked: resign=%v err=%v", resign, err)
+		}
+		if ev, err := n.dbManager.ZnnStorage().GetWrapRequestById(badWrap); err != nil || ev != nil {
+			t.Fatalf("badWrap mismatching confirmed SetTokenPair must not be stored: ev=%+v err=%v", ev, err)
+		}
+	})
+
+	t.Run("replaces stale local wrap payload on re-sign publish so signer uses confirmed digest", func(t *testing.T) {
+		evmSrv := fakeEvmRpcServer(t)
+		defer evmSrv.Close()
+
+		// Exact regression for Round 17 Finding 1 (batch write + signing path):
+		// Local LevelDB already holds a stale row for wrapID with wrong
+		// TokenAddress, wrong Fee, and a stale signature. After ReSignState
+		// validates the confirmed wrap against momentumStore + SetTokenPair,
+		// PublishResignWraps must overwrite the local payload (and clear the
+		// stale signature) so GetResignableWrapRequests and GetMessage sign the
+		// confirmed digest rather than the stale local row.
+		const (
+			canonicalToken = "0x0000000000000000000000000000000000003333"
+			staleToken     = "0x0000000000000000000000000000000000004444"
+			destAddr       = "0x000000000000000000000000000000000000cafe"
+		)
+		wrapID := types.Hash{0xc7}
+		canonical := &embedded.WrapTokenRequest{
+			WrapTokenRequest: &definition.WrapTokenRequest{
+				NetworkClass:           definition.EvmClass,
+				ChainId:                1,
+				Id:                     wrapID,
+				ToAddress:              destAddr,
+				TokenAddress:           canonicalToken,
+				Amount:                 big.NewInt(100),
+				Fee:                    big.NewInt(10),
+				CreationMomentumHeight: 99,
+			},
+			ConfirmationsToFinality: 0,
+		}
+
+		bridge := &wrapTestBridge{
+			networks: &embedded.NetworkInfoList{
+				Count: 1,
+				List: []*definition.NetworkInfo{{
+					NetworkClass: definition.EvmClass, Id: 1, Name: "Ethereum",
+					ContractAddress: "0x0000000000000000000000000000000000000001",
+				}},
+			},
+			confirmedTokenPairAtFn: func(height uint64) (*definition.TokenPairParam, bool) {
+				if height != 2 {
+					return nil, false
+				}
+				return &definition.TokenPairParam{
+					NetworkClass:  definition.EvmClass,
+					ChainId:       1,
+					TokenStandard: types.ZeroTokenStandard,
+					TokenAddress:  canonicalToken,
+					Bridgeable:    true,
+					Redeemable:    true,
+					MinAmount:     big.NewInt(1),
+					FeePercentage: 1000,
+					RedeemDelay:   1,
+					Metadata:      "{}",
+				}, true
+			},
+			frontierMomFn: func(_ context.Context, _ int32) (*api.Momentum, error) {
+				return testMomentum(105), nil
+			},
+			frontierFn: func(_ context.Context, _ int32) (*api.AccountBlock, error) {
+				return testAccountBlock(10, types.Hash{0xaa, 0, 10}), nil
+			},
+			allWraps: &embedded.WrapTokenRequestList{
+				Count: 1,
+				List:  []*embedded.WrapTokenRequest{canonical},
+			},
+		}
+
+		n := wrapTestNodeWithEvm(t, common.LiveState, bridge, map[string]string{"Ethereum": evmSrv.URL})
+		// Seed a stale local row before ReSignState runs.
+		staleLocal := events.WrapRequestZnn{
+			NetworkClass:  definition.EvmClass,
+			ChainId:       1,
+			Id:            wrapID,
+			ToAddress:     "0x000000000000000000000000000000000000dead",
+			TokenAddress:  staleToken,
+			Amount:        big.NewInt(100),
+			Fee:           big.NewInt(99),
+			Signature:     "stale-sig",
+			SentSignature: true,
+			RedeemStatus:  common.UnredeemedStatus,
+		}
+		if err := n.dbManager.ZnnStorage().AddWrapRequest(staleLocal); err != nil {
+			t.Fatal(err)
+		}
+
+		if activated, err := n.state.ActivateResign(definition.EvmClass, 1); err != nil || !activated {
+			t.Fatalf("ActivateResign failed: activated=%v err=%v", activated, err)
+		}
+		if ok := n.runReSignScan(); !ok {
+			t.Fatal("runReSignScan returned false")
+		}
+
+		stored, err := n.dbManager.ZnnStorage().GetWrapRequestById(wrapID)
+		if err != nil || stored == nil {
+			t.Fatalf("GetWrapRequestById: stored=%+v err=%v", stored, err)
+		}
+		if stored.ToAddress != destAddr || stored.TokenAddress != canonicalToken ||
+			stored.Amount.Cmp(big.NewInt(100)) != 0 || stored.Fee.Cmp(big.NewInt(10)) != 0 {
+			t.Fatalf("stale local payload was not replaced by confirmed wrap: got=%+v", stored)
+		}
+		if stored.Signature != "" || stored.SentSignature {
+			t.Fatalf("stale signature was not cleared after payload refresh: sig=%q sent=%v", stored.Signature, stored.SentSignature)
+		}
+
+		contractAddr := n.networksManager.LookupEvm(1).ContractAddress()
+		gotDigest, err := stored.GetMessage(contractAddr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		wantEvent := common.ZnnWrapToOrchestratorWrap(canonical.WrapTokenRequest)
+		wantDigest, err := wantEvent.GetMessage(contractAddr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(gotDigest, wantDigest) {
+			t.Fatalf("signing digest mismatch after resign publish: got %x, want %x", gotDigest, wantDigest)
 		}
 	})
 }
@@ -4672,13 +5081,13 @@ func TestParseLocalStateParticipantKeysAndEmptyBaseDir(t *testing.T) {
 	}
 }
 
-func TestDefaultNodeConfigUsesLoopbackForSupernova(t *testing.T) {
+func TestDefaultNodeConfigRequiresExplicitSupernovaEndpoint(t *testing.T) {
 	sn, ok := DefaultNodeConfig.Networks["Supernova"]
 	if !ok {
 		t.Fatal("Supernova missing from DefaultNodeConfig.Networks")
 	}
-	if len(sn.Urls) != 1 || sn.Urls[0] != "ws://127.0.0.1:8545" {
-		t.Fatalf("Supernova default Urls = %v, want [ws://127.0.0.1:8545]", sn.Urls)
+	if len(sn.Urls) != 0 {
+		t.Fatalf("Supernova default Urls = %v, want empty slice requiring an explicit endpoint", sn.Urls)
 	}
 	for name, netCfg := range DefaultNodeConfig.Networks {
 		for _, u := range netCfg.Urls {

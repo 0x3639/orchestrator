@@ -152,3 +152,43 @@ func TestUpdatesOfMissingWrapRequestFail(t *testing.T) {
 		t.Fatalf("missing record read as %v %v", got, err)
 	}
 }
+
+func TestPublishResignWrapsReplacesStalePayloadAndResetsStaleSignature(t *testing.T) {
+	store := NewZnnStorage(zdb.NewMemDB(), nil)
+	stale := sampleWrap(0)
+	stale.ToAddress = "0x0000000000000000000000000000000000000001"
+	stale.TokenAddress = "0x0000000000000000000000000000000000000002"
+	stale.Amount = big.NewInt(100)
+	stale.Fee = big.NewInt(99)
+	stale.Signature = "stale-sig-over-wrong-payload"
+	stale.SentSignature = true
+	if err := store.AddWrapRequest(stale); err != nil {
+		t.Fatal(err)
+	}
+
+	canonical := sampleWrap(0)
+	canonical.ToAddress = "0x00000000000000000000000000000000000000aa"
+	canonical.TokenAddress = "0x00000000000000000000000000000000000000bb"
+	canonical.Amount = big.NewInt(100)
+	canonical.Fee = big.NewInt(1)
+	canonical.Signature = ""
+	if err := store.PublishResignWraps([]events.WrapRequestZnn{canonical}); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := store.GetWrapRequestById(canonical.Id)
+	if err != nil || got == nil {
+		t.Fatalf("GetWrapRequestById: got=%+v err=%v", got, err)
+	}
+	if got.ToAddress != canonical.ToAddress || got.TokenAddress != canonical.TokenAddress ||
+		got.Amount.Cmp(canonical.Amount) != 0 || got.Fee.Cmp(canonical.Fee) != 0 {
+		t.Fatalf("PublishResignWraps preserved stale payload: got=%+v want=%+v", got, canonical)
+	}
+	if got.Signature != "" || got.SentSignature {
+		t.Fatalf("PublishResignWraps preserved stale signature after payload replacement: sig=%q sent=%v", got.Signature, got.SentSignature)
+	}
+	resign, err := store.GetResignStatus(canonical.Id)
+	if err != nil || !resign {
+		t.Fatalf("expected resign flag true, got %v err=%v", resign, err)
+	}
+}

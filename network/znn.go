@@ -1857,7 +1857,7 @@ func (rC *znnNetwork) startRuntimeEvmNetwork(network *definition.NetworkInfo) er
 		return errors.Errorf("missing RPC configuration for network %s (%d)", network.Name, network.Id)
 	}
 	ctx := rC.listenerCtx
-	client, err := rpc.NewEvmRpcClientContext(ctx, cfg, network.Name, ecommon.HexToAddress(network.ContractAddress))
+	client, err := rpc.NewEvmRpcClientForChainContext(ctx, cfg, network.Id, network.Name, ecommon.HexToAddress(network.ContractAddress))
 	if err != nil {
 		return err
 	}

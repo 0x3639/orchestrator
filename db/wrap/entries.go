@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"math/big"
 	"github.com/syndtr/goleveldb/leveldb"
 	zcommon "github.com/zenon-network/go-zenon/common"
 	"github.com/zenon-network/go-zenon/common/types"
@@ -496,9 +497,9 @@ func (es *eventStore) SetResignStatus(id types.Hash, status bool) error {
 	return nil
 }
 
-// PublishResignWraps atomically persists any missing wrap records and sets
-// their resign flags in a single durable batch. Existing rows keep their stored
-// fields (only filling in a missing signature), and rows that have already
+// PublishResignWraps atomically persists any missing wrap records, refreshes
+// existing unredeemed rows with the validated canonical wrap signing payload,
+// and sets their resign flags in a single durable batch. Rows that have already
 // moved past UnredeemedStatus are skipped.
 func (es *eventStore) PublishResignWraps(wraps []events.WrapRequestZnn) error {
 	if len(wraps) == 0 {
@@ -556,14 +557,43 @@ func (es *eventStore) PublishResignWraps(wraps []events.WrapRequestZnn) error {
 		if existing.RedeemStatus != common.UnredeemedStatus {
 			continue
 		}
-		if existing.Signature == "" && wrap.Signature != "" {
-			rawExisting, err := events.DeserializeWrapEventZnn(data)
-			if err != nil {
-				es.SendSigInt()
-				return err
+		rawExisting, err := events.DeserializeWrapEventZnn(data)
+		if err != nil {
+			es.SendSigInt()
+			return err
+		}
+		payloadChanged := rawExisting.NetworkClass != wrap.NetworkClass ||
+			rawExisting.ChainId != wrap.ChainId ||
+			rawExisting.ToAddress != wrap.ToAddress ||
+			rawExisting.TokenAddress != wrap.TokenAddress ||
+			(rawExisting.Amount == nil) != (wrap.Amount == nil) ||
+			(rawExisting.Amount != nil && rawExisting.Amount.Cmp(wrap.Amount) != 0) ||
+			(rawExisting.Fee == nil) != (wrap.Fee == nil) ||
+			(rawExisting.Fee != nil && rawExisting.Fee.Cmp(wrap.Fee) != 0)
+		if payloadChanged || (existing.Signature == "" && wrap.Signature != "") {
+			rawExisting.NetworkClass = wrap.NetworkClass
+			rawExisting.ChainId = wrap.ChainId
+			rawExisting.ToAddress = wrap.ToAddress
+			rawExisting.TokenAddress = wrap.TokenAddress
+			if wrap.Amount != nil {
+				rawExisting.Amount = new(big.Int).Set(wrap.Amount)
+			} else {
+				rawExisting.Amount = nil
 			}
-			rawExisting.Signature = wrap.Signature
-			rawExisting.SentSignature = rawExisting.SentSignature || wrap.SentSignature
+			if wrap.Fee != nil {
+				rawExisting.Fee = new(big.Int).Set(wrap.Fee)
+			} else {
+				rawExisting.Fee = nil
+			}
+			if payloadChanged {
+				// Any cached signature on a stale local payload no longer
+				// matches the confirmed wrap digest.
+				rawExisting.Signature = wrap.Signature
+				rawExisting.SentSignature = wrap.Signature != ""
+			} else {
+				rawExisting.Signature = wrap.Signature
+				rawExisting.SentSignature = rawExisting.SentSignature || wrap.SentSignature
+			}
 			serialized, serErr := rawExisting.Serialize()
 			if serErr != nil {
 				es.SendSigInt()

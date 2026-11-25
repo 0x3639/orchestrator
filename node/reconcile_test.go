@@ -3,6 +3,7 @@
 package node
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math/big"
@@ -253,7 +254,26 @@ func (c reconciliationChain) openNetworks(t *testing.T, state *common.GlobalStat
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := manager.RpcManager().AddEvmClient(cfg, entry.id, name, ecommon.Address{}); err != nil {
+		evmCfg := cfg
+		if entry.id > 0 {
+			chainHex := fmt.Sprintf(`"0x%x"`, entry.id)
+			evmSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				var req struct {
+					ID     json.RawMessage `json:"id"`
+					Method string          `json:"method"`
+				}
+				_ = json.NewDecoder(r.Body).Decode(&req)
+				w.Header().Set("Content-Type", "application/json")
+				if req.Method == "eth_chainId" {
+					_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":` + string(req.ID) + `,"result":` + chainHex + `}`))
+					return
+				}
+				_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":` + string(req.ID) + `,"result":"0x0"}`))
+			}))
+			t.Cleanup(evmSrv.Close)
+			evmCfg = config.BaseNetworkConfig{Urls: []string{evmSrv.URL}}
+		}
+		if err := manager.RpcManager().AddEvmClient(evmCfg, entry.id, name, ecommon.Address{}); err != nil {
 			t.Fatal(err)
 		}
 		manager.AddEvmNetwork(net)
