@@ -476,6 +476,18 @@ func (es *eventStore) PublishResignWraps(wraps []events.WrapRequestZnn) error {
 		key := getWrapEventKey(wrap.Id)
 		data, err := es.DB.Get(key)
 		if errors.Is(err, leveldb.ErrNotFound) {
+			// ApplyRedeemLog can record a finalized EVM outcome before the
+			// Zenon wrap row is stored. Check the separate redeem status record
+			// under es.mu so a known outcome is never marked for re-signing.
+			merged := wrap
+			checked, checkErr := es.withRedeemStatus(&merged)
+			if checkErr != nil {
+				es.SendSigInt()
+				return checkErr
+			}
+			if checked.RedeemStatus != common.UnredeemedStatus {
+				continue
+			}
 			serialized, serErr := wrap.Serialize()
 			if serErr != nil {
 				es.SendSigInt()

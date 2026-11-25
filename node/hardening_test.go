@@ -1,6 +1,7 @@
 package node
 
 import (
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"encoding/base64"
@@ -11,6 +12,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1506,7 +1508,32 @@ func TestReSignStateRetriesFailedFrontierRPCWithoutSkippingVisibleWrap(t *testin
 	}
 }
 
-func TestReSignStateCompletesDespiteContinuousBridgeActivityDuringCollection(t *testing.T) {
+// sortZenonWraps orders wrap entries using go-zenon's exact bridge storage key
+// order: CreationMomentumHeight descending, then Id ascending.
+func sortZenonWraps(wraps []*embedded.WrapTokenRequest) {
+	sort.Slice(wraps, func(i, j int) bool {
+		if wraps[i].CreationMomentumHeight != wraps[j].CreationMomentumHeight {
+			return wraps[i].CreationMomentumHeight > wraps[j].CreationMomentumHeight
+		}
+		return bytes.Compare(wraps[i].Id.Bytes(), wraps[j].Id.Bytes()) < 0
+	})
+}
+
+func paginateZenonWraps(wraps []*embedded.WrapTokenRequest, pageIndex, pageSize uint32) *embedded.WrapTokenRequestList {
+	start := int(pageIndex) * int(pageSize)
+	if start >= len(wraps) {
+		return &embedded.WrapTokenRequestList{Count: len(wraps), List: []*embedded.WrapTokenRequest{}}
+	}
+	end := start + int(pageSize)
+	if end > len(wraps) {
+		end = len(wraps)
+	}
+	page := make([]*embedded.WrapTokenRequest, end-start)
+	copy(page, wraps[start:end])
+	return &embedded.WrapTokenRequestList{Count: len(wraps), List: page}
+}
+
+func TestReSignStateCapturesSameCutoffHeightArrivalBeforePassedOffset(t *testing.T) {
 	prevDelay := resignRetryDelay
 	prevPageSize := resignPageSize
 	resignRetryDelay = 20 * time.Millisecond
@@ -1519,13 +1546,6 @@ func TestReSignStateCompletesDespiteContinuousBridgeActivityDuringCollection(t *
 	evmSrv := fakeEvmRpcServer(t)
 	defer evmSrv.Close()
 
-	wrapA := types.Hash{0xe1}
-	wrapB := types.Hash{0xe2}
-	wrapC := types.Hash{0xe3}
-	sameMomentumNewWrap := types.Hash{0xe4}
-	otherChainWrap := types.Hash{0xe5}
-	futureWrap := types.Hash{0xe6}
-
 	makeEntry := func(chainID uint32, id types.Hash, height uint64) *embedded.WrapTokenRequest {
 		return &embedded.WrapTokenRequest{
 			WrapTokenRequest: &definition.WrapTokenRequest{
@@ -1536,72 +1556,54 @@ func TestReSignStateCompletesDespiteContinuousBridgeActivityDuringCollection(t *
 		}
 	}
 
-	// Simulate continuous bridge activity on EVERY single page read:
-	// - Frontier account block advances on every call (simulating unrelated bridge activity).
-	// - Between page 0 and page 1: otherChainWrap (chain 2, h=100) inserts at
-	//   index 0 shifting existing wraps right, and sameMomentumNewWrap (chain 1,
-	//   h=100) arrives at the tail (same momentum height 100).
-	// - Between page 1 and page 2: futureWrap (chain 1, h=101 > cutoff 100)
-	//   inserts at index 0 shifting existing wraps right again.
-	// Forward pagination tied to the fixed cutoff 100 must complete in ONE pass
-	// without restarting page 0, mark wrapA/wrapB/wrapC/sameMomentumNewWrap,
-	// and exclude otherChainWrap and futureWrap.
-	var page0Calls atomic.Int32
-	var frontierHeight atomic.Uint64
-	frontierHeight.Store(10)
+	// Using go-zenon's exact ordering (CreationMomentumHeight DESC, Id ASC):
+	// Initial table at cutoffMomentum=100 (Count=3):
+	//   [ (100, 0x05), (100, 0x08), (99, 0x01) ]
+	// After page 0 is probed (and tail page 1 is read), two new wraps arrive at
+	// the exact cutoff height 100:
+	//   - sameHeightSmallerID (100, 0x02): inserts at index 0 (BEFORE 0x05, an
+	//     offset already passed by page 0)
+	//   - sameHeightLargerID  (100, 0x09): inserts AFTER 0x08 inside height 100
+	// All 5 wraps within cutoff 100 must be captured and marked before LiveState.
+	wrap100Mid := types.Hash{0x05}
+	wrap100High := types.Hash{0x08}
+	wrap99 := types.Hash{0x01}
+	sameHeightSmallerID := types.Hash{0x02}
+	sameHeightLargerID := types.Hash{0x09}
+
+	var tableMu sync.Mutex
+	table := []*embedded.WrapTokenRequest{
+		makeEntry(1, wrap100Mid, 100),
+		makeEntry(1, wrap100High, 100),
+		makeEntry(1, wrap99, 99),
+	}
+	sortZenonWraps(table)
+	var insertedSmaller, insertedLarger bool
 
 	bridge := &wrapTestBridge{
 		networks: &embedded.NetworkInfoList{
 			Count: 1,
 			List: []*definition.NetworkInfo{{
-				NetworkClass:    definition.EvmClass,
-				Id:              1,
-				Name:            "Ethereum",
+				NetworkClass: definition.EvmClass, Id: 1, Name: "Ethereum",
 				ContractAddress: "0x0000000000000000000000000000000000000001",
 			}},
 		},
 		frontierMomFn: func(_ context.Context, _ int32) (*api.Momentum, error) {
 			return testMomentum(100), nil
 		},
-		frontierFn: func(_ context.Context, _ int32) (*api.AccountBlock, error) {
-			h := frontierHeight.Add(1)
-			return testAccountBlock(h, types.Hash{byte(h)}), nil
-		},
-		pageHandler: func(pageIndex, _ uint32, _ int32) *embedded.WrapTokenRequestList {
-			// Advance bridge frontier on every page read to simulate constant bridge activity.
-			frontierHeight.Add(1)
-			switch pageIndex {
-			case 0:
-				page0Calls.Add(1)
-				// Initial table: [wrapA, wrapB, wrapC] (Count=3).
-				return &embedded.WrapTokenRequestList{
-					Count: 3,
-					List: []*embedded.WrapTokenRequest{
-						makeEntry(1, wrapA, 100),
-						makeEntry(1, wrapB, 100),
-					},
-				}
-			case 1:
-				// Mutated table: [otherChainWrap, wrapA, wrapB, wrapC, sameMomentumNewWrap] (Count=5).
-				return &embedded.WrapTokenRequestList{
-					Count: 5,
-					List: []*embedded.WrapTokenRequest{
-						makeEntry(1, wrapB, 100),
-						makeEntry(1, wrapC, 100),
-					},
-				}
-			case 2:
-				// Mutated again: [futureWrap, otherChainWrap, wrapA, wrapB, wrapC, sameMomentumNewWrap] (Count=6).
-				return &embedded.WrapTokenRequestList{
-					Count: 6,
-					List: []*embedded.WrapTokenRequest{
-						makeEntry(1, wrapC, 100),
-						makeEntry(1, sameMomentumNewWrap, 100),
-					},
-				}
-			default:
-				return &embedded.WrapTokenRequestList{Count: 6, List: []*embedded.WrapTokenRequest{}}
+		pageHandler: func(pageIndex, pageSize uint32, call int32) *embedded.WrapTokenRequestList {
+			tableMu.Lock()
+			defer tableMu.Unlock()
+			if call == 3 && !insertedSmaller {
+				insertedSmaller = true
+				table = append(table, makeEntry(1, sameHeightSmallerID, 100))
+				sortZenonWraps(table)
+			} else if call == 4 && !insertedLarger {
+				insertedLarger = true
+				table = append(table, makeEntry(1, sameHeightLargerID, 100))
+				sortZenonWraps(table)
 			}
+			return paginateZenonWraps(table, pageIndex, pageSize)
 		},
 	}
 
@@ -1617,23 +1619,132 @@ func TestReSignStateCompletesDespiteContinuousBridgeActivityDuringCollection(t *
 		<-done
 	})
 
-	eventually(t, "ReSignState to complete forward scan despite continuous bridge activity", func() bool {
+	eventually(t, "ReSignState to capture same-cutoff-height arrivals inserted before and after passed offsets", func() bool {
 		st, _ := n.state.GetState()
-		rA, eA := n.dbManager.ZnnStorage().GetResignStatus(wrapA)
-		rB, eB := n.dbManager.ZnnStorage().GetResignStatus(wrapB)
-		rC, eC := n.dbManager.ZnnStorage().GetResignStatus(wrapC)
-		rS, eS := n.dbManager.ZnnStorage().GetResignStatus(sameMomentumNewWrap)
-		return eA == nil && eB == nil && eC == nil && eS == nil && rA && rB && rC && rS && st == common.LiveState
+		for _, id := range []types.Hash{wrap100Mid, wrap100High, wrap99, sameHeightSmallerID, sameHeightLargerID} {
+			r, err := n.dbManager.ZnnStorage().GetResignStatus(id)
+			if err != nil || !r {
+				return false
+			}
+		}
+		return st == common.LiveState
+	})
+}
+
+func TestReSignStateTerminatesUnderSustainedArrivalsExceedingPageSize(t *testing.T) {
+	prevDelay := resignRetryDelay
+	prevPageSize := resignPageSize
+	resignRetryDelay = 20 * time.Millisecond
+	resignPageSize = 2
+	t.Cleanup(func() {
+		resignRetryDelay = prevDelay
+		resignPageSize = prevPageSize
 	})
 
-	if got := page0Calls.Load(); got != 1 {
-		t.Fatalf("expected single forward pass without restarting page 0, got %d page-0 reads", got)
+	evmSrv := fakeEvmRpcServer(t)
+	defer evmSrv.Close()
+
+	makeEntry := func(chainID uint32, id types.Hash, height uint64) *embedded.WrapTokenRequest {
+		return &embedded.WrapTokenRequest{
+			WrapTokenRequest: &definition.WrapTokenRequest{
+				NetworkClass: definition.EvmClass, ChainId: chainID, Id: id,
+				Amount: big.NewInt(10), Fee: big.NewInt(1), CreationMomentumHeight: height,
+			},
+			ConfirmationsToFinality: 0,
+		}
 	}
-	if ev, err := n.dbManager.ZnnStorage().GetWrapRequestById(otherChainWrap); err != nil || ev != nil {
-		t.Fatalf("unrelated chain wrap should not have been stored: ev=%+v err=%v", ev, err)
-	}
-	if ev, err := n.dbManager.ZnnStorage().GetWrapRequestById(futureWrap); err != nil || ev != nil {
-		t.Fatalf("post-cutoff wrap should not have been stored: ev=%+v err=%v", ev, err)
+
+	// Test sustained growth at BOTH == pageSize (+2/call) and > pageSize (+3/call)
+	// continuing on EVERY single GetAllWrapTokenRequests call throughout the
+	// entire scan without ever stopping.
+	for _, arrivalsPerCall := range []int{2, 3} {
+		arrivalsPerCall := arrivalsPerCall
+		t.Run(strings.Repeat("+", arrivalsPerCall)+"_arrivals_per_rpc", func(t *testing.T) {
+			wrap4 := types.Hash{0xe4}
+			wrap3 := types.Hash{0xe3}
+			wrap2 := types.Hash{0xe2}
+			wrap1 := types.Hash{0xe1}
+			otherChainWrap := types.Hash{0xe9}
+
+			var tableMu sync.Mutex
+			table := []*embedded.WrapTokenRequest{
+				makeEntry(1, wrap4, 100),
+				makeEntry(1, wrap3, 99),
+				makeEntry(2, otherChainWrap, 99),
+				makeEntry(1, wrap2, 98),
+				makeEntry(1, wrap1, 97),
+			}
+			sortZenonWraps(table)
+			var futureSeq uint32
+			var futureIDs []types.Hash
+
+			bridge := &wrapTestBridge{
+				networks: &embedded.NetworkInfoList{
+					Count: 1,
+					List: []*definition.NetworkInfo{{
+						NetworkClass: definition.EvmClass, Id: 1, Name: "Ethereum",
+						ContractAddress: "0x0000000000000000000000000000000000000001",
+					}},
+				},
+				frontierMomFn: func(_ context.Context, _ int32) (*api.Momentum, error) {
+					return testMomentum(100), nil
+				},
+				pageHandler: func(pageIndex, pageSize uint32, call int32) *embedded.WrapTokenRequestList {
+					tableMu.Lock()
+					defer tableMu.Unlock()
+					// Keep growing the table on EVERY call after the initial probe,
+					// including the final call that terminates the scan.
+					if call > 1 {
+						for i := 0; i < arrivalsPerCall; i++ {
+							futureSeq++
+							id := types.Hash{0xf0, byte(futureSeq >> 8), byte(futureSeq)}
+							futureIDs = append(futureIDs, id)
+							table = append(table, makeEntry(1, id, 100+uint64(call)))
+						}
+						sortZenonWraps(table)
+					}
+					return paginateZenonWraps(table, pageIndex, pageSize)
+				},
+			}
+
+			n := wrapTestNodeWithEvm(t, common.LiveState, bridge, map[string]string{"Ethereum": evmSrv.URL})
+			if activated, err := n.state.ActivateResign(definition.EvmClass, 1); err != nil || !activated {
+				t.Fatalf("ActivateResign failed: activated=%v err=%v", activated, err)
+			}
+			n.state.CompleteStartup()
+
+			n.workers.start(n.processSignatures)
+			t.Cleanup(func() {
+				done := n.workers.shutdown()
+				<-done
+			})
+
+			eventually(t, "ReSignState to terminate despite sustained arrivals on every RPC", func() bool {
+				st, _ := n.state.GetState()
+				for _, id := range []types.Hash{wrap4, wrap3, wrap2, wrap1} {
+					r, err := n.dbManager.ZnnStorage().GetResignStatus(id)
+					if err != nil || !r {
+						return false
+					}
+				}
+				return st == common.LiveState
+			})
+
+			if ev, err := n.dbManager.ZnnStorage().GetWrapRequestById(otherChainWrap); err != nil || ev != nil {
+				t.Fatalf("unrelated chain wrap should not have been stored: ev=%+v err=%v", ev, err)
+			}
+			tableMu.Lock()
+			createdFuture := append([]types.Hash(nil), futureIDs...)
+			tableMu.Unlock()
+			if len(createdFuture) < arrivalsPerCall*2 {
+				t.Fatalf("expected sustained future arrivals during scan, got only %d", len(createdFuture))
+			}
+			for _, id := range createdFuture {
+				if ev, err := n.dbManager.ZnnStorage().GetWrapRequestById(id); err != nil || ev != nil {
+					t.Fatalf("post-cutoff wrap %s should not have been stored: ev=%+v err=%v", id, ev, err)
+				}
+			}
+		})
 	}
 }
 

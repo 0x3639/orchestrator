@@ -56,6 +56,18 @@ func TestGetAllWrapTokenRequestsContextRejectsMissingNullFinalityAndNullPage(t *
 		}
 	})
 
+	const testWrapFieldsNoID = `"networkClass":2,"chainId":1,` +
+		`"toAddress":"0x0000000000000000000000000000000000000001",` +
+		`"tokenStandard":"zts1znnxxxxxxxxxxxxx9z4ulx",` +
+		`"tokenAddress":"0x0000000000000000000000000000000000000002",` +
+		`"amount":"100","fee":"1","signature":"sig","creationMomentumHeight":42,"confirmationsToFinality":0`
+	const testWrapFieldsNoHeight = `"networkClass":2,"chainId":1,` +
+		`"id":"00000000000000000000000000000000000000000000000000000000000000bb",` +
+		`"toAddress":"0x0000000000000000000000000000000000000001",` +
+		`"tokenStandard":"zts1znnxxxxxxxxxxxxx9z4ulx",` +
+		`"tokenAddress":"0x0000000000000000000000000000000000000002",` +
+		`"amount":"100","fee":"1","signature":"sig","confirmationsToFinality":0`
+
 	for _, tc := range []struct {
 		name  string
 		reply string
@@ -66,6 +78,11 @@ func TestGetAllWrapTokenRequestsContextRejectsMissingNullFinalityAndNullPage(t *
 		{"null entry", `{"count":1,"list":[null]}`},
 		{"omitted confirmationsToFinality", `{"count":1,"list":[{` + testWrapFields + `}]}`},
 		{"null confirmationsToFinality", `{"count":1,"list":[{` + testWrapFields + `,"confirmationsToFinality":null}]}`},
+		{"omitted id", `{"count":1,"list":[{` + testWrapFieldsNoID + `}]}`},
+		{"null id", `{"count":1,"list":[{` + testWrapFieldsNoID + `,"id":null}]}`},
+		{"zero id", `{"count":1,"list":[{` + testWrapFieldsNoID + `,"id":"0000000000000000000000000000000000000000000000000000000000000000"}]}`},
+		{"omitted creationMomentumHeight", `{"count":1,"list":[{` + testWrapFieldsNoHeight + `}]}`},
+		{"null creationMomentumHeight", `{"count":1,"list":[{` + testWrapFieldsNoHeight + `,"creationMomentumHeight":null}]}`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			znn := newRawZnnRPC(t, tc.reply)
@@ -96,12 +113,29 @@ func TestGetWrapTokenRequestByIdContextRejectsMissingAndNullFinality(t *testing.
 		}
 	})
 
+	const testWrapFieldsNoID = `"networkClass":2,"chainId":1,` +
+		`"toAddress":"0x0000000000000000000000000000000000000001",` +
+		`"tokenStandard":"zts1znnxxxxxxxxxxxxx9z4ulx",` +
+		`"tokenAddress":"0x0000000000000000000000000000000000000002",` +
+		`"amount":"100","fee":"1","signature":"sig","creationMomentumHeight":42,"confirmationsToFinality":0`
+	const testWrapFieldsNoHeight = `"networkClass":2,"chainId":1,` +
+		`"id":"00000000000000000000000000000000000000000000000000000000000000bb",` +
+		`"toAddress":"0x0000000000000000000000000000000000000001",` +
+		`"tokenStandard":"zts1znnxxxxxxxxxxxxx9z4ulx",` +
+		`"tokenAddress":"0x0000000000000000000000000000000000000002",` +
+		`"amount":"100","fee":"1","signature":"sig","confirmationsToFinality":0`
+
 	for _, tc := range []struct {
 		name  string
 		reply string
 	}{
 		{"omitted confirmationsToFinality", `{` + testWrapFields + `}`},
 		{"null confirmationsToFinality", `{` + testWrapFields + `,"confirmationsToFinality":null}`},
+		{"omitted id", `{` + testWrapFieldsNoID + `}`},
+		{"null id", `{` + testWrapFieldsNoID + `,"id":null}`},
+		{"zero id", `{` + testWrapFieldsNoID + `,"id":"0000000000000000000000000000000000000000000000000000000000000000"}`},
+		{"omitted creationMomentumHeight", `{` + testWrapFieldsNoHeight + `}`},
+		{"null creationMomentumHeight", `{` + testWrapFieldsNoHeight + `,"creationMomentumHeight":null}`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			znn := newRawZnnRPC(t, tc.reply)

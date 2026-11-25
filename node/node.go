@@ -1306,15 +1306,6 @@ var resignRPCTimeout = rpc.ZnnLedgerTimeout
 // ReSignState (overridable in tests to exercise real multi-page scans).
 var resignPageSize uint32 = 100
 
-// hasMoreWrapPages reports whether GetAllWrapTokenRequests has further pages
-// after pageIndex given the reported total Count.
-func hasMoreWrapPages(pageIndex, pageSize uint32, count, listLen int) bool {
-	if count > 0 {
-		return int(pageIndex+1)*int(pageSize) < count
-	}
-	return listLen > 0
-}
-
 // expectedWrapPageLen returns the exact number of wrap entries a complete
 // GetAllWrapTokenRequests(pageIndex, pageSize) response must contain when
 // Count total requests exist in bridge storage.
@@ -1330,13 +1321,74 @@ func expectedWrapPageLen(pageIndex, pageSize uint32, count int) int {
 	return rem
 }
 
-// captureReSignSnapshot collects all wrap requests matching
+// fetchCompleteWrapPage reads pageIndex with strict per-page completeness:
+// the returned List must contain exactly expectedWrapPageLen distinct non-nil
+// wrap entries for the reported Count.
+func (node *Node) fetchCompleteWrapPage(pageIndex, pageSize uint32, resignGen uint64) (page *embedded.WrapTokenRequestList, stale, stop bool) {
+	for {
+		if node.workerStopping() {
+			return nil, false, true
+		}
+		if !node.state.IsResignGenerationCurrent(resignGen) {
+			return nil, true, false
+		}
+
+		pageCtx, pageCancel := context.WithTimeout(node.workers.context(), resignRPCTimeout)
+		wrapRequests, err := node.networksManager.Znn().GetAllWrapTokenRequestsContext(pageCtx, pageIndex, pageSize)
+		pageCancel()
+		if node.workerStopping() {
+			return nil, false, true
+		}
+		if err != nil {
+			node.logger.Debugf("resign scan page %d RPC failed: %v", pageIndex, err)
+			if !node.workerSleep(resignRetryDelay) {
+				return nil, false, true
+			}
+			continue
+		}
+
+		expectedLen := expectedWrapPageLen(pageIndex, pageSize, wrapRequests.Count)
+		pageValid := len(wrapRequests.List) == expectedLen
+		if pageValid {
+			pageIDs := make(map[types.Hash]struct{}, len(wrapRequests.List))
+			for _, wrap := range wrapRequests.List {
+				if wrap == nil || wrap.WrapTokenRequest == nil {
+					pageValid = false
+					break
+				}
+				if _, dup := pageIDs[wrap.Id]; dup {
+					pageValid = false
+					break
+				}
+				pageIDs[wrap.Id] = struct{}{}
+			}
+		}
+		if !pageValid {
+			node.logger.Debugf("resign scan page %d incomplete (got %d, want %d for count %d); retrying page", pageIndex, len(wrapRequests.List), expectedLen, wrapRequests.Count)
+			if !node.workerSleep(resignRetryDelay) {
+				return nil, false, true
+			}
+			continue
+		}
+		return wrapRequests, false, false
+	}
+}
+
+// captureReSignSnapshot collects every wrap request matching
 // (resignNetworkClass, resignChainId) created at or before a live Zenon
-// frontier momentum cutoff. Because Zenon stores wrap requests append-only in
-// ascending ID order, forward pagination with per-page completeness verification
-// and a total distinct-ID coverage check makes strict forward progress even
-// under continuous bridge activity, retries any page with omitted/null entries,
-// and never falls back to a stale cached frontier height.
+// frontier momentum cutoff.
+//
+// Zenon stores wrap requests in descending CreationMomentumHeight order
+// (breaking ties by ascending Id), so new arrivals prepend at index 0 while
+// older wraps keep a fixed reverse index (revIdx = Count - 1 - idx) from the
+// tail. Scanning contiguously from the tail (revIdx = 0) upward until either
+// index 0 or the first wrap with CreationMomentumHeight > cutoffMomentum:
+//   - guarantees no wrap within cutoffMomentum is missed (including same-height
+//     insertions before already-read offsets),
+//   - terminates cleanly even under sustained arrivals at >= pageSize per RPC
+//     by anchoring progress to the fixed tail membership and compensating for
+//     observed prefix growth, and
+//   - never falls back to a stale cached frontier height.
 func (node *Node) captureReSignSnapshot(resignNetworkClass, resignChainId uint32, resignGen uint64) (wraps []*embedded.WrapTokenRequest, stale, stop bool) {
 	pageSize := resignPageSize
 	if pageSize == 0 {
@@ -1369,6 +1421,64 @@ func (node *Node) captureReSignSnapshot(resignNetworkClass, resignChainId uint32
 		}
 	}
 
+	// Probe page 0 to learn the initial Count. Small tables (<= pageSize)
+	// complete atomically in a single verified RPC.
+	probe, stale, stop := node.fetchCompleteWrapPage(0, pageSize, resignGen)
+	if stale || stop {
+		return nil, stale, stop
+	}
+	node.logger.Debugf("len(wrapRequests.List): %d, count: %d, pageIndex: 0", len(probe.List), probe.Count)
+	if probe.Count == 0 {
+		return nil, false, false
+	}
+
+	snapshotByID := make(map[types.Hash]*embedded.WrapTokenRequest)
+	snapshotOrder := make([]types.Hash, 0)
+	recordWrap := func(wrap *embedded.WrapTokenRequest) {
+		if wrap.NetworkClass != resignNetworkClass || wrap.ChainId != resignChainId {
+			return
+		}
+		if wrap.CreationMomentumHeight > cutoffMomentum {
+			return
+		}
+		if _, exists := snapshotByID[wrap.Id]; !exists {
+			snapshotOrder = append(snapshotOrder, wrap.Id)
+		}
+		snapshotByID[wrap.Id] = wrap
+	}
+
+	if probe.Count <= int(pageSize) {
+		for _, wrap := range probe.List {
+			recordWrap(wrap)
+		}
+		snapshot := make([]*embedded.WrapTokenRequest, 0, len(snapshotOrder))
+		for _, id := range snapshotOrder {
+			snapshot = append(snapshot, snapshotByID[id])
+		}
+		return snapshot, false, false
+	}
+
+	// Walk contiguously from the oldest tail wrap (revIdx = 0) upward until
+	// index 0 or the first wrap with CreationMomentumHeight > cutoffMomentum.
+	// Entries strictly below cutoffMomentum never shift in revIdx; entries at
+	// cutoffMomentum become permanently fixed once any wrap above cutoffMomentum
+	// is observed.
+	const maxResignPageSize uint32 = 1024
+	curPageSize := pageSize
+	estCount := probe.Count
+	prevCount := probe.Count
+	estGrowth := 0
+	stalledReads := 0
+	immutableTail := 0
+	sawAboveCutoff := false
+	for _, wrap := range probe.List {
+		if wrap.CreationMomentumHeight > cutoffMomentum {
+			sawAboveCutoff = true
+			break
+		}
+	}
+	coveredFromTail := make(map[int]*embedded.WrapTokenRequest)
+
 	for {
 		if node.workerStopping() {
 			return nil, false, true
@@ -1377,101 +1487,107 @@ func (node *Node) captureReSignSnapshot(resignNetworkClass, resignChainId uint32
 			return nil, true, false
 		}
 
-		allSeenIDs := make(map[types.Hash]struct{})
-		snapshotByID := make(map[types.Hash]*embedded.WrapTokenRequest)
-		snapshotOrder := make([]types.Hash, 0)
-		startCount := -1
-		pageIndex := uint32(0)
-
+		doneFromTail := immutableTail
 		for {
-			if node.workerStopping() {
-				return nil, false, true
-			}
-			if !node.state.IsResignGenerationCurrent(resignGen) {
-				return nil, true, false
-			}
-
-			pageCtx, pageCancel := context.WithTimeout(node.workers.context(), resignRPCTimeout)
-			wrapRequests, err := node.networksManager.Znn().GetAllWrapTokenRequestsContext(pageCtx, pageIndex, pageSize)
-			pageCancel()
-			if node.workerStopping() {
-				return nil, false, true
-			}
-			if err != nil {
-				node.logger.Debugf("resign scan page %d RPC failed: %v", pageIndex, err)
-				if !node.workerSleep(resignRetryDelay) {
-					return nil, false, true
-				}
-				continue
-			}
-
-			// Verify page completeness: the Zenon RPC reports Count over all
-			// stored wraps and can omit entries from List on transient per-item
-			// errors. Retry this page until all expected distinct entries arrive.
-			expectedLen := expectedWrapPageLen(pageIndex, pageSize, wrapRequests.Count)
-			pageValid := len(wrapRequests.List) == expectedLen
-			if pageValid {
-				pageIDs := make(map[types.Hash]struct{}, len(wrapRequests.List))
-				for _, wrap := range wrapRequests.List {
-					if wrap == nil || wrap.WrapTokenRequest == nil {
-						pageValid = false
-						break
-					}
-					if _, dup := pageIDs[wrap.Id]; dup {
-						pageValid = false
-						break
-					}
-					pageIDs[wrap.Id] = struct{}{}
-				}
-			}
-			if !pageValid {
-				node.logger.Debugf("resign scan page %d incomplete (got %d, want %d for count %d); retrying page", pageIndex, len(wrapRequests.List), expectedLen, wrapRequests.Count)
-				if !node.workerSleep(resignRetryDelay) {
-					return nil, false, true
-				}
-				continue
-			}
-
-			if pageIndex == 0 {
-				startCount = wrapRequests.Count
-			}
-			node.logger.Debugf("len(wrapRequests.List): %d, count: %d, pageIndex: %d", len(wrapRequests.List), wrapRequests.Count, pageIndex)
-			for _, wrap := range wrapRequests.List {
-				allSeenIDs[wrap.Id] = struct{}{}
-				if wrap.NetworkClass != resignNetworkClass || wrap.ChainId != resignChainId {
-					continue
-				}
-				if wrap.CreationMomentumHeight > cutoffMomentum {
-					continue
-				}
-				if _, exists := snapshotByID[wrap.Id]; !exists {
-					snapshotOrder = append(snapshotOrder, wrap.Id)
-				}
-				snapshotByID[wrap.Id] = wrap
-			}
-
-			if !hasMoreWrapPages(pageIndex, pageSize, wrapRequests.Count, len(wrapRequests.List)) {
+			if _, ok := coveredFromTail[doneFromTail]; !ok {
 				break
 			}
-			pageIndex++
+			doneFromTail++
 		}
 
-		if !node.state.IsResignGenerationCurrent(resignGen) {
-			return nil, true, false
+		predCount := estCount + estGrowth
+		wantEnd := predCount - doneFromTail
+		if wantEnd <= 0 {
+			wantEnd = 1
 		}
-		if startCount < 0 || len(allSeenIDs) < startCount {
-			node.logger.Debugf("resign scan observed %d distinct wraps across pages, fewer than initial count %d; retrying pass", len(allSeenIDs), startCount)
-			if !node.workerSleep(resignRetryDelay) {
-				return nil, false, true
+		pageIndex := uint32((wantEnd - 1) / int(curPageSize))
+
+		wrapRequests, stale, stop := node.fetchCompleteWrapPage(pageIndex, curPageSize, resignGen)
+		if stale || stop {
+			return nil, stale, stop
+		}
+		node.logger.Debugf("len(wrapRequests.List): %d, count: %d, pageIndex: %d", len(wrapRequests.List), wrapRequests.Count, pageIndex)
+
+		actualCount := wrapRequests.Count
+		if actualCount > prevCount {
+			estGrowth = actualCount - prevCount
+		} else {
+			estGrowth = 0
+		}
+		countChanged := actualCount != prevCount
+		prevCount = actualCount
+		estCount = actualCount
+
+		wasAboveCutoff := sawAboveCutoff
+		for _, wrap := range wrapRequests.List {
+			if wrap.CreationMomentumHeight > cutoffMomentum {
+				sawAboveCutoff = true
+				break
 			}
-			continue
+		}
+		// While wraps can still arrive at height == cutoffMomentum, count changes
+		// can shift revIdx inside that single momentum. Drop only the unfinalized
+		// cutoff-height cache; immutableTail (< cutoffMomentum) never shifts.
+		if countChanged && !wasAboveCutoff && len(coveredFromTail) > 0 {
+			clear(coveredFromTail)
 		}
 
-		snapshot := make([]*embedded.WrapTokenRequest, 0, len(snapshotOrder))
-		for _, id := range snapshotOrder {
-			snapshot = append(snapshot, snapshotByID[id])
+		startIdx := int(pageIndex) * int(curPageSize)
+		for i, wrap := range wrapRequests.List {
+			revIdx := actualCount - 1 - (startIdx + i)
+			if revIdx >= immutableTail {
+				coveredFromTail[revIdx] = wrap
+			}
 		}
-		return snapshot, false, false
+
+		r := immutableTail
+		done := false
+		for {
+			wrap, ok := coveredFromTail[r]
+			if !ok {
+				break
+			}
+			if wrap.CreationMomentumHeight > cutoffMomentum {
+				// Reached the > cutoffMomentum boundary contiguously from revIdx 0.
+				for k := immutableTail; k < r; k++ {
+					recordWrap(coveredFromTail[k])
+				}
+				done = true
+				break
+			}
+			if wrap.CreationMomentumHeight < cutoffMomentum || sawAboveCutoff {
+				recordWrap(wrap)
+				delete(coveredFromTail, r)
+				immutableTail++
+			}
+			r++
+		}
+		if !done && r >= actualCount {
+			// Contiguously covered revIdx 0..actualCount-1 all the way to index 0.
+			for k := immutableTail; k < actualCount; k++ {
+				recordWrap(coveredFromTail[k])
+			}
+			done = true
+		}
+		if done {
+			snapshot := make([]*embedded.WrapTokenRequest, 0, len(snapshotOrder))
+			for _, id := range snapshotOrder {
+				snapshot = append(snapshot, snapshotByID[id])
+			}
+			return snapshot, false, false
+		}
+		if r > doneFromTail {
+			stalledReads = 0
+		} else {
+			stalledReads++
+			if stalledReads >= 2 && curPageSize < maxResignPageSize {
+				curPageSize *= 2
+				if curPageSize > maxResignPageSize {
+					curPageSize = maxResignPageSize
+				}
+				stalledReads = 0
+			}
+		}
 	}
 }
 

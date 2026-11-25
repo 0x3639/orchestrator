@@ -267,13 +267,21 @@ func decodeWrapTokenRequestWithFinality(raw json.RawMessage) (*embedded.WrapToke
 	if len(raw) == 0 || string(raw) == "null" {
 		return nil, nil
 	}
-	var finality struct {
-		ConfirmationsToFinality *uint64 `json:"confirmationsToFinality"`
+	var fields struct {
+		Id                      *types.Hash `json:"id"`
+		CreationMomentumHeight  *uint64     `json:"creationMomentumHeight"`
+		ConfirmationsToFinality *uint64     `json:"confirmationsToFinality"`
 	}
-	if err := json.Unmarshal(raw, &finality); err != nil {
+	if err := json.Unmarshal(raw, &fields); err != nil {
 		return nil, err
 	}
-	if finality.ConfirmationsToFinality == nil {
+	if fields.Id == nil || *fields.Id == types.ZeroHash {
+		return nil, errors.New("wrap request reply without a valid id")
+	}
+	if fields.CreationMomentumHeight == nil {
+		return nil, errors.New("wrap request reply without creationMomentumHeight")
+	}
+	if fields.ConfirmationsToFinality == nil {
 		return nil, errors.New("wrap request reply without confirmationsToFinality")
 	}
 	wrap, err := decodeRedeemWrap(raw)
@@ -285,7 +293,7 @@ func decodeWrapTokenRequestWithFinality(raw json.RawMessage) (*embedded.WrapToke
 	}
 	return &embedded.WrapTokenRequest{
 		WrapTokenRequest:        wrap,
-		ConfirmationsToFinality: *finality.ConfirmationsToFinality,
+		ConfirmationsToFinality: *fields.ConfirmationsToFinality,
 	}, nil
 }
 

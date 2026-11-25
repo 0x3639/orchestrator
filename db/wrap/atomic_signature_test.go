@@ -95,6 +95,7 @@ func TestPublishResignWrapsAtomicallyStoresMissingAndSkipsRedeemed(t *testing.T)
 		missingID := types.Hash{0x61}
 		existingUnredeemedID := types.Hash{0x62}
 		redeemedID := types.Hash{0x63}
+		preRedeemedNoRowID := types.Hash{0x64}
 
 		if err := store.AddWrapRequest(events.WrapRequestZnn{
 			NetworkClass: 2, ChainId: 1, Id: existingUnredeemedID,
@@ -110,11 +111,16 @@ func TestPublishResignWrapsAtomicallyStoresMissingAndSkipsRedeemed(t *testing.T)
 		}); err != nil {
 			t.Fatal(err)
 		}
+		// Record an EVM redeem outcome BEFORE the Zenon wrap row exists.
+		if err := store.ApplyRedeemLog(1, preRedeemedNoRowID, 50, 0, common.RedeemedStatus); err != nil {
+			t.Fatal(err)
+		}
 
 		batch := []events.WrapRequestZnn{
 			{NetworkClass: 2, ChainId: 1, Id: missingID, Amount: big.NewInt(10), Fee: big.NewInt(1), Signature: "bridge-sig", RedeemStatus: common.UnredeemedStatus},
 			{NetworkClass: 2, ChainId: 1, Id: existingUnredeemedID, Amount: big.NewInt(20), Fee: big.NewInt(1), Signature: "other-sig", RedeemStatus: common.UnredeemedStatus},
 			{NetworkClass: 2, ChainId: 1, Id: redeemedID, Amount: big.NewInt(30), Fee: big.NewInt(1), Signature: "other-sig", RedeemStatus: common.UnredeemedStatus},
+			{NetworkClass: 2, ChainId: 1, Id: preRedeemedNoRowID, Amount: big.NewInt(40), Fee: big.NewInt(1), Signature: "bridge-sig", RedeemStatus: common.UnredeemedStatus},
 		}
 		if err := store.PublishResignWraps(batch); err != nil {
 			t.Fatalf("PublishResignWraps failed: %v", err)
@@ -134,6 +140,9 @@ func TestPublishResignWrapsAtomicallyStoresMissingAndSkipsRedeemed(t *testing.T)
 		}
 		if resign, err := store.GetResignStatus(redeemedID); err != nil || resign {
 			t.Fatalf("already-redeemed wrap must not be marked for resign: resign=%v err=%v", resign, err)
+		}
+		if resign, err := store.GetResignStatus(preRedeemedNoRowID); err != nil || resign {
+			t.Fatalf("wrap with pre-existing EVM redeem outcome must not be marked for resign: resign=%v err=%v", resign, err)
 		}
 	}
 
