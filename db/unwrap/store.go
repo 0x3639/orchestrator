@@ -1,6 +1,7 @@
 package unwrap
 
 import (
+	"github.com/syndtr/goleveldb/leveldb"
 	zdb "github.com/zenon-network/go-zenon/common/db"
 	"orchestrator/common"
 	"orchestrator/db"
@@ -14,6 +15,9 @@ func getStorageIterator() []byte {
 
 type evmStorage struct {
 	zdb.DB
+	// rawLdb, when set, is used for fsynced writes (Sync: true) of crash-critical
+	// metadata such as pre-broadcast pending EVM transaction watermarks.
+	rawLdb                   *leveldb.DB
 	stopChan                 chan os.Signal
 	contractDeploymentHeight uint64
 	// mu serializes every read-modify-write of an unwrap record. Sync, the
@@ -49,6 +53,22 @@ func NewEvmStorage(db zdb.DB, stopChan chan os.Signal, contractDeploymentHeight 
 	}
 	return &evmStorage{
 		DB:                       db,
+		stopChan:                 stopChan,
+		contractDeploymentHeight: contractDeploymentHeight,
+		mu:                       &sync.Mutex{},
+	}
+}
+
+// NewEvmStorageWithLevelDB constructs an EVM store backed by ldb so
+// crash-critical writes (such as pre-broadcast pending transaction watermarks)
+// can flush synchronously with opt.WriteOptions{Sync: true}.
+func NewEvmStorageWithLevelDB(ldb *leveldb.DB, stopChan chan os.Signal, contractDeploymentHeight uint64) db.EvmStorage {
+	if ldb == nil {
+		panic("account store can't operate with nil leveldb")
+	}
+	return &evmStorage{
+		DB:                       zdb.NewLevelDBWrapper(ldb),
+		rawLdb:                   ldb,
 		stopChan:                 stopChan,
 		contractDeploymentHeight: contractDeploymentHeight,
 		mu:                       &sync.Mutex{},

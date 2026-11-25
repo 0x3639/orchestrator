@@ -494,22 +494,19 @@ func (m *NetworksManager) AddEvmNetwork(network *evmNetwork) {
 func (m *NetworksManager) RemoveEvmNetwork(chainId uint32) {
 	m.health.RemoveNetwork(chainId)
 	m.evmMu.Lock()
-	defer m.evmMu.Unlock()
+	var removed *evmNetwork
 	for idx, network := range m.evmNetworks {
 		if network.ChainId() == chainId {
-			// halt closes done and stops the health poller under one lock,
-			// so a Start running beside this removal cannot begin a poller
-			// after it.
-			network.halt()
-			// A worker waiting on the queue returns, and the queue is free for
-			// a network added again under the same name. With done closed, a
-			// worker that finds the queue closed does not stop the node.
-			if err := network.closeQueue(); err != nil {
-				m.logger.Debugf("queue of removed EVM network %d: %v", chainId, err)
-			}
+			removed = network
 			m.evmNetworks = append(m.evmNetworks[:idx], m.evmNetworks[idx+1:]...)
-			return
+			break
 		}
+	}
+	m.evmMu.Unlock()
+	if removed != nil {
+		// Release evmMu before waiting so in-flight workers and health polls
+		// finish cleanly before the caller closes or deletes the backing store.
+		removed.drainWorkers(removed.client != nil)
 	}
 }
 

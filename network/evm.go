@@ -30,6 +30,18 @@ import (
 	"time"
 )
 
+type queuedUnwrapKey struct {
+	txHash   ecommon.Hash
+	logIndex uint32
+}
+
+func normalizeQueuedLogIndex(logIndex uint32) uint32 {
+	if logIndex >= common.AffiliateLogIndexAddition {
+		return logIndex - common.AffiliateLogIndexAddition
+	}
+	return logIndex
+}
+
 type evmNetwork struct {
 	// A runtime addition uses its own client until startup succeeds.
 	client      *rpc.EvmRpc
@@ -39,19 +51,29 @@ type evmNetwork struct {
 	// aheadOfBridgeAccount.
 	bridgeRead    <-chan struct{}
 	rollbackStore func()
+	// store pins this network instance's workers to the LevelDB store opened
+	// for it, so removing or re-adding the chain ID never causes an in-flight
+	// worker to dereference nil or write into a replacement store.
+	store db.EvmStorage
+	// workersWg tracks background loops started by Start (SubscribeToEvents
+	// and ProcessEvents) so RemoveEvmNetwork / Stop drain them before closing
+	// the backing store.
+	workersWg sync.WaitGroup
 	// stopHealth is set by Start and read by Stop and by a runtime removal,
-	// which can run on other goroutines; healthMu guards it.
+	// which can run on other goroutines; healthMu guards it and workersWg.Add.
 	healthMu   sync.Mutex
 	stopHealth func()
 	health     *snapshot.Store
 	config.EvmParams
 	// queueMu serializes unconfirmedQueue non-blocking operations (Size,
-	// Enqueue, Dequeue, Close) and tracks queued event block heights so
-	// dque.Size never races with dque.Close and coverage checks only wait on
-	// queued events at or below the finalized target height.
+	// Enqueue, Dequeue, Close) and tracks queued event block heights and keys
+	// so dque.Size never races with dque.Close and coverage checks wait on
+	// matching queued evidence at any height as well as queued work at or
+	// below the finalized target height.
 	queueMu           sync.Mutex
 	queueClosed       bool
 	queuedBlockCounts map[uint64]int
+	queuedTxKeys      map[queuedUnwrapKey]int
 	unknownQueued     int
 	unconfirmedQueue  *dque.DQue
 	dbManager         networkEventStores
@@ -181,6 +203,7 @@ func NewEvmNetwork(network *definition.NetworkInfo, dbManager networkEventStores
 
 	newEvmNetwork := &evmNetwork{
 		rollbackStore:     rollback,
+		store:             dbManager.EvmStorage(network.Id),
 		storageName:       storageName,
 		EvmParams:         newConfig,
 		health:            state.HealthStore(),
@@ -188,6 +211,7 @@ func NewEvmNetwork(network *definition.NetworkInfo, dbManager networkEventStores
 		rpcManager:        rpcManager,
 		unconfirmedQueue:  newQueue,
 		queuedBlockCounts: make(map[uint64]int),
+		queuedTxKeys:      make(map[queuedUnwrapKey]int),
 		unknownQueued:     newQueue.Size(),
 		state:             state,
 		stopChan:          stop,
@@ -274,13 +298,13 @@ func (eN *evmNetwork) Start() (startErr error) {
 		eN.logger.Debug(err)
 		return err
 	}
-	lastUpdateHeight, err := eN.dbManager.EvmStorage(eN.ChainId()).GetLastUpdateHeight()
+	lastUpdateHeight, err := eN.eventsStore().GetLastUpdateHeight()
 	if err != nil {
 		eN.logger.Debug(err)
 		return errors.Wrapf(err, "read sync cursor for chainId %d", eN.ChainId())
 	}
 	if lastUpdateHeight == 0 {
-		if err := eN.dbManager.EvmStorage(eN.ChainId()).SetLastUpdateHeight(eN.ContractDeploymentHeight()); err != nil {
+		if err := eN.eventsStore().SetLastUpdateHeight(eN.ContractDeploymentHeight()); err != nil {
 			eN.logger.Debug(err)
 			return err
 		}
@@ -297,7 +321,7 @@ func (eN *evmNetwork) Start() (startErr error) {
 			if err := eN.pruneNonCanonicalUnsigned(target); err != nil {
 				return err
 			}
-			if err := eN.dbManager.EvmStorage(eN.ChainId()).SetLastUpdateHeight(target); err != nil {
+			if err := eN.eventsStore().SetLastUpdateHeight(target); err != nil {
 				return err
 			}
 		}
@@ -312,23 +336,37 @@ func (eN *evmNetwork) Start() (startErr error) {
 		return syncErr
 	}
 
+	eN.healthMu.Lock()
 	select {
 	case <-eN.startupDone:
+		eN.healthMu.Unlock()
 		return context.Canceled
 	case <-eN.done:
 		// Stopped or removed while it was starting.
+		eN.healthMu.Unlock()
 		return context.Canceled
 	default:
 	}
+	eN.workersWg.Add(2)
+	eN.healthMu.Unlock()
 	eN.observeQueueDepth()
-	go eN.SubscribeToEvents()
+	go func() {
+		defer eN.workersWg.Done()
+		eN.SubscribeToEvents()
+	}()
 	// todo defer unsub?
 
-	go eN.ProcessEvents()
+	go func() {
+		defer eN.workersWg.Done()
+		eN.ProcessEvents()
+	}()
 	return nil
 }
 
 func (eN *evmNetwork) eventsStore() db.EvmStorage {
+	if eN.store != nil {
+		return eN.store
+	}
 	return eN.dbManager.EvmStorage(eN.ChainId())
 }
 
@@ -437,6 +475,20 @@ func (eN *evmNetwork) hasQueuedAtOrBelow(height uint64) bool {
 	return false
 }
 
+// hasQueuedEvent reports whether a matching unwrap event (at any block height)
+// is currently pending confirmation in this network's unconfirmed queue.
+func (eN *evmNetwork) hasQueuedEvent(txHash ecommon.Hash, logIndex uint32) bool {
+	eN.queueMu.Lock()
+	defer eN.queueMu.Unlock()
+	if eN.unconfirmedQueue == nil || eN.queueClosed {
+		return false
+	}
+	if eN.unknownQueued > 0 {
+		return true
+	}
+	return eN.queuedTxKeys[queuedUnwrapKey{txHash: txHash, logIndex: normalizeQueuedLogIndex(logIndex)}] > 0
+}
+
 func (eN *evmNetwork) enqueueUnconfirmed(ev *events.UnwrapRequestEvm) error {
 	eN.queueMu.Lock()
 	defer eN.queueMu.Unlock()
@@ -450,6 +502,10 @@ func (eN *evmNetwork) enqueueUnconfirmed(ev *events.UnwrapRequestEvm) error {
 		eN.queuedBlockCounts = make(map[uint64]int)
 	}
 	eN.queuedBlockCounts[ev.BlockNumber]++
+	if eN.queuedTxKeys == nil {
+		eN.queuedTxKeys = make(map[queuedUnwrapKey]int)
+	}
+	eN.queuedTxKeys[queuedUnwrapKey{txHash: ev.TransactionHash, logIndex: normalizeQueuedLogIndex(ev.LogIndex)}]++
 	return nil
 }
 
@@ -1245,6 +1301,11 @@ func (eN *evmNetwork) ProcessEvents() {
 			continue
 
 		case outcomeConfirmed:
+			select {
+			case <-eN.done:
+				return
+			default:
+			}
 			attempts = 0
 			backoff = processEventsBaseBackoff
 			discardVotes = 0
@@ -1316,10 +1377,21 @@ func (eN *evmNetwork) dropQueuedEvent() bool {
 	}
 	dequeued, err := eN.unconfirmedQueue.Dequeue()
 	if err == nil {
-		if ev, ok := dequeued.(*events.UnwrapRequestEvm); ok && eN.queuedBlockCounts[ev.BlockNumber] > 0 {
-			eN.queuedBlockCounts[ev.BlockNumber]--
-			if eN.queuedBlockCounts[ev.BlockNumber] == 0 {
-				delete(eN.queuedBlockCounts, ev.BlockNumber)
+		if ev, ok := dequeued.(*events.UnwrapRequestEvm); ok {
+			if eN.queuedBlockCounts[ev.BlockNumber] > 0 {
+				eN.queuedBlockCounts[ev.BlockNumber]--
+				if eN.queuedBlockCounts[ev.BlockNumber] == 0 {
+					delete(eN.queuedBlockCounts, ev.BlockNumber)
+				}
+			} else if eN.unknownQueued > 0 {
+				eN.unknownQueued--
+			}
+			k := queuedUnwrapKey{txHash: ev.TransactionHash, logIndex: normalizeQueuedLogIndex(ev.LogIndex)}
+			if eN.queuedTxKeys[k] > 0 {
+				eN.queuedTxKeys[k]--
+				if eN.queuedTxKeys[k] == 0 {
+					delete(eN.queuedTxKeys, k)
+				}
 			}
 		} else if eN.unknownQueued > 0 {
 			eN.unknownQueued--
@@ -1371,10 +1443,29 @@ func (eN *evmNetwork) halt() {
 	}
 }
 
-func (eN *evmNetwork) Stop() {
+// drainWorkers halts the network, optionally stops its dedicated RPC client so
+// in-flight worker RPCs unblock immediately, closes its queue so any blocked
+// PeekBlock returns, and waits for all background workers started by Start to
+// exit before the caller closes or deletes the backing store.
+func (eN *evmNetwork) drainWorkers(stopClient bool) {
 	eN.halt()
-	eN.EvmRpc().Stop()
-	_ = eN.closeQueue()
+	if stopClient {
+		if eN.client != nil {
+			eN.client.Stop()
+		} else if eN.rpcManager != nil {
+			if c, ok := eN.rpcManager.LookupEvm(eN.ChainId()); ok {
+				c.Stop()
+			}
+		}
+	}
+	if err := eN.closeQueue(); err != nil {
+		eN.logger.Debugf("queue of stopped EVM network %d: %v", eN.ChainId(), err)
+	}
+	eN.workersWg.Wait()
+}
+
+func (eN *evmNetwork) Stop() {
+	eN.drainWorkers(true)
 }
 
 func (eN *evmNetwork) SignTx(tx *etypes.Transaction, ecdsaPrivateKey *ecdsa.PrivateKey, chainId uint32) (*etypes.Transaction, error) {

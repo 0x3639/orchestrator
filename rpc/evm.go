@@ -637,7 +637,7 @@ func (r *EvmRpc) reconcileSentTx(tx *etypes.Transaction, prevSnapshot *pendingEv
 	}
 }
 
-func (r *EvmRpc) lookupPendingTx(key evmTxKey, confirmedNonce, pendingNonce uint64, havePending bool) *pendingEvmTx {
+func (r *EvmRpc) loadPendingTx(key evmTxKey) *pendingEvmTx {
 	r.txMu.Lock()
 	prev := r.pendingTx[key]
 	store := r.pendingTxStore
@@ -666,65 +666,79 @@ func (r *EvmRpc) lookupPendingTx(key evmTxKey, confirmedNonce, pendingNonce uint
 			r.txMu.Unlock()
 		}
 	}
+	return prev
+}
+
+func (r *EvmRpc) clearPendingTx(key evmTxKey) {
+	r.txMu.Lock()
+	delete(r.pendingTx, key)
+	store := r.pendingTxStore
+	r.txMu.Unlock()
+	if store != nil {
+		if err := store.DeletePendingEvmTx(key.sender, key.contract, key.kind); err != nil {
+			r.logger.Debugf("failed to clear stale pending EVM tx record: %v", err)
+		}
+	}
+}
+
+func (r *EvmRpc) lookupPendingTx(key evmTxKey, confirmedNonce, pendingNonce uint64, havePending, otherOwnsLower bool) *pendingEvmTx {
+	_ = r.loadPendingTx(key)
 
 	r.txMu.Lock()
-	prev = r.pendingTx[key]
+	prev := r.pendingTx[key]
 	if prev == nil {
 		r.txMu.Unlock()
 		return nil
 	}
 	// Clear when already mined OR when a preceding pending transaction was
-	// evicted leaving a nonce gap (pendingNonce < prev.nonce) that would strand
-	// fee bumps on an unexecutable future nonce.
-	if prev.nonce < confirmedNonce || (havePending && pendingNonce < prev.nonce) {
-		delete(r.pendingTx, key)
+	// evicted leaving a nonce gap (pendingNonce < prev.nonce) that is NOT
+	// owned by another persisted tracked action.
+	if prev.nonce < confirmedNonce || (havePending && pendingNonce < prev.nonce && !otherOwnsLower) {
 		r.txMu.Unlock()
-		if store != nil {
-			if err := store.DeletePendingEvmTx(key.sender, key.contract, key.kind); err != nil {
-				r.logger.Debugf("failed to clear stale pending EVM tx record: %v", err)
-			}
-		}
+		r.clearPendingTx(key)
 		return nil
 	}
-	cloned := &pendingEvmTx{
-		nonce:     prev.nonce,
-		gasPrice:  cloneBigInt(prev.gasPrice),
-		tipCap:    cloneBigInt(prev.tipCap),
-		feeCap:    cloneBigInt(prev.feeCap),
-		isDynamic: prev.isDynamic,
-	}
+	cloned := clonePendingEvmTx(prev)
 	r.txMu.Unlock()
 	return cloned
 }
 
-// hasOtherTrackedNonceInRange reports whether another tracked action for the
-// same sender currently owns a pending nonce in [confirmedNonce, pendingNonce).
-// It loads and reconciles persisted records for all tracked action kinds so
-// the first action after a restart cannot steal a nonce owned by another
-// persisted pending action.
-func (r *EvmRpc) hasOtherTrackedNonceInRange(key evmTxKey, confirmedNonce, pendingNonce uint64, havePending bool) bool {
+// otherTrackedNonces loads and reconciles persisted and in-memory ownership
+// for all other tracked actions of key.sender independently of PendingNonceAt.
+// Entries already mined (< confirmedNonce) are cleared. It returns the highest
+// nonce+1 owned by another tracked action at or above confirmedNonce, the
+// lowest such owned nonce, and whether any such owner exists.
+func (r *EvmRpc) otherTrackedNonces(key evmTxKey, confirmedNonce uint64) (maxNext uint64, minOwned uint64, hasOwner bool) {
 	for _, otherKind := range []string{evmTxKindHalt, evmTxKindSetTss} {
 		if otherKind == key.kind {
 			continue
 		}
 		otherKey := evmTxKey{sender: key.sender, contract: key.contract, kind: otherKind}
-		if other := r.lookupPendingTx(otherKey, confirmedNonce, pendingNonce, havePending); other != nil {
-			if other.nonce >= confirmedNonce && other.nonce < pendingNonce {
-				return true
-			}
-		}
+		_ = r.loadPendingTx(otherKey)
 	}
+	var toClear []evmTxKey
 	r.txMu.Lock()
-	defer r.txMu.Unlock()
 	for k, entry := range r.pendingTx {
 		if k == key || k.sender != key.sender || entry == nil {
 			continue
 		}
-		if entry.nonce >= confirmedNonce && entry.nonce < pendingNonce {
-			return true
+		if entry.nonce < confirmedNonce {
+			toClear = append(toClear, k)
+			continue
 		}
+		if !hasOwner || entry.nonce < minOwned {
+			minOwned = entry.nonce
+		}
+		if entry.nonce+1 > maxNext {
+			maxNext = entry.nonce + 1
+		}
+		hasOwner = true
 	}
-	return false
+	r.txMu.Unlock()
+	for _, k := range toClear {
+		r.clearPendingTx(k)
+	}
+	return maxNext, minOwned, hasOwner
 }
 
 func (r *EvmRpc) buildContractTx(sender ecommon.Address, contractAddress *ecommon.Address, kind string, encodedData []byte, label string) (*etypes.Transaction, error) {
@@ -752,17 +766,23 @@ func (r *EvmRpc) buildContractTx(sender ecommon.Address, contractAddress *ecommo
 	havePending := pendErr == nil
 
 	key := evmTxKey{sender: sender, contract: *contractAddress, kind: kind}
-	prev := r.lookupPendingTx(key, confirmedNonce, pendingNonce, havePending)
+	// Always reconcile persisted ownership for all other actions of sender
+	// BEFORE checking PendingNonceAt so a stale (pending == confirmed) or
+	// unavailable pending nonce RPC can never silently steal another action's
+	// persisted nonce after an ambiguous broadcast + restart.
+	otherNext, otherMin, hasOtherOwner := r.otherTrackedNonces(key, confirmedNonce)
+	otherOwnsLower := hasOtherOwner && otherMin >= confirmedNonce && (!havePending || otherMin <= pendingNonce)
+	prev := r.lookupPendingTx(key, confirmedNonce, pendingNonce, havePending, otherOwnsLower)
 	nonce := confirmedNonce
 	if prev != nil {
 		nonce = prev.nonce
-	} else if havePending && pendingNonce > confirmedNonce {
-		// Only advance to pendingNonce when another tracked action (in memory
-		// or persisted across restarts) for this sender owns an active nonce
-		// in [confirmedNonce, pendingNonce). Otherwise recover ownership of
-		// confirmedNonce so we replace rather than queue behind our own stuck
-		// transaction.
-		if r.hasOtherTrackedNonceInRange(key, confirmedNonce, pendingNonce, havePending) {
+	} else if hasOtherOwner {
+		// Another tracked action owns at least one unconfirmed nonce >= confirmedNonce;
+		// allocate past both its persisted nonce and the node's pending nonce.
+		if otherNext > nonce {
+			nonce = otherNext
+		}
+		if havePending && pendingNonce > nonce {
 			nonce = pendingNonce
 		}
 	}
@@ -1309,16 +1329,39 @@ func (r *EvmRpc) AnySecondaryHasReceipt(txHash ecommon.Hash) (bool, error) {
 	return false, nil
 }
 
-// AnySecondaryHasUnwrapLog corroborates absence of an Unwrapped source log
-// across every secondary endpoint in [fromBlock, toBlock]. Scanning backwards
-// from toBlock down to fromBlock in FilterQuerySize chunks finds recent logs
-// quickly. Returns (true, nil) if any secondary serves a matching Unwrapped
-// log (even when its receipt index is pruned), (false, err) if any secondary
-// cannot serve the log range definitively, and (false, nil) only when every
-// secondary confirms the log is absent across the full range.
-func (r *EvmRpc) AnySecondaryHasUnwrapLog(parent context.Context, fromBlock, toBlock uint64, txHash ecommon.Hash, logIndex uint32) (bool, error) {
-	if toBlock < fromBlock {
-		return false, nil
+const (
+	defaultSecondaryLogMaxChunks = 16
+	secondaryLogAttemptTimeout   = 15 * time.Second
+)
+
+// HasIndependentSecondary reports whether this client is configured with at
+// least one secondary endpoint URL distinct from the active primary URL.
+func (r *EvmRpc) HasIndependentSecondary() bool {
+	primaryURL := r.Urls.GetCurrentUrl()
+	for idx, u := range r.Urls.Urls {
+		if uint32(idx) != r.Urls.CurrentUrlIndex && u != primaryURL {
+			return true
+		}
+	}
+	return false
+}
+
+// AnySecondaryHasUnwrapLogChunked corroborates absence of an Unwrapped source
+// log across every independent secondary endpoint for one bounded batch of
+// chunks walking backwards from resumeEnd toward fromBlock.
+//
+// Each secondary must report a head >= targetHead so it cannot silently clip
+// eth_getLogs below the window being verified. Each call processes at most
+// maxChunks FilterQuerySize chunks within secondaryLogAttemptTimeout and
+// returns (found, lowestVerified, complete, err) so callers can retain
+// verified progress across retries without blocking the bridge listener past
+// its hold-tracking window.
+func (r *EvmRpc) AnySecondaryHasUnwrapLogChunked(parent context.Context, fromBlock, targetHead, resumeEnd uint64, txHash ecommon.Hash, logIndex uint32, maxChunks int) (bool, uint64, bool, error) {
+	if !r.HasIndependentSecondary() {
+		return false, 0, false, errors.New("no independent secondary EVM endpoint configured")
+	}
+	if resumeEnd < fromBlock {
+		return false, fromBlock, true, nil
 	}
 	baseIndex := logIndex
 	if baseIndex >= common.AffiliateLogIndexAddition {
@@ -1328,15 +1371,31 @@ func (r *EvmRpc) AnySecondaryHasUnwrapLog(parent context.Context, fromBlock, toB
 	if step == 0 {
 		step = defaultFilterQuerySize
 	}
+	if maxChunks <= 0 {
+		maxChunks = defaultSecondaryLogMaxChunks
+	}
+	windowFrom := fromBlock
+	if maxSpan := step * uint64(maxChunks); maxSpan/step == uint64(maxChunks) && resumeEnd > fromBlock && resumeEnd-fromBlock >= maxSpan {
+		windowFrom = resumeEnd - maxSpan + 1
+	}
+
+	if parent == nil {
+		parent = context.Background()
+	}
+	attemptCtx, cancel := context.WithTimeout(parent, secondaryLogAttemptTimeout)
+	defer cancel()
+
+	primaryURL := r.Urls.GetCurrentUrl()
 	urls := r.Urls.Urls
 	type logAnswer struct {
-		found bool
-		err   error
+		checked bool
+		found   bool
+		err     error
 	}
 	results := make([]logAnswer, len(urls))
 	var wg sync.WaitGroup
-	for idx := range urls {
-		if uint32(idx) == r.Urls.CurrentUrlIndex {
+	for idx, u := range urls {
+		if uint32(idx) == r.Urls.CurrentUrlIndex || u == primaryURL {
 			continue
 		}
 		wg.Add(1)
@@ -1344,13 +1403,30 @@ func (r *EvmRpc) AnySecondaryHasUnwrapLog(parent context.Context, fromBlock, toB
 			defer wg.Done()
 			var found bool
 			var scanErr error
-			for end := toBlock; ; {
-				if parent != nil && parent.Err() != nil {
-					scanErr = parent.Err()
+			// Verify the secondary's head covers targetHead so it cannot clip logs.
+			if err := r.callEndpoint(idx, func(ctx context.Context, client *ethclient.Client) error {
+				if attemptCtx.Err() != nil {
+					return attemptCtx.Err()
+				}
+				head, err := client.BlockNumber(ctx)
+				if err != nil {
+					return err
+				}
+				if head < targetHead {
+					return fmt.Errorf("secondary head %d lags target %d", head, targetHead)
+				}
+				return nil
+			}); err != nil {
+				results[idx] = logAnswer{checked: true, err: errors.New(config.RedactErrorForURL(err, urls[idx]))}
+				return
+			}
+			for end := resumeEnd; ; {
+				if attemptCtx.Err() != nil {
+					scanErr = attemptCtx.Err()
 					break
 				}
-				start := fromBlock
-				if end > fromBlock && end-fromBlock >= step {
+				start := windowFrom
+				if end > windowFrom && end-windowFrom >= step {
 					start = end - step + 1
 				}
 				query := ethereum.FilterQuery{
@@ -1360,7 +1436,13 @@ func (r *EvmRpc) AnySecondaryHasUnwrapLog(parent context.Context, fromBlock, toB
 					Topics:    [][]ecommon.Hash{{common.UnwrapSigHash}},
 				}
 				err := r.callEndpoint(idx, func(ctx context.Context, client *ethclient.Client) error {
-					logs, err := client.FilterLogs(ctx, query)
+					callCtx, stop := context.WithCancel(ctx)
+					unlink := context.AfterFunc(attemptCtx, stop)
+					defer func() {
+						unlink()
+						stop()
+					}()
+					logs, err := client.FilterLogs(callCtx, query)
 					if err != nil {
 						return err
 					}
@@ -1377,27 +1459,32 @@ func (r *EvmRpc) AnySecondaryHasUnwrapLog(parent context.Context, fromBlock, toB
 					scanErr = errors.New(config.RedactErrorForURL(err, urls[idx]))
 					break
 				}
-				if found || start == fromBlock {
+				if found || start == windowFrom {
 					break
 				}
 				end = start - 1
 			}
-			results[idx] = logAnswer{found: found, err: scanErr}
+			results[idx] = logAnswer{checked: true, found: found, err: scanErr}
 		}(idx)
 	}
 	wg.Wait()
+	checkedAny := false
 	for idx, res := range results {
-		if uint32(idx) == r.Urls.CurrentUrlIndex {
+		if !res.checked {
 			continue
 		}
+		checkedAny = true
 		if res.err != nil {
-			return false, fmt.Errorf("endpoint #%d unwrap log check failed: %w", idx, res.err)
+			return false, 0, false, fmt.Errorf("endpoint #%d unwrap log check failed: %w", idx, res.err)
 		}
 		if res.found {
-			return true, nil
+			return true, 0, false, nil
 		}
 	}
-	return false, nil
+	if !checkedAny {
+		return false, 0, false, errors.New("no independent secondary EVM endpoint checked")
+	}
+	return false, windowFrom, windowFrom == fromBlock, nil
 }
 
 // agreeCanonicalHash reduces per-endpoint answers to one hash, or an error

@@ -8,6 +8,7 @@ import (
 
 	ecommon "github.com/ethereum/go-ethereum/common"
 	"github.com/syndtr/goleveldb/leveldb"
+	"github.com/syndtr/goleveldb/leveldb/opt"
 	zcommon "github.com/zenon-network/go-zenon/common"
 
 	"orchestrator/common"
@@ -48,7 +49,7 @@ func BindContractAddress(ldb *leveldb.DB, contractAddress ecommon.Address, hasEx
 		if hasAny {
 			return false, nil
 		}
-		if putErr := ldb.Put(contractAddressPrefix, contractAddress.Bytes(), nil); putErr != nil {
+		if putErr := ldb.Put(contractAddressPrefix, contractAddress.Bytes(), &opt.WriteOptions{Sync: true}); putErr != nil {
 			return false, putErr
 		}
 		return true, nil
@@ -69,7 +70,16 @@ func pendingEvmTxKey(sender, contract ecommon.Address, kind string) []byte {
 func (es *evmStorage) LoadPendingEvmTx(sender, contract ecommon.Address, kind string) (*common.PendingEvmTx, error) {
 	es.mu.Lock()
 	defer es.mu.Unlock()
-	raw, err := es.DB.Get(pendingEvmTxKey(sender, contract, kind))
+	key := pendingEvmTxKey(sender, contract, kind)
+	var (
+		raw []byte
+		err error
+	)
+	if es.rawLdb != nil {
+		raw, err = es.rawLdb.Get(key, nil)
+	} else {
+		raw, err = es.DB.Get(key)
+	}
 	if errors.Is(err, leveldb.ErrNotFound) {
 		return nil, nil
 	}
@@ -93,13 +103,23 @@ func (es *evmStorage) SavePendingEvmTx(sender, contract ecommon.Address, kind st
 	if err != nil {
 		return err
 	}
-	return es.DB.Put(pendingEvmTxKey(sender, contract, kind), raw)
+	key := pendingEvmTxKey(sender, contract, kind)
+	if es.rawLdb != nil {
+		return es.rawLdb.Put(key, raw, &opt.WriteOptions{Sync: true})
+	}
+	return es.DB.Put(key, raw)
 }
 
 func (es *evmStorage) DeletePendingEvmTx(sender, contract ecommon.Address, kind string) error {
 	es.mu.Lock()
 	defer es.mu.Unlock()
-	err := es.DB.Delete(pendingEvmTxKey(sender, contract, kind))
+	key := pendingEvmTxKey(sender, contract, kind)
+	var err error
+	if es.rawLdb != nil {
+		err = es.rawLdb.Delete(key, &opt.WriteOptions{Sync: true})
+	} else {
+		err = es.DB.Delete(key)
+	}
 	if errors.Is(err, leveldb.ErrNotFound) {
 		return nil
 	}

@@ -538,62 +538,25 @@ func TestHaltAndSetTssRecoverStrandedNonceGap(t *testing.T) {
 				t.Fatal(err)
 			}
 			sender := crypto.PubkeyToAddress(key.PublicKey)
-			signer := etypes.LatestSignerForChainID(big.NewInt(1))
 
-			// Pre-seed a distinct in-process pending action at nonce 5 so build uses pendingNonce 6.
+			// Simulate a previously submitted target action at nonce 6 (behind an external
+			// predecessor at nonce 5) whose predecessor was subsequently evicted from the
+			// mempool (confirmed=5, pending=5), leaving nonce 6 stranded behind a gap.
+			if err := store.SavePendingEvmTx(sender, contract, action, &common.PendingEvmTx{
+				Nonce:     6,
+				TipCap:    big.NewInt(2_000_000_000),
+				FeeCap:    big.NewInt(42_000_000_000),
+				IsDynamic: true,
+			}); err != nil {
+				t.Fatal(err)
+			}
+
 			buildTx := func() (*etypes.Transaction, error) {
 				if action == "halt" {
 					return client.GetHaltTxEvm(sender, []byte{1, 2, 3}, &contract)
 				}
 				return client.GetSetTssEcdsaPubKeyEvmTx(newTss, sender, []byte{4}, []byte{5}, &contract)
 			}
-			// Occupy nonce 5 with the opposite action first.
-			if action == "halt" {
-				mock.pendingNonce = 5
-				other, err := client.GetSetTssEcdsaPubKeyEvmTx(newTss, sender, []byte{4}, []byte{5}, &contract)
-				if err != nil {
-					t.Fatal(err)
-				}
-				signedOther, err := etypes.SignTx(other, signer, key)
-				if err != nil {
-					t.Fatal(err)
-				}
-				if err := client.SendTransaction(signedOther); err != nil {
-					t.Fatal(err)
-				}
-			} else {
-				mock.pendingNonce = 5
-				other, err := client.GetHaltTxEvm(sender, []byte{1, 2, 3}, &contract)
-				if err != nil {
-					t.Fatal(err)
-				}
-				signedOther, err := etypes.SignTx(other, signer, key)
-				if err != nil {
-					t.Fatal(err)
-				}
-				if err := client.SendTransaction(signedOther); err != nil {
-					t.Fatal(err)
-				}
-			}
-
-			// Now pendingNonce == 6; build and send target action at nonce 6.
-			tx1, err := buildTx()
-			if err != nil {
-				t.Fatal(err)
-			}
-			if tx1.Nonce() != 6 {
-				t.Fatalf("tx1 nonce = %d, want 6", tx1.Nonce())
-			}
-			signed1, err := etypes.SignTx(tx1, signer, key)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if err := client.SendTransaction(signed1); err != nil {
-				t.Fatal(err)
-			}
-
-			// Simulate predecessor at nonce 5 being evicted from mempool: pendingNonce drops to 5
-			// leaving nonce 6 stranded behind a nonce gap.
 			mock.mu.Lock()
 			mock.confirmedNonce = 5
 			mock.pendingNonce = 5
@@ -1031,5 +994,143 @@ func TestSendTransactionRateLimiterWaitCountsTowardSendTimeout(t *testing.T) {
 	}
 	if mock.sendCalls.Load() != 0 {
 		t.Fatalf("expected 0 send calls while rate-limited, got %d", mock.sendCalls.Load())
+	}
+}
+
+func TestAmbiguousBroadcastPersistedOwnerRespectedWithStaleOrFailingPendingNonce(t *testing.T) {
+	contract := ecommon.HexToAddress("0x5656565656565656565656565656565656565656")
+	newTss := ecommon.HexToAddress("0x7878787878787878787878787878787878787878")
+
+	for _, firstAction := range []string{"setTss", "halt"} {
+		secondAction := "halt"
+		if firstAction == "halt" {
+			secondAction = "setTss"
+		}
+		for _, failPendingRPC := range []bool{false, true} {
+			mode := "stale_pending_eq_confirmed"
+			if failPendingRPC {
+				mode = "pending_rpc_unavailable"
+			}
+			t.Run(firstAction+"_ambiguous_then_"+secondAction+"_"+mode, func(t *testing.T) {
+				store := newMemPendingTxStore()
+				key, err := crypto.GenerateKey()
+				if err != nil {
+					t.Fatal(err)
+				}
+				sender := crypto.PubkeyToAddress(key.PublicKey)
+				signer := etypes.LatestSignerForChainID(big.NewInt(1))
+
+				var dropSend atomic.Bool
+				dropSend.Store(true)
+				var failPending atomic.Bool
+
+				srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					var req struct {
+						ID     json.RawMessage   `json:"id"`
+						Method string            `json:"method"`
+						Params []json.RawMessage `json:"params"`
+					}
+					if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+						http.Error(w, err.Error(), http.StatusBadRequest)
+						return
+					}
+					if req.Method == "eth_sendRawTransaction" && dropSend.Load() {
+						if hj, ok := w.(http.Hijacker); ok {
+							if conn, _, err := hj.Hijack(); err == nil {
+								_ = conn.Close()
+								return
+							}
+						}
+					}
+					resp := map[string]interface{}{"jsonrpc": "2.0", "id": req.ID}
+					switch req.Method {
+					case "eth_chainId":
+						resp["result"] = hexutil.EncodeUint64(1)
+					case "eth_blockNumber":
+						resp["result"] = hexutil.EncodeUint64(100)
+					case "eth_getBalance":
+						resp["result"] = (*hexutil.Big)(new(big.Int).Mul(big.NewInt(10), big.NewInt(1e18)))
+					case "eth_getTransactionCount":
+						var tag string
+						if len(req.Params) >= 2 {
+							_ = json.Unmarshal(req.Params[1], &tag)
+						}
+						if tag == "pending" && failPending.Load() {
+							resp["error"] = map[string]interface{}{"code": -32000, "message": "pending nonce unavailable"}
+						} else {
+							// Stale endpoint reports pending == confirmed == 5.
+							resp["result"] = hexutil.EncodeUint64(5)
+						}
+					case "eth_getBlockByNumber":
+						resp["result"] = map[string]interface{}{
+							"number":        hexutil.EncodeUint64(100),
+							"hash":          ecommon.HexToHash("0x11"),
+							"baseFeePerGas": (*hexutil.Big)(big.NewInt(20_000_000_000)),
+						}
+					case "eth_maxPriorityFeePerGas":
+						resp["result"] = (*hexutil.Big)(big.NewInt(2_000_000_000))
+					case "eth_estimateGas":
+						resp["result"] = hexutil.EncodeUint64(100_000)
+					default:
+						resp["result"] = ecommon.HexToHash("0xcc").Hex()
+					}
+					w.Header().Set("Content-Type", "application/json")
+					_ = json.NewEncoder(w).Encode(resp)
+				}))
+				t.Cleanup(srv.Close)
+
+				build := func(c *EvmRpc, action string) (*etypes.Transaction, error) {
+					if action == "halt" {
+						return c.GetHaltTxEvm(sender, []byte{1, 2, 3}, &contract)
+					}
+					return c.GetSetTssEcdsaPubKeyEvmTx(newTss, sender, []byte{4}, []byte{5}, &contract)
+				}
+
+				// Process 1: ambiguous EOF broadcast of firstAction at nonce 5.
+				c1, err := NewEvmRpcClient(config.BaseNetworkConfig{Urls: []string{srv.URL}}, "ambig-1", contract)
+				if err != nil {
+					t.Fatal(err)
+				}
+				c1.SetChainID(1)
+				c1.SetPendingTxStore(store)
+				tx1, err := build(c1, firstAction)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if tx1.Nonce() != 5 {
+					t.Fatalf("firstAction nonce = %d, want 5", tx1.Nonce())
+				}
+				signed1, err := etypes.SignTx(tx1, signer, key)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := c1.SendTransaction(signed1); err == nil {
+					t.Fatal("expected ambiguous EOF error")
+				}
+				c1.Stop()
+
+				// Process 2 (after restart): endpoint reports pending == confirmed == 5 or
+				// fails the pending nonce RPC. Building secondAction first MUST respect
+				// firstAction's persisted ownership of nonce 5 and allocate nonce 6.
+				dropSend.Store(false)
+				failPending.Store(failPendingRPC)
+				c2, err := NewEvmRpcClient(config.BaseNetworkConfig{Urls: []string{srv.URL}}, "ambig-2", contract)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer c2.Stop()
+				c2.SetChainID(1)
+				c2.SetPendingTxStore(store)
+
+				tx2, err := build(c2, secondAction)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if tx2.Nonce() != 6 {
+					t.Fatalf("%s stole persisted nonce 5 owned by %s (%s): got nonce %d, want 6",
+						secondAction, firstAction, mode, tx2.Nonce())
+				}
+			})
+		}
 	}
 }

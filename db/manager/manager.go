@@ -3,7 +3,6 @@ package manager
 import (
 	"fmt"
 	ecommon "github.com/ethereum/go-ethereum/common"
-	zdb "github.com/zenon-network/go-zenon/common/db"
 	"go.uber.org/zap"
 	"orchestrator/common"
 	"orchestrator/common/storage"
@@ -98,19 +97,19 @@ func (m *Manager) AddEvmEventStoreForContract(chainId uint32, name string, contr
 		if err != nil {
 			return "", nil, err
 		}
-		scopedMatches, err := unwrap.BindContractAddress(ldb, contractAddress, false)
+		scopedMatches, err := unwrap.BindContractAddress(ldb, contractAddress, queueDirExists(storageName))
 		if err != nil {
 			_ = ldb.Close()
 			return "", nil, err
 		}
 		if !scopedMatches {
 			_ = ldb.Close()
-			return "", nil, fmt.Errorf("contract-scoped store %s bound to a different contract address", storageName)
+			return "", nil, fmt.Errorf("contract-scoped store %s cannot be verified (conflicting contract marker or orphaned queue directory)", storageName)
 		}
 		m.logger.Infof("EVM network %s (%d) isolated to contract-scoped store %s for bridge contract %s; previous store %s retained on disk",
 			name, chainId, storageName, contractAddress.Hex(), name)
 	}
-	store := unwrap.NewEvmStorage(zdb.NewLevelDBWrapper(ldb), m.stopChan, contractDeploymentHeight)
+	store := unwrap.NewEvmStorageWithLevelDB(ldb, m.stopChan, contractDeploymentHeight)
 	var closeOnce sync.Once
 	closeDB := func() error {
 		var closeErr error
