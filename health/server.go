@@ -173,7 +173,10 @@ func (s *Handler) buildStatus() (Status, error) {
 
 	networksStatus := make(map[string]StatusNetworkInfo)
 	for _, evmNetwork := range s.networksManager.Networks() {
-		lastUpdateHeight, err := s.dbManager.EvmStorage(evmNetwork.ChainId()).GetLastUpdateHeight()
+		lastUpdateHeight, ok, err := evmNetwork.LastUpdateHeight()
+		if !ok {
+			continue
+		}
 		if err != nil {
 			return Status{}, fmt.Errorf("read sync cursor for chainId %d: %w", evmNetwork.ChainId(), err)
 		}
@@ -228,13 +231,29 @@ func (s *Handler) buildStatus() (Status, error) {
 		}
 	}
 
+	var receiveHold *ReceiveHoldStatus
+	if hold := s.state.ReceiveHold(); hold != nil {
+		receiveHold = &ReceiveHoldStatus{
+			Height:   hold.Height,
+			Since:    hold.Since,
+			Attempts: hold.Attempts,
+		}
+	}
+	pendingRedeemIncidents, redeemHaltPending, errPending := s.state.PendingRedeemIncidentStatus()
+	if errPending != nil {
+		common.GlobalLogger.Warnf("getStatus: cannot read pending redeem incidents: %v", errPending)
+	}
+
 	status := Status{
-		State:            state,
-		StateName:        common.StateToText(state),
-		FrontierMomentum: frontierMomentum,
-		Networks:         networksStatus,
-		PeersLen:         peersLen,
-		Peers:            peers,
+		State:                  state,
+		StateName:              common.StateToText(state),
+		FrontierMomentum:       frontierMomentum,
+		Networks:               networksStatus,
+		PeersLen:               peersLen,
+		Peers:                  peers,
+		ReceiveHold:            receiveHold,
+		PendingRedeemIncidents: pendingRedeemIncidents,
+		RedeemHaltPending:      redeemHaltPending,
 	}
 
 	return status, nil

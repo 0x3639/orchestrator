@@ -34,6 +34,8 @@ type GlobalState struct {
 	Health                *snapshot.Store
 	state                 *uint8
 	stateMu               sync.Mutex
+	stateChanged          chan struct{}
+	activeKeyGenPubKey    string
 	persistEmergency      func(uint8) error
 	emergencyWritePending bool
 	redeemIncidents       RedeemIncidentStore
@@ -59,12 +61,17 @@ type GlobalState struct {
 	nodeReadyOnce sync.Once
 	// Set when the node goes on running although it has read, as history, a
 	// change to what it took from the bridge when it started.
-	settingsMu             sync.RWMutex
-	settingsStale          bool
+	settingsMu      sync.RWMutex
+	settingsStale   bool
+	restartRequired atomic.Bool
+	receiveHoldMu   sync.RWMutex
+	receiveHold     *snapshot.ReceiveHold
 	frontierMomentumHeight uint64
 	frontierMomSemaphore   *semaphore.Weighted
 	lastCeremony           CeremonyWindow
+	roleMu                 sync.RWMutex
 	isAdministratorActive  atomic.Bool
+	localProducerAddress   string
 	tokensMap              map[uint32]map[string]string
 	affiliateMu            sync.RWMutex
 	// [chainId][token] -> bool
@@ -76,7 +83,10 @@ type GlobalState struct {
 	affiliateGeneration uint64
 	// The networks of the affiliate program SetIsAffiliateProgram applied
 	// last.
-	appliedAffiliate     map[uint32]AffiliateNetwork
+	appliedAffiliate map[uint32]AffiliateNetwork
+	// Last applied affiliate network settings per chain, retained across
+	// partial updates so runtime token-pair refreshes can recompute flags.
+	affiliateNetworks    map[uint32]AffiliateNetwork
 	resignNetworkClass   uint32 // guarded by stateMu
 	resignNetworkChainId uint32 // guarded by stateMu
 	resignGeneration     uint64 // guarded by stateMu
@@ -91,6 +101,7 @@ func NewGlobalState(state *uint8) *GlobalState {
 func NewPersistentGlobalState(state *uint8, persistEmergency func(uint8) error) *GlobalState {
 	return &GlobalState{
 		persistEmergency:         persistEmergency,
+		stateChanged:             make(chan struct{}),
 		startupDone:              make(chan struct{}),
 		nodeReady:                make(chan struct{}),
 		state:                    state,
@@ -99,6 +110,7 @@ func NewPersistentGlobalState(state *uint8, persistEmergency func(uint8) error) 
 		tokensMap:                make(map[uint32]map[string]string),
 		isAffiliateProgramActive: make(map[uint32]map[string]bool),
 		affiliateStartingHeight:  make(map[uint32]uint64),
+		affiliateNetworks:        make(map[uint32]AffiliateNetwork),
 	}
 }
 
@@ -135,6 +147,9 @@ func (gs *GlobalState) SetStateIf(expected, newState uint8) (bool, error) {
 func (gs *GlobalState) setStateLocked(newState uint8) error {
 	oldEffective := gs.effectiveStateLocked()
 	previous := *gs.state
+	if gs.restartRequired.Load() && newState != EmergencyState && newState != HaltedState {
+		return errors.New("restart required before resuming live operations")
+	}
 	if previous == EmergencyState && newState != EmergencyState && newState != HaltedState {
 		return errors.New("emergency halt is still pending")
 	}
@@ -179,10 +194,59 @@ func (gs *GlobalState) effectiveStateLocked() uint8 {
 	return *gs.state
 }
 
+func (gs *GlobalState) notifyStateChangedLocked() {
+	if gs.stateChanged != nil {
+		close(gs.stateChanged)
+	}
+	gs.stateChanged = make(chan struct{})
+}
+
+// StateChanged returns a channel that is closed the next time the bridge state
+// or restart-required latch changes.
+func (gs *GlobalState) StateChanged() <-chan struct{} {
+	gs.stateMu.Lock()
+	defer gs.stateMu.Unlock()
+	if gs.stateChanged == nil {
+		gs.stateChanged = make(chan struct{})
+	}
+	return gs.stateChanged
+}
+
+// SetActiveKeyGenPubKey records the new TSS public key that an active keygen
+// publication round is currently rolling out across Zenon and EVM networks.
+func (gs *GlobalState) SetActiveKeyGenPubKey(pubKey string) {
+	gs.stateMu.Lock()
+	defer gs.stateMu.Unlock()
+	gs.activeKeyGenPubKey = pubKey
+}
+
+// ClearActiveKeyGenPubKey clears the active keygen publication key when it
+// matches pubKey (or unconditionally when pubKey is empty).
+func (gs *GlobalState) ClearActiveKeyGenPubKey(pubKey string) {
+	gs.stateMu.Lock()
+	defer gs.stateMu.Unlock()
+	if pubKey == "" || gs.activeKeyGenPubKey == pubKey {
+		gs.activeKeyGenPubKey = ""
+	}
+}
+
+// IsActiveKeyGenPubKey reports whether pubKey matches the keygen publication
+// round currently in progress so Zenon's acceptance of that key does not
+// prematurely leave KeyGenState before EVM rotation and local key installation.
+func (gs *GlobalState) IsActiveKeyGenPubKey(pubKey string) bool {
+	if pubKey == "" {
+		return false
+	}
+	gs.stateMu.Lock()
+	defer gs.stateMu.Unlock()
+	return gs.activeKeyGenPubKey == pubKey
+}
+
 func (gs *GlobalState) publishStateLocked(oldState uint8) {
 	current := StateToText(gs.effectiveStateLocked())
 	GlobalLogger.Infof("Old state: %s, New state: %s", StateToText(oldState), current)
 	gs.Health.SetBridgeState(current)
+	gs.notifyStateChangedLocked()
 }
 
 // HaltSigning moves a signer in LiveState, KeyGenState or ReSignState to
@@ -198,6 +262,33 @@ func (gs *GlobalState) HaltSigning() (bool, error) {
 		return true, gs.setStateLocked(HaltedState)
 	}
 	return false, nil
+}
+
+// RequireRestart permanently latches that this process must restart before
+// signing or publishing any further transfers. It waits for any in-flight
+// WhileLive publication under transferSendMu, moves signing states to
+// HaltedState (preserving EmergencyState if active), and blocks any later
+// transition back to LiveState, KeyGenState, or ReSignState.
+func (gs *GlobalState) RequireRestart() error {
+	gs.transferSendMu.Lock()
+	defer gs.transferSendMu.Unlock()
+	gs.stateMu.Lock()
+	defer gs.stateMu.Unlock()
+	gs.restartRequired.Store(true)
+	gs.notifyStateChangedLocked()
+	switch gs.effectiveStateLocked() {
+	case LiveState, KeyGenState, ReSignState:
+		return gs.setStateLocked(HaltedState)
+	}
+	return nil
+}
+
+// RestartRequired reports whether RequireRestart has been latched.
+func (gs *GlobalState) RestartRequired() bool {
+	if gs == nil {
+		return false
+	}
+	return gs.restartRequired.Load()
 }
 
 // A receive retried after a storage error may by then be historical. Even
@@ -229,6 +320,9 @@ func (gs *GlobalState) SaveConfig(save func() error) error {
 func (gs *GlobalState) WhileSigningTransfers(do func()) bool {
 	gs.stateMu.Lock()
 	defer gs.stateMu.Unlock()
+	if gs.restartRequired.Load() {
+		return false
+	}
 	if state := gs.effectiveStateLocked(); state == EmergencyState || state == HaltedState {
 		return false
 	}
@@ -329,6 +423,9 @@ func (gs *GlobalState) lockTransfersFor(newState uint8) func() {
 func (gs *GlobalState) WhileLive(send func() error) (bool, error) {
 	gs.transferSendMu.RLock()
 	defer gs.transferSendMu.RUnlock()
+	if gs.restartRequired.Load() {
+		return false, nil
+	}
 	if state, err := gs.GetState(); err != nil || state != LiveState {
 		return false, err
 	}
@@ -373,16 +470,152 @@ func (gs *GlobalState) BeginCeremony(window CeremonyWindow) bool {
 func (gs *GlobalState) SetTokensMap(chainId uint32, zts, token string) {
 	gs.affiliateMu.Lock()
 	defer gs.affiliateMu.Unlock()
+	zts = strings.ToLower(zts)
 	token = strings.ToLower(token)
+	if zts == "" || token == "" {
+		return
+	}
 	if _, found := gs.tokensMap[chainId]; !found {
 		gs.tokensMap[chainId] = make(map[string]string)
 	}
-	if gs.tokensMap[chainId][zts] != token || gs.tokensMap[chainId][token] != zts {
-		gs.affiliateGeneration++
+	changed := gs.tokensMap[chainId][zts] != token || gs.tokensMap[chainId][token] != zts
+	if prevToken := gs.tokensMap[chainId][zts]; prevToken != "" && prevToken != token {
+		delete(gs.tokensMap[chainId], prevToken)
+		changed = true
 	}
-
+	if prevZts := gs.tokensMap[chainId][token]; prevZts != "" && prevZts != zts {
+		delete(gs.tokensMap[chainId], prevZts)
+		changed = true
+	}
 	gs.tokensMap[chainId][zts] = token
 	gs.tokensMap[chainId][token] = zts
+	if gs.recomputeAffiliateFlagsLocked(chainId) {
+		changed = true
+	}
+	if changed {
+		gs.affiliateGeneration++
+	}
+}
+
+// ReplaceTokensMap atomically replaces all token pair mappings for chainId,
+// recomputes cached affiliate flags for that chain, and bumps
+// affiliateGeneration if any mapping or flag changed.
+func (gs *GlobalState) ReplaceTokensMap(chainId uint32, pairs map[string]string) {
+	_ = gs.ReplaceTokensMapWithRollback(chainId, pairs)
+}
+
+// ReplaceTokensMapWithRollback replaces all token pair mappings for chainId
+// and returns a rollback closure that restores the previous mappings and
+// cached affiliate flags (for example if runtime network startup fails).
+func (gs *GlobalState) ReplaceTokensMapWithRollback(chainId uint32, pairs map[string]string) func() {
+	gs.affiliateMu.Lock()
+	prev := maps.Clone(gs.tokensMap[chainId])
+	gs.replaceTokensMapLocked(chainId, pairs)
+	gs.affiliateMu.Unlock()
+	return func() {
+		gs.affiliateMu.Lock()
+		defer gs.affiliateMu.Unlock()
+		changed := !maps.Equal(gs.tokensMap[chainId], prev)
+		if len(prev) == 0 {
+			delete(gs.tokensMap, chainId)
+		} else {
+			gs.tokensMap[chainId] = maps.Clone(prev)
+		}
+		if gs.recomputeAffiliateFlagsLocked(chainId) {
+			changed = true
+		}
+		if changed {
+			gs.affiliateGeneration++
+		}
+	}
+}
+
+func (gs *GlobalState) replaceTokensMapLocked(chainId uint32, pairs map[string]string) {
+	next := make(map[string]string, len(pairs)*2)
+	for zts, token := range pairs {
+		zts = strings.ToLower(zts)
+		token = strings.ToLower(token)
+		if zts == "" || token == "" {
+			continue
+		}
+		next[zts] = token
+		next[token] = zts
+	}
+	changed := !maps.Equal(gs.tokensMap[chainId], next)
+	if len(next) == 0 {
+		delete(gs.tokensMap, chainId)
+	} else {
+		gs.tokensMap[chainId] = next
+	}
+	if gs.recomputeAffiliateFlagsLocked(chainId) {
+		changed = true
+	}
+	if changed {
+		gs.affiliateGeneration++
+	}
+}
+
+// RemoveTokenPair deletes the bidirectional mapping for (zts, token) on
+// chainId, recomputes cached affiliate flags, and bumps affiliateGeneration if
+// anything changed.
+func (gs *GlobalState) RemoveTokenPair(chainId uint32, zts, token string) {
+	gs.affiliateMu.Lock()
+	defer gs.affiliateMu.Unlock()
+	chainMap, found := gs.tokensMap[chainId]
+	if !found {
+		return
+	}
+	zts = strings.ToLower(zts)
+	token = strings.ToLower(token)
+	changed := false
+	if zts != "" {
+		if mapped, ok := chainMap[zts]; ok {
+			delete(chainMap, zts)
+			delete(chainMap, mapped)
+			changed = true
+		}
+	}
+	if token != "" {
+		if mapped, ok := chainMap[token]; ok {
+			delete(chainMap, token)
+			delete(chainMap, mapped)
+			changed = true
+		}
+	}
+	if len(chainMap) == 0 {
+		delete(gs.tokensMap, chainId)
+	}
+	if gs.recomputeAffiliateFlagsLocked(chainId) {
+		changed = true
+	}
+	if changed {
+		gs.affiliateGeneration++
+	}
+}
+
+func (gs *GlobalState) affiliateFlagsLocked(chainId uint32, values AffiliateNetwork) map[string]bool {
+	znn, qsr := types.ZnnTokenStandard.String(), types.QsrTokenStandard.String()
+	flags := map[string]bool{znn: values.ZNN, qsr: values.QSR}
+	if addr := gs.tokensMap[chainId][znn]; addr != "" {
+		flags[addr] = values.WZNN
+	}
+	if addr := gs.tokensMap[chainId][qsr]; addr != "" {
+		flags[addr] = values.WQSR
+	}
+	return flags
+}
+
+func (gs *GlobalState) recomputeAffiliateFlagsLocked(chainId uint32) bool {
+	values, ok := gs.affiliateNetworks[chainId]
+	if !ok {
+		return false
+	}
+	flags := gs.affiliateFlagsLocked(chainId, values)
+	if maps.Equal(gs.isAffiliateProgramActive[chainId], flags) {
+		return false
+	}
+	gs.isAffiliateProgramActive[chainId] = flags
+	return true
 }
 
 func (gs *GlobalState) GetTokensMap(chainId uint32, ztsOrToken string) string {
@@ -395,7 +628,9 @@ func (gs *GlobalState) GetTokensMap(chainId uint32, ztsOrToken string) string {
 }
 
 func (gs *GlobalState) SetIsAdministratorActive(value bool) {
+	gs.roleMu.Lock()
 	gs.isAdministratorActive.Store(value)
+	gs.roleMu.Unlock()
 	GlobalLogger.Infof("SetAdministratorActive to : %t", value)
 }
 
@@ -403,24 +638,56 @@ func (gs *GlobalState) GetIsAdministratorActive() bool {
 	return gs.isAdministratorActive.Load()
 }
 
+// SetLocalProducerAddress records the local orchestrator's Zenon address so
+// runtime administrator changes can detect when this process gains or loses
+// the administrator role.
+func (gs *GlobalState) SetLocalProducerAddress(addr string) {
+	gs.roleMu.Lock()
+	gs.localProducerAddress = addr
+	gs.roleMu.Unlock()
+}
+
+// AdminRoleChanged reports whether newAdmin changes this node's operational
+// role (gaining or losing administrator status).
+func (gs *GlobalState) AdminRoleChanged(newAdmin string) bool {
+	gs.roleMu.RLock()
+	defer gs.roleMu.RUnlock()
+	if gs.localProducerAddress == "" {
+		return false
+	}
+	return (newAdmin == gs.localProducerAddress) != gs.isAdministratorActive.Load()
+}
+
+// SetIsAffiliateProgram applies the bridge metadata's affiliate settings.
+//
+// Wrapped flags (wZNN/wQSR -> SplitAffiliate) control whether EVM ingestion
+// splits unwraps into 101%+2% transfers, while native flags (ZNN/QSR ->
+// VerifyAffiliate) control whether NoM verification accepts those split
+// registrations. Safe rollout order is therefore: enable VerifyAffiliate before
+// SplitAffiliate, and disable SplitAffiliate before VerifyAffiliate. Enabling
+// SplitAffiliate without VerifyAffiliate causes split unwraps to fail NoM
+// verification and trigger an emergency halt, so it is logged as an error.
 func (gs *GlobalState) SetIsAffiliateProgram(program AffiliateProgram) {
 	gs.affiliateMu.Lock()
 	defer gs.affiliateMu.Unlock()
+	if gs.affiliateNetworks == nil {
+		gs.affiliateNetworks = make(map[uint32]AffiliateNetwork)
+	}
 	// An update replaces the listed chains. Unlisted chains keep their settings.
 	for id, values := range program.Networks {
-		znn, qsr := types.ZnnTokenStandard.String(), types.QsrTokenStandard.String()
-		flags := map[string]bool{znn: values.ZNN, qsr: values.QSR}
-		if addr := gs.tokensMap[id][znn]; addr != "" {
-			flags[addr] = values.WZNN
+		if values.WZNN && !values.ZNN {
+			GlobalLogger.Errorf("Affiliate metadata misconfiguration for network %d: wZNN (SplitAffiliate) is enabled without ZNN (VerifyAffiliate); split unwraps will fail NoM verification and trigger an emergency halt", id)
 		}
-		if addr := gs.tokensMap[id][qsr]; addr != "" {
-			flags[addr] = values.WQSR
+		if values.WQSR && !values.QSR {
+			GlobalLogger.Errorf("Affiliate metadata misconfiguration for network %d: wQSR (SplitAffiliate) is enabled without QSR (VerifyAffiliate); split unwraps will fail NoM verification and trigger an emergency halt", id)
 		}
+		flags := gs.affiliateFlagsLocked(id, values)
 		if !maps.Equal(gs.isAffiliateProgramActive[id], flags) || gs.affiliateStartingHeight[id] != values.StartingHeight {
 			gs.affiliateGeneration++
 		}
 		gs.isAffiliateProgramActive[id] = flags
 		gs.affiliateStartingHeight[id] = values.StartingHeight
+		gs.affiliateNetworks[id] = values
 		GlobalLogger.Infof("Updated affiliate program for network %d at starting height %d", id, values.StartingHeight)
 	}
 	gs.appliedAffiliate = maps.Clone(program.Networks)
@@ -673,4 +940,42 @@ func (gs *GlobalState) HealthStore() *snapshot.Store {
 		return nil
 	}
 	return gs.Health
+}
+
+// SetReceiveHold records or clears the Zenon bridge account receive hold so
+// both the HTTP getStatus endpoint and the local health snapshot report it.
+func (gs *GlobalState) SetReceiveHold(hold *snapshot.ReceiveHold) {
+	if gs == nil {
+		return
+	}
+	var stored *snapshot.ReceiveHold
+	if hold != nil {
+		h := *hold
+		stored = &h
+	}
+	gs.receiveHoldMu.Lock()
+	gs.receiveHold = stored
+	gs.receiveHoldMu.Unlock()
+	gs.Health.UpdateZenon(func(z *snapshot.Zenon) {
+		if stored == nil {
+			z.ReceiveHold = nil
+			return
+		}
+		h := *stored
+		z.ReceiveHold = &h
+	})
+}
+
+// ReceiveHold returns a copy of the current bridge account receive hold, or nil.
+func (gs *GlobalState) ReceiveHold() *snapshot.ReceiveHold {
+	if gs == nil {
+		return nil
+	}
+	gs.receiveHoldMu.RLock()
+	defer gs.receiveHoldMu.RUnlock()
+	if gs.receiveHold == nil {
+		return nil
+	}
+	h := *gs.receiveHold
+	return &h
 }

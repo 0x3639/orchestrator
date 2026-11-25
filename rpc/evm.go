@@ -1,6 +1,7 @@
 package rpc
 
 import (
+	"bytes"
 	"context"
 	stderrors "errors"
 	"fmt"
@@ -41,6 +42,7 @@ type EvmRpc struct {
 	reconnecting *primaryReconnect
 	Urls         config.UrlsInfo
 	networkName  string
+	storageName  string
 	chainId      uint32
 
 	bridgeContract  *bridge.Bridge
@@ -69,12 +71,73 @@ type EvmRpc struct {
 	secondaryMu      sync.Mutex
 	secondary        map[string]*secondaryClient
 	secondaryStopped bool
+
+	// pendingMu serializes durable pendingTxStore read/modify/write operations
+	// with in-memory pendingTx, inFlight, and sendGen updates (never held across
+	// network RPCs).
+	pendingMu sync.Mutex
+	inFlight  map[evmTxKey]int
+	sendGen   map[evmTxKey]uint64
+	// txMu guards storageName, chainID, pendingTx, pendingTxStore, and
+	// sendTimeout, which track the latest unconfirmed halt or key-change
+	// transaction per (sender, contract, action) so retries reuse the same
+	// nonce with bumped fees and recover ownership across restarts and
+	// evicted predecessors.
+	txMu                sync.Mutex
+	chainID             *big.Int
+	pendingTx           map[evmTxKey]*pendingEvmTx
+	pendingTxStore      common.PendingEvmTxStore
+	sendTimeout         time.Duration
+	secondaryLogTimeout time.Duration
+}
+
+type evmTxKey struct {
+	sender   ecommon.Address
+	contract ecommon.Address
+	kind     string
+}
+
+type pendingEvmTx struct {
+	nonce     uint64
+	txHash    ecommon.Hash
+	gasPrice  *big.Int
+	tipCap    *big.Int
+	feeCap    *big.Int
+	isDynamic bool
+}
+
+type pendingAttempt struct {
+	key          evmTxKey
+	nonce        uint64
+	txHash       ecommon.Hash
+	recorded     bool
+	prevSnapshot *pendingEvmTx
 }
 
 type secondaryClient struct {
-	mu      sync.Mutex
-	client  *ethclient.Client
-	limiter *rate.Limiter
+	sem          chan struct{}
+	client       *ethclient.Client
+	limiter      *rate.Limiter
+	verifiedHead uint64
+	logStep      uint64
+}
+
+func (s *secondaryClient) acquire(ctx context.Context) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+	}
+	select {
+	case s.sem <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (s *secondaryClient) release() {
+	<-s.sem
 }
 
 func isWebSocketURL(rawURL string) bool {
@@ -336,6 +399,9 @@ func NewEvmRpcClientForChainContext(parent context.Context, networkConfig config
 		limit:           limit,
 		burst:           burst,
 	}
+	if chainId != 0 {
+		evmRpc.chainID = new(big.Int).SetUint64(uint64(chainId))
+	}
 	newBridgeContract, err := bridge.NewBridge(address, bridgeReadBackend{rpc: evmRpc})
 	if err != nil {
 		cancel()
@@ -578,12 +644,35 @@ func (r *EvmRpc) Stop() {
 	r.closeSecondaryClients()
 }
 
+// SetStorageName binds the resolved storage directory name (e.g.
+// <name>-<contractHex> after a same-name contract rotation) so removal deletes
+// only the active contract's directories and preserves any retained pre-rotation
+// store on disk.
+func (r *EvmRpc) SetStorageName(name string) {
+	r.txMu.Lock()
+	defer r.txMu.Unlock()
+	r.storageName = name
+}
+
+// StorageName returns the resolved directory name used for this client's
+// LevelDB event store and unconfirmed queue.
+func (r *EvmRpc) StorageName() string {
+	r.txMu.Lock()
+	name := r.storageName
+	r.txMu.Unlock()
+	if name != "" {
+		return name
+	}
+	return r.networkName
+}
+
 // todo return an error?
 func (r *EvmRpc) DeleteDirectories() {
-	if errDel := storage.DeleteQueue(r.networkName); errDel != nil {
+	name := r.StorageName()
+	if errDel := storage.DeleteQueue(name); errDel != nil {
 		r.logger.Debug(errDel)
 	}
-	if errDel := storage.DeleteLvlDb(r.networkName); errDel != nil {
+	if errDel := storage.DeleteLvlDb(name); errDel != nil {
 		r.logger.Debug(errDel)
 	}
 }
@@ -625,6 +714,18 @@ func (r *EvmRpc) syncState(callerCtx, attemptCtx context.Context) (bool, error) 
 	if err != nil {
 		return false, err
 	}
+	return evaluateSyncProgress(progress)
+}
+
+func syncStateForClient(ctx context.Context, client *ethclient.Client) (bool, error) {
+	progress, err := client.SyncProgress(ctx)
+	if err != nil {
+		return false, err
+	}
+	return evaluateSyncProgress(progress)
+}
+
+func evaluateSyncProgress(progress *ethereum.SyncProgress) (bool, error) {
 	if progress == nil {
 		return true, nil
 	}
@@ -658,14 +759,880 @@ func (r *EvmRpc) SubscribeToLogs(ctx context.Context) (ethereum.Subscription, ch
 
 /// Transactions
 
-func (r *EvmRpc) SendTransaction(tx *etypes.Transaction) error {
-	return r.doPrimary(r.ctx, func(_ context.Context, client *ethclient.Client) error {
-		return client.SendTransaction(context.Background(), tx)
+const (
+	evmTxKindHalt   = "halt"
+	evmTxKindSetTss = "setTss"
+	// evmReplacementFeeBumpPercent exceeds the 10% mempool replacement minimum
+	// used by go-ethereum and other EVM clients so retries replace stuck txs.
+	evmReplacementFeeBumpPercent = 20
+)
+
+func (r *EvmRpc) SetChainID(chainId uint32) {
+	r.txMu.Lock()
+	defer r.txMu.Unlock()
+	r.chainID = new(big.Int).SetUint64(uint64(chainId))
+}
+
+// SetPendingTxStore attaches a persistent store for unconfirmed halt and
+// key-change transaction metadata so nonce ownership and fee watermarks
+// survive process restarts.
+func (r *EvmRpc) SetPendingTxStore(store common.PendingEvmTxStore) {
+	r.txMu.Lock()
+	defer r.txMu.Unlock()
+	r.pendingTxStore = store
+}
+
+func (r *EvmRpc) ChainID() (*big.Int, error) {
+	return r.ChainIDContext(r.ctx)
+}
+
+func (r *EvmRpc) ChainIDContext(parent context.Context) (*big.Int, error) {
+	r.txMu.Lock()
+	if r.chainID != nil {
+		id := new(big.Int).Set(r.chainID)
+		r.txMu.Unlock()
+		return id, nil
+	}
+	r.txMu.Unlock()
+
+	ctx, cancel, err := r.callContextWithParent(parent, evmCallTimeout)
+	if err != nil {
+		return nil, err
+	}
+	defer cancel()
+	var id *big.Int
+	err = r.doPrimaryWithParent(parent, ctx, evmCallTimeout, func(callCtx context.Context, client *ethclient.Client) error {
+		var callErr error
+		id, callErr = client.ChainID(callCtx)
+		return callErr
 	})
+	if err != nil {
+		return nil, err
+	}
+	r.txMu.Lock()
+	r.chainID = new(big.Int).Set(id)
+	r.txMu.Unlock()
+	return id, nil
+}
+
+func (r *EvmRpc) sendCallTimeout() time.Duration {
+	r.txMu.Lock()
+	d := r.sendTimeout
+	r.txMu.Unlock()
+	if d > 0 {
+		return d
+	}
+	return evmCallTimeout
+}
+
+func (r *EvmRpc) SendTransaction(tx *etypes.Transaction) error {
+	return r.SendTransactionContext(r.ctx, tx, nil)
+}
+
+// SendTransactionContext submits tx while honoring parent cancellation across
+// rate-limiter waits and RPC I/O, and re-checking allowSend right before
+// persisting ownership and broadcasting.
+func (r *EvmRpc) SendTransactionContext(parent context.Context, tx *etypes.Transaction, allowSend func() bool) error {
+	// Start the send deadline BEFORE acquiring a rate-limiter permit so a
+	// depleted limiter cannot stall emergency halt broadcasts (and hold
+	// WhileEmergency's read lock) past evmCallTimeout.
+	timeout := r.sendCallTimeout()
+	ctx, cancel := combineContexts(r.ctx, parent, timeout)
+	defer cancel()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if allowSend != nil && !allowSend() {
+		return context.Canceled
+	}
+	if r.limiter != nil {
+		if err := r.limiter.Wait(ctx); err != nil {
+			return err
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if allowSend != nil && !allowSend() {
+		return context.Canceled
+	}
+	attempt, tracked, err := r.recordPendingTxAttempt(tx)
+	if err != nil {
+		return err
+	}
+	sendErr := r.doPrimaryWithParent(ctx, ctx, timeout, func(callCtx context.Context, client *ethclient.Client) error {
+		if allowSend != nil && !allowSend() {
+			return context.Canceled
+		}
+		return client.SendTransaction(callCtx, tx)
+	})
+	if tracked {
+		r.reconcileSentTx(tx, attempt, sendErr)
+	}
+	return sendErr
+}
+
+func cloneBigInt(v *big.Int) *big.Int {
+	if v == nil {
+		return nil
+	}
+	return new(big.Int).Set(v)
+}
+
+func maxBigInt(a, b *big.Int) *big.Int {
+	if a == nil {
+		return cloneBigInt(b)
+	}
+	if b == nil {
+		return cloneBigInt(a)
+	}
+	if a.Cmp(b) >= 0 {
+		return new(big.Int).Set(a)
+	}
+	return new(big.Int).Set(b)
+}
+
+// bumpFee increases prev by evmReplacementFeeBumpPercent using ceiling
+// division and guarantees at least +1 wei progress.
+func bumpFee(prev *big.Int) *big.Int {
+	if prev == nil || prev.Sign() <= 0 {
+		return big.NewInt(1)
+	}
+	factor := big.NewInt(100 + evmReplacementFeeBumpPercent)
+	bumped := new(big.Int).Mul(prev, factor)
+	bumped.Add(bumped, big.NewInt(99))
+	bumped.Div(bumped, big.NewInt(100))
+	if bumped.Cmp(prev) <= 0 {
+		bumped.Add(prev, big.NewInt(1))
+	}
+	return bumped
+}
+
+func evmTxKeyFromTx(tx *etypes.Transaction) (evmTxKey, bool) {
+	if tx == nil || tx.To() == nil || len(tx.Data()) < 4 {
+		return evmTxKey{}, false
+	}
+	var kind string
+	switch {
+	case bytes.Equal(tx.Data()[:4], common.EvmContractAbi.Methods["halt"].ID):
+		kind = evmTxKindHalt
+	case bytes.Equal(tx.Data()[:4], common.EvmContractAbi.Methods["setTss"].ID):
+		kind = evmTxKindSetTss
+	default:
+		return evmTxKey{}, false
+	}
+	var signer etypes.Signer
+	if cid := tx.ChainId(); cid != nil && cid.Sign() > 0 {
+		signer = etypes.LatestSignerForChainID(cid)
+	} else {
+		signer = etypes.HomesteadSigner{}
+	}
+	sender, err := etypes.Sender(signer, tx)
+	if err != nil {
+		return evmTxKey{}, false
+	}
+	return evmTxKey{sender: sender, contract: *tx.To(), kind: kind}, true
+}
+
+// isDefinitivePreMempoolRejection reports whether err proves the EVM node
+// definitively rejected the transaction before accepting it into the mempool,
+// so rolling back a fresh pre-broadcast watermark is safe. Ambiguous transport
+// failures (EOF, connection reset, timeouts) and mempool pricing/duplicate
+// errors return false so the persisted watermark is preserved.
+func isDefinitivePreMempoolRejection(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "insufficient funds") ||
+		strings.Contains(msg, "intrinsic gas too low") ||
+		strings.Contains(msg, "exceeds block gas limit") ||
+		strings.Contains(msg, "invalid sender") ||
+		strings.Contains(msg, "oversized data") ||
+		strings.Contains(msg, "nonce too high") ||
+		strings.Contains(msg, "max priority fee per gas higher than max fee per gas")
+}
+
+func isNonceTooLowErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(strings.ToLower(err.Error()), "nonce too low")
+}
+
+func clonePendingEvmTx(p *pendingEvmTx) *pendingEvmTx {
+	if p == nil {
+		return nil
+	}
+	return &pendingEvmTx{
+		nonce:     p.nonce,
+		txHash:    p.txHash,
+		gasPrice:  cloneBigInt(p.gasPrice),
+		tipCap:    cloneBigInt(p.tipCap),
+		feeCap:    cloneBigInt(p.feeCap),
+		isDynamic: p.isDynamic,
+	}
+}
+
+func toCommonPendingEvmTx(p *pendingEvmTx) *common.PendingEvmTx {
+	if p == nil {
+		return nil
+	}
+	return &common.PendingEvmTx{
+		Nonce:     p.nonce,
+		TxHash:    p.txHash,
+		GasPrice:  cloneBigInt(p.gasPrice),
+		TipCap:    cloneBigInt(p.tipCap),
+		FeeCap:    cloneBigInt(p.feeCap),
+		IsDynamic: p.isDynamic,
+	}
+}
+
+func fromCommonPendingEvmTx(rec *common.PendingEvmTx) *pendingEvmTx {
+	if rec == nil {
+		return nil
+	}
+	return &pendingEvmTx{
+		nonce:     rec.Nonce,
+		txHash:    rec.TxHash,
+		gasPrice:  cloneBigInt(rec.GasPrice),
+		tipCap:    cloneBigInt(rec.TipCap),
+		feeCap:    cloneBigInt(rec.FeeCap),
+		isDynamic: rec.IsDynamic,
+	}
+}
+
+func otherEvmTxKind(kind string) string {
+	if kind == evmTxKindHalt {
+		return evmTxKindSetTss
+	}
+	return evmTxKindHalt
+}
+
+// recordPendingTxAttempt durably persists tx's nonce and fee watermark BEFORE
+// broadcast so a process crash or dropped connection after node acceptance
+// cannot erase the watermark. Competing action rows (setTss vs halt) are kept
+// independent until acceptance so a failed or obsolete halt never erases a
+// live rotation record.
+func (r *EvmRpc) recordPendingTxAttempt(tx *etypes.Transaction) (*pendingAttempt, bool, error) {
+	key, ok := evmTxKeyFromTx(tx)
+	if !ok {
+		return nil, false, nil
+	}
+	r.pendingMu.Lock()
+	defer r.pendingMu.Unlock()
+
+	prev, err := r.loadPendingTxLocked(key)
+	if err != nil {
+		return nil, false, fmt.Errorf("load pending EVM tx record before broadcast: %w", err)
+	}
+
+	r.txMu.Lock()
+	store := r.pendingTxStore
+	r.txMu.Unlock()
+
+	entry := &pendingEvmTx{
+		nonce:     tx.Nonce(),
+		txHash:    tx.Hash(),
+		isDynamic: tx.Type() == etypes.DynamicFeeTxType,
+	}
+	if entry.isDynamic {
+		entry.tipCap = cloneBigInt(tx.GasTipCap())
+		entry.feeCap = cloneBigInt(tx.GasFeeCap())
+	} else {
+		entry.gasPrice = cloneBigInt(tx.GasPrice())
+	}
+
+	if r.sendGen == nil {
+		r.sendGen = make(map[evmTxKey]uint64)
+	}
+	if r.inFlight == nil {
+		r.inFlight = make(map[evmTxKey]int)
+	}
+
+	if prev != nil && prev.nonce > entry.nonce {
+		// Leave the higher-nonce durable record intact while tracking that a
+		// broadcast is in flight so concurrent cleanup defers safely.
+		r.sendGen[key]++
+		r.inFlight[key]++
+		return &pendingAttempt{
+			key:      key,
+			nonce:    entry.nonce,
+			txHash:   entry.txHash,
+			recorded: false,
+		}, true, nil
+	}
+	if prev != nil && prev.nonce == entry.nonce {
+		entry.gasPrice = maxBigInt(prev.gasPrice, entry.gasPrice)
+		entry.tipCap = maxBigInt(prev.tipCap, entry.tipCap)
+		entry.feeCap = maxBigInt(prev.feeCap, entry.feeCap)
+	}
+
+	if store != nil {
+		if err := store.SavePendingEvmTx(key.sender, key.contract, key.kind, toCommonPendingEvmTx(entry)); err != nil {
+			r.logger.Errorf("failed to persist pending EVM tx record before broadcast: %v", err)
+			return nil, false, fmt.Errorf("persist pending EVM tx before broadcast: %w", err)
+		}
+	}
+
+	r.txMu.Lock()
+	if r.pendingTx == nil {
+		r.pendingTx = make(map[evmTxKey]*pendingEvmTx)
+	}
+	r.pendingTx[key] = entry
+	r.txMu.Unlock()
+
+	r.sendGen[key]++
+	r.inFlight[key]++
+	return &pendingAttempt{
+		key:          key,
+		nonce:        entry.nonce,
+		txHash:       entry.txHash,
+		recorded:     true,
+		prevSnapshot: prev,
+	}, true, nil
+}
+
+// reconcileSentTx updates or rolls back the pre-broadcast watermark based on
+// the broadcast outcome:
+//   - On acceptance (sendErr == nil), an accepted halt clears any superseded
+//     same-nonce setTss record.
+//   - On nonce-too-low, the confirmed record is deleted.
+//   - On definitive pre-mempool rejections (insufficient funds, etc.), the
+//     record rolls back to prevSnapshot only if no newer send superseded it.
+//   - On ambiguous failures (EOF, timeout, underpriced), the watermark stays
+//     persisted so the next retry bumps fees cleanly.
+func (r *EvmRpc) reconcileSentTx(tx *etypes.Transaction, attempt *pendingAttempt, sendErr error) {
+	if attempt == nil {
+		return
+	}
+	r.pendingMu.Lock()
+	defer r.pendingMu.Unlock()
+
+	key := attempt.key
+	if n := r.inFlight[key]; n <= 1 {
+		delete(r.inFlight, key)
+	} else {
+		r.inFlight[key] = n - 1
+	}
+	if !attempt.recorded {
+		return
+	}
+
+	if sendErr == nil {
+		if key.kind == evmTxKindHalt {
+			otherKey := evmTxKey{sender: key.sender, contract: key.contract, kind: evmTxKindSetTss}
+			if otherRec, err := r.loadPendingTxLocked(otherKey); err == nil && otherRec != nil && otherRec.nonce == attempt.nonce {
+				_, _ = r.clearPendingTxIfMatchesLocked(otherKey, otherRec)
+			}
+		}
+		return
+	}
+
+	if isNonceTooLowErr(sendErr) {
+		r.txMu.Lock()
+		store := r.pendingTxStore
+		cur := r.pendingTx[key]
+		shouldDelete := cur != nil && (cur.nonce < attempt.nonce || (cur.nonce == attempt.nonce && cur.txHash == attempt.txHash))
+		r.txMu.Unlock()
+		if !shouldDelete {
+			return
+		}
+		if store != nil {
+			if err := store.DeletePendingEvmTx(key.sender, key.contract, key.kind); err != nil {
+				r.logger.Errorf("failed to delete confirmed pending EVM tx record: %v", err)
+				return
+			}
+		}
+		r.txMu.Lock()
+		if cur := r.pendingTx[key]; cur != nil && (cur.nonce < attempt.nonce || (cur.nonce == attempt.nonce && cur.txHash == attempt.txHash)) {
+			delete(r.pendingTx, key)
+		}
+		r.txMu.Unlock()
+		return
+	}
+
+	if !isDefinitivePreMempoolRejection(sendErr) {
+		return
+	}
+
+	r.txMu.Lock()
+	store := r.pendingTxStore
+	cur := r.pendingTx[key]
+	matches := cur != nil && cur.nonce == attempt.nonce && cur.txHash == attempt.txHash
+	r.txMu.Unlock()
+	if !matches {
+		return
+	}
+
+	if attempt.prevSnapshot != nil {
+		if store != nil {
+			if err := store.SavePendingEvmTx(key.sender, key.contract, key.kind, toCommonPendingEvmTx(attempt.prevSnapshot)); err != nil {
+				r.logger.Errorf("failed to roll back rejected pending EVM tx record: %v", err)
+				return
+			}
+		}
+		r.txMu.Lock()
+		if cur := r.pendingTx[key]; cur != nil && cur.nonce == attempt.nonce && cur.txHash == attempt.txHash {
+			r.pendingTx[key] = clonePendingEvmTx(attempt.prevSnapshot)
+		}
+		r.txMu.Unlock()
+	} else {
+		if store != nil {
+			if err := store.DeletePendingEvmTx(key.sender, key.contract, key.kind); err != nil {
+				r.logger.Errorf("failed to delete rejected pending EVM tx record: %v", err)
+				return
+			}
+		}
+		r.txMu.Lock()
+		if cur := r.pendingTx[key]; cur != nil && cur.nonce == attempt.nonce && cur.txHash == attempt.txHash {
+			delete(r.pendingTx, key)
+		}
+		r.txMu.Unlock()
+	}
+	if r.sendGen == nil {
+		r.sendGen = make(map[evmTxKey]uint64)
+	}
+	r.sendGen[key]++
+}
+
+func (r *EvmRpc) loadPendingTxLocked(key evmTxKey) (*pendingEvmTx, error) {
+	r.txMu.Lock()
+	prev := r.pendingTx[key]
+	store := r.pendingTxStore
+	r.txMu.Unlock()
+
+	if prev == nil && store != nil {
+		rec, err := store.LoadPendingEvmTx(key.sender, key.contract, key.kind)
+		if err != nil {
+			r.logger.Errorf("failed to load persisted pending EVM tx record (%s): %v", key.kind, err)
+			return nil, fmt.Errorf("load pending %s EVM tx record: %w", key.kind, err)
+		}
+		if rec != nil {
+			loaded := fromCommonPendingEvmTx(rec)
+			r.txMu.Lock()
+			if r.pendingTx == nil {
+				r.pendingTx = make(map[evmTxKey]*pendingEvmTx)
+			}
+			if r.pendingTx[key] == nil {
+				r.pendingTx[key] = loaded
+			}
+			prev = r.pendingTx[key]
+			r.txMu.Unlock()
+		}
+	}
+	return clonePendingEvmTx(prev), nil
+}
+
+func (r *EvmRpc) clearPendingTxIfMatchesLocked(key evmTxKey, expected *pendingEvmTx) (bool, error) {
+	r.txMu.Lock()
+	cur := clonePendingEvmTx(r.pendingTx[key])
+	store := r.pendingTxStore
+	if expected != nil && (cur == nil || cur.nonce != expected.nonce || cur.txHash != expected.txHash) {
+		r.txMu.Unlock()
+		return false, nil
+	}
+	r.txMu.Unlock()
+
+	if store != nil {
+		if err := store.DeletePendingEvmTx(key.sender, key.contract, key.kind); err != nil {
+			r.logger.Errorf("failed to clear pending EVM tx record: %v", err)
+			return false, err
+		}
+	}
+
+	cleared := false
+	r.txMu.Lock()
+	liveCur := r.pendingTx[key]
+	if expected == nil || (liveCur != nil && liveCur.nonce == expected.nonce && liveCur.txHash == expected.txHash) {
+		delete(r.pendingTx, key)
+		cleared = true
+	}
+	r.txMu.Unlock()
+	return cleared, nil
+}
+
+// ClearObsoleteHaltTx clears a persisted halt reservation once the emergency
+// has completed (e.g. another signer's halt won on-chain) and this sender's
+// dropped halt transaction is verified absent from the EVM mempool. Live halt
+// transactions still pending in the mempool (or unreadable pending state) are
+// preserved so later key rotations never collide with them.
+func (r *EvmRpc) ClearObsoleteHaltTx(sender ecommon.Address) error {
+	return r.ClearObsoleteHaltTxContext(r.ctx, sender)
+}
+
+func (r *EvmRpc) ClearObsoleteHaltTxContext(parent context.Context, sender ecommon.Address) error {
+	key := evmTxKey{sender: sender, contract: r.bridgeAddress, kind: evmTxKindHalt}
+	r.pendingMu.Lock()
+	rec, err := r.loadPendingTxLocked(key)
+	r.pendingMu.Unlock()
+	if err != nil {
+		return err
+	}
+	if rec == nil {
+		return nil
+	}
+	blockHeight, err := r.BlockNumberContext(parent)
+	if err != nil {
+		return err
+	}
+	confirmedNonce, err := r.NonceAtContext(parent, sender, blockHeight)
+	if err != nil {
+		return err
+	}
+	r.pendingMu.Lock()
+	rec, err = r.loadPendingTxLocked(key)
+	if err != nil {
+		r.pendingMu.Unlock()
+		return err
+	}
+	if rec == nil {
+		r.pendingMu.Unlock()
+		return nil
+	}
+	if rec.nonce < confirmedNonce {
+		_, clrErr := r.clearPendingTxIfMatchesLocked(key, rec)
+		r.pendingMu.Unlock()
+		return clrErr
+	}
+	if r.inFlight[key] > 0 {
+		r.pendingMu.Unlock()
+		return nil
+	}
+	obsGen := r.sendGen[key]
+	r.pendingMu.Unlock()
+
+	pendingNonce, err := r.PendingNonceAtContext(parent, sender)
+	if err != nil {
+		// Fail safe: keep halt ownership when mempool state is unreadable.
+		return err
+	}
+	if pendingNonce > confirmedNonce {
+		// A transaction from this sender is still pending in the mempool; keep ownership.
+		return nil
+	}
+	if rec.txHash != (ecommon.Hash{}) {
+		tx, _, txErr := r.TransactionByHashContext(parent, rec.txHash)
+		if txErr == nil && tx != nil && tx.Nonce() >= confirmedNonce {
+			return nil
+		}
+		if txErr != nil && !errors.Is(txErr, ethereum.NotFound) {
+			return txErr
+		}
+	}
+
+	r.pendingMu.Lock()
+	defer r.pendingMu.Unlock()
+	if r.sendGen[key] != obsGen || r.inFlight[key] > 0 {
+		return nil
+	}
+	_, err = r.clearPendingTxIfMatchesLocked(key, rec)
+	return err
+}
+
+func (r *EvmRpc) lookupPendingTx(key evmTxKey, confirmedNonce, pendingNonce uint64, havePending, otherOwnsLower bool) (*pendingEvmTx, error) {
+	r.pendingMu.Lock()
+	defer r.pendingMu.Unlock()
+
+	cloned, err := r.loadPendingTxLocked(key)
+	if err != nil || cloned == nil {
+		return nil, err
+	}
+	if cloned.nonce < confirmedNonce {
+		_, _ = r.clearPendingTxIfMatchesLocked(key, cloned)
+		return nil, nil
+	}
+	// When an unconfirmed reservation sits above a verified nonce gap
+	// (pendingNonce < cloned.nonce and not owned by another tracked action),
+	// return nil so the caller builds a gap-filling transaction at pendingNonce
+	// without deleting the unconfirmed durable record.
+	if havePending && pendingNonce < cloned.nonce && !otherOwnsLower {
+		return nil, nil
+	}
+	return cloned, nil
+}
+
+// otherTrackedNonces loads and reconciles persisted and in-memory ownership
+// for all other tracked actions of key.sender independently of PendingNonceAt.
+// Storage/decoding errors are propagated so an unreadable halt record can
+// never be mistaken for an absent one. Entries already mined (< confirmedNonce)
+// are cleared.
+func (r *EvmRpc) otherTrackedNonces(key evmTxKey, confirmedNonce uint64) (maxNext uint64, minOwned uint64, atConfirmed *pendingEvmTx, sameContractOther *pendingEvmTx, hasOwner bool, err error) {
+	r.pendingMu.Lock()
+	defer r.pendingMu.Unlock()
+
+	otherKey := evmTxKey{sender: key.sender, contract: key.contract, kind: otherEvmTxKind(key.kind)}
+	if _, loadErr := r.loadPendingTxLocked(otherKey); loadErr != nil {
+		return 0, 0, nil, nil, false, loadErr
+	}
+	type staleEntry struct {
+		key evmTxKey
+		rec *pendingEvmTx
+	}
+	var toClear []staleEntry
+	r.txMu.Lock()
+	for k, entry := range r.pendingTx {
+		if k == key || k.sender != key.sender || entry == nil {
+			continue
+		}
+		if entry.nonce < confirmedNonce {
+			toClear = append(toClear, staleEntry{key: k, rec: clonePendingEvmTx(entry)})
+			continue
+		}
+		if !hasOwner || entry.nonce < minOwned {
+			minOwned = entry.nonce
+		}
+		if entry.nonce == confirmedNonce && atConfirmed == nil {
+			atConfirmed = clonePendingEvmTx(entry)
+		}
+		if k == otherKey {
+			sameContractOther = clonePendingEvmTx(entry)
+		}
+		if entry.nonce+1 > maxNext {
+			maxNext = entry.nonce + 1
+		}
+		hasOwner = true
+	}
+	r.txMu.Unlock()
+	for _, item := range toClear {
+		_, _ = r.clearPendingTxIfMatchesLocked(item.key, item.rec)
+	}
+	return maxNext, minOwned, atConfirmed, sameContractOther, hasOwner, nil
+}
+
+func (r *EvmRpc) buildContractTx(sender ecommon.Address, contractAddress *ecommon.Address, kind string, encodedData []byte, label string) (*etypes.Transaction, error) {
+	return r.buildContractTxContext(r.ctx, sender, contractAddress, kind, encodedData, label)
+}
+
+func (r *EvmRpc) buildContractTxContext(parent context.Context, sender ecommon.Address, contractAddress *ecommon.Address, kind string, encodedData []byte, label string) (*etypes.Transaction, error) {
+	if contractAddress == nil {
+		return nil, errors.Errorf("missing contract address for %s", label)
+	}
+	if parent == nil {
+		parent = r.ctx
+	}
+	blockHeight, err := r.BlockNumberContext(parent)
+	if err != nil {
+		return nil, err
+	}
+	balance, err := r.BalanceAtContext(parent, sender, blockHeight)
+	if err != nil {
+		return nil, err
+	}
+	if balance.Sign() <= 0 {
+		return nil, errors.Errorf("Balance is 0, not enough to send %s", label)
+	}
+	r.logger.Debugf("Balance: %s", balance.String())
+
+	confirmedNonce, err := r.NonceAtContext(parent, sender, blockHeight)
+	if err != nil {
+		return nil, err
+	}
+	pendingNonce, pendErr := r.PendingNonceAtContext(parent, sender)
+	havePending := pendErr == nil
+	if pendErr != nil && (parent.Err() != nil || r.ctx.Err() != nil) {
+		return nil, pendErr
+	}
+
+	key := evmTxKey{sender: sender, contract: *contractAddress, kind: kind}
+	// Always reconcile persisted ownership for all other actions of sender
+	// BEFORE checking PendingNonceAt so a stale (pending == confirmed) or
+	// unavailable pending nonce RPC can never silently collide with another
+	// action's persisted nonce after an ambiguous broadcast + restart.
+	otherNext, otherMin, otherAtConfirmed, sameContractOther, hasOtherOwner, err := r.otherTrackedNonces(key, confirmedNonce)
+	if err != nil {
+		return nil, err
+	}
+	otherOwnsLower := hasOtherOwner && otherMin >= confirmedNonce && (!havePending || otherMin <= pendingNonce)
+	prev, err := r.lookupPendingTx(key, confirmedNonce, pendingNonce, havePending, otherOwnsLower)
+	if err != nil {
+		return nil, err
+	}
+	nonce := confirmedNonce
+	if prev != nil {
+		if kind == evmTxKindSetTss && sameContractOther != nil && sameContractOther.nonce == prev.nonce {
+			// An active emergency halt is already contesting prev.nonce; do not
+			// overwrite it with setTss. Allocate past the halt reservation.
+			if otherNext > nonce {
+				nonce = otherNext
+			}
+			if havePending && pendingNonce > nonce {
+				nonce = pendingNonce
+			}
+			prev = nil
+		} else {
+			nonce = prev.nonce
+			if kind == evmTxKindHalt && sameContractOther != nil && sameContractOther.nonce == prev.nonce {
+				// Ensure a halt superseding a same-nonce setTss always bumps above
+				// both watermarks.
+				prev.gasPrice = maxBigInt(prev.gasPrice, sameContractOther.gasPrice)
+				prev.tipCap = maxBigInt(prev.tipCap, sameContractOther.tipCap)
+				prev.feeCap = maxBigInt(prev.feeCap, sameContractOther.feeCap)
+			}
+		}
+	} else if kind == evmTxKindHalt && otherAtConfirmed != nil {
+		// An emergency halt must never be stranded behind a dropped or
+		// un-retried key-rotation (setTss) tx at confirmedNonce. Explicitly
+		// supersede setTss at confirmedNonce using >=20% bumped fees above
+		// setTss's persisted fee watermark so halt either mines immediately
+		// (if setTss was lost in transit) or cleanly replaces setTss in the
+		// mempool without underpriced retry loops.
+		nonce = confirmedNonce
+		prev = otherAtConfirmed
+	} else if hasOtherOwner {
+		if havePending && pendingNonce >= confirmedNonce && pendingNonce < otherMin {
+			// The other tracked reservation sits above a verified nonce gap
+			// (e.g. confirmed=5, pending=5, stranded setTss=6); fill the first
+			// available nonce instead of queueing past the stranded gap.
+			nonce = pendingNonce
+		} else {
+			// Non-halt actions (setTss) never supersede an active emergency halt;
+			// allocate past both its persisted nonce and the node's pending nonce.
+			if otherNext > nonce {
+				nonce = otherNext
+			}
+			if havePending && pendingNonce > nonce {
+				nonce = pendingNonce
+			}
+		}
+	}
+
+	// Prefer EIP-1559 dynamic fees when the latest block carries a baseFeePerGas
+	// and the node serves tip suggestions and chain ID; fall back to legacy
+	// gasPrice on non-1559 chains or endpoints that do not support 1559 RPCs.
+	baseFee, baseFeeErr := r.baseFeeByNumberContext(parent, blockHeight)
+	if baseFeeErr != nil {
+		if parent.Err() != nil {
+			return nil, parent.Err()
+		}
+		if r.ctx.Err() != nil {
+			return nil, r.ctx.Err()
+		}
+		r.logger.Debugf("baseFee lookup failed for %s, falling back to legacy gas price: %v", label, baseFeeErr)
+		baseFee = nil
+	}
+	if baseFee != nil && baseFee.Sign() < 0 {
+		baseFee = nil
+	}
+
+	if baseFee != nil {
+		tipCap, tipErr := r.SuggestGasTipCapContext(parent)
+		chainID, chainErr := r.ChainIDContext(parent)
+		if tipErr == nil && chainErr == nil {
+			if tipCap == nil || tipCap.Sign() < 0 {
+				tipCap = big.NewInt(0)
+			}
+			if prev != nil {
+				if prev.tipCap != nil {
+					if minTip := bumpFee(prev.tipCap); tipCap.Cmp(minTip) < 0 {
+						tipCap = minTip
+					}
+				}
+				if prev.gasPrice != nil {
+					if minFromLegacy := bumpFee(prev.gasPrice); tipCap.Cmp(minFromLegacy) < 0 {
+						tipCap = minFromLegacy
+					}
+				}
+			}
+			feeCap := new(big.Int).Mul(baseFee, big.NewInt(2))
+			feeCap.Add(feeCap, tipCap)
+			if prev != nil {
+				if prev.feeCap != nil {
+					if minFee := bumpFee(prev.feeCap); feeCap.Cmp(minFee) < 0 {
+						feeCap = minFee
+					}
+				}
+				if prev.gasPrice != nil {
+					if minFromLegacy := bumpFee(prev.gasPrice); feeCap.Cmp(minFromLegacy) < 0 {
+						feeCap = minFromLegacy
+					}
+				}
+			}
+
+			msg := ethereum.CallMsg{
+				From:      sender,
+				To:        contractAddress,
+				Gas:       0,
+				GasTipCap: tipCap,
+				GasFeeCap: feeCap,
+				Value:     big.NewInt(0),
+				Data:      encodedData,
+			}
+			estimatedGas, err := r.EstimateGasContext(parent, msg)
+			if err != nil {
+				return nil, err
+			}
+			r.logger.Debug("estimatedGas: ", estimatedGas)
+
+			fees := new(big.Int).Mul(feeCap, new(big.Int).SetUint64(estimatedGas))
+			if balance.Cmp(fees) < 0 {
+				return nil, errors.Errorf("not enough balance to send %s", label)
+			}
+			return etypes.NewTx(&etypes.DynamicFeeTx{
+				ChainID:   chainID,
+				Nonce:     nonce,
+				GasTipCap: tipCap,
+				GasFeeCap: feeCap,
+				Gas:       estimatedGas,
+				To:        contractAddress,
+				Value:     big.NewInt(0),
+				Data:      encodedData,
+			}), nil
+		}
+		if parent.Err() != nil {
+			return nil, parent.Err()
+		}
+		if r.ctx.Err() != nil {
+			return nil, r.ctx.Err()
+		}
+		r.logger.Debugf("EIP-1559 fee suggestion unavailable for %s (tipErr=%v chainErr=%v), falling back to legacy gas price", label, tipErr, chainErr)
+	}
+
+	gasPrice, err := r.SuggestGasPriceContext(parent)
+	if err != nil {
+		return nil, err
+	}
+	if prev != nil {
+		prevPrice := maxBigInt(prev.gasPrice, prev.feeCap)
+		if minPrice := bumpFee(prevPrice); gasPrice.Cmp(minPrice) < 0 {
+			gasPrice = minPrice
+		}
+	}
+
+	msg := ethereum.CallMsg{
+		From:     sender,
+		To:       contractAddress,
+		Gas:      0,
+		GasPrice: gasPrice,
+		Value:    big.NewInt(0),
+		Data:     encodedData,
+	}
+	estimatedGas, err := r.EstimateGasContext(parent, msg)
+	if err != nil {
+		return nil, err
+	}
+	r.logger.Debug("estimatedGas: ", estimatedGas)
+
+	fees := new(big.Int).Mul(gasPrice, new(big.Int).SetUint64(estimatedGas))
+	if balance.Cmp(fees) < 0 {
+		return nil, errors.Errorf("not enough balance to send %s", label)
+	}
+	return etypes.NewTx(&etypes.LegacyTx{
+		Nonce:    nonce,
+		To:       contractAddress,
+		Value:    big.NewInt(0),
+		Gas:      estimatedGas,
+		GasPrice: gasPrice,
+		Data:     encodedData,
+	}), nil
 }
 
 func (r *EvmRpc) GetSetTssEcdsaPubKeyEvmMessage(newAddress ecommon.Address, networkClass, chainId uint32, contractAddress *ecommon.Address) ([]byte, error) {
-	actionsNonce, err := r.GetActionNonce()
+	return r.GetSetTssEcdsaPubKeyEvmMessageContext(r.ctx, newAddress, networkClass, chainId, contractAddress)
+}
+
+func (r *EvmRpc) GetSetTssEcdsaPubKeyEvmMessageContext(ctx context.Context, newAddress ecommon.Address, networkClass, chainId uint32, contractAddress *ecommon.Address) ([]byte, error) {
+	actionsNonce, err := r.GetActionNonceContext(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -691,69 +1658,26 @@ func (r *EvmRpc) GetSetTssEcdsaPubKeyEvmMessage(newAddress ecommon.Address, netw
 }
 
 func (r *EvmRpc) GetSetTssEcdsaPubKeyEvmTx(newTss, sender ecommon.Address, oldFullSignature, newFullSignature []byte, contractAddress *ecommon.Address) (*etypes.Transaction, error) {
-	if blockHeight, err := r.BlockNumber(); err != nil {
+	return r.GetSetTssEcdsaPubKeyEvmTxContext(r.ctx, newTss, sender, oldFullSignature, newFullSignature, contractAddress)
+}
+
+func (r *EvmRpc) GetSetTssEcdsaPubKeyEvmTxContext(ctx context.Context, newTss, sender ecommon.Address, oldFullSignature, newFullSignature []byte, contractAddress *ecommon.Address) (*etypes.Transaction, error) {
+	encodedData, err := common.EvmContractAbi.Pack("setTss", newTss, oldFullSignature, newFullSignature)
+	if err != nil {
 		return nil, err
-	} else {
-		if balance, err := r.BalanceAt(sender, blockHeight); err != nil {
-			return nil, err
-		} else {
-			if balance.Cmp(big.NewInt(0)) == 0 {
-				return nil, errors.New("Balance is 0, not enough to send set ecdsa pub key tx")
-			}
-			r.logger.Debugf("Balance: %s", balance.String())
-			if nonce, err := r.NonceAt(sender, blockHeight); err != nil {
-				return nil, err
-			} else {
-				gasPrice, err := r.SuggestGasPrice()
-				if err != nil {
-					return nil, err
-				}
-
-				encodedData, err := common.EvmContractAbi.Pack("setTss", newTss, oldFullSignature, newFullSignature)
-				if err != nil {
-					return nil, err
-				}
-				msg := ethereum.CallMsg{
-					From:     sender,
-					To:       contractAddress,
-					Gas:      0,
-					GasPrice: gasPrice,
-					Value:    big.NewInt(0),
-					Data:     encodedData,
-				}
-				estimatedGas, err := r.EstimateGas(msg)
-				if err != nil {
-					return nil, err
-				} else {
-					r.logger.Debug("estimatedGas: ", estimatedGas)
-				}
-
-				fees := big.NewInt(0).Mul(gasPrice, big.NewInt(0).SetUint64(estimatedGas))
-				// We subtract the fees and send the difference to the contract
-				// We subtract the fees and send the difference to the contract
-				if balance.Cmp(fees) < 0 {
-					return nil, errors.New("not enough balance to send set ecdsa pub key tx")
-				}
-				balance.Sub(balance, fees)
-				tx := etypes.NewTx(&etypes.LegacyTx{
-					Nonce:    nonce,
-					To:       contractAddress,
-					Value:    big.NewInt(0),
-					Gas:      estimatedGas,
-					GasPrice: gasPrice,
-					Data:     encodedData,
-				})
-
-				return tx, nil
-			}
-		}
 	}
+	return r.buildContractTxContext(ctx, sender, contractAddress, evmTxKindSetTss, encodedData, "set ecdsa pub key tx")
 }
 
 func (r *EvmRpc) GetHaltEvmMessage(networkClass, chainId uint32, contractAddress *ecommon.Address) ([]byte, error) {
+	msg, _, err := r.GetHaltEvmMessageWithNonce(networkClass, chainId, contractAddress)
+	return msg, err
+}
+
+func (r *EvmRpc) GetHaltEvmMessageWithNonce(networkClass, chainId uint32, contractAddress *ecommon.Address) ([]byte, *big.Int, error) {
 	actionsNonce, err := r.GetActionNonce()
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	args := abi.Arguments{{Type: definition.StringTy}, {Type: definition.Uint256Ty}, {Type: definition.Uint256Ty}, {Type: definition.AddressTy}, {Type: definition.Uint256Ty}}
@@ -762,70 +1686,29 @@ func (r *EvmRpc) GetHaltEvmMessage(networkClass, chainId uint32, contractAddress
 
 	packedData, err := args.PackValues(values)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	hasher := sha3.NewLegacyKeccak256()
 	hasher.Write(packedData)
 	data := hasher.Sum(nil)
-	return implementation.GetMessageToSignEvm(data)
+	msg, err := implementation.GetMessageToSignEvm(data)
+	if err != nil {
+		return nil, nil, err
+	}
+	return msg, new(big.Int).Set(actionsNonce), nil
 }
 
 func (r *EvmRpc) GetHaltTxEvm(sender ecommon.Address, signature []byte, contractAddress *ecommon.Address) (*etypes.Transaction, error) {
-	if blockHeight, err := r.BlockNumber(); err != nil {
+	return r.GetHaltTxEvmContext(r.ctx, sender, signature, contractAddress)
+}
+
+func (r *EvmRpc) GetHaltTxEvmContext(ctx context.Context, sender ecommon.Address, signature []byte, contractAddress *ecommon.Address) (*etypes.Transaction, error) {
+	encodedData, err := common.EvmContractAbi.Pack("halt", signature)
+	if err != nil {
 		return nil, err
-	} else {
-		if balance, err := r.BalanceAt(sender, blockHeight); err != nil {
-			return nil, err
-		} else {
-			if balance.Cmp(big.NewInt(0)) == 0 {
-				return nil, errors.New("Balance is 0, not enough to send halt evm tx")
-			}
-			r.logger.Debugf("Balance: %s", balance.String())
-			if nonce, err := r.NonceAt(sender, blockHeight); err != nil {
-				return nil, err
-			} else {
-				gasPrice, err := r.SuggestGasPrice()
-				if err != nil {
-					return nil, err
-				}
-
-				encodedData, err := common.EvmContractAbi.Pack("halt", signature)
-				if err != nil {
-					return nil, err
-				}
-				msg := ethereum.CallMsg{
-					From:     sender,
-					To:       contractAddress,
-					Gas:      0,
-					GasPrice: gasPrice,
-					Value:    big.NewInt(0),
-					Data:     encodedData,
-				}
-				estimatedGas, err := r.EstimateGas(msg)
-				if err != nil {
-					return nil, err
-				}
-
-				fees := big.NewInt(0).Mul(gasPrice, big.NewInt(0).SetUint64(estimatedGas))
-				// We subtract the fees and send the difference to the contract
-				if balance.Cmp(fees) < 0 {
-					return nil, errors.New("not enough balance to send halt evm tx")
-				}
-				balance.Sub(balance, fees)
-				tx := etypes.NewTx(&etypes.LegacyTx{
-					Nonce:    nonce,
-					To:       contractAddress,
-					Value:    big.NewInt(0),
-					Gas:      estimatedGas,
-					GasPrice: gasPrice,
-					Data:     encodedData,
-				})
-
-				return tx, nil
-			}
-		}
 	}
+	return r.buildContractTxContext(ctx, sender, contractAddress, evmTxKindHalt, encodedData, "halt evm tx")
 }
 
 /// Rpc Calls
@@ -840,8 +1723,53 @@ const (
 	defaultFilterQuerySize = 2000
 )
 
+func combineContexts(base, caller context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
+	root := caller
+	if root == nil {
+		root = base
+	}
+	if root == nil {
+		root = context.Background()
+	}
+	var ctx context.Context
+	var cancel context.CancelFunc
+	if timeout > 0 {
+		ctx, cancel = context.WithTimeout(root, timeout)
+	} else {
+		ctx, cancel = context.WithCancel(root)
+	}
+	if base != nil && base != root {
+		stop := context.AfterFunc(base, cancel)
+		if base.Err() != nil {
+			cancel()
+		}
+		orig := cancel
+		cancel = func() {
+			stop()
+			orig()
+		}
+	}
+	return ctx, cancel
+}
+
 func (r *EvmRpc) callContext(timeout time.Duration) (context.Context, context.CancelFunc, error) {
 	return limitedCallContext(r.ctx, r.limiter, timeout)
+}
+
+func (r *EvmRpc) callContextWithParent(parent context.Context, timeout time.Duration) (context.Context, context.CancelFunc, error) {
+	if parent == nil || parent == r.ctx {
+		return r.callContext(timeout)
+	}
+	ctx, cancel := combineContexts(r.ctx, parent, 0)
+	read, end, err := limitedCallContext(ctx, r.limiter, timeout)
+	if err != nil {
+		cancel()
+		return nil, nil, err
+	}
+	return read, func() {
+		end()
+		cancel()
+	}, nil
 }
 
 // onPermitGranted is an optional test hook invoked immediately after a rate
@@ -948,13 +1876,17 @@ func (r *EvmRpc) TransactionReceiptContext(parent context.Context, txHash ecommo
 }
 
 func (r *EvmRpc) EstimateGas(msg ethereum.CallMsg) (uint64, error) {
-	ctx, cancel, err := r.callContext(evmCallTimeout)
+	return r.EstimateGasContext(r.ctx, msg)
+}
+
+func (r *EvmRpc) EstimateGasContext(parent context.Context, msg ethereum.CallMsg) (uint64, error) {
+	ctx, cancel, err := r.callContextWithParent(parent, evmCallTimeout)
 	if err != nil {
 		return 0, err
 	}
 	defer cancel()
 	var gas uint64
-	err = r.doPrimary(ctx, func(callCtx context.Context, client *ethclient.Client) error {
+	err = r.doPrimaryWithParent(parent, ctx, evmCallTimeout, func(callCtx context.Context, client *ethclient.Client) error {
 		var callErr error
 		gas, callErr = client.EstimateGas(callCtx, msg)
 		return callErr
@@ -963,13 +1895,17 @@ func (r *EvmRpc) EstimateGas(msg ethereum.CallMsg) (uint64, error) {
 }
 
 func (r *EvmRpc) SuggestGasPrice() (*big.Int, error) {
-	ctx, cancel, err := r.callContext(evmCallTimeout)
+	return r.SuggestGasPriceContext(r.ctx)
+}
+
+func (r *EvmRpc) SuggestGasPriceContext(parent context.Context) (*big.Int, error) {
+	ctx, cancel, err := r.callContextWithParent(parent, evmCallTimeout)
 	if err != nil {
 		return nil, err
 	}
 	defer cancel()
 	var price *big.Int
-	err = r.doPrimary(ctx, func(callCtx context.Context, client *ethclient.Client) error {
+	err = r.doPrimaryWithParent(parent, ctx, evmCallTimeout, func(callCtx context.Context, client *ethclient.Client) error {
 		var callErr error
 		price, callErr = client.SuggestGasPrice(callCtx)
 		return callErr
@@ -977,14 +1913,37 @@ func (r *EvmRpc) SuggestGasPrice() (*big.Int, error) {
 	return price, err
 }
 
+func (r *EvmRpc) SuggestGasTipCap() (*big.Int, error) {
+	return r.SuggestGasTipCapContext(r.ctx)
+}
+
+func (r *EvmRpc) SuggestGasTipCapContext(parent context.Context) (*big.Int, error) {
+	ctx, cancel, err := r.callContextWithParent(parent, evmCallTimeout)
+	if err != nil {
+		return nil, err
+	}
+	defer cancel()
+	var tip *big.Int
+	err = r.doPrimaryWithParent(parent, ctx, evmCallTimeout, func(callCtx context.Context, client *ethclient.Client) error {
+		var callErr error
+		tip, callErr = client.SuggestGasTipCap(callCtx)
+		return callErr
+	})
+	return tip, err
+}
+
 func (r *EvmRpc) NonceAt(address ecommon.Address, blockNumber uint64) (uint64, error) {
-	ctx, cancel, err := r.callContext(evmCallTimeout)
+	return r.NonceAtContext(r.ctx, address, blockNumber)
+}
+
+func (r *EvmRpc) NonceAtContext(parent context.Context, address ecommon.Address, blockNumber uint64) (uint64, error) {
+	ctx, cancel, err := r.callContextWithParent(parent, evmCallTimeout)
 	if err != nil {
 		return 0, err
 	}
 	defer cancel()
 	var nonce uint64
-	err = r.doPrimary(ctx, func(callCtx context.Context, client *ethclient.Client) error {
+	err = r.doPrimaryWithParent(parent, ctx, evmCallTimeout, func(callCtx context.Context, client *ethclient.Client) error {
 		var callErr error
 		nonce, callErr = client.NonceAt(callCtx, address, big.NewInt(0).SetUint64(blockNumber))
 		return callErr
@@ -992,14 +1951,64 @@ func (r *EvmRpc) NonceAt(address ecommon.Address, blockNumber uint64) (uint64, e
 	return nonce, err
 }
 
+func (r *EvmRpc) PendingNonceAt(address ecommon.Address) (uint64, error) {
+	return r.PendingNonceAtContext(r.ctx, address)
+}
+
+func (r *EvmRpc) PendingNonceAtContext(parent context.Context, address ecommon.Address) (uint64, error) {
+	ctx, cancel, err := r.callContextWithParent(parent, evmCallTimeout)
+	if err != nil {
+		return 0, err
+	}
+	defer cancel()
+	var nonce uint64
+	err = r.doPrimaryWithParent(parent, ctx, evmCallTimeout, func(callCtx context.Context, client *ethclient.Client) error {
+		var callErr error
+		nonce, callErr = client.PendingNonceAt(callCtx, address)
+		return callErr
+	})
+	return nonce, err
+}
+
+// baseFeeByNumber reads only baseFeePerGas from eth_getBlockByNumber so
+// minimal or pre-London RPC responses without full header fields do not fail
+// decoding, and returns (nil, nil) on non-1559 chains.
+func (r *EvmRpc) baseFeeByNumber(blockNumber uint64) (*big.Int, error) {
+	return r.baseFeeByNumberContext(r.ctx, blockNumber)
+}
+
+func (r *EvmRpc) baseFeeByNumberContext(parent context.Context, blockNumber uint64) (*big.Int, error) {
+	ctx, cancel, err := r.callContextWithParent(parent, evmCallTimeout)
+	if err != nil {
+		return nil, err
+	}
+	defer cancel()
+	var raw struct {
+		BaseFee *hexutil.Big `json:"baseFeePerGas"`
+	}
+	if err := r.doPrimaryWithParent(parent, ctx, evmCallTimeout, func(callCtx context.Context, client *ethclient.Client) error {
+		return client.Client().CallContext(callCtx, &raw, "eth_getBlockByNumber", hexutil.EncodeUint64(blockNumber), false)
+	}); err != nil {
+		return nil, err
+	}
+	if raw.BaseFee == nil {
+		return nil, nil
+	}
+	return raw.BaseFee.ToInt(), nil
+}
+
 func (r *EvmRpc) BalanceAt(address ecommon.Address, blockNumber uint64) (*big.Int, error) {
-	ctx, cancel, err := r.callContext(evmCallTimeout)
+	return r.BalanceAtContext(r.ctx, address, blockNumber)
+}
+
+func (r *EvmRpc) BalanceAtContext(parent context.Context, address ecommon.Address, blockNumber uint64) (*big.Int, error) {
+	ctx, cancel, err := r.callContextWithParent(parent, evmCallTimeout)
 	if err != nil {
 		return nil, err
 	}
 	defer cancel()
 	var bal *big.Int
-	err = r.doPrimary(ctx, func(callCtx context.Context, client *ethclient.Client) error {
+	err = r.doPrimaryWithParent(parent, ctx, evmCallTimeout, func(callCtx context.Context, client *ethclient.Client) error {
 		var callErr error
 		bal, callErr = client.BalanceAt(callCtx, address, big.NewInt(0).SetUint64(blockNumber))
 		return callErr
@@ -1008,13 +2017,17 @@ func (r *EvmRpc) BalanceAt(address ecommon.Address, blockNumber uint64) (*big.In
 }
 
 func (r *EvmRpc) BlockNumber() (uint64, error) {
-	ctx, cancel, err := r.callContext(evmCallTimeout)
+	return r.BlockNumberContext(r.ctx)
+}
+
+func (r *EvmRpc) BlockNumberContext(parent context.Context) (uint64, error) {
+	ctx, cancel, err := r.callContextWithParent(parent, evmCallTimeout)
 	if err != nil {
 		return 0, err
 	}
 	defer cancel()
 	var num uint64
-	err = r.doPrimary(ctx, func(callCtx context.Context, client *ethclient.Client) error {
+	err = r.doPrimaryWithParent(parent, ctx, evmCallTimeout, func(callCtx context.Context, client *ethclient.Client) error {
 		var callErr error
 		num, callErr = client.BlockNumber(callCtx)
 		return callErr
@@ -1101,6 +2114,378 @@ func (r *EvmRpc) CanonicalHash(number uint64) (ecommon.Hash, error) {
 	return agreeCanonicalHash(number, results)
 }
 
+// EndpointHeads queries every configured endpoint for sync status and chain
+// head. It returns (minHead, maxHead, nil) only when every endpoint responds
+// and reports itself synced.
+func (r *EvmRpc) EndpointHeads() (uint64, uint64, error) {
+	urls := r.Urls.Urls
+	if len(urls) == 0 {
+		return 0, 0, errors.New("no EVM endpoints configured")
+	}
+	type headAnswer struct {
+		head uint64
+		err  error
+	}
+	results := make([]headAnswer, len(urls))
+	var wg sync.WaitGroup
+	for idx := range urls {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			var head uint64
+			err := r.callEndpoint(idx, func(ctx context.Context, client *ethclient.Client) error {
+				synced, err := syncStateForClient(ctx, client)
+				if err != nil {
+					return err
+				}
+				if !synced {
+					return errors.New("endpoint is still syncing")
+				}
+				return nil
+			})
+			if err == nil {
+				err = r.callEndpoint(idx, func(ctx context.Context, client *ethclient.Client) error {
+					var callErr error
+					head, callErr = client.BlockNumber(ctx)
+					if callErr == nil && uint32(idx) != r.Urls.CurrentUrlIndex {
+						r.recordSecondaryVerifiedHead(urls[idx], head)
+					}
+					return callErr
+				})
+			}
+			if err != nil {
+				err = errors.New(config.RedactErrorForURL(err, urls[idx]))
+			}
+			results[idx] = headAnswer{head: head, err: err}
+		}(idx)
+	}
+	wg.Wait()
+	var minHead, maxHead uint64
+	for idx, res := range results {
+		if res.err != nil {
+			return 0, 0, fmt.Errorf("endpoint #%d head unavailable: %w", idx, res.err)
+		}
+		if idx == 0 || res.head < minHead {
+			minHead = res.head
+		}
+		if idx == 0 || res.head > maxHead {
+			maxHead = res.head
+		}
+	}
+	return minHead, maxHead, nil
+}
+
+// AnySecondaryHasReceipt checks every secondary endpoint (all configured URLs
+// other than the primary) for a transaction receipt. It returns true if any
+// secondary serves a receipt, and an error if any secondary fails to answer
+// definitively.
+func (r *EvmRpc) AnySecondaryHasReceipt(txHash ecommon.Hash) (bool, error) {
+	urls := r.Urls.Urls
+	type receiptAnswer struct {
+		found bool
+		err   error
+	}
+	results := make([]receiptAnswer, len(urls))
+	var wg sync.WaitGroup
+	for idx := range urls {
+		if uint32(idx) == r.Urls.CurrentUrlIndex {
+			continue
+		}
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			var found bool
+			err := r.callEndpoint(idx, func(ctx context.Context, client *ethclient.Client) error {
+				receipt, err := client.TransactionReceipt(ctx, txHash)
+				if errors.Is(err, ethereum.NotFound) {
+					return nil
+				}
+				if err != nil {
+					return err
+				}
+				found = receipt != nil
+				return nil
+			})
+			if err != nil {
+				err = errors.New(config.RedactErrorForURL(err, urls[idx]))
+			}
+			results[idx] = receiptAnswer{found: found, err: err}
+		}(idx)
+	}
+	wg.Wait()
+	for idx, res := range results {
+		if uint32(idx) == r.Urls.CurrentUrlIndex {
+			continue
+		}
+		if res.err != nil {
+			return false, fmt.Errorf("endpoint #%d receipt check failed: %w", idx, res.err)
+		}
+		if res.found {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+const (
+	defaultSecondaryLogMaxChunks = 16
+	secondaryLogAttemptTimeout   = 15 * time.Second
+)
+
+// HasIndependentSecondary reports whether this client is configured with at
+// least one secondary endpoint URL distinct from the active primary URL.
+func (r *EvmRpc) HasIndependentSecondary() bool {
+	primaryURL := r.Urls.GetCurrentUrl()
+	for idx, u := range r.Urls.Urls {
+		if uint32(idx) != r.Urls.CurrentUrlIndex && u != primaryURL {
+			return true
+		}
+	}
+	return false
+}
+
+// SecondaryURLs returns the sorted unique list of configured independent
+// secondary endpoint URLs (excluding the primary endpoint) so persisted
+// corroboration progress is invalidated whenever the secondary set changes.
+func (r *EvmRpc) SecondaryURLs() []string {
+	primaryURL := r.Urls.GetCurrentUrl()
+	seen := make(map[string]struct{}, len(r.Urls.Urls))
+	out := make([]string, 0, len(r.Urls.Urls))
+	for idx, u := range r.Urls.Urls {
+		if uint32(idx) == r.Urls.CurrentUrlIndex || u == primaryURL {
+			continue
+		}
+		if _, ok := seen[u]; ok {
+			continue
+		}
+		seen[u] = struct{}{}
+		out = append(out, u)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// AnySecondaryHasUnwrapLogChunked corroborates absence of an Unwrapped source
+// log across every independent secondary endpoint for one bounded batch of
+// chunks walking backwards from resumeEnd toward fromBlock.
+//
+// Each secondary must report a head >= targetHead so it cannot silently clip
+// eth_getLogs below the window being verified. Each call processes at most
+// maxChunks FilterQuerySize chunks within secondaryLogAttemptTimeout and
+// returns (found, lowestVerified, complete, err) so callers can retain
+// verified progress across retries without blocking the bridge listener past
+// its hold-tracking window.
+func isAttemptBudgetErr(err error, attemptCtx, parent context.Context) bool {
+	if err == nil || (parent != nil && parent.Err() != nil) {
+		return false
+	}
+	if attemptCtx.Err() != nil && (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) {
+		return true
+	}
+	return strings.Contains(err.Error(), "would exceed context deadline")
+}
+
+func (r *EvmRpc) AnySecondaryHasUnwrapLogChunked(parent context.Context, fromBlock, targetHead, resumeEnd uint64, txHash ecommon.Hash, logIndex uint32, maxChunks int) (bool, uint64, bool, error) {
+	if !r.HasIndependentSecondary() {
+		return false, 0, false, errors.New("no independent secondary EVM endpoint configured")
+	}
+	if resumeEnd < fromBlock {
+		return false, fromBlock, true, nil
+	}
+	baseIndex := logIndex
+	if baseIndex >= common.AffiliateLogIndexAddition {
+		baseIndex -= common.AffiliateLogIndexAddition
+	}
+	step := r.filterQuerySize
+	if step == 0 {
+		step = defaultFilterQuerySize
+	}
+	if maxChunks <= 0 {
+		maxChunks = defaultSecondaryLogMaxChunks
+	}
+	windowFrom := fromBlock
+	if maxSpan := step * uint64(maxChunks); maxSpan/step == uint64(maxChunks) && resumeEnd > fromBlock && resumeEnd-fromBlock >= maxSpan {
+		windowFrom = resumeEnd - maxSpan + 1
+	}
+
+	if parent == nil {
+		parent = context.Background()
+	}
+	r.txMu.Lock()
+	budget := r.secondaryLogTimeout
+	r.txMu.Unlock()
+	if budget <= 0 {
+		budget = secondaryLogAttemptTimeout
+		// At supported fractional RPC rates (e.g. 0.05 req/s = 20s per permit),
+		// allow at least one permit refill + RPC margin (bounded by
+		// evmFilterLogsTimeout) so every retry can advance at least one chunk.
+		if r.limit > 0 {
+			permitInterval := time.Duration(float64(time.Second) / float64(r.limit))
+			minForOneChunk := permitInterval + 5*time.Second
+			if minForOneChunk > evmFilterLogsTimeout {
+				minForOneChunk = evmFilterLogsTimeout
+			}
+			if minForOneChunk > budget {
+				budget = minForOneChunk
+			}
+		}
+	}
+	attemptCtx, cancel := context.WithTimeout(parent, budget)
+	defer cancel()
+
+	primaryURL := r.Urls.GetCurrentUrl()
+	urls := r.Urls.Urls
+	type logAnswer struct {
+		checked        bool
+		found          bool
+		completedAny   bool
+		lowestVerified uint64
+		err            error
+	}
+	results := make([]logAnswer, len(urls))
+	var wg sync.WaitGroup
+	for idx, u := range urls {
+		if uint32(idx) == r.Urls.CurrentUrlIndex || u == primaryURL {
+			continue
+		}
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			var found bool
+			var completedAny bool
+			var lowestVerified uint64
+			var scanErr error
+			// Verify the secondary's head covers targetHead so it cannot clip logs.
+			// Reuse a previously verified head >= targetHead (from EndpointHeads or
+			// an earlier corroboration attempt) so low-rate-limit endpoints spend
+			// their permit budget advancing log chunks instead of repeating BlockNumber.
+			if r.getSecondaryVerifiedHead(urls[idx]) < targetHead {
+				if err := r.callEndpointContext(attemptCtx, idx, func(ctx context.Context, client *ethclient.Client) error {
+					head, err := client.BlockNumber(ctx)
+					if err != nil {
+						return err
+					}
+					if head < targetHead {
+						return fmt.Errorf("secondary head %d lags target %d", head, targetHead)
+					}
+					r.recordSecondaryVerifiedHead(urls[idx], head)
+					return nil
+				}); err != nil {
+					results[idx] = logAnswer{checked: true, err: errors.New(config.RedactErrorForURL(err, urls[idx]))}
+					return
+				}
+			}
+			epStep := step
+			if cached := r.getSecondaryLogStep(urls[idx]); cached > 0 && cached < epStep {
+				epStep = cached
+			}
+			chunksDone := 0
+			for end := resumeEnd; ; {
+				if attemptCtx.Err() != nil {
+					if parent.Err() != nil || !completedAny {
+						scanErr = attemptCtx.Err()
+					}
+					break
+				}
+				start := windowFrom
+				if end > windowFrom && end-windowFrom >= epStep {
+					start = end - epStep + 1
+				}
+				attemptWidth := end - start + 1
+				query := ethereum.FilterQuery{
+					FromBlock: new(big.Int).SetUint64(start),
+					ToBlock:   new(big.Int).SetUint64(end),
+					Addresses: []ecommon.Address{r.bridgeAddress},
+					Topics:    [][]ecommon.Hash{{common.UnwrapSigHash}},
+				}
+				err := r.callEndpointContext(attemptCtx, idx, func(ctx context.Context, client *ethclient.Client) error {
+					logs, err := client.FilterLogs(ctx, query)
+					if err != nil {
+						return err
+					}
+					for i := range logs {
+						l := &logs[i]
+						if !l.Removed && l.TxHash == txHash && uint32(l.Index) == baseIndex {
+							found = true
+							return nil
+						}
+					}
+					return nil
+				})
+				if err != nil {
+					// If the provider rejected the eth_getLogs block width or
+					// result size, shrink the secondary step (honoring any
+					// suggested range hint, otherwise halving down to 1 block)
+					// and retry the current range immediately.
+					if IsLogRangeLimitError(err) && attemptWidth > 1 {
+						hint, _ := SuggestedLogRange(err)
+						nextStep := hint
+						if nextStep == 0 || nextStep >= attemptWidth {
+							nextStep = attemptWidth / 2
+							if nextStep == 0 {
+								nextStep = 1
+							}
+						}
+						if nextStep < epStep {
+							epStep = nextStep
+							r.recordSecondaryLogStep(urls[idx], epStep)
+							continue
+						}
+					}
+					// If the per-attempt time budget expired (or the rate limiter
+					// rejected a permit exceeding the remaining attempt budget)
+					// after completing at least one chunk, retain partial progress
+					// so low-rate-limit nodes advance across retries.
+					if completedAny && isAttemptBudgetErr(err, attemptCtx, parent) {
+						break
+					}
+					scanErr = errors.New(config.RedactErrorForURL(err, urls[idx]))
+					break
+				}
+				completedAny = true
+				chunksDone++
+				lowestVerified = start
+				if found || start == windowFrom || chunksDone >= maxChunks {
+					break
+				}
+				end = start - 1
+			}
+			results[idx] = logAnswer{
+				checked:        true,
+				found:          found,
+				completedAny:   completedAny,
+				lowestVerified: lowestVerified,
+				err:            scanErr,
+			}
+		}(idx)
+	}
+	wg.Wait()
+	checkedAny := false
+	var agreedLowest uint64
+	for idx, res := range results {
+		if !res.checked {
+			continue
+		}
+		if res.err != nil {
+			return false, 0, false, fmt.Errorf("endpoint #%d unwrap log check failed: %w", idx, res.err)
+		}
+		if res.found {
+			return true, 0, false, nil
+		}
+		if !res.completedAny {
+			return false, 0, false, fmt.Errorf("endpoint #%d completed no unwrap log chunks within attempt budget", idx)
+		}
+		if !checkedAny || res.lowestVerified > agreedLowest {
+			agreedLowest = res.lowestVerified
+		}
+		checkedAny = true
+	}
+	if !checkedAny {
+		return false, 0, false, errors.New("no independent secondary EVM endpoint checked")
+	}
+	return false, agreedLowest, agreedLowest == fromBlock, nil
+}
+
 // agreeCanonicalHash reduces per-endpoint answers to one hash, or an error
 // when any endpoint failed or the answers differ.
 func agreeCanonicalHash(number uint64, results []headerResult) (ecommon.Hash, error) {
@@ -1135,16 +2520,30 @@ func agreeCanonicalHash(number uint64, results []headerResult) (ecommon.Hash, er
 
 // callEndpoint charges the endpoint's own limiter and reuses its client.
 func (r *EvmRpc) callEndpoint(idx int, read func(context.Context, *ethclient.Client) error) error {
+	return r.callEndpointContext(r.ctx, idx, read)
+}
+
+// callEndpointContext applies parent's deadline and cancellation BEFORE
+// acquiring the endpoint lock, waiting for a rate-limiter permit, dialling,
+// and running read.
+func (r *EvmRpc) callEndpointContext(parent context.Context, idx int, read func(context.Context, *ethclient.Client) error) error {
 	if uint32(idx) == r.Urls.CurrentUrlIndex {
-		ctx, cancel, err := r.callContext(evmCallTimeout)
+		ctx, cancel, err := r.callContextWithParent(parent, evmCallTimeout)
 		if err != nil {
 			return err
 		}
 		defer cancel()
-		return r.doPrimary(ctx, func(callCtx context.Context, client *ethclient.Client) error {
+		return r.doPrimaryWithParent(parent, ctx, evmCallTimeout, func(callCtx context.Context, client *ethclient.Client) error {
 			return read(callCtx, client)
 		})
 	}
+	merged, stopMerged := mergeCancelContext(parent, r.ctx)
+	defer stopMerged()
+	if err := merged.Err(); err != nil {
+		return err
+	}
+	acquireCtx, cancelAcquire := context.WithTimeout(merged, evmCallTimeout)
+	defer cancelAcquire()
 	url := r.Urls.Urls[idx]
 	r.secondaryMu.Lock()
 	if r.secondaryStopped {
@@ -1156,7 +2555,7 @@ func (r *EvmRpc) callEndpoint(idx int, read func(context.Context, *ethclient.Cli
 		if r.secondary == nil {
 			r.secondary = make(map[string]*secondaryClient)
 		}
-		entry = &secondaryClient{}
+		entry = &secondaryClient{sem: make(chan struct{}, 1)}
 		if url == r.Urls.GetCurrentUrl() {
 			entry.limiter = r.limiter
 		} else if r.limit > 0 {
@@ -1166,8 +2565,10 @@ func (r *EvmRpc) callEndpoint(idx int, read func(context.Context, *ethclient.Cli
 	}
 	r.secondaryMu.Unlock()
 
-	entry.mu.Lock()
-	defer entry.mu.Unlock()
+	if err := entry.acquire(acquireCtx); err != nil {
+		return err
+	}
+	defer entry.release()
 	// Stop may have closed this entry between the check above and taking
 	// its lock; never dial a client that nothing will close.
 	r.secondaryMu.Lock()
@@ -1177,11 +2578,21 @@ func (r *EvmRpc) callEndpoint(idx int, read func(context.Context, *ethclient.Cli
 		return errors.New("evm rpc stopped")
 	}
 	dialSecondary := func() error {
-		// Charge eth_chainId verification separately from the read RPC so
-		// dialing a secondary client respects RpcRequestsPerSecond / RpcBurst.
-		dialCtx, dialCancel, err := limitedCallContext(r.ctx, entry.limiter, evmCallTimeout)
-		if err != nil {
-			return err
+		// Charge eth_chainId verification separately from the read RPC only
+		// when chainId != 0 (i.e. when dialVerifiedEvmClient actually issues
+		// an eth_chainId probe), matching NewEvmRpcClientForChainContext.
+		var (
+			dialCtx    context.Context
+			dialCancel context.CancelFunc
+			err        error
+		)
+		if r.chainId != 0 {
+			dialCtx, dialCancel, err = limitedCallContext(merged, entry.limiter, evmCallTimeout)
+			if err != nil {
+				return err
+			}
+		} else {
+			dialCtx, dialCancel = context.WithTimeout(merged, evmCallTimeout)
 		}
 		client, err := dialVerifiedEvmClient(dialCtx, url, r.chainId, r.networkName)
 		dialCancel()
@@ -1196,11 +2607,11 @@ func (r *EvmRpc) callEndpoint(idx int, read func(context.Context, *ethclient.Cli
 			return err
 		}
 	}
-	ctx, cancel, err := limitedCallContext(r.ctx, entry.limiter, evmCallTimeout)
+	readCtx, cancel, err := limitedCallContext(merged, entry.limiter, evmCallTimeout)
 	if err != nil {
 		return err
 	}
-	readErr := read(ctx, entry.client)
+	readErr := read(readCtx, entry.client)
 	cancel()
 	if readErr == nil {
 		return nil
@@ -1221,7 +2632,7 @@ func (r *EvmRpc) callEndpoint(idx int, read func(context.Context, *ethclient.Cli
 	if err := dialSecondary(); err != nil {
 		return err
 	}
-	retryCtx, retryCancel, err := limitedCallContext(r.ctx, entry.limiter, evmCallTimeout)
+	retryCtx, retryCancel, err := limitedCallContext(merged, entry.limiter, evmCallTimeout)
 	if err != nil {
 		return err
 	}
@@ -1245,12 +2656,12 @@ func (r *EvmRpc) closeSecondaryClients() {
 	}
 	r.secondaryMu.Unlock()
 	for _, entry := range entries {
-		entry.mu.Lock()
+		entry.sem <- struct{}{}
 		if entry.client != nil {
 			entry.client.Close()
 			entry.client = nil
 		}
-		entry.mu.Unlock()
+		entry.release()
 	}
 }
 
@@ -1462,19 +2873,100 @@ func (b bridgeReadBackend) SubscribeFilterLogs(ctx context.Context, query ethere
 }
 
 func (r *EvmRpc) GetCurrentTss() (ecommon.Address, error) {
-	return r.bridgeContract.Tss(&bind.CallOpts{Context: r.ctx})
+	return r.GetCurrentTssContext(r.ctx)
+}
+
+func (r *EvmRpc) GetCurrentTssContext(parent context.Context) (ecommon.Address, error) {
+	ctx, cancel := combineContexts(r.ctx, parent, 0)
+	defer cancel()
+	return r.bridgeContract.Tss(&bind.CallOpts{Context: ctx})
 }
 
 func (r *EvmRpc) HaltFlagSet() (bool, error) {
-	return r.bridgeContract.Halted(&bind.CallOpts{Context: r.ctx})
+	return r.HaltFlagSetContext(r.ctx)
+}
+
+func (r *EvmRpc) HaltFlagSetContext(parent context.Context) (bool, error) {
+	ctx, cancel := combineContexts(r.ctx, parent, 0)
+	defer cancel()
+	return r.bridgeContract.Halted(&bind.CallOpts{Context: ctx})
 }
 
 func (r *EvmRpc) IsHalted() (bool, error) {
 	return r.bridgeContract.IsHalted(&bind.CallOpts{Context: r.ctx})
 }
 
+func (r *EvmRpc) getSecondaryVerifiedHead(url string) uint64 {
+	r.secondaryMu.Lock()
+	defer r.secondaryMu.Unlock()
+	if entry := r.secondary[url]; entry != nil {
+		return entry.verifiedHead
+	}
+	return 0
+}
+
+func (r *EvmRpc) recordSecondaryVerifiedHead(url string, head uint64) {
+	r.secondaryMu.Lock()
+	defer r.secondaryMu.Unlock()
+	if r.secondary == nil {
+		r.secondary = make(map[string]*secondaryClient)
+	}
+	entry := r.secondary[url]
+	if entry == nil {
+		entry = &secondaryClient{sem: make(chan struct{}, 1)}
+		if url == r.Urls.GetCurrentUrl() {
+			entry.limiter = r.limiter
+		} else if r.limit > 0 {
+			entry.limiter = rate.NewLimiter(r.limit, r.burst)
+		}
+		r.secondary[url] = entry
+	}
+	if head > entry.verifiedHead {
+		entry.verifiedHead = head
+	}
+}
+
+func (r *EvmRpc) getSecondaryLogStep(url string) uint64 {
+	r.secondaryMu.Lock()
+	defer r.secondaryMu.Unlock()
+	if entry := r.secondary[url]; entry != nil {
+		return entry.logStep
+	}
+	return 0
+}
+
+func (r *EvmRpc) recordSecondaryLogStep(url string, step uint64) {
+	if step == 0 {
+		return
+	}
+	r.secondaryMu.Lock()
+	defer r.secondaryMu.Unlock()
+	if r.secondary == nil {
+		r.secondary = make(map[string]*secondaryClient)
+	}
+	entry := r.secondary[url]
+	if entry == nil {
+		entry = &secondaryClient{sem: make(chan struct{}, 1)}
+		if url == r.Urls.GetCurrentUrl() {
+			entry.limiter = r.limiter
+		} else if r.limit > 0 {
+			entry.limiter = rate.NewLimiter(r.limit, r.burst)
+		}
+		r.secondary[url] = entry
+	}
+	if entry.logStep == 0 || step < entry.logStep {
+		entry.logStep = step
+	}
+}
+
 func (r *EvmRpc) GetActionNonce() (*big.Int, error) {
-	return r.bridgeContract.ActionsNonce(&bind.CallOpts{Context: r.ctx})
+	return r.GetActionNonceContext(r.ctx)
+}
+
+func (r *EvmRpc) GetActionNonceContext(parent context.Context) (*big.Int, error) {
+	ctx, cancel := combineContexts(r.ctx, parent, 0)
+	defer cancel()
+	return r.bridgeContract.ActionsNonce(&bind.CallOpts{Context: ctx})
 }
 
 func (r *EvmRpc) EstimatedBlockTime() (uint64, error) {
@@ -1505,7 +2997,11 @@ func (r *EvmRpc) ContractDeploymentHeight() (uint64, error) {
 }
 
 func (r *EvmRpc) TransactionByHash(hash ecommon.Hash) (*etypes.Transaction, bool, error) {
-	ctx, cancel, err := r.callContext(evmCallTimeout)
+	return r.TransactionByHashContext(r.ctx, hash)
+}
+
+func (r *EvmRpc) TransactionByHashContext(parent context.Context, hash ecommon.Hash) (*etypes.Transaction, bool, error) {
+	ctx, cancel, err := r.callContextWithParent(parent, evmCallTimeout)
 	if err != nil {
 		return nil, false, err
 	}
@@ -1514,7 +3010,7 @@ func (r *EvmRpc) TransactionByHash(hash ecommon.Hash) (*etypes.Transaction, bool
 		tx        *etypes.Transaction
 		isPending bool
 	)
-	err = r.doPrimary(ctx, func(callCtx context.Context, client *ethclient.Client) error {
+	err = r.doPrimaryWithParent(parent, ctx, evmCallTimeout, func(callCtx context.Context, client *ethclient.Client) error {
 		var callErr error
 		tx, isPending, callErr = client.TransactionByHash(callCtx, hash)
 		return callErr

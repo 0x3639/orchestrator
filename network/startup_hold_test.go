@@ -1714,7 +1714,7 @@ func TestNetworkAddedDuringAHeldStartThatFailsDoesNotStopASignerInAnEmergency(t 
 	if err != nil {
 		t.Fatal(err)
 	}
-	adding := h.zenon.append(nil, data, heldAdministrator)
+	adding := h.zenon.append(acceptedReceive, data, heldAdministrator)
 	h.setUnreadable(blocked, false)
 	waitFor(t, "the hold at the receive that adds the network", func() bool { hold := h.hold(); return hold != nil && hold.Height == adding })
 	h.retries(3)
@@ -1756,7 +1756,7 @@ func TestNetworkAddedDuringTheFirstReadIsStartedOnce(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	adding := h.zenon.append(nil, data, heldAdministrator)
+	adding := h.zenon.append(acceptedReceive, data, heldAdministrator)
 
 	if err := h.start(); err != nil {
 		t.Fatal(err)
