@@ -43,12 +43,13 @@ type AffiliateNetwork struct {
 // transaction for a (sender, contract, kind) tuple so retries recover nonce
 // ownership and fee watermarks across process restarts and network removals.
 type PendingEvmTx struct {
-	Nonce     uint64       `json:"nonce"`
-	TxHash    ecommon.Hash `json:"txHash,omitempty"`
-	GasPrice  *big.Int     `json:"gasPrice,omitempty"`
-	TipCap    *big.Int     `json:"tipCap,omitempty"`
-	FeeCap    *big.Int     `json:"feeCap,omitempty"`
-	IsDynamic bool         `json:"isDynamic"`
+	Nonce         uint64         `json:"nonce"`
+	TxHash        ecommon.Hash   `json:"txHash,omitempty"`
+	PriorTxHashes []ecommon.Hash `json:"priorTxHashes,omitempty"`
+	GasPrice      *big.Int       `json:"gasPrice,omitempty"`
+	TipCap        *big.Int       `json:"tipCap,omitempty"`
+	FeeCap        *big.Int       `json:"feeCap,omitempty"`
+	IsDynamic     bool           `json:"isDynamic"`
 }
 
 // PendingEvmTxOp describes one save (Record != nil) or delete (Record == nil)
