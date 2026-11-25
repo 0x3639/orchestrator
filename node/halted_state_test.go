@@ -1,6 +1,7 @@
 package node
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
@@ -3442,5 +3443,110 @@ func TestConfigurePubKeyDoesNotWhitelistRetiredHistoricalKeyPeers(t *testing.T) 
 	}
 	if node.config.TssConfig.PubKeyWhitelist[retiredPeerID] {
 		t.Fatalf("retired historical peer %s was reauthorized in PubKeyWhitelist on restart", retiredPeerID)
+	}
+}
+
+func TestReconcileLiveKeyAndWhitelistPromotesConfirmedZenonKeyAndRevokesAlternatePeers(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	baseDir := filepath.Join(t.TempDir(), "tss")
+	if err := os.MkdirAll(baseDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	oldPriv, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldCompressed := base64.StdEncoding.EncodeToString(crypto.CompressPubkey(&oldPriv.PublicKey))
+	newPriv, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	newCompressed := base64.StdEncoding.EncodeToString(crypto.CompressPubkey(&newPriv.PublicKey))
+
+	makeParty := func(seed byte) (string, string) {
+		edPub := ed25519.NewKeyFromSeed(bytes.Repeat([]byte{seed}, ed25519.SeedSize)).Public().(ed25519.PublicKey)
+		b64 := base64.StdEncoding.EncodeToString(edPub)
+		pid, err := pubKeyToPeerID(b64)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return b64, pid.String()
+	}
+	oldParty, oldPeerID := makeParty(0x51)
+	newParty, newPeerID := makeParty(0x52)
+	extraParty, extraPeerID := makeParty(0x53)
+	_ = extraParty
+
+	writeShare := func(compressed, party string) {
+		name, err := common.GetPublicKeyFileName(compressed)
+		if err != nil {
+			t.Fatal(err)
+		}
+		raw, err := json.Marshal(map[string]interface{}{"participant_keys": []string{party}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(baseDir, name), raw, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeShare(oldCompressed, oldParty)
+	writeShare(newCompressed, newParty)
+
+	updater := newFakeParticipantUpdater(oldPeerID)
+	updater.SetNewLocalPubKeys([]string{oldParty})
+
+	liveState := common.LiveState
+	node := &Node{
+		config: &config.Config{
+			DataPath: t.TempDir(),
+			TssConfig: config.TssManagerConfig{
+				BaseDir:         baseDir,
+				PublicKey:       oldCompressed,
+				LocalPubKeys:    []string{oldParty},
+				PubKeyWhitelist: map[string]bool{oldPeerID: true},
+			},
+		},
+		state:              common.NewGlobalState(&liveState),
+		activeKeyPeerIDs:   map[string]bool{oldPeerID: true},
+		activeKeyPubKeys:   []string{oldParty},
+		participantUpdater: updater,
+		logger:             zap.NewNop().Sugar(),
+	}
+
+	// 1. Emergency admission adds an alternate peer live, then returning to LiveState
+	// on the same Zenon key revokes it back to the active key baseline.
+	node.admitEmergencyKeyPeers([]string{extraPeerID})
+	if !node.config.TssConfig.PubKeyWhitelist[extraPeerID] || !updater.p2pWL[extraPeerID] {
+		t.Fatalf("expected emergency-admitted peer %s in config and live whitelist", extraPeerID)
+	}
+	node.reconcileLiveKeyAndWhitelist(&definition.BridgeInfoVariable{
+		CompressedTssECDSAPubKey: oldCompressed,
+	})
+	if node.config.TssConfig.PubKeyWhitelist[extraPeerID] || updater.p2pWL[extraPeerID] {
+		t.Fatalf("expected emergency-admitted peer %s to be revoked on LiveState reconciliation", extraPeerID)
+	}
+	if !node.config.TssConfig.PubKeyWhitelist[oldPeerID] || !updater.p2pWL[oldPeerID] {
+		t.Fatalf("expected active Zenon key peer %s to remain whitelisted", oldPeerID)
+	}
+
+	// 2. If Zenon already confirmed newCompressed (e.g. emergency interrupted
+	// finishKeyGenRound after Zenon rotated), LiveState reconciles the local
+	// key from disk and revokes the retired old key's peers.
+	node.reconcileLiveKeyAndWhitelist(&definition.BridgeInfoVariable{
+		CompressedTssECDSAPubKey: newCompressed,
+	})
+	if node.config.TssConfig.PublicKey != newCompressed {
+		t.Fatalf("PublicKey = %s, want %s", node.config.TssConfig.PublicKey, newCompressed)
+	}
+	if len(node.config.TssConfig.LocalPubKeys) != 1 || node.config.TssConfig.LocalPubKeys[0] != newParty {
+		t.Fatalf("LocalPubKeys = %v, want [%s]", node.config.TssConfig.LocalPubKeys, newParty)
+	}
+	if !node.config.TssConfig.PubKeyWhitelist[newPeerID] || !updater.p2pWL[newPeerID] {
+		t.Fatalf("expected confirmed Zenon key peer %s in config and live whitelist", newPeerID)
+	}
+	if node.config.TssConfig.PubKeyWhitelist[oldPeerID] || updater.p2pWL[oldPeerID] {
+		t.Fatalf("expected retired old key peer %s to be revoked after promotion", oldPeerID)
 	}
 }

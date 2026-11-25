@@ -107,6 +107,10 @@ type Node struct {
 	// preempted keygen rotation so EmergencyState can sign halt messages for
 	// every chain using that chain's observed active key (old or new).
 	pendingKeyGenPubKey string
+	// emergencyPeersAdmitted tracks whether admitEmergencyKeyPeers added
+	// alternate-key peers during an emergency so they are revoked once the
+	// emergency ends.
+	emergencyPeersAdmitted atomic.Bool
 	// tssSettingsMu serializes TssManager key/party setup and cancellation
 	// checks between keygen and emergency signing ceremonies.
 	tssSettingsMu sync.Mutex
@@ -683,6 +687,11 @@ func (node *Node) processSignatures() {
 				node.logger.Debug("processSignatures bridgeInfo == nil")
 				continue
 			}
+			// Reconcile local active TSS key and whitelist if Zenon already
+			// confirmed a key we hold on disk (e.g. after an emergency
+			// interrupted key rotation) or if retired alternate-key peers can
+			// now be revoked.
+			node.reconcileLiveKeyAndWhitelist(bridgeInfo)
 			if bridgeInfo.AllowKeyGen == true {
 				// this means we generated a key and we wait for the administrator to change it
 				if len(bridgeInfo.CompressedTssECDSAPubKey) == 0 && len(node.tssManager.GetPubKey()) != 0 {
@@ -1933,6 +1942,69 @@ func (node *Node) reconcileHaltedState() {
 			node.logger.Debug(err)
 		} else if changed {
 			node.networksManager.ClearObsoleteHaltTx(node.evmAddress)
+			if node.emergencyPeersAdmitted.Swap(false) && node.config != nil {
+				node.restoreActiveKeyParticipants(true)
+			}
+		}
+	}
+}
+
+// reconcileLiveKeyAndWhitelist ensures that once the node is in LiveState:
+// 1) If Zenon already confirmed a replacement key whose local share exists on
+//    disk (for example because an emergency halt preempted finishKeyGenRound
+//    after Zenon accepted ChangeTssECDSAPubKey), this node promotes that key
+//    locally so ordinary signing resumes without waiting for a restart.
+// 2) Any emergency-admitted or startup split-rotation alternate-key peers are
+//    revoked from the TSS whitelist once no active EVM bridge still relies on
+//    the alternate key.
+func (node *Node) reconcileLiveKeyAndWhitelist(bridgeInfo *definition.BridgeInfoVariable) {
+	if bridgeInfo == nil || node.config == nil {
+		return
+	}
+	pruned := false
+	zenonKey := bridgeInfo.CompressedTssECDSAPubKey
+	if zenonKey != "" && zenonKey != node.activeSigningPubKey() {
+		fileName, err := common.GetPublicKeyFileName(zenonKey)
+		if err == nil {
+			if raw, found, err := oconfig.ReadKeyShareFile(node.config.TssConfig.BaseDir, fileName); err == nil && found {
+				if parties, err := parseLocalStateParticipantKeys(raw, fileName); err == nil && len(parties) > 0 {
+					if decompressed, err := common.DecompressPubKey(zenonKey); err == nil {
+						oldKey := node.activeSigningPubKey()
+						sort.Strings(parties)
+						node.finalizeKeyRotationWithParties(zenonKey, decompressed, parties)
+						node.emergencyPeersAdmitted.Store(false)
+						pruned = true
+						if node.networksManager != nil {
+							if missing, err := node.networksManager.NetworksWithoutKey(zenonKey); err == nil && len(missing) == 0 {
+								node.setPendingKeyGenPubKey("")
+							} else if oldKey != "" {
+								node.setPendingKeyGenPubKey(oldKey)
+							}
+							node.resetSignatures()
+						} else {
+							node.setPendingKeyGenPubKey("")
+						}
+						if node.state != nil {
+							if err := node.SaveConfig(); err != nil {
+								node.logger.Info(err.Error())
+							}
+						}
+						node.logger.Infof("Reconciled local active TSS key with confirmed Zenon bridge key %s", zenonKey)
+					}
+				}
+			}
+		}
+	}
+	if !pruned && node.emergencyPeersAdmitted.Swap(false) {
+		node.restoreActiveKeyParticipants(true)
+		pruned = true
+	}
+	if node.getPendingKeyGenPubKey() != "" && zenonKey != "" && zenonKey == node.activeSigningPubKey() && node.networksManager != nil {
+		if missing, err := node.networksManager.NetworksWithoutKey(zenonKey); err == nil && len(missing) == 0 {
+			node.setPendingKeyGenPubKey("")
+			if !pruned {
+				node.restoreActiveKeyParticipants(true)
+			}
 		}
 	}
 }
@@ -3186,6 +3258,7 @@ func (node *Node) admitEmergencyKeyPeers(peerIDs []string) {
 		missing = append(missing, pid)
 	}
 	if len(missing) > 0 {
+		node.emergencyPeersAdmitted.Store(true)
 		if backend := node.participantsBackend(); backend != nil {
 			backend.AddWhitelistEntries(missing...)
 		}
@@ -3630,9 +3703,16 @@ func (node *Node) removeParticipant(pubKey string) {
 // active key participant set and TSS whitelist down to the new key's signers
 // plus self.
 func (node *Node) finalizeKeyRotation(newPubKey, decompressedNewPubKey string) {
+	node.finalizeKeyRotationWithParties(newPubKey, decompressedNewPubKey, nil)
+}
+
+func (node *Node) finalizeKeyRotationWithParties(newPubKey, decompressedNewPubKey string, explicitParties []string) {
 	selfPeerID, _ := node.selfPeerID()
 
 	node.participantsMu.Lock()
+	if explicitParties != nil {
+		node.config.TssConfig.LocalPubKeys = slices.Clone(explicitParties)
+	}
 	node.config.TssConfig.PublicKey = newPubKey
 	node.config.TssConfig.DecompressedPublicKey = decompressedNewPubKey
 
@@ -4169,6 +4249,15 @@ func (node *Node) configurePubKeyFrom(bridgeInfo *definition.BridgeInfoVariable,
 	}
 	sort.Strings(localPubKeys)
 
+	// Capture the Zenon-key / pillar bootstrap baseline BEFORE adding any
+	// EVM-only split-rotation alternate-key peers to the initial whitelist, so
+	// restoreActiveKeyParticipants(true) never retains retired alternate-key
+	// peers once those EVM bridges rotate or are removed.
+	var bootstrapBaseline map[string]bool
+	if len(activePeers) == 0 {
+		bootstrapBaseline = maps.Clone(whitelist)
+	}
+
 	// Rediscover any alternate local TSS key still active on an EVM bridge
 	// (e.g. after a restart during a split key rotation) and pre-populate the
 	// allowlist ONLY with participants of keys currently active on Zenon or an
@@ -4183,9 +4272,6 @@ func (node *Node) configurePubKeyFrom(bridgeInfo *definition.BridgeInfoVariable,
 			for _, pid := range info.peerIDs {
 				if pid != "" {
 					whitelist[pid] = true
-					if len(localPubKeys) > 0 {
-						activePeers[pid] = true
-					}
 				}
 			}
 			if info.compressedPubKey != node.config.TssConfig.PublicKey {
@@ -4226,7 +4312,7 @@ func (node *Node) configurePubKeyFrom(bridgeInfo *definition.BridgeInfoVariable,
 		node.bootstrapWhitelist = nil
 	} else {
 		node.activeKeyPubKeys = nil
-		node.bootstrapWhitelist = maps.Clone(whitelist)
+		node.bootstrapWhitelist = bootstrapBaseline
 	}
 	node.participantsMu.Unlock()
 

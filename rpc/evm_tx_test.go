@@ -18,6 +18,7 @@ import (
 	"github.com/ethereum/go-ethereum/common/hexutil"
 	etypes "github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
+	"golang.org/x/time/rate"
 
 	"orchestrator/common"
 	"orchestrator/common/config"
@@ -2049,5 +2050,62 @@ func TestAnySecondaryHasUnwrapLogChunkedShrinksRejectedLogRange(t *testing.T) {
 	}
 	if rejectedWide.Load() != prevRejected {
 		t.Fatalf("second call did not reuse cached smaller step: wide rejections increased from %d to %d", prevRejected, rejectedWide.Load())
+	}
+}
+
+func TestEndpointHeadsChargesSeparatePermitsForSyncAndBlockNumber(t *testing.T) {
+	contract := ecommon.HexToAddress("0x1111111111111111111111111111111111111111")
+	makeSrv := func() *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			var req struct {
+				ID     json.RawMessage `json:"id"`
+				Method string          `json:"method"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&req)
+			resp := map[string]interface{}{"jsonrpc": "2.0", "id": req.ID}
+			switch req.Method {
+			case "eth_syncing":
+				resp["result"] = false
+			case "eth_blockNumber":
+				resp["result"] = hexutil.EncodeUint64(42)
+			default:
+				resp["result"] = hexutil.EncodeUint64(1)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(resp)
+		}))
+	}
+	primarySrv := makeSrv()
+	t.Cleanup(primarySrv.Close)
+	secondarySrv := makeSrv()
+	t.Cleanup(secondarySrv.Close)
+
+	var permits atomic.Int32
+	prevHook := onPermitGranted
+	onPermitGranted = func(*rate.Limiter) {
+		permits.Add(1)
+	}
+	t.Cleanup(func() { onPermitGranted = prevHook })
+
+	client, err := NewEvmRpcClient(config.BaseNetworkConfig{
+		Urls:                 []string{primarySrv.URL, secondarySrv.URL},
+		RpcRequestsPerSecond: 100,
+		RpcBurst:             1,
+	}, "heads-burst", contract)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Stop()
+
+	minHead, maxHead, err := client.EndpointHeads()
+	if err != nil {
+		t.Fatalf("EndpointHeads failed: %v", err)
+	}
+	if minHead != 42 || maxHead != 42 {
+		t.Fatalf("EndpointHeads = (%d, %d), want (42, 42)", minHead, maxHead)
+	}
+	// 2 endpoints * (eth_syncing + eth_blockNumber) = 4 separate permits.
+	if got := permits.Load(); got != 4 {
+		t.Fatalf("EndpointHeads charged %d permits for 4 RPCs across 2 endpoints, want 4", got)
 	}
 }

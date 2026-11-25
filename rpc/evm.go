@@ -2141,12 +2141,18 @@ func (r *EvmRpc) EndpointHeads() (uint64, uint64, error) {
 				if !synced {
 					return errors.New("endpoint is still syncing")
 				}
-				head, err = client.BlockNumber(ctx)
-				if err == nil && uint32(idx) != r.Urls.CurrentUrlIndex {
-					r.recordSecondaryVerifiedHead(urls[idx], head)
-				}
-				return err
+				return nil
 			})
+			if err == nil {
+				err = r.callEndpoint(idx, func(ctx context.Context, client *ethclient.Client) error {
+					var callErr error
+					head, callErr = client.BlockNumber(ctx)
+					if callErr == nil && uint32(idx) != r.Urls.CurrentUrlIndex {
+						r.recordSecondaryVerifiedHead(urls[idx], head)
+					}
+					return callErr
+				})
+			}
 			if err != nil {
 				err = errors.New(config.RedactErrorForURL(err, urls[idx]))
 			}
