@@ -1056,42 +1056,86 @@ func (r *EvmRpc) clearPendingTxIfMatches(key evmTxKey, expected *pendingEvmTx) {
 }
 
 func (r *EvmRpc) clearPendingTxIfMatchesLocked(key evmTxKey, expected *pendingEvmTx) bool {
+	otherKey := evmTxKey{sender: key.sender, contract: key.contract, kind: otherEvmTxKind(key.kind)}
 	r.txMu.Lock()
-	cur := r.pendingTx[key]
+	cur := clonePendingEvmTx(r.pendingTx[key])
+	curOther := clonePendingEvmTx(r.pendingTx[otherKey])
 	store := r.pendingTxStore
 	if expected != nil && (cur == nil || cur.nonce != expected.nonce || cur.txHash != expected.txHash) {
 		r.txMu.Unlock()
 		return false
 	}
 	r.txMu.Unlock()
-	if store != nil {
-		if err := store.DeletePendingEvmTx(key.sender, key.contract, key.kind); err != nil {
-			r.logger.Errorf("failed to clear stale pending EVM tx record: %v", err)
-			return false
-		}
-	}
-	cleared := false
-	r.txMu.Lock()
-	cur = r.pendingTx[key]
-	if expected == nil || (cur != nil && cur.nonce == expected.nonce && cur.txHash == expected.txHash) {
-		if cur != nil {
-			nk := evmNonceKey{sender: key.sender, contract: key.contract, nonce: cur.nonce}
-			if st := r.nonceStack[nk]; len(st) > 0 && st[len(st)-1].kind == key.kind {
-				// Pop only trailing entries of key.kind so any live competing
-				// action attempt underneath on the same nonce is preserved.
-				cut := len(st)
-				for cut > 0 && st[cut-1].kind == key.kind {
-					cut--
-				}
-				if cut == 0 {
-					delete(r.nonceStack, nk)
-					delete(r.failedRollbacks, nk)
-				} else {
-					r.nonceStack[nk] = st[:cut]
+
+	var nk evmNonceKey
+	hasStack := false
+	cut := 0
+	var restoreOther *pendingAttempt
+	if cur != nil {
+		nk = evmNonceKey{sender: key.sender, contract: key.contract, nonce: cur.nonce}
+		if st := r.nonceStack[nk]; len(st) > 0 && st[len(st)-1].kind == key.kind {
+			hasStack = true
+			cut = len(st)
+			for cut > 0 && (st[cut-1].kind == key.kind || st[cut-1].rejected) {
+				cut--
+			}
+			if cut > 0 {
+				surviving := st[cut-1]
+				if surviving.kind == otherKey.kind && (curOther == nil || curOther.nonce <= surviving.nonce) {
+					restoreOther = surviving
 				}
 			}
 		}
+	}
+
+	if store != nil {
+		if restoreOther != nil {
+			ops := []common.PendingEvmTxOp{
+				{
+					Sender:   key.sender,
+					Contract: key.contract,
+					Kind:     key.kind,
+					Record:   nil,
+				},
+				{
+					Sender:   otherKey.sender,
+					Contract: otherKey.contract,
+					Kind:     otherKey.kind,
+					Record:   toCommonPendingEvmTx(restoreOther.entry),
+				},
+			}
+			if err := store.ApplyPendingEvmTxBatch(ops); err != nil {
+				r.logger.Errorf("failed to atomically clear stale pending EVM tx and restore surviving owner: %v", err)
+				return false
+			}
+		} else {
+			if err := store.DeletePendingEvmTx(key.sender, key.contract, key.kind); err != nil {
+				r.logger.Errorf("failed to clear stale pending EVM tx record: %v", err)
+				return false
+			}
+		}
+	}
+
+	cleared := false
+	r.txMu.Lock()
+	liveCur := r.pendingTx[key]
+	if expected == nil || (liveCur != nil && liveCur.nonce == expected.nonce && liveCur.txHash == expected.txHash) {
+		if hasStack {
+			if cut == 0 {
+				delete(r.nonceStack, nk)
+				delete(r.failedRollbacks, nk)
+			} else {
+				r.nonceStack[nk] = r.nonceStack[nk][:cut]
+				delete(r.failedRollbacks, nk)
+			}
+		}
 		delete(r.pendingTx, key)
+		if restoreOther != nil {
+			if r.pendingTx == nil {
+				r.pendingTx = make(map[evmTxKey]*pendingEvmTx)
+			}
+			r.pendingTx[otherKey] = clonePendingEvmTx(restoreOther.entry)
+		}
 		cleared = true
 	}
 	r.txMu.Unlock()
@@ -1167,21 +1211,66 @@ func (r *EvmRpc) ClearObsoleteHaltTxContext(parent context.Context, sender ecomm
 	if r.clearPendingTxIfMatchesLocked(key, rec) {
 		// Only prune earlier dropped halt stacks when rec itself still owned
 		// key (a concurrent replacement at the same nonce keeps its stack),
-		// and preserve any competing-action entries underneath.
+		// preserving and restoring any surviving competing-action attempt
+		// uncovered underneath before updating in-memory stacks.
+		otherKey := evmTxKey{sender: sender, contract: r.bridgeAddress, kind: evmTxKindSetTss}
+		type prunePlan struct {
+			nk  evmNonceKey
+			cut int
+		}
+		var plans []prunePlan
+		var bestSurvivingOther *pendingAttempt
 		for nk, st := range r.nonceStack {
 			if nk.sender != sender || nk.contract != r.bridgeAddress || nk.nonce > rec.nonce {
 				continue
 			}
 			cut := len(st)
-			for cut > 0 && st[cut-1].kind == evmTxKindHalt {
+			for cut > 0 && (st[cut-1].kind == evmTxKindHalt || st[cut-1].rejected) {
 				cut--
 			}
-			if cut == 0 {
-				delete(r.nonceStack, nk)
-				delete(r.failedRollbacks, nk)
-			} else if cut < len(st) {
-				r.nonceStack[nk] = st[:cut]
+			if cut == len(st) {
+				continue
 			}
+			plans = append(plans, prunePlan{nk: nk, cut: cut})
+			if cut > 0 {
+				if top := st[cut-1]; top.kind == evmTxKindSetTss && (bestSurvivingOther == nil || top.nonce > bestSurvivingOther.nonce) {
+					bestSurvivingOther = top
+				}
+			}
+		}
+		if bestSurvivingOther != nil {
+			r.txMu.Lock()
+			curOther := clonePendingEvmTx(r.pendingTx[otherKey])
+			store := r.pendingTxStore
+			r.txMu.Unlock()
+			if curOther == nil || curOther.nonce <= bestSurvivingOther.nonce {
+				ops := []common.PendingEvmTxOp{{
+					Sender:   otherKey.sender,
+					Contract: otherKey.contract,
+					Kind:     otherKey.kind,
+					Record:   toCommonPendingEvmTx(bestSurvivingOther.entry),
+				}}
+				if store != nil {
+					if err := store.ApplyPendingEvmTxBatch(ops); err != nil {
+						r.pendingMu.Unlock()
+						return err
+					}
+				}
+				r.txMu.Lock()
+				if r.pendingTx == nil {
+					r.pendingTx = make(map[evmTxKey]*pendingEvmTx)
+				}
+				r.pendingTx[otherKey] = clonePendingEvmTx(bestSurvivingOther.entry)
+				r.txMu.Unlock()
+			}
+		}
+		for _, p := range plans {
+			if p.cut == 0 {
+				delete(r.nonceStack, p.nk)
+			} else {
+				r.nonceStack[p.nk] = r.nonceStack[p.nk][:p.cut]
+			}
+			delete(r.failedRollbacks, p.nk)
 		}
 	}
 	r.pendingMu.Unlock()
