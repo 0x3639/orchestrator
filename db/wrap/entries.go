@@ -196,6 +196,51 @@ func (es *eventStore) MarkWrapRequestSignatureSent(id types.Hash, expectedSignat
 	return true, nil
 }
 
+// AcknowledgeWrapRequestSignature atomically applies an on-chain
+// UpdateWrapRequest confirmation under es.mu:
+//   - if no row exists yet, inserts wrap with Signature=signature and SentSignature=true,
+//   - if the row has no signature yet, fills Signature=signature and SentSignature=true,
+//   - if the row already holds signature, sets SentSignature=true,
+//   - if the row holds a different (newer) local signature, leaves it untouched.
+//
+// Any pending re-sign flag is always preserved (only SaveSignedWrapRequest
+// clears it when a replacement signature is stored).
+func (es *eventStore) AcknowledgeWrapRequestSignature(wrap events.WrapRequestZnn, signature string) error {
+	es.mu.Lock()
+	defer es.mu.Unlock()
+
+	data, err := es.DB.Get(getWrapEventKey(wrap.Id))
+	if errors.Is(err, leveldb.ErrNotFound) {
+		wrap.Signature = signature
+		wrap.SentSignature = true
+		return es.putWrap(&wrap)
+	}
+	if err != nil {
+		es.SendSigInt()
+		return err
+	}
+	current, err := events.DeserializeWrapEventZnn(data)
+	if err != nil {
+		es.SendSigInt()
+		return err
+	}
+	switch current.Signature {
+	case "":
+		current.Signature = signature
+		current.SentSignature = true
+		return es.putWrap(current)
+	case signature:
+		if !current.SentSignature {
+			current.SentSignature = true
+			return es.putWrap(current)
+		}
+		return nil
+	default:
+		// Preserve a newer local signature and its SentSignature state.
+		return nil
+	}
+}
+
 func (es *eventStore) GetUnsentSignedWrapRequests() ([]*events.WrapRequestZnn, error) {
 	iterator := es.DB.NewIterator(getWrapEventPrefix())
 	defer iterator.Release()

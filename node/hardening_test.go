@@ -544,7 +544,7 @@ func (b *wrapTestBridge) GetAllWrapTokenRequests(pageIndex, pageSize uint32) *em
 		return handler(pageIndex, pageSize, n)
 	}
 	if pageIndex > 0 || allWraps == nil {
-		return &embedded.WrapTokenRequestList{}
+		return &embedded.WrapTokenRequestList{List: []*embedded.WrapTokenRequest{}}
 	}
 	return allWraps
 }
@@ -1746,6 +1746,196 @@ func TestReSignStateTerminatesUnderSustainedArrivalsExceedingPageSize(t *testing
 			}
 		})
 	}
+}
+
+func TestReSignStateCapturesDelayedReceiveStrictlyBelowCutoff(t *testing.T) {
+	prevDelay := resignRetryDelay
+	prevPageSize := resignPageSize
+	resignRetryDelay = 20 * time.Millisecond
+	resignPageSize = 2
+	t.Cleanup(func() {
+		resignRetryDelay = prevDelay
+		resignPageSize = prevPageSize
+	})
+
+	evmSrv := fakeEvmRpcServer(t)
+	defer evmSrv.Close()
+
+	makeEntry := func(id types.Hash, height uint64) *embedded.WrapTokenRequest {
+		return &embedded.WrapTokenRequest{
+			WrapTokenRequest: &definition.WrapTokenRequest{
+				NetworkClass: definition.EvmClass, ChainId: 1, Id: id,
+				Amount: big.NewInt(10), Fee: big.NewInt(1), CreationMomentumHeight: height,
+			},
+			ConfirmationsToFinality: 0,
+		}
+	}
+
+	// Cutoff is 100, pageSize is 2.
+	// Initial table has 3 wraps strictly below cutoff (height 99):
+	//   [ A(99, 0x01), B(99, 0x02), C(99, 0x03) ]
+	// Call 1 (probe page 0) sees Count=3.
+	// Call 2 (tail page 1) records C at revIdx=0.
+	// Before Call 3, a delayed bridge receive D(99, 0x04) confirmed at height 99
+	// becomes visible and takes revIdx=0, shifting C to revIdx=1.
+	// The scanner must detect the shifted tail and include D in the snapshot.
+	wrapA := types.Hash{0x01}
+	wrapB := types.Hash{0x02}
+	wrapC := types.Hash{0x03}
+	delayedWrapD := types.Hash{0x04}
+
+	var tableMu sync.Mutex
+	table := []*embedded.WrapTokenRequest{
+		makeEntry(wrapA, 99),
+		makeEntry(wrapB, 99),
+		makeEntry(wrapC, 99),
+	}
+	sortZenonWraps(table)
+	var insertedDelayed bool
+
+	bridge := &wrapTestBridge{
+		networks: &embedded.NetworkInfoList{
+			Count: 1,
+			List: []*definition.NetworkInfo{{
+				NetworkClass: definition.EvmClass, Id: 1, Name: "Ethereum",
+				ContractAddress: "0x0000000000000000000000000000000000000001",
+			}},
+		},
+		frontierMomFn: func(_ context.Context, _ int32) (*api.Momentum, error) {
+			return testMomentum(100), nil
+		},
+		pageHandler: func(pageIndex, pageSize uint32, call int32) *embedded.WrapTokenRequestList {
+			tableMu.Lock()
+			defer tableMu.Unlock()
+			if call == 3 && !insertedDelayed {
+				insertedDelayed = true
+				table = append(table, makeEntry(delayedWrapD, 99))
+				sortZenonWraps(table)
+			}
+			return paginateZenonWraps(table, pageIndex, pageSize)
+		},
+	}
+
+	n := wrapTestNodeWithEvm(t, common.LiveState, bridge, map[string]string{"Ethereum": evmSrv.URL})
+	if activated, err := n.state.ActivateResign(definition.EvmClass, 1); err != nil || !activated {
+		t.Fatalf("ActivateResign failed: activated=%v err=%v", activated, err)
+	}
+	n.state.CompleteStartup()
+
+	n.workers.start(n.processSignatures)
+	t.Cleanup(func() {
+		done := n.workers.shutdown()
+		<-done
+	})
+
+	eventually(t, "ReSignState to detect delayed receive strictly below cutoff and mark all 4 wraps", func() bool {
+		st, _ := n.state.GetState()
+		for _, id := range []types.Hash{wrapA, wrapB, wrapC, delayedWrapD} {
+			r, err := n.dbManager.ZnnStorage().GetResignStatus(id)
+			if err != nil || !r {
+				return false
+			}
+		}
+		return st == common.LiveState
+	})
+}
+
+func TestReSignStateTerminatesUnderAlternatingBurstsAtMaxPageSize(t *testing.T) {
+	prevDelay := resignRetryDelay
+	prevPageSize := resignPageSize
+	prevMaxPageSize := resignMaxPageSize
+	resignRetryDelay = 20 * time.Millisecond
+	// Start directly at the maximum page size cap (1024) and alternate between
+	// +1024 and +2048 new wraps on every successful read. The previous-growth
+	// estimator must break the oscillation and complete ReSignState -> LiveState.
+	resignPageSize = 1024
+	resignMaxPageSize = 1024
+	t.Cleanup(func() {
+		resignRetryDelay = prevDelay
+		resignPageSize = prevPageSize
+		resignMaxPageSize = prevMaxPageSize
+	})
+
+	evmSrv := fakeEvmRpcServer(t)
+	defer evmSrv.Close()
+
+	makeEntry := func(chainID uint32, id types.Hash, height uint64) *embedded.WrapTokenRequest {
+		return &embedded.WrapTokenRequest{
+			WrapTokenRequest: &definition.WrapTokenRequest{
+				NetworkClass: definition.EvmClass, ChainId: chainID, Id: id,
+				Amount: big.NewInt(10), Fee: big.NewInt(1), CreationMomentumHeight: height,
+			},
+			ConfirmationsToFinality: 0,
+		}
+	}
+
+	targetOld := types.Hash{0xaa, 0x01}
+	targetCut := types.Hash{0xaa, 0x02}
+
+	// Build an initial table > 1024 entries (1026 wraps at height <= 100):
+	// 2 target chain-1 wraps at the tail/head plus 1024 unrelated chain-2 wraps
+	// so multi-page tail scanning runs at the 1024 cap.
+	var tableMu sync.Mutex
+	table := make([]*embedded.WrapTokenRequest, 0, 1026)
+	table = append(table, makeEntry(1, targetCut, 100))
+	for i := 1; i <= 1024; i++ {
+		table = append(table, makeEntry(2, types.Hash{0x50, byte(i >> 8), byte(i)}, 99))
+	}
+	table = append(table, makeEntry(1, targetOld, 98))
+	sortZenonWraps(table)
+
+	var seq uint32
+	bridge := &wrapTestBridge{
+		networks: &embedded.NetworkInfoList{
+			Count: 1,
+			List: []*definition.NetworkInfo{{
+				NetworkClass: definition.EvmClass, Id: 1, Name: "Ethereum",
+				ContractAddress: "0x0000000000000000000000000000000000000001",
+			}},
+		},
+		frontierMomFn: func(_ context.Context, _ int32) (*api.Momentum, error) {
+			return testMomentum(100), nil
+		},
+		pageHandler: func(pageIndex, pageSize uint32, call int32) *embedded.WrapTokenRequestList {
+			tableMu.Lock()
+			defer tableMu.Unlock()
+			// After the initial probe, alternate +1024 and +2048 future wraps
+			// on every single RPC call (prepended in descending height order).
+			if call > 1 {
+				burst := 1024
+				if call%2 == 1 {
+					burst = 2048
+				}
+				prefix := make([]*embedded.WrapTokenRequest, burst)
+				h := 100 + uint64(call)
+				for i := 0; i < burst; i++ {
+					seq++
+					prefix[i] = makeEntry(1, types.Hash{0xf1, byte(seq >> 16), byte(seq >> 8), byte(seq)}, h)
+				}
+				table = append(prefix, table...)
+			}
+			return paginateZenonWraps(table, pageIndex, pageSize)
+		},
+	}
+
+	n := wrapTestNodeWithEvm(t, common.LiveState, bridge, map[string]string{"Ethereum": evmSrv.URL})
+	if activated, err := n.state.ActivateResign(definition.EvmClass, 1); err != nil || !activated {
+		t.Fatalf("ActivateResign failed: activated=%v err=%v", activated, err)
+	}
+	n.state.CompleteStartup()
+
+	n.workers.start(n.processSignatures)
+	t.Cleanup(func() {
+		done := n.workers.shutdown()
+		<-done
+	})
+
+	eventually(t, "ReSignState to break +1024/+2048 burst oscillation at max page size and return to LiveState", func() bool {
+		st, _ := n.state.GetState()
+		r1, e1 := n.dbManager.ZnnStorage().GetResignStatus(targetOld)
+		r2, e2 := n.dbManager.ZnnStorage().GetResignStatus(targetCut)
+		return e1 == nil && e2 == nil && r1 && r2 && st == common.LiveState
+	})
 }
 
 func TestReSignStateBoundsAndCancelsStalledDeferredWrapRPC(t *testing.T) {

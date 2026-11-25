@@ -68,6 +68,17 @@ func TestGetAllWrapTokenRequestsContextRejectsMissingNullFinalityAndNullPage(t *
 		`"tokenAddress":"0x0000000000000000000000000000000000000002",` +
 		`"amount":"100","fee":"1","signature":"sig","confirmationsToFinality":0`
 
+	t.Run("valid empty page accepted", func(t *testing.T) {
+		znn := newRawZnnRPC(t, `{"count":0,"list":[]}`)
+		page, err := znn.GetAllWrapTokenRequestsContext(context.Background(), 0, 10)
+		if err != nil {
+			t.Fatalf("unexpected error for empty page: %v", err)
+		}
+		if page.Count != 0 || len(page.List) != 0 {
+			t.Fatalf("empty page count=%d len=%d, want 0/0", page.Count, len(page.List))
+		}
+	})
+
 	for _, tc := range []struct {
 		name  string
 		reply string
@@ -75,6 +86,8 @@ func TestGetAllWrapTokenRequestsContextRejectsMissingNullFinalityAndNullPage(t *
 		{"null page", `null`},
 		{"missing count", `{"list":[]}`},
 		{"negative count", `{"count":-1,"list":[]}`},
+		{"missing list", `{"count":0}`},
+		{"null list", `{"count":0,"list":null}`},
 		{"null entry", `{"count":1,"list":[null]}`},
 		{"omitted confirmationsToFinality", `{"count":1,"list":[{` + testWrapFields + `}]}`},
 		{"null confirmationsToFinality", `{"count":1,"list":[{` + testWrapFields + `,"confirmationsToFinality":null}]}`},

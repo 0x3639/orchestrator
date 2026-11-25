@@ -370,8 +370,8 @@ func (r *ZnnRpc) GetAllWrapTokenRequestsContext(ctx context.Context, pageIndex, 
 		return nil, errors.New("missing Zenon wrap token request page")
 	}
 	var page struct {
-		Count *int              `json:"count"`
-		List  []json.RawMessage `json:"list"`
+		Count *int            `json:"count"`
+		List  json.RawMessage `json:"list"`
 	}
 	if err := json.Unmarshal(raw, &page); err != nil {
 		return nil, err
@@ -379,8 +379,15 @@ func (r *ZnnRpc) GetAllWrapTokenRequestsContext(ctx context.Context, pageIndex, 
 	if page.Count == nil || *page.Count < 0 {
 		return nil, errors.New("wrap token request page with missing or negative count")
 	}
-	list := make([]*embedded.WrapTokenRequest, 0, len(page.List))
-	for _, itemRaw := range page.List {
+	if len(page.List) == 0 || string(page.List) == "null" {
+		return nil, errors.New("wrap token request page with missing or null list")
+	}
+	var rawItems []json.RawMessage
+	if err := json.Unmarshal(page.List, &rawItems); err != nil {
+		return nil, err
+	}
+	list := make([]*embedded.WrapTokenRequest, 0, len(rawItems))
+	for _, itemRaw := range rawItems {
 		wrap, err := decodeWrapTokenRequestWithFinality(itemRaw)
 		if err != nil {
 			return nil, err

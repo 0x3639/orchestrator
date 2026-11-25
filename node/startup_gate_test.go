@@ -74,7 +74,7 @@ func (b *startupBridge) GetAllNetworks(uint32, uint32) *embedded.NetworkInfoList
 
 func (b *startupBridge) GetAllWrapTokenRequests(uint32, uint32) *embedded.WrapTokenRequestList {
 	b.wrapPages.Add(1)
-	return &embedded.WrapTokenRequestList{}
+	return &embedded.WrapTokenRequestList{List: []*embedded.WrapTokenRequest{}}
 }
 
 func (b *startupBridge) GetWrapTokenRequestById(types.Hash) (*definition.WrapTokenRequest, error) {

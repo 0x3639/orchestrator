@@ -81,6 +81,11 @@ type ZnnStorage interface {
 	// MarkWrapRequestSignatureSent marks SentSignature=true only if the stored
 	// wrap request still holds expectedSignature, reporting whether it matched.
 	MarkWrapRequestSignatureSent(types.Hash, string) (bool, error)
+	// AcknowledgeWrapRequestSignature atomically records an on-chain signature
+	// update for wrap: stores the row as sent if missing, fills an empty
+	// signature, or marks a matching signature as sent, while preserving any
+	// newer local signature and any pending re-sign flag.
+	AcknowledgeWrapRequestSignature(events.WrapRequestZnn, string) error
 	GetWrapRequestById(types.Hash) (*events.WrapRequestZnn, error)
 	GetUnsentSignedWrapRequests() ([]*events.WrapRequestZnn, error)
 	GetUnredeemedWrapRequests() ([]*events.WrapRequestZnn, error)

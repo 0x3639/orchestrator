@@ -1302,9 +1302,12 @@ var resignRetryDelay = time.Second
 // scan so a stalled endpoint cannot wedge the worker or block shutdown.
 var resignRPCTimeout = rpc.ZnnLedgerTimeout
 
-// resignPageSize is the page size used when enumerating wrap requests in
-// ReSignState (overridable in tests to exercise real multi-page scans).
+// resignPageSize is the initial page size used when enumerating wrap requests
+// in ReSignState (overridable in tests to exercise real multi-page scans).
 var resignPageSize uint32 = 100
+
+// resignMaxPageSize bounds adaptive page-size backoff during sustained bursts.
+var resignMaxPageSize uint32 = 1024
 
 // expectedWrapPageLen returns the exact number of wrap entries a complete
 // GetAllWrapTokenRequests(pageIndex, pageSize) response must contain when
@@ -1460,24 +1463,24 @@ func (node *Node) captureReSignSnapshot(resignNetworkClass, resignChainId uint32
 
 	// Walk contiguously from the oldest tail wrap (revIdx = 0) upward until
 	// index 0 or the first wrap with CreationMomentumHeight > cutoffMomentum.
-	// Entries strictly below cutoffMomentum never shift in revIdx; entries at
-	// cutoffMomentum become permanently fixed once any wrap above cutoffMomentum
-	// is observed.
-	const maxResignPageSize uint32 = 1024
+	// Because Zenon derives a wrap's CreationMomentumHeight from the momentum
+	// that confirmed its send, a delayed bridge receive can appear later at a
+	// height strictly below cutoffMomentum and shift already-read reverse
+	// indices. We therefore keep the revIdx -> wrap and id -> revIdx maps across
+	// the entire scanned tail: any shift in a previously observed revIdx or ID
+	// is detected immediately, resets the shifted cache cleanly, and re-reads
+	// from revIdx 0 so no wrap within cutoffMomentum can be skipped.
+	maxPageSize := resignMaxPageSize
+	if maxPageSize < pageSize {
+		maxPageSize = pageSize
+	}
 	curPageSize := pageSize
 	estCount := probe.Count
 	prevCount := probe.Count
 	estGrowth := 0
 	stalledReads := 0
-	immutableTail := 0
-	sawAboveCutoff := false
-	for _, wrap := range probe.List {
-		if wrap.CreationMomentumHeight > cutoffMomentum {
-			sawAboveCutoff = true
-			break
-		}
-	}
-	coveredFromTail := make(map[int]*embedded.WrapTokenRequest)
+	coveredByRevIdx := make(map[int]*embedded.WrapTokenRequest)
+	revIdxByID := make(map[types.Hash]int)
 
 	for {
 		if node.workerStopping() {
@@ -1487,9 +1490,9 @@ func (node *Node) captureReSignSnapshot(resignNetworkClass, resignChainId uint32
 			return nil, true, false
 		}
 
-		doneFromTail := immutableTail
+		doneFromTail := 0
 		for {
-			if _, ok := coveredFromTail[doneFromTail]; !ok {
+			if _, ok := coveredByRevIdx[doneFromTail]; !ok {
 				break
 			}
 			doneFromTail++
@@ -1509,63 +1512,62 @@ func (node *Node) captureReSignSnapshot(resignNetworkClass, resignChainId uint32
 		node.logger.Debugf("len(wrapRequests.List): %d, count: %d, pageIndex: %d", len(wrapRequests.List), wrapRequests.Count, pageIndex)
 
 		actualCount := wrapRequests.Count
+		actualDelta := 0
 		if actualCount > prevCount {
-			estGrowth = actualCount - prevCount
-		} else {
-			estGrowth = 0
+			actualDelta = actualCount - prevCount
 		}
-		countChanged := actualCount != prevCount
 		prevCount = actualCount
 		estCount = actualCount
 
-		wasAboveCutoff := sawAboveCutoff
-		for _, wrap := range wrapRequests.List {
-			if wrap.CreationMomentumHeight > cutoffMomentum {
-				sawAboveCutoff = true
+		startIdx := int(pageIndex) * int(curPageSize)
+		tailShifted := false
+		for i, wrap := range wrapRequests.List {
+			revIdx := actualCount - 1 - (startIdx + i)
+			if prevRev, seen := revIdxByID[wrap.Id]; seen && prevRev != revIdx {
+				tailShifted = true
+				break
+			}
+			if prevWrap, occupied := coveredByRevIdx[revIdx]; occupied && prevWrap.Id != wrap.Id {
+				tailShifted = true
 				break
 			}
 		}
-		// While wraps can still arrive at height == cutoffMomentum, count changes
-		// can shift revIdx inside that single momentum. Drop only the unfinalized
-		// cutoff-height cache; immutableTail (< cutoffMomentum) never shifts.
-		if countChanged && !wasAboveCutoff && len(coveredFromTail) > 0 {
-			clear(coveredFromTail)
+		if tailShifted {
+			node.logger.Debug("Detected shifted wrap tail position during ReSignState scan; re-verifying tail")
+			clear(coveredByRevIdx)
+			clear(revIdxByID)
+			doneFromTail = 0
 		}
 
-		startIdx := int(pageIndex) * int(curPageSize)
 		for i, wrap := range wrapRequests.List {
 			revIdx := actualCount - 1 - (startIdx + i)
-			if revIdx >= immutableTail {
-				coveredFromTail[revIdx] = wrap
+			if revIdx >= 0 {
+				coveredByRevIdx[revIdx] = wrap
+				revIdxByID[wrap.Id] = revIdx
 			}
 		}
 
-		r := immutableTail
+		r := 0
 		done := false
 		for {
-			wrap, ok := coveredFromTail[r]
+			wrap, ok := coveredByRevIdx[r]
 			if !ok {
 				break
 			}
 			if wrap.CreationMomentumHeight > cutoffMomentum {
 				// Reached the > cutoffMomentum boundary contiguously from revIdx 0.
-				for k := immutableTail; k < r; k++ {
-					recordWrap(coveredFromTail[k])
+				for k := 0; k < r; k++ {
+					recordWrap(coveredByRevIdx[k])
 				}
 				done = true
 				break
-			}
-			if wrap.CreationMomentumHeight < cutoffMomentum || sawAboveCutoff {
-				recordWrap(wrap)
-				delete(coveredFromTail, r)
-				immutableTail++
 			}
 			r++
 		}
 		if !done && r >= actualCount {
 			// Contiguously covered revIdx 0..actualCount-1 all the way to index 0.
-			for k := immutableTail; k < actualCount; k++ {
-				recordWrap(coveredFromTail[k])
+			for k := 0; k < actualCount; k++ {
+				recordWrap(coveredByRevIdx[k])
 			}
 			done = true
 		}
@@ -1578,14 +1580,20 @@ func (node *Node) captureReSignSnapshot(resignNetworkClass, resignChainId uint32
 		}
 		if r > doneFromTail {
 			stalledReads = 0
+			estGrowth = actualDelta
 		} else {
 			stalledReads++
-			if stalledReads >= 2 && curPageSize < maxResignPageSize {
+			if stalledReads%2 == 0 && curPageSize < maxPageSize {
 				curPageSize *= 2
-				if curPageSize > maxResignPageSize {
-					curPageSize = maxResignPageSize
+				if curPageSize > maxPageSize {
+					curPageSize = maxPageSize
 				}
-				stalledReads = 0
+			}
+			// Update estGrowth only at powers of two while stalled so periodic
+			// arrival bursts (e.g. alternating +1024/+2048 at the max page size
+			// cap) cannot phase-lock the estimator.
+			if stalledReads&(stalledReads-1) == 0 {
+				estGrowth = actualDelta
 			}
 		}
 	}

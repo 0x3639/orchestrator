@@ -902,24 +902,18 @@ func (rC *znnNetwork) interpretSendBlockData(ctx context.Context, sendBlock *api
 			rC.logger.Info("update request non existent")
 			break
 		} else {
-			// The record is added only if it is still missing: this node's
-			// scan of the destination chain may have written it, with a
-			// redeem, since the bridge was asked.
-			if added, err := rC.eventsStore().AddWrapRequestIfMissing(wrapEvent(request)); err != nil {
+			if param.Signature == request.Signature {
+				// Apply the on-chain confirmation atomically under the store
+				// lock so a concurrent SaveSignedWrapRequest or PublishResignWraps
+				// cannot have its newer signature overwritten or its pending
+				// re-sign flag cleared.
+				if err = rC.eventsStore().AcknowledgeWrapRequestSignature(wrapEvent(request), param.Signature); err != nil {
+					return err
+				}
+			} else if added, err := rC.eventsStore().AddWrapRequestIfMissing(wrapEvent(request)); err != nil {
 				return err
 			} else if added {
 				rC.logger.Info("request did not exist locally and was added")
-			}
-			if param.Signature == request.Signature {
-				if err = rC.SetResignStatus(request.Id, false); err != nil {
-					return err
-				}
-				if err = rC.eventsStore().SetWrapRequestSentSignature(request.Id, true); err != nil {
-					return err
-				}
-				if err = rC.SetWrapRequestSignature(request.Id, param.Signature); err != nil {
-					return err
-				}
 			}
 		}
 	case base64.StdEncoding.EncodeToString(definition.ABIBridge.Methods[definition.RedeemUnwrapMethodName].Id()):

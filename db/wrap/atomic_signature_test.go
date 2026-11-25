@@ -159,3 +159,70 @@ func TestPublishResignWrapsAtomicallyStoresMissingAndSkipsRedeemed(t *testing.T)
 		run(t, NewDurableZnnStorage(raw, nil))
 	})
 }
+
+func TestAcknowledgeWrapRequestSignaturePreservesNewerSignatureAndResignFlag(t *testing.T) {
+	run := func(t *testing.T, store db.ZnnStorage) {
+		// 1. Missing row is inserted with signature marked sent.
+		missingID := types.Hash{0x71}
+		baseWrap := func(id types.Hash, sig string) events.WrapRequestZnn {
+			return events.WrapRequestZnn{
+				NetworkClass: 2, ChainId: 1, Id: id,
+				Amount: big.NewInt(10), Fee: big.NewInt(1),
+				Signature: sig, RedeemStatus: common.UnredeemedStatus,
+			}
+		}
+		if err := store.AcknowledgeWrapRequestSignature(baseWrap(missingID, "sig-1"), "sig-1"); err != nil {
+			t.Fatal(err)
+		}
+		if got, err := store.GetWrapRequestById(missingID); err != nil || got == nil || got.Signature != "sig-1" || !got.SentSignature {
+			t.Fatalf("missing row ack = (%+v, %v), want sig-1 sent=true", got, err)
+		}
+
+		// 2. Stale old-sig acknowledgement must NOT overwrite newer unsent signature.
+		replacedID := types.Hash{0x72}
+		if err := store.AddWrapRequest(baseWrap(replacedID, "old-sig")); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.SaveSignedWrapRequest(replacedID, "new-sig"); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.AcknowledgeWrapRequestSignature(baseWrap(replacedID, "old-sig"), "old-sig"); err != nil {
+			t.Fatal(err)
+		}
+		if got, err := store.GetWrapRequestById(replacedID); err != nil || got == nil || got.Signature != "new-sig" || got.SentSignature {
+			t.Fatalf("stale ack corrupted newer signature: got=%+v err=%v", got, err)
+		}
+
+		// 3. Matching old-sig acknowledgement marks SentSignature=true while
+		// preserving a newly published pending re-sign flag.
+		resignID := types.Hash{0x73}
+		if err := store.AddWrapRequest(baseWrap(resignID, "old-sig")); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.SetResignStatus(resignID, true); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.AcknowledgeWrapRequestSignature(baseWrap(resignID, "old-sig"), "old-sig"); err != nil {
+			t.Fatal(err)
+		}
+		if got, err := store.GetWrapRequestById(resignID); err != nil || got == nil || got.Signature != "old-sig" || !got.SentSignature {
+			t.Fatalf("matching ack did not mark sent: got=%+v err=%v", got, err)
+		}
+		if resign, err := store.GetResignStatus(resignID); err != nil || !resign {
+			t.Fatalf("matching ack cleared pending resign flag: resign=%v err=%v", resign, err)
+		}
+	}
+
+	t.Run("memdb", func(t *testing.T) {
+		run(t, NewZnnStorage(zdb.NewMemDB(), nil))
+	})
+
+	t.Run("durable-leveldb", func(t *testing.T) {
+		raw, err := leveldb.Open(storage.NewMemStorage(), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer raw.Close()
+		run(t, NewDurableZnnStorage(raw, nil))
+	})
+}
