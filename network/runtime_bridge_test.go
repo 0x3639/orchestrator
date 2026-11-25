@@ -3,6 +3,7 @@ package network
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"math/big"
 	"net/http"
 	"net/http/httptest"
@@ -3732,4 +3733,44 @@ func TestLateUnknownUnwrapCorrobCursorPersistsAcrossRestartAndResetsOnReorg(t *t
 		t.Fatalf("after secondary URL swap across restart, secondary started at toBlock=%v, want 20", swapEnds)
 	}
 	_ = ldb2.Close()
+}
+
+// A signing loop can still hold a network from m.networks() after a runtime
+// RemoveNetwork has drained it and closed its LevelDB. Its reconciliation
+// status write must stop at the detached guard instead of reaching the closed
+// store, which would ask the node to stop.
+func TestReconciliationStatusOnDetachedNetworkReturnsCanceled(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	stopChan := make(chan os.Signal, 8)
+	dbMgr, err := manager.NewDbManager(stopChan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := common.NewGlobalState(new(uint8))
+	state.Health = snapshot.New("test", "")
+	t.Cleanup(state.Health.Close)
+
+	info := &definition.NetworkInfo{NetworkClass: definition.EvmClass, Id: 1, Name: "eth", ContractAddress: "0x1111111111111111111111111111111111111111"}
+	net, err := NewEvmNetwork(info, dbMgr, nil, state, stopChan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ev := events.UnwrapRequestEvm{ChainId: 1, TransactionHash: ecommon.HexToHash("0xfeed"), Amount: big.NewInt(1), RedeemStatus: common.UnredeemedStatus}
+	if err := dbMgr.EvmStorage(1).AddUnwrapRequest(ev); err != nil {
+		t.Fatal(err)
+	}
+	// The manager still lists the network, as the slice a caller cloned from
+	// m.networks() before RemoveEvmNetwork took it out does.
+	mgr := &NetworksManager{evmNetworks: []*evmNetwork{net}, health: state.Health, logger: zap.NewNop().Sugar()}
+	net.drainWorkers(false)
+	if err := dbMgr.RemoveEvmEventStore(1); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := mgr.SetEvmUnwrapRequestStatus(&ev, common.PendingRedeemStatus); !errors.Is(err, context.Canceled) {
+		t.Errorf("status write on a detached network returned %v; want context.Canceled", err)
+	}
+	if n := len(stopChan); n != 0 {
+		t.Errorf("status write on a detached network sent %d stop requests; want 0", n)
+	}
 }

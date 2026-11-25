@@ -1558,6 +1558,15 @@ func (eN *evmNetwork) SetUnwrapRequestStatus(txHash ecommon.Hash, logIndex, stat
 	return eN.eventsStore().SetUnwrapRequestStatus(txHash, logIndex, status)
 }
 
+func (eN *evmNetwork) ApplyUnwrapReconciliationStatus(txHash ecommon.Hash, logIndex, expected, status uint32) error {
+	eN.useMu.RLock()
+	defer eN.useMu.RUnlock()
+	if eN.detached {
+		return context.Canceled
+	}
+	return eN.eventsStore().ApplyUnwrapReconciliationStatus(txHash, logIndex, expected, status)
+}
+
 func (eN *evmNetwork) SetUnwrapRequestSignature(txHash ecommon.Hash, logIndex uint32, signature string) error {
 	eN.useMu.RLock()
 	defer eN.useMu.RUnlock()

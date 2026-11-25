@@ -1,11 +1,13 @@
 package unwrap
 
 import (
+	"errors"
 	"math/big"
 	"os"
 	"testing"
 
 	ecommon "github.com/ethereum/go-ethereum/common"
+	"github.com/syndtr/goleveldb/leveldb"
 	zdb "github.com/zenon-network/go-zenon/common/db"
 
 	"orchestrator/common"
@@ -386,4 +388,66 @@ func TestUnwrapSourceLocationIsKeptApartFromRequests(t *testing.T) {
 	if number, hash, _, err = store.UnwrapSourceLocation(tx, 0); err != nil || number != 101 || hash != ecommon.HexToHash("0xb2") {
 		t.Fatalf("after a newer scan: block %d %s, err %v", number, hash, err)
 	}
+}
+
+func TestApplyUnwrapReconciliationStatus(t *testing.T) {
+	const (
+		unredeemed = common.UnredeemedStatus
+		pending    = common.PendingRedeemStatus
+		redeemed   = common.RedeemedStatus
+		revoked    = common.RevokedStatus
+	)
+	for _, tc := range []struct {
+		name                        string
+		current, expected, reported uint32
+		want                        uint32
+	}{
+		{"unredeemed becomes pending", unredeemed, unredeemed, pending, pending},
+		{"unredeemed becomes redeemed", unredeemed, unredeemed, redeemed, redeemed},
+		{"unredeemed becomes revoked", unredeemed, unredeemed, revoked, revoked},
+		{"pending advances to redeemed", pending, unredeemed, redeemed, redeemed},
+		{"pending advances to revoked", pending, unredeemed, revoked, revoked},
+		{"pending stays pending", pending, unredeemed, pending, pending},
+		{"redeemed survives pending", redeemed, unredeemed, pending, redeemed},
+		{"redeemed survives revoked", redeemed, unredeemed, revoked, redeemed},
+		{"revoked survives pending", revoked, unredeemed, pending, revoked},
+		{"revoked survives redeemed", revoked, unredeemed, redeemed, revoked},
+		{"changed snapshot is left alone", unredeemed, pending, redeemed, unredeemed},
+		{"pending never returns to unredeemed", pending, pending, unredeemed, pending},
+		{"unredeemed stays unredeemed", unredeemed, unredeemed, unredeemed, unredeemed},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := newTestStorage(t)
+			ev := sampleEvent("0x01", 0)
+			if _, err := store.AddUnwrapRequestIfMissing(ev); err != nil {
+				t.Fatal(err)
+			}
+			if err := store.SetUnwrapRequestSignature(ev.TransactionHash, 0, "sig"); err != nil {
+				t.Fatal(err)
+			}
+			if err := store.SetUnwrapRequestStatus(ev.TransactionHash, 0, tc.current); err != nil {
+				t.Fatal(err)
+			}
+			if err := store.ApplyUnwrapReconciliationStatus(ev.TransactionHash, 0, tc.expected, tc.reported); err != nil {
+				t.Fatal(err)
+			}
+			got, err := store.GetUnwrapRequestByHashAndLog(ev.TransactionHash, 0)
+			if err != nil || got == nil {
+				t.Fatalf("reading the record back: %v", err)
+			}
+			if got.RedeemStatus != tc.want {
+				t.Errorf("stored status %d; want %d", got.RedeemStatus, tc.want)
+			}
+			if got.Signature != "sig" {
+				t.Errorf("signature %q was not kept", got.Signature)
+			}
+		})
+	}
+	t.Run("missing record", func(t *testing.T) {
+		store := newTestStorage(t)
+		err := store.ApplyUnwrapReconciliationStatus(ecommon.HexToHash("0x02"), 0, unredeemed, pending)
+		if !errors.Is(err, leveldb.ErrNotFound) {
+			t.Fatalf("got %v; want leveldb.ErrNotFound", err)
+		}
+	})
 }

@@ -42,6 +42,11 @@ type EvmStorage interface {
 	// still refers to the given block hash. It reports whether it deleted.
 	DeleteUnwrapRequestIfUnsigned(txHash ecommon.Hash, logIndex uint32, blockHash ecommon.Hash) (bool, error)
 	SetUnwrapRequestStatus(ecommon.Hash, uint32, uint32) error
+	// ApplyUnwrapReconciliationStatus preserves terminal statuses and permits a
+	// pending record to advance to a terminal result. Other updates require
+	// the current status to match the snapshot taken before the Zenon lookup.
+	// It never moves a record back to unredeemed.
+	ApplyUnwrapReconciliationStatus(txHash ecommon.Hash, logIndex, expected, status uint32) error
 	SetUnwrapRequestSignature(ecommon.Hash, uint32, string) error
 	GetUnwrapRequestsByStatus(uint32) ([]*events.UnwrapRequestEvm, error)
 	GetUnsignedUnwrapRequests() ([]*events.UnwrapRequestEvm, error)
