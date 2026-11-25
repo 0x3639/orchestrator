@@ -3,6 +3,7 @@ package manager
 import (
 	"fmt"
 	ecommon "github.com/ethereum/go-ethereum/common"
+	zdb "github.com/zenon-network/go-zenon/common/db"
 	"go.uber.org/zap"
 	"orchestrator/common"
 	"orchestrator/common/storage"
@@ -121,7 +122,7 @@ func (m *Manager) AddEvmEventStoreForContract(chainId uint32, name string, contr
 		m.logger.Infof("EVM network %s (%d) isolated to contract-scoped store %s for bridge contract %s; previous store %s retained on disk",
 			name, chainId, storageName, contractAddress.Hex(), name)
 	}
-	store := unwrap.NewEvmStorageWithLevelDB(ldb, m.stopChan, contractDeploymentHeight)
+	store := unwrap.NewEvmStorage(zdb.NewLevelDBWrapper(ldb), m.stopChan, contractDeploymentHeight)
 	var closeOnce sync.Once
 	closeDB := func() error {
 		var closeErr error

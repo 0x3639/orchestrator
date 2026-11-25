@@ -62,13 +62,12 @@ type EvmRpc struct {
 	secondary        map[string]*secondaryClient
 	secondaryStopped bool
 
-	// pendingMu serializes durable pendingTxStore read/modify/write batches
-	// with in-memory pendingTx, nonceStack, failedRollbacks, and sendGen
-	// updates (never held across network RPCs).
-	pendingMu       sync.Mutex
-	nonceStack      map[evmNonceKey][]*pendingAttempt
-	failedRollbacks map[evmNonceKey]struct{}
-	sendGen         map[evmTxKey]uint64
+	// pendingMu serializes durable pendingTxStore read/modify/write operations
+	// with in-memory pendingTx, inFlight, and sendGen updates (never held across
+	// network RPCs).
+	pendingMu sync.Mutex
+	inFlight  map[evmTxKey]int
+	sendGen   map[evmTxKey]uint64
 	// txMu guards storageName, chainID, pendingTx, pendingTxStore, and
 	// sendTimeout, which track the latest unconfirmed halt or key-change
 	// transaction per (sender, contract, action) so retries reuse the same
@@ -88,31 +87,21 @@ type evmTxKey struct {
 	kind     string
 }
 
-type evmNonceKey struct {
-	sender   ecommon.Address
-	contract ecommon.Address
-	nonce    uint64
-}
-
 type pendingEvmTx struct {
-	nonce              uint64
-	txHash             ecommon.Hash
-	priorTxHashes      []common.PendingEvmTxHash
-	priorTruncatedUpTo *uint64
-	supersededOther    *pendingEvmTx
-	gasPrice           *big.Int
-	tipCap             *big.Int
-	feeCap             *big.Int
-	isDynamic          bool
+	nonce     uint64
+	txHash    ecommon.Hash
+	gasPrice  *big.Int
+	tipCap    *big.Int
+	feeCap    *big.Int
+	isDynamic bool
 }
 
 type pendingAttempt struct {
-	kind     string
-	txHash   ecommon.Hash
-	nonce    uint64
-	entry    *pendingEvmTx
-	inFlight bool
-	rejected bool
+	key          evmTxKey
+	nonce        uint64
+	txHash       ecommon.Hash
+	recorded     bool
+	prevSnapshot *pendingEvmTx
 }
 
 type secondaryClient struct {
@@ -571,200 +560,46 @@ func isNonceTooLowErr(err error) bool {
 	return strings.Contains(strings.ToLower(err.Error()), "nonce too low")
 }
 
-const maxPriorPendingTxHashes = 16
-
-func cloneUint64Ptr(p *uint64) *uint64 {
+func clonePendingEvmTx(p *pendingEvmTx) *pendingEvmTx {
 	if p == nil {
 		return nil
-	}
-	v := *p
-	return &v
-}
-
-func maxUint64Ptr(a, b *uint64) *uint64 {
-	if a == nil && b == nil {
-		return nil
-	}
-	var v uint64
-	switch {
-	case a == nil:
-		v = *b
-	case b == nil:
-		v = *a
-	case *a >= *b:
-		v = *a
-	default:
-		v = *b
-	}
-	return &v
-}
-
-// mergePriorTxHashList merges nonce-tagged prior transaction hashes and caps
-// the retained slice at maxPriorPendingTxHashes. When eviction is needed, it
-// evicts the lowest-nonce (oldest-first within a nonce) entry and updates
-// truncatedUpTo to the maximum evicted nonce so higher-nonce history stays
-// intact and post-restart cleanup only defers when an evicted nonce is still
-// unconfirmed (>= confirmedNonce).
-func mergePriorTxHashList(
-	existing []common.PendingEvmTxHash,
-	existingTruncatedUpTo *uint64,
-	additions []common.PendingEvmTxHash,
-	additionsTruncatedUpTo *uint64,
-	currentNonce uint64,
-	currentHash ecommon.Hash,
-) ([]common.PendingEvmTxHash, *uint64) {
-	out := make([]common.PendingEvmTxHash, 0, len(existing)+len(additions))
-	seen := make(map[common.PendingEvmTxHash]struct{}, len(existing)+len(additions))
-	add := func(item common.PendingEvmTxHash) {
-		if item.Hash == (ecommon.Hash{}) || (item.Nonce == currentNonce && item.Hash == currentHash) {
-			return
-		}
-		if _, ok := seen[item]; ok {
-			return
-		}
-		seen[item] = struct{}{}
-		out = append(out, item)
-	}
-	for _, item := range existing {
-		add(item)
-	}
-	for _, item := range additions {
-		add(item)
-	}
-	truncatedUpTo := maxUint64Ptr(existingTruncatedUpTo, additionsTruncatedUpTo)
-	for len(out) > maxPriorPendingTxHashes {
-		evictIdx := 0
-		for i := 1; i < len(out); i++ {
-			if out[i].Nonce < out[evictIdx].Nonce {
-				evictIdx = i
-			}
-		}
-		evictedNonce := out[evictIdx].Nonce
-		truncatedUpTo = maxUint64Ptr(truncatedUpTo, &evictedNonce)
-		out = append(out[:evictIdx], out[evictIdx+1:]...)
-	}
-	if len(out) == 0 {
-		out = nil
-	}
-	return out, truncatedUpTo
-}
-
-func clonePendingEvmTxWithoutSuperseded(p *pendingEvmTx) *pendingEvmTx {
-	if p == nil {
-		return nil
-	}
-	var prior []common.PendingEvmTxHash
-	if len(p.priorTxHashes) > 0 {
-		prior = append([]common.PendingEvmTxHash(nil), p.priorTxHashes...)
 	}
 	return &pendingEvmTx{
-		nonce:              p.nonce,
-		txHash:             p.txHash,
-		priorTxHashes:      prior,
-		priorTruncatedUpTo: cloneUint64Ptr(p.priorTruncatedUpTo),
-		gasPrice:           cloneBigInt(p.gasPrice),
-		tipCap:             cloneBigInt(p.tipCap),
-		feeCap:             cloneBigInt(p.feeCap),
-		isDynamic:          p.isDynamic,
-	}
-}
-
-func clonePendingEvmTx(p *pendingEvmTx) *pendingEvmTx {
-	cp := clonePendingEvmTxWithoutSuperseded(p)
-	if cp != nil && p.supersededOther != nil {
-		cp.supersededOther = clonePendingEvmTxWithoutSuperseded(p.supersededOther)
-	}
-	return cp
-}
-
-// mergeSupersededOther retains the highest-nonce superseded competing-action
-// record (depth capped at 1) while preserving prior hashes and monotonic fees
-// if two superseded records exist.
-func mergeSupersededOther(a, b *pendingEvmTx) *pendingEvmTx {
-	if a == nil {
-		return clonePendingEvmTxWithoutSuperseded(b)
-	}
-	if b == nil {
-		return clonePendingEvmTxWithoutSuperseded(a)
-	}
-	primary, secondary := b, a
-	if a.nonce > b.nonce {
-		primary, secondary = a, b
-	}
-	out := clonePendingEvmTxWithoutSuperseded(primary)
-	if primary.nonce == secondary.nonce {
-		out.gasPrice = maxBigInt(out.gasPrice, secondary.gasPrice)
-		out.tipCap = maxBigInt(out.tipCap, secondary.tipCap)
-		out.feeCap = maxBigInt(out.feeCap, secondary.feeCap)
-	}
-	additions := make([]common.PendingEvmTxHash, 0, len(secondary.priorTxHashes)+1)
-	additions = append(additions, secondary.priorTxHashes...)
-	additions = append(additions, common.PendingEvmTxHash{Nonce: secondary.nonce, Hash: secondary.txHash})
-	out.priorTxHashes, out.priorTruncatedUpTo = mergePriorTxHashList(
-		out.priorTxHashes,
-		out.priorTruncatedUpTo,
-		additions,
-		secondary.priorTruncatedUpTo,
-		out.nonce,
-		out.txHash,
-	)
-	return out
-}
-
-func toCommonPendingEvmTxWithoutSuperseded(p *pendingEvmTx) *common.PendingEvmTx {
-	if p == nil {
-		return nil
-	}
-	var prior []common.PendingEvmTxHash
-	if len(p.priorTxHashes) > 0 {
-		prior = append([]common.PendingEvmTxHash(nil), p.priorTxHashes...)
-	}
-	return &common.PendingEvmTx{
-		Nonce:              p.nonce,
-		TxHash:             p.txHash,
-		PriorTxHashes:      prior,
-		PriorTruncatedUpTo: cloneUint64Ptr(p.priorTruncatedUpTo),
-		GasPrice:           cloneBigInt(p.gasPrice),
-		TipCap:             cloneBigInt(p.tipCap),
-		FeeCap:             cloneBigInt(p.feeCap),
-		IsDynamic:          p.isDynamic,
+		nonce:     p.nonce,
+		txHash:    p.txHash,
+		gasPrice:  cloneBigInt(p.gasPrice),
+		tipCap:    cloneBigInt(p.tipCap),
+		feeCap:    cloneBigInt(p.feeCap),
+		isDynamic: p.isDynamic,
 	}
 }
 
 func toCommonPendingEvmTx(p *pendingEvmTx) *common.PendingEvmTx {
-	out := toCommonPendingEvmTxWithoutSuperseded(p)
-	if out != nil && p.supersededOther != nil {
-		out.SupersededOther = toCommonPendingEvmTxWithoutSuperseded(p.supersededOther)
-	}
-	return out
-}
-
-func fromCommonPendingEvmTxWithoutSuperseded(rec *common.PendingEvmTx) *pendingEvmTx {
-	if rec == nil {
+	if p == nil {
 		return nil
 	}
-	var prior []common.PendingEvmTxHash
-	if len(rec.PriorTxHashes) > 0 {
-		prior = append([]common.PendingEvmTxHash(nil), rec.PriorTxHashes...)
-	}
-	return &pendingEvmTx{
-		nonce:              rec.Nonce,
-		txHash:             rec.TxHash,
-		priorTxHashes:      prior,
-		priorTruncatedUpTo: cloneUint64Ptr(rec.PriorTruncatedUpTo),
-		gasPrice:           cloneBigInt(rec.GasPrice),
-		tipCap:             cloneBigInt(rec.TipCap),
-		feeCap:             cloneBigInt(rec.FeeCap),
-		isDynamic:          rec.IsDynamic,
+	return &common.PendingEvmTx{
+		Nonce:     p.nonce,
+		TxHash:    p.txHash,
+		GasPrice:  cloneBigInt(p.gasPrice),
+		TipCap:    cloneBigInt(p.tipCap),
+		FeeCap:    cloneBigInt(p.feeCap),
+		IsDynamic: p.isDynamic,
 	}
 }
 
 func fromCommonPendingEvmTx(rec *common.PendingEvmTx) *pendingEvmTx {
-	out := fromCommonPendingEvmTxWithoutSuperseded(rec)
-	if out != nil && rec.SupersededOther != nil {
-		out.supersededOther = fromCommonPendingEvmTxWithoutSuperseded(rec.SupersededOther)
+	if rec == nil {
+		return nil
 	}
-	return out
+	return &pendingEvmTx{
+		nonce:     rec.Nonce,
+		txHash:    rec.TxHash,
+		gasPrice:  cloneBigInt(rec.GasPrice),
+		tipCap:    cloneBigInt(rec.TipCap),
+		feeCap:    cloneBigInt(rec.FeeCap),
+		isDynamic: rec.IsDynamic,
+	}
 }
 
 func otherEvmTxKind(kind string) string {
@@ -774,12 +609,11 @@ func otherEvmTxKind(kind string) string {
 	return evmTxKindHalt
 }
 
-// recordPendingTxAttempt durably records tx's nonce and fee watermark BEFORE
+// recordPendingTxAttempt durably persists tx's nonce and fee watermark BEFORE
 // broadcast so a process crash or dropped connection after node acceptance
-// cannot erase the watermark. Both setTss and halt attempts for the same
-// (sender, contract, nonce) share one lineage stack under pendingMu so
-// cross-action superseding and overlapping rollbacks always restore the last
-// viable owner in a single atomic fsynced batch.
+// cannot erase the watermark. Competing action rows (setTss vs halt) are kept
+// independent until acceptance so a failed or obsolete halt never erases a
+// live rotation record.
 func (r *EvmRpc) recordPendingTxAttempt(tx *etypes.Transaction) (*pendingAttempt, bool, error) {
 	key, ok := evmTxKeyFromTx(tx)
 	if !ok {
@@ -788,34 +622,14 @@ func (r *EvmRpc) recordPendingTxAttempt(tx *etypes.Transaction) (*pendingAttempt
 	r.pendingMu.Lock()
 	defer r.pendingMu.Unlock()
 
-	if r.sendGen == nil {
-		r.sendGen = make(map[evmTxKey]uint64)
-	}
-	// Advance sendGen before checking/persisting so any concurrent
-	// ClearObsoleteHaltTx lookup snapshot (including for a same-hash
-	// rebroadcast) is immediately invalidated.
-	r.sendGen[key]++
-
-	otherKey := evmTxKey{sender: key.sender, contract: key.contract, kind: otherEvmTxKind(key.kind)}
-	if _, err := r.loadPendingTxLocked(key); err != nil {
+	prev, err := r.loadPendingTxLocked(key)
+	if err != nil {
 		return nil, false, fmt.Errorf("load pending EVM tx record before broadcast: %w", err)
-	}
-	if _, err := r.loadPendingTxLocked(otherKey); err != nil {
-		return nil, false, fmt.Errorf("load competing EVM tx record before broadcast: %w", err)
-	}
-	if err := r.retryFailedRollbacksLocked(key.sender, key.contract); err != nil {
-		return nil, false, fmt.Errorf("retry failed rollback before broadcast: %w", err)
 	}
 
 	r.txMu.Lock()
-	if r.pendingTx == nil {
-		r.pendingTx = make(map[evmTxKey]*pendingEvmTx)
-	}
-	prev := r.pendingTx[key]
-	prevSnapshot := clonePendingEvmTx(prev)
-	otherPrev := r.pendingTx[otherKey]
-	otherSnapshot := clonePendingEvmTx(otherPrev)
 	store := r.pendingTxStore
+	r.txMu.Unlock()
 
 	entry := &pendingEvmTx{
 		nonce:     tx.Nonce(),
@@ -828,550 +642,158 @@ func (r *EvmRpc) recordPendingTxAttempt(tx *etypes.Transaction) (*pendingAttempt
 	} else {
 		entry.gasPrice = cloneBigInt(tx.GasPrice())
 	}
-	if prev != nil {
-		if prev.nonce > entry.nonce {
-			r.txMu.Unlock()
-			// Leave the higher-nonce durable owner intact, while durably
-			// recording this lower-nonce tx hash on the higher-nonce record
-			// BEFORE broadcast so post-restart cleanup still sees a live
-			// lower-nonce queued halt, and tracking the attempt in nonceStack
-			// through reconciliation so in-flight guards, fee watermarks, and
-			// superseded rotation recovery remain intact.
-			updatedPrev := clonePendingEvmTx(prevSnapshot)
-			updatedPrev.priorTxHashes, updatedPrev.priorTruncatedUpTo = mergePriorTxHashList(
-				updatedPrev.priorTxHashes,
-				updatedPrev.priorTruncatedUpTo,
-				[]common.PendingEvmTxHash{{Nonce: entry.nonce, Hash: entry.txHash}},
-				nil,
-				updatedPrev.nonce,
-				updatedPrev.txHash,
-			)
-			if store != nil {
-				if err := store.ApplyPendingEvmTxBatch([]common.PendingEvmTxOp{{
-					Sender:   key.sender,
-					Contract: key.contract,
-					Kind:     key.kind,
-					Record:   toCommonPendingEvmTx(updatedPrev),
-				}}); err != nil {
-					r.logger.Errorf("failed to persist lower-nonce pending EVM tx hash before broadcast: %v", err)
-					return nil, false, fmt.Errorf("persist lower-nonce pending EVM tx before broadcast: %w", err)
-				}
-			}
-			r.txMu.Lock()
-			r.pendingTx[key] = updatedPrev
-			r.txMu.Unlock()
-			prevNk := evmNonceKey{sender: key.sender, contract: key.contract, nonce: updatedPrev.nonce}
-			for i := len(r.nonceStack[prevNk]) - 1; i >= 0; i-- {
-				a := r.nonceStack[prevNk][i]
-				if !a.rejected && a.kind == key.kind && a.txHash == updatedPrev.txHash && a.entry != nil {
-					a.entry = clonePendingEvmTx(updatedPrev)
-					break
-				}
-			}
 
-			nk := evmNonceKey{sender: key.sender, contract: key.contract, nonce: entry.nonce}
-			if r.nonceStack == nil {
-				r.nonceStack = make(map[evmNonceKey][]*pendingAttempt)
-			}
-			if otherSnapshot != nil && otherSnapshot.nonce == entry.nonce {
-				entry.gasPrice = maxBigInt(otherSnapshot.gasPrice, entry.gasPrice)
-				entry.tipCap = maxBigInt(otherSnapshot.tipCap, entry.tipCap)
-				entry.feeCap = maxBigInt(otherSnapshot.feeCap, entry.feeCap)
-				entry.supersededOther = mergeSupersededOther(entry.supersededOther, otherSnapshot)
-				if len(r.nonceStack[nk]) == 0 {
-					r.nonceStack[nk] = append(r.nonceStack[nk], &pendingAttempt{
-						kind:   otherKey.kind,
-						txHash: otherSnapshot.txHash,
-						nonce:  otherSnapshot.nonce,
-						entry:  otherSnapshot,
-					})
-				}
-			}
-			for i := len(r.nonceStack[nk]) - 1; i >= 0; i-- {
-				if !r.nonceStack[nk][i].rejected && r.nonceStack[nk][i].entry != nil {
-					topEntry := r.nonceStack[nk][i].entry
-					entry.gasPrice = maxBigInt(topEntry.gasPrice, entry.gasPrice)
-					entry.tipCap = maxBigInt(topEntry.tipCap, entry.tipCap)
-					entry.feeCap = maxBigInt(topEntry.feeCap, entry.feeCap)
-					if r.nonceStack[nk][i].kind == key.kind {
-						additions := make([]common.PendingEvmTxHash, 0, len(topEntry.priorTxHashes)+1)
-						additions = append(additions, topEntry.priorTxHashes...)
-						additions = append(additions, common.PendingEvmTxHash{Nonce: topEntry.nonce, Hash: topEntry.txHash})
-						entry.priorTxHashes, entry.priorTruncatedUpTo = mergePriorTxHashList(
-							entry.priorTxHashes,
-							entry.priorTruncatedUpTo,
-							additions,
-							topEntry.priorTruncatedUpTo,
-							entry.nonce,
-							entry.txHash,
-						)
-						entry.supersededOther = mergeSupersededOther(entry.supersededOther, topEntry.supersededOther)
-					} else {
-						entry.supersededOther = mergeSupersededOther(entry.supersededOther, topEntry)
-					}
-					break
-				}
-			}
-			if prevSnapshot.supersededOther != nil && prevSnapshot.supersededOther.nonce <= entry.nonce {
-				entry.supersededOther = mergeSupersededOther(entry.supersededOther, prevSnapshot.supersededOther)
-			}
-			attempt := &pendingAttempt{
-				kind:     key.kind,
-				txHash:   tx.Hash(),
-				nonce:    tx.Nonce(),
-				entry:    clonePendingEvmTx(entry),
-				inFlight: true,
-			}
-			r.nonceStack[nk] = append(r.nonceStack[nk], attempt)
-			return attempt, true, nil
-		}
-		if prev.nonce == entry.nonce {
-			entry.gasPrice = maxBigInt(prev.gasPrice, entry.gasPrice)
-			entry.tipCap = maxBigInt(prev.tipCap, entry.tipCap)
-			entry.feeCap = maxBigInt(prev.feeCap, entry.feeCap)
-		}
-		// Carry nonce-tagged prior hashes and superseded competing-action state
-		// forward across both same-nonce retries and higher-nonce advances so a
-		// queued lower-nonce halt or superseded rotation survives restarts.
-		entry.priorTxHashes, entry.priorTruncatedUpTo = mergePriorTxHashList(
-			prev.priorTxHashes,
-			prev.priorTruncatedUpTo,
-			[]common.PendingEvmTxHash{{Nonce: prev.nonce, Hash: prev.txHash}},
-			nil,
-			entry.nonce,
-			entry.txHash,
-		)
-		if prev.supersededOther != nil {
-			entry.supersededOther = mergeSupersededOther(entry.supersededOther, prev.supersededOther)
-		}
+	if r.sendGen == nil {
+		r.sendGen = make(map[evmTxKey]uint64)
 	}
-	deleteOther := otherPrev != nil && otherPrev.nonce == entry.nonce
-	if deleteOther {
-		entry.gasPrice = maxBigInt(otherPrev.gasPrice, entry.gasPrice)
-		entry.tipCap = maxBigInt(otherPrev.tipCap, entry.tipCap)
-		entry.feeCap = maxBigInt(otherPrev.feeCap, entry.feeCap)
-		entry.supersededOther = mergeSupersededOther(entry.supersededOther, otherPrev)
+	if r.inFlight == nil {
+		r.inFlight = make(map[evmTxKey]int)
 	}
-	ops := []common.PendingEvmTxOp{{
-		Sender:   key.sender,
-		Contract: key.contract,
-		Kind:     key.kind,
-		Record:   toCommonPendingEvmTx(entry),
-	}}
-	if deleteOther {
-		ops = append(ops, common.PendingEvmTxOp{
-			Sender:   otherKey.sender,
-			Contract: otherKey.contract,
-			Kind:     otherKey.kind,
-			Record:   nil,
-		})
+
+	if prev != nil && prev.nonce > entry.nonce {
+		// Leave the higher-nonce durable record intact while tracking that a
+		// broadcast is in flight so concurrent cleanup defers safely.
+		r.sendGen[key]++
+		r.inFlight[key]++
+		return &pendingAttempt{
+			key:      key,
+			nonce:    entry.nonce,
+			txHash:   entry.txHash,
+			recorded: false,
+		}, true, nil
 	}
-	r.txMu.Unlock()
+	if prev != nil && prev.nonce == entry.nonce {
+		entry.gasPrice = maxBigInt(prev.gasPrice, entry.gasPrice)
+		entry.tipCap = maxBigInt(prev.tipCap, entry.tipCap)
+		entry.feeCap = maxBigInt(prev.feeCap, entry.feeCap)
+	}
 
 	if store != nil {
-		if err := store.ApplyPendingEvmTxBatch(ops); err != nil {
+		if err := store.SavePendingEvmTx(key.sender, key.contract, key.kind, toCommonPendingEvmTx(entry)); err != nil {
 			r.logger.Errorf("failed to persist pending EVM tx record before broadcast: %v", err)
 			return nil, false, fmt.Errorf("persist pending EVM tx before broadcast: %w", err)
 		}
 	}
 
-	nk := evmNonceKey{sender: key.sender, contract: key.contract, nonce: entry.nonce}
-	if r.nonceStack == nil {
-		r.nonceStack = make(map[evmNonceKey][]*pendingAttempt)
-	}
-	if prevSnapshot != nil && prevSnapshot.nonce != entry.nonce {
-		prevNk := evmNonceKey{sender: key.sender, contract: key.contract, nonce: prevSnapshot.nonce}
-		if len(r.nonceStack[prevNk]) == 0 {
-			r.nonceStack[prevNk] = append(r.nonceStack[prevNk], &pendingAttempt{
-				kind:   key.kind,
-				txHash: prevSnapshot.txHash,
-				nonce:  prevSnapshot.nonce,
-				entry:  prevSnapshot,
-			})
-		}
-	}
-	if len(r.nonceStack[nk]) == 0 {
-		if deleteOther && otherSnapshot != nil {
-			r.nonceStack[nk] = append(r.nonceStack[nk], &pendingAttempt{
-				kind:   otherKey.kind,
-				txHash: otherSnapshot.txHash,
-				nonce:  otherSnapshot.nonce,
-				entry:  otherSnapshot,
-			})
-		} else if prevSnapshot != nil && prevSnapshot.nonce == entry.nonce {
-			r.nonceStack[nk] = append(r.nonceStack[nk], &pendingAttempt{
-				kind:   key.kind,
-				txHash: prevSnapshot.txHash,
-				nonce:  prevSnapshot.nonce,
-				entry:  prevSnapshot,
-			})
-		}
-	}
-	attempt := &pendingAttempt{
-		kind:     key.kind,
-		txHash:   tx.Hash(),
-		nonce:    tx.Nonce(),
-		entry:    clonePendingEvmTx(entry),
-		inFlight: true,
-	}
-	r.nonceStack[nk] = append(r.nonceStack[nk], attempt)
-
 	r.txMu.Lock()
+	if r.pendingTx == nil {
+		r.pendingTx = make(map[evmTxKey]*pendingEvmTx)
+	}
 	r.pendingTx[key] = entry
-	if deleteOther {
-		delete(r.pendingTx, otherKey)
-	}
-	r.txMu.Unlock()
-	return attempt, true, nil
-}
-
-// findFallbackOwnerLocked scans r.nonceStack across nonces for (sender, contract)
-// (skipping excludeNonce when exclude is true) and returns the highest-nonce
-// surviving top owner matching kind. Caller must hold r.pendingMu.
-func (r *EvmRpc) findFallbackOwnerLocked(sender, contract ecommon.Address, kind string, exclude bool, excludeNonce uint64) *pendingAttempt {
-	var best *pendingAttempt
-	for nk, st := range r.nonceStack {
-		if nk.sender != sender || nk.contract != contract || (exclude && nk.nonce == excludeNonce) {
-			continue
-		}
-		var top *pendingAttempt
-		for i := len(st) - 1; i >= 0; i-- {
-			if !st[i].rejected {
-				top = st[i]
-				break
-			}
-		}
-		if top == nil || top.kind != kind {
-			continue
-		}
-		if best == nil || top.nonce > best.nonce {
-			best = top
-		}
-	}
-	return best
-}
-
-// markFailedRollbackLocked records nk as having a transiently failed rollback
-// batch awaiting atomic retry. Caller must hold r.pendingMu.
-func (r *EvmRpc) markFailedRollbackLocked(nk evmNonceKey) {
-	if r.failedRollbacks == nil {
-		r.failedRollbacks = make(map[evmNonceKey]struct{})
-	}
-	r.failedRollbacks[nk] = struct{}{}
-}
-
-// applyStackRollbackLocked atomically applies the pending rollback for nk by
-// unwinding all trailing rejected attempts in r.nonceStack[nk] and updating
-// durable storage + in-memory pendingTx in a single ApplyPendingEvmTxBatch
-// call (so deleting a rejected owner and restoring a surviving owner never
-// split across batches). On store write failure, nk is recorded in
-// r.failedRollbacks and the error is returned. Caller must hold r.pendingMu.
-func (r *EvmRpc) applyStackRollbackLocked(nk evmNonceKey, key evmTxKey, rejectedHash ecommon.Hash) error {
-	stack := r.nonceStack[nk]
-	cut := len(stack)
-	for cut > 0 && stack[cut-1].rejected {
-		cut--
-	}
-	remaining := stack[:cut]
-	var surviving *pendingAttempt
-	if len(remaining) > 0 {
-		surviving = remaining[len(remaining)-1]
-	}
-
-	r.txMu.Lock()
-	store := r.pendingTxStore
-	curKey := clonePendingEvmTx(r.pendingTx[key])
-	otherKey := evmTxKey{sender: key.sender, contract: key.contract, kind: otherEvmTxKind(key.kind)}
-	curOther := clonePendingEvmTx(r.pendingTx[otherKey])
 	r.txMu.Unlock()
 
-	ownsKey := curKey != nil && curKey.nonce == nk.nonce && curKey.txHash == rejectedHash
-	var keyReplacement *pendingAttempt
-	var otherReplacement *pendingAttempt
-	clearOtherConflict := false
-	if ownsKey {
-		if surviving != nil && surviving.kind == key.kind {
-			keyReplacement = surviving
-		} else {
-			keyReplacement = r.findFallbackOwnerLocked(key.sender, key.contract, key.kind, true, nk.nonce)
-			if surviving != nil && (curOther == nil || curOther.nonce <= surviving.nonce) {
-				otherReplacement = surviving
-			}
-		}
-		if keyReplacement != nil {
-			merged := clonePendingEvmTx(keyReplacement.entry)
-			// Preserve all viable same-or-lower-nonce prior hashes and
-			// superseded competing-action state from r.nonceStack (e.g. a
-			// lower-nonce send accepted while the rolled-back attempt was in
-			// flight) so restarting after rollback cannot lose them.
-			for stackNk, st := range r.nonceStack {
-				if stackNk.sender != key.sender || stackNk.contract != key.contract || stackNk.nonce > keyReplacement.nonce {
-					continue
-				}
-				for _, a := range st {
-					if a.rejected || a.kind != key.kind {
-						continue
-					}
-					additions := []common.PendingEvmTxHash{{Nonce: a.nonce, Hash: a.txHash}}
-					var addTrunc *uint64
-					if a.entry != nil {
-						additions = append(additions, a.entry.priorTxHashes...)
-						addTrunc = a.entry.priorTruncatedUpTo
-						if a.entry.supersededOther != nil && a.entry.supersededOther.nonce <= merged.nonce {
-							merged.supersededOther = mergeSupersededOther(merged.supersededOther, a.entry.supersededOther)
-						}
-					}
-					merged.priorTxHashes, merged.priorTruncatedUpTo = mergePriorTxHashList(
-						merged.priorTxHashes,
-						merged.priorTruncatedUpTo,
-						additions,
-						addTrunc,
-						merged.nonce,
-						merged.txHash,
-					)
-				}
-			}
-			// If keyReplacement resolves to a fallback at the exact same nonce
-			// currently owned by otherKey (e.g. halt(5) superseding setTss(5)
-			// while halt(6) was in flight, then halt(6) rejects), merge curOther's
-			// fee watermark monotonically, preserve curOther in supersededOther
-			// so post-restart cleanup still restores a live rotation, and clear
-			// otherKey atomically in the same batch so two owners are never
-			// persisted for the same nonce.
-			if otherReplacement == nil && curOther != nil && curOther.nonce == keyReplacement.nonce {
-				merged.gasPrice = maxBigInt(curOther.gasPrice, merged.gasPrice)
-				merged.tipCap = maxBigInt(curOther.tipCap, merged.tipCap)
-				merged.feeCap = maxBigInt(curOther.feeCap, merged.feeCap)
-				merged.supersededOther = mergeSupersededOther(merged.supersededOther, curOther)
-				clearOtherConflict = true
-			}
-			keyReplacement = &pendingAttempt{
-				kind:   keyReplacement.kind,
-				txHash: keyReplacement.txHash,
-				nonce:  keyReplacement.nonce,
-				entry:  merged,
-			}
-		}
-	} else if surviving != nil && surviving.kind != key.kind && (curOther == nil || curOther.nonce <= surviving.nonce) {
-		otherReplacement = surviving
-	}
-
-	var ops []common.PendingEvmTxOp
-	if ownsKey {
-		if keyReplacement != nil {
-			ops = append(ops, common.PendingEvmTxOp{
-				Sender:   key.sender,
-				Contract: key.contract,
-				Kind:     key.kind,
-				Record:   toCommonPendingEvmTx(keyReplacement.entry),
-			})
-		} else {
-			ops = append(ops, common.PendingEvmTxOp{
-				Sender:   key.sender,
-				Contract: key.contract,
-				Kind:     key.kind,
-				Record:   nil,
-			})
-		}
-	}
-	if otherReplacement != nil {
-		ops = append(ops, common.PendingEvmTxOp{
-			Sender:   key.sender,
-			Contract: key.contract,
-			Kind:     otherReplacement.kind,
-			Record:   toCommonPendingEvmTx(otherReplacement.entry),
-		})
-	} else if clearOtherConflict {
-		ops = append(ops, common.PendingEvmTxOp{
-			Sender:   otherKey.sender,
-			Contract: otherKey.contract,
-			Kind:     otherKey.kind,
-			Record:   nil,
-		})
-	}
-	if len(ops) > 0 && store != nil {
-		if err := store.ApplyPendingEvmTxBatch(ops); err != nil {
-			r.markFailedRollbackLocked(nk)
-			r.logger.Errorf("failed to atomically roll back rejected pending EVM tx record: %v", err)
-			return err
-		}
-	}
-	delete(r.failedRollbacks, nk)
-	if len(remaining) == 0 {
-		delete(r.nonceStack, nk)
-	} else {
-		r.nonceStack[nk] = remaining
-	}
-	if len(ops) > 0 {
-		if ownsKey {
-			if r.sendGen == nil {
-				r.sendGen = make(map[evmTxKey]uint64)
-			}
-			r.sendGen[key]++
-		}
-		r.txMu.Lock()
-		if ownsKey {
-			if keyReplacement != nil {
-				r.pendingTx[key] = clonePendingEvmTx(keyReplacement.entry)
-			} else {
-				delete(r.pendingTx, key)
-			}
-		}
-		if otherReplacement != nil {
-			r.pendingTx[otherKey] = clonePendingEvmTx(otherReplacement.entry)
-		} else if clearOtherConflict {
-			delete(r.pendingTx, otherKey)
-		}
-		r.txMu.Unlock()
-	}
-	return nil
-}
-
-// retryFailedRollbacksLocked retries only rollbacks that explicitly failed a
-// prior ApplyPendingEvmTxBatch write for (sender, contract), executing each
-// failed rollback's delete+restore atomically in nonce order. Unrelated
-// cleared reservations are never touched. Caller must hold r.pendingMu.
-func (r *EvmRpc) retryFailedRollbacksLocked(sender, contract ecommon.Address) error {
-	if len(r.failedRollbacks) == 0 {
-		return nil
-	}
-	var pending []evmNonceKey
-	for nk := range r.failedRollbacks {
-		if nk.sender == sender && nk.contract == contract {
-			pending = append(pending, nk)
-		}
-	}
-	if len(pending) == 0 {
-		return nil
-	}
-	sort.Slice(pending, func(i, j int) bool {
-		return pending[i].nonce < pending[j].nonce
-	})
-	for _, nk := range pending {
-		stack := r.nonceStack[nk]
-		if len(stack) == 0 || !stack[len(stack)-1].rejected {
-			delete(r.failedRollbacks, nk)
-			continue
-		}
-		lastRej := stack[len(stack)-1]
-		rejKey := evmTxKey{sender: nk.sender, contract: nk.contract, kind: lastRej.kind}
-		if err := r.applyStackRollbackLocked(nk, rejKey, lastRej.txHash); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-// pruneConfirmedNonceStacksLocked discards nonce-lineage stacks and any failed
-// rollback markers for nonces already confirmed on-chain so rollbacks never
-// restore a mined transaction. Caller must hold r.pendingMu.
-func (r *EvmRpc) pruneConfirmedNonceStacksLocked(sender, contract ecommon.Address, confirmedNonce uint64) {
-	for nk := range r.nonceStack {
-		if nk.sender == sender && nk.contract == contract && nk.nonce < confirmedNonce {
-			delete(r.nonceStack, nk)
-		}
-	}
-	for nk := range r.failedRollbacks {
-		if nk.sender == sender && nk.contract == contract && nk.nonce < confirmedNonce {
-			delete(r.failedRollbacks, nk)
-		}
-	}
+	r.sendGen[key]++
+	r.inFlight[key]++
+	return &pendingAttempt{
+		key:          key,
+		nonce:        entry.nonce,
+		txHash:       entry.txHash,
+		recorded:     true,
+		prevSnapshot: prev,
+	}, true, nil
 }
 
 // reconcileSentTx updates or rolls back the pre-broadcast watermark based on
-// the broadcast outcome. Both setTss and halt attempts for a nonce share one
-// lineage stack under pendingMu so:
-//   - An accepted attempt collapses all older attempts below it.
-//   - Ambiguous failures (EOF, timeouts, underpriced) remain viable.
-//   - A rejected attempt that is no longer top of stack is marked rejected and
-//     never mutates durable storage while a newer owner is active.
-//   - When the top attempt is definitively rejected, any earlier failed
-//     rollbacks for (sender, contract) are retried atomically first, and then
-//     ALL trailing rejected attempts at tx.Nonce() unwind together in one
-//     atomic batch.
+// the broadcast outcome:
+//   - On acceptance (sendErr == nil), an accepted halt clears any superseded
+//     same-nonce setTss record.
+//   - On nonce-too-low, the confirmed record is deleted.
+//   - On definitive pre-mempool rejections (insufficient funds, etc.), the
+//     record rolls back to prevSnapshot only if no newer send superseded it.
+//   - On ambiguous failures (EOF, timeout, underpriced), the watermark stays
+//     persisted so the next retry bumps fees cleanly.
 func (r *EvmRpc) reconcileSentTx(tx *etypes.Transaction, attempt *pendingAttempt, sendErr error) {
 	if attempt == nil {
 		return
 	}
-	key, ok := evmTxKeyFromTx(tx)
-	if !ok {
-		return
-	}
 	r.pendingMu.Lock()
 	defer r.pendingMu.Unlock()
-	attempt.inFlight = false
 
-	nk := evmNonceKey{sender: key.sender, contract: key.contract, nonce: tx.Nonce()}
-	stack := r.nonceStack[nk]
+	key := attempt.key
+	if n := r.inFlight[key]; n <= 1 {
+		delete(r.inFlight, key)
+	} else {
+		r.inFlight[key] = n - 1
+	}
+	if !attempt.recorded {
+		return
+	}
+
 	if sendErr == nil {
-		for i, a := range stack {
-			if a == attempt {
-				r.nonceStack[nk] = stack[i:]
-				break
+		if key.kind == evmTxKindHalt {
+			otherKey := evmTxKey{sender: key.sender, contract: key.contract, kind: evmTxKindSetTss}
+			if otherRec, err := r.loadPendingTxLocked(otherKey); err == nil && otherRec != nil && otherRec.nonce == attempt.nonce {
+				_, _ = r.clearPendingTxIfMatchesLocked(otherKey, otherRec)
 			}
 		}
-		// Only clear a failed-rollback retry marker if no trailing rejected
-		// attempt remains above attempt on this nonce's stack; otherwise leave
-		// the marker intact so retryFailedRollbacksLocked (now or on retry)
-		// atomically unwinds the rejected attempt above attempt.
-		if curStack := r.nonceStack[nk]; len(curStack) == 0 || !curStack[len(curStack)-1].rejected {
-			delete(r.failedRollbacks, nk)
-		}
-		_ = r.retryFailedRollbacksLocked(key.sender, key.contract)
 		return
 	}
 
 	if isNonceTooLowErr(sendErr) {
-		attempt.rejected = true
-		r.pruneConfirmedNonceStacksLocked(key.sender, key.contract, tx.Nonce()+1)
 		r.txMu.Lock()
 		store := r.pendingTxStore
 		cur := r.pendingTx[key]
-		shouldDelete := cur != nil && (cur.nonce < tx.Nonce() || (cur.nonce == tx.Nonce() && cur.txHash == tx.Hash()))
+		shouldDelete := cur != nil && (cur.nonce < attempt.nonce || (cur.nonce == attempt.nonce && cur.txHash == attempt.txHash))
 		r.txMu.Unlock()
 		if !shouldDelete {
-			_ = r.retryFailedRollbacksLocked(key.sender, key.contract)
 			return
 		}
 		if store != nil {
 			if err := store.DeletePendingEvmTx(key.sender, key.contract, key.kind); err != nil {
-				r.logger.Errorf("failed to delete obsolete pending EVM tx record: %v", err)
+				r.logger.Errorf("failed to delete confirmed pending EVM tx record: %v", err)
 				return
 			}
 		}
 		r.txMu.Lock()
-		if cur := r.pendingTx[key]; cur != nil && (cur.nonce < tx.Nonce() || (cur.nonce == tx.Nonce() && cur.txHash == tx.Hash())) {
+		if cur := r.pendingTx[key]; cur != nil && (cur.nonce < attempt.nonce || (cur.nonce == attempt.nonce && cur.txHash == attempt.txHash)) {
 			delete(r.pendingTx, key)
 		}
 		r.txMu.Unlock()
-		_ = r.retryFailedRollbacksLocked(key.sender, key.contract)
 		return
 	}
+
 	if !isDefinitivePreMempoolRejection(sendErr) {
 		return
 	}
 
-	attempt.rejected = true
-	if len(stack) == 0 || stack[len(stack)-1] != attempt {
+	r.txMu.Lock()
+	store := r.pendingTxStore
+	cur := r.pendingTx[key]
+	matches := cur != nil && cur.nonce == attempt.nonce && cur.txHash == attempt.txHash
+	r.txMu.Unlock()
+	if !matches {
 		return
 	}
 
-	// Retry any earlier transiently failed rollbacks for (sender, contract)
-	// before applying this rollback so deferred restorations (e.g. setTss(5)
-	// beneath an earlier rejected halt(5)) recover before clearing the last
-	// halt slot. If an earlier rollback still fails to write, defer this
-	// rollback too instead of deleting the last reservation prematurely.
-	if err := r.retryFailedRollbacksLocked(key.sender, key.contract); err != nil {
-		r.markFailedRollbackLocked(nk)
-		return
+	if attempt.prevSnapshot != nil {
+		if store != nil {
+			if err := store.SavePendingEvmTx(key.sender, key.contract, key.kind, toCommonPendingEvmTx(attempt.prevSnapshot)); err != nil {
+				r.logger.Errorf("failed to roll back rejected pending EVM tx record: %v", err)
+				return
+			}
+		}
+		r.txMu.Lock()
+		if cur := r.pendingTx[key]; cur != nil && cur.nonce == attempt.nonce && cur.txHash == attempt.txHash {
+			r.pendingTx[key] = clonePendingEvmTx(attempt.prevSnapshot)
+		}
+		r.txMu.Unlock()
+	} else {
+		if store != nil {
+			if err := store.DeletePendingEvmTx(key.sender, key.contract, key.kind); err != nil {
+				r.logger.Errorf("failed to delete rejected pending EVM tx record: %v", err)
+				return
+			}
+		}
+		r.txMu.Lock()
+		if cur := r.pendingTx[key]; cur != nil && cur.nonce == attempt.nonce && cur.txHash == attempt.txHash {
+			delete(r.pendingTx, key)
+		}
+		r.txMu.Unlock()
 	}
-	_ = r.applyStackRollbackLocked(nk, key, tx.Hash())
-}
-
-func (r *EvmRpc) loadPendingTx(key evmTxKey) (*pendingEvmTx, error) {
-	r.pendingMu.Lock()
-	defer r.pendingMu.Unlock()
-	return r.loadPendingTxLocked(key)
+	if r.sendGen == nil {
+		r.sendGen = make(map[evmTxKey]uint64)
+	}
+	r.sendGen[key]++
 }
 
 func (r *EvmRpc) loadPendingTxLocked(key evmTxKey) (*pendingEvmTx, error) {
@@ -1402,11 +824,9 @@ func (r *EvmRpc) loadPendingTxLocked(key evmTxKey) (*pendingEvmTx, error) {
 	return clonePendingEvmTx(prev), nil
 }
 
-func (r *EvmRpc) clearPendingTxIfMatchesLocked(key evmTxKey, expected *pendingEvmTx, confirmedNonce uint64) (bool, error) {
-	otherKey := evmTxKey{sender: key.sender, contract: key.contract, kind: otherEvmTxKind(key.kind)}
+func (r *EvmRpc) clearPendingTxIfMatchesLocked(key evmTxKey, expected *pendingEvmTx) (bool, error) {
 	r.txMu.Lock()
 	cur := clonePendingEvmTx(r.pendingTx[key])
-	curOther := clonePendingEvmTx(r.pendingTx[otherKey])
 	store := r.pendingTxStore
 	if expected != nil && (cur == nil || cur.nonce != expected.nonce || cur.txHash != expected.txHash) {
 		r.txMu.Unlock()
@@ -1414,60 +834,10 @@ func (r *EvmRpc) clearPendingTxIfMatchesLocked(key evmTxKey, expected *pendingEv
 	}
 	r.txMu.Unlock()
 
-	var nk evmNonceKey
-	hasStack := false
-	cut := 0
-	var restoreOther *pendingEvmTx
-	if cur != nil {
-		nk = evmNonceKey{sender: key.sender, contract: key.contract, nonce: cur.nonce}
-		if st := r.nonceStack[nk]; len(st) > 0 && st[len(st)-1].kind == key.kind {
-			hasStack = true
-			cut = len(st)
-			for cut > 0 && (st[cut-1].kind == key.kind || st[cut-1].rejected) {
-				cut--
-			}
-			if cut > 0 {
-				surviving := st[cut-1]
-				if surviving.kind == otherKey.kind && surviving.nonce >= confirmedNonce && surviving.entry != nil {
-					restoreOther = surviving.entry
-				}
-			}
-		}
-		if cur.supersededOther != nil && cur.supersededOther.nonce >= confirmedNonce {
-			if restoreOther == nil || cur.supersededOther.nonce > restoreOther.nonce {
-				restoreOther = cur.supersededOther
-			}
-		}
-		if restoreOther != nil && curOther != nil && curOther.nonce > restoreOther.nonce {
-			restoreOther = nil
-		}
-	}
-
 	if store != nil {
-		if restoreOther != nil {
-			ops := []common.PendingEvmTxOp{
-				{
-					Sender:   key.sender,
-					Contract: key.contract,
-					Kind:     key.kind,
-					Record:   nil,
-				},
-				{
-					Sender:   otherKey.sender,
-					Contract: otherKey.contract,
-					Kind:     otherKey.kind,
-					Record:   toCommonPendingEvmTx(restoreOther),
-				},
-			}
-			if err := store.ApplyPendingEvmTxBatch(ops); err != nil {
-				r.logger.Errorf("failed to atomically clear stale pending EVM tx and restore surviving owner: %v", err)
-				return false, err
-			}
-		} else {
-			if err := store.DeletePendingEvmTx(key.sender, key.contract, key.kind); err != nil {
-				r.logger.Errorf("failed to clear stale pending EVM tx record: %v", err)
-				return false, err
-			}
+		if err := store.DeletePendingEvmTx(key.sender, key.contract, key.kind); err != nil {
+			r.logger.Errorf("failed to clear pending EVM tx record: %v", err)
+			return false, err
 		}
 	}
 
@@ -1475,169 +845,11 @@ func (r *EvmRpc) clearPendingTxIfMatchesLocked(key evmTxKey, expected *pendingEv
 	r.txMu.Lock()
 	liveCur := r.pendingTx[key]
 	if expected == nil || (liveCur != nil && liveCur.nonce == expected.nonce && liveCur.txHash == expected.txHash) {
-		if hasStack {
-			if cut == 0 {
-				delete(r.nonceStack, nk)
-				delete(r.failedRollbacks, nk)
-			} else {
-				r.nonceStack[nk] = r.nonceStack[nk][:cut]
-				delete(r.failedRollbacks, nk)
-			}
-		}
 		delete(r.pendingTx, key)
-		if restoreOther != nil {
-			if r.pendingTx == nil {
-				r.pendingTx = make(map[evmTxKey]*pendingEvmTx)
-			}
-			r.pendingTx[otherKey] = clonePendingEvmTx(restoreOther)
-		}
 		cleared = true
 	}
 	r.txMu.Unlock()
 	return cleared, nil
-}
-
-// hasInFlightKindLocked reports whether any attempt of kind for (sender,
-// contract) at nonce <= maxNonce currently has an in-flight
-// eth_sendRawTransaction RPC (including superseded attempts beneath the latest
-// tracked record). Caller must hold r.pendingMu.
-func (r *EvmRpc) hasInFlightKindLocked(sender, contract ecommon.Address, kind string, maxNonce uint64) bool {
-	for nk, st := range r.nonceStack {
-		if nk.sender != sender || nk.contract != contract || nk.nonce > maxNonce {
-			continue
-		}
-		for _, a := range st {
-			if a.inFlight && a.kind == kind {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-// hasFailedRollbacksLocked reports whether (sender, contract) has any failed
-// rollback awaiting retry. Caller must hold r.pendingMu.
-func (r *EvmRpc) hasFailedRollbacksLocked(sender, contract ecommon.Address) bool {
-	for nk := range r.failedRollbacks {
-		if nk.sender == sender && nk.contract == contract {
-			return true
-		}
-	}
-	return false
-}
-
-// clearObsoleteHaltLocked atomically clears an obsolete halt reservation if it
-// still matches expected, no new send for key began after obsGen, and no
-// affected halt broadcast at nonce <= expected.nonce remains in flight. It
-// prunes confirmed stacks below confirmedNonce first, resolves pending failed
-// rollbacks, and commits both the halt deletion and any surviving unconfirmed
-// rotation uncovered across nonces <= expected.nonce in a single
-// ApplyPendingEvmTxBatch. Caller must hold r.pendingMu.
-func (r *EvmRpc) clearObsoleteHaltLocked(key evmTxKey, expected *pendingEvmTx, confirmedNonce uint64, obsGen uint64, restoreSupersededOther bool) error {
-	r.pruneConfirmedNonceStacksLocked(key.sender, key.contract, confirmedNonce)
-	if err := r.retryFailedRollbacksLocked(key.sender, key.contract); err != nil {
-		return err
-	}
-	if r.sendGen[key] != obsGen {
-		// A new send (including a same-hash rebroadcast) started after the
-		// mempool lookup snapshot was taken; defer cleanup.
-		return nil
-	}
-	otherKey := evmTxKey{sender: key.sender, contract: key.contract, kind: evmTxKindSetTss}
-	r.txMu.Lock()
-	cur := clonePendingEvmTx(r.pendingTx[key])
-	curOther := clonePendingEvmTx(r.pendingTx[otherKey])
-	store := r.pendingTxStore
-	r.txMu.Unlock()
-	if cur == nil || cur.nonce != expected.nonce || cur.txHash != expected.txHash {
-		return nil
-	}
-	if r.hasInFlightKindLocked(key.sender, key.contract, key.kind, cur.nonce) {
-		// Defer cleanup while any affected halt broadcast (including a
-		// superseded halt underneath cur) remains in flight so subsequent
-		// acceptance never loses its durable reservation.
-		return nil
-	}
-
-	type prunePlan struct {
-		nk  evmNonceKey
-		cut int
-	}
-	var plans []prunePlan
-	var restoreOther *pendingEvmTx
-	for nk, st := range r.nonceStack {
-		if nk.sender != key.sender || nk.contract != key.contract || nk.nonce > cur.nonce {
-			continue
-		}
-		cut := len(st)
-		for cut > 0 && (st[cut-1].kind == evmTxKindHalt || st[cut-1].rejected) {
-			cut--
-		}
-		if cut == len(st) {
-			continue
-		}
-		plans = append(plans, prunePlan{nk: nk, cut: cut})
-		if cut > 0 {
-			if top := st[cut-1]; top.kind == evmTxKindSetTss && top.entry != nil && (restoreOther == nil || top.nonce > restoreOther.nonce) {
-				restoreOther = top.entry
-			}
-		}
-	}
-	if restoreSupersededOther && cur.supersededOther != nil && cur.supersededOther.nonce >= confirmedNonce {
-		if restoreOther == nil || cur.supersededOther.nonce > restoreOther.nonce {
-			restoreOther = cur.supersededOther
-		}
-	}
-	if restoreOther != nil && curOther != nil && curOther.nonce > restoreOther.nonce {
-		restoreOther = nil
-	}
-
-	if store != nil {
-		if restoreOther != nil {
-			ops := []common.PendingEvmTxOp{
-				{
-					Sender:   key.sender,
-					Contract: key.contract,
-					Kind:     key.kind,
-					Record:   nil,
-				},
-				{
-					Sender:   otherKey.sender,
-					Contract: otherKey.contract,
-					Kind:     otherKey.kind,
-					Record:   toCommonPendingEvmTx(restoreOther),
-				},
-			}
-			if err := store.ApplyPendingEvmTxBatch(ops); err != nil {
-				r.logger.Errorf("failed to atomically clear obsolete halt and restore surviving rotation: %v", err)
-				return err
-			}
-		} else {
-			if err := store.DeletePendingEvmTx(key.sender, key.contract, key.kind); err != nil {
-				r.logger.Errorf("failed to clear obsolete halt record: %v", err)
-				return err
-			}
-		}
-	}
-
-	for _, p := range plans {
-		if p.cut == 0 {
-			delete(r.nonceStack, p.nk)
-		} else {
-			r.nonceStack[p.nk] = r.nonceStack[p.nk][:p.cut]
-		}
-		delete(r.failedRollbacks, p.nk)
-	}
-	r.txMu.Lock()
-	delete(r.pendingTx, key)
-	if restoreOther != nil {
-		if r.pendingTx == nil {
-			r.pendingTx = make(map[evmTxKey]*pendingEvmTx)
-		}
-		r.pendingTx[otherKey] = clonePendingEvmTx(restoreOther)
-	}
-	r.txMu.Unlock()
-	return nil
 }
 
 // ClearObsoleteHaltTx clears a persisted halt reservation once the emergency
@@ -1653,12 +865,11 @@ func (r *EvmRpc) ClearObsoleteHaltTxContext(parent context.Context, sender ecomm
 	key := evmTxKey{sender: sender, contract: r.bridgeAddress, kind: evmTxKindHalt}
 	r.pendingMu.Lock()
 	rec, err := r.loadPendingTxLocked(key)
-	hasFailed := r.hasFailedRollbacksLocked(sender, r.bridgeAddress)
 	r.pendingMu.Unlock()
 	if err != nil {
 		return err
 	}
-	if rec == nil && !hasFailed {
+	if rec == nil {
 		return nil
 	}
 	blockHeight, err := r.BlockNumberContext(parent)
@@ -1669,14 +880,7 @@ func (r *EvmRpc) ClearObsoleteHaltTxContext(parent context.Context, sender ecomm
 	if err != nil {
 		return err
 	}
-	// Prune consumed stacks (< confirmedNonce) BEFORE retrying any failed
-	// rollbacks so a consumed rotation is never restored after confirmation.
 	r.pendingMu.Lock()
-	r.pruneConfirmedNonceStacksLocked(sender, r.bridgeAddress, confirmedNonce)
-	if err := r.retryFailedRollbacksLocked(sender, r.bridgeAddress); err != nil {
-		r.pendingMu.Unlock()
-		return err
-	}
 	rec, err = r.loadPendingTxLocked(key)
 	if err != nil {
 		r.pendingMu.Unlock()
@@ -1687,87 +891,16 @@ func (r *EvmRpc) ClearObsoleteHaltTxContext(parent context.Context, sender ecomm
 		return nil
 	}
 	if rec.nonce < confirmedNonce {
-		_, clrErr := r.clearPendingTxIfMatchesLocked(key, rec, confirmedNonce)
+		_, clrErr := r.clearPendingTxIfMatchesLocked(key, rec)
 		r.pendingMu.Unlock()
 		return clrErr
 	}
-	if r.hasInFlightKindLocked(key.sender, key.contract, key.kind, rec.nonce) {
+	if r.inFlight[key] > 0 {
 		r.pendingMu.Unlock()
 		return nil
 	}
 	obsGen := r.sendGen[key]
-	// Collect all viable halt tx hashes across nonces [confirmedNonce..rec.nonce]
-	// (including earlier accepted halts queued behind a nonce gap underneath an
-	// ambiguous replacement) so cleanup never discards a live queued halt.
-	seenHashes := make(map[ecommon.Hash]struct{})
-	var hashesToCheck []ecommon.Hash
-	addHash := func(h ecommon.Hash) {
-		if h == (ecommon.Hash{}) {
-			return
-		}
-		if _, ok := seenHashes[h]; ok {
-			return
-		}
-		seenHashes[h] = struct{}{}
-		hashesToCheck = append(hashesToCheck, h)
-	}
-	// Only treat truncated hash history as incomplete when an evicted hash
-	// belonged to an unconfirmed nonce (>= confirmedNonce). Evictions strictly
-	// below confirmedNonce are already mined/consumed and must not strand later
-	// nonces behind an empty slot.
-	historyIncomplete := rec.priorTruncatedUpTo != nil && *rec.priorTruncatedUpTo >= confirmedNonce
-	addHash(rec.txHash)
-	for _, item := range rec.priorTxHashes {
-		if item.Nonce >= confirmedNonce {
-			addHash(item.Hash)
-		}
-	}
-	for nk, st := range r.nonceStack {
-		if nk.sender != sender || nk.contract != r.bridgeAddress || nk.nonce < confirmedNonce || nk.nonce > rec.nonce {
-			continue
-		}
-		for _, a := range st {
-			if !a.rejected && a.kind == evmTxKindHalt {
-				addHash(a.txHash)
-				if a.entry != nil {
-					if a.entry.priorTruncatedUpTo != nil && *a.entry.priorTruncatedUpTo >= confirmedNonce {
-						historyIncomplete = true
-					}
-					for _, item := range a.entry.priorTxHashes {
-						if item.Nonce >= confirmedNonce {
-							addHash(item.Hash)
-						}
-					}
-				}
-			}
-		}
-	}
-	var supersededHashes []ecommon.Hash
-	supersededTruncated := false
-	if rec.supersededOther != nil && rec.supersededOther.nonce >= confirmedNonce {
-		supersededTruncated = rec.supersededOther.priorTruncatedUpTo != nil && *rec.supersededOther.priorTruncatedUpTo >= confirmedNonce
-		seenSup := make(map[ecommon.Hash]struct{})
-		addSup := func(h ecommon.Hash) {
-			if h == (ecommon.Hash{}) {
-				return
-			}
-			if _, ok := seenSup[h]; ok {
-				return
-			}
-			seenSup[h] = struct{}{}
-			supersededHashes = append(supersededHashes, h)
-		}
-		addSup(rec.supersededOther.txHash)
-		for _, item := range rec.supersededOther.priorTxHashes {
-			if item.Nonce >= confirmedNonce {
-				addSup(item.Hash)
-			}
-		}
-	}
 	r.pendingMu.Unlock()
-	if historyIncomplete {
-		return nil
-	}
 
 	pendingNonce, err := r.PendingNonceAtContext(parent, sender)
 	if err != nil {
@@ -1778,69 +911,42 @@ func (r *EvmRpc) ClearObsoleteHaltTxContext(parent context.Context, sender ecomm
 		// A transaction from this sender is still pending in the mempool; keep ownership.
 		return nil
 	}
-	for _, h := range hashesToCheck {
-		tx, _, txErr := r.TransactionByHashContext(parent, h)
-		if txErr == nil && tx != nil {
-			// Any returned transaction with nonce >= confirmedNonce is still
-			// unconfirmed/queued in the mempool and must retain ownership;
-			// already-consumed lower-nonce transactions (< confirmedNonce) are
-			// ignored.
-			if tx.Nonce() >= confirmedNonce {
-				return nil
-			}
-			continue
+	if rec.txHash != (ecommon.Hash{}) {
+		tx, _, txErr := r.TransactionByHashContext(parent, rec.txHash)
+		if txErr == nil && tx != nil && tx.Nonce() >= confirmedNonce {
+			return nil
 		}
 		if txErr != nil && !errors.Is(txErr, ethereum.NotFound) {
 			return txErr
 		}
 	}
-	restoreSupersededOther := supersededTruncated
-	if !restoreSupersededOther {
-		for _, h := range supersededHashes {
-			tx, _, txErr := r.TransactionByHashContext(parent, h)
-			if txErr == nil && tx != nil {
-				if tx.Nonce() >= confirmedNonce {
-					restoreSupersededOther = true
-					break
-				}
-				continue
-			}
-			if txErr != nil && !errors.Is(txErr, ethereum.NotFound) {
-				return txErr
-			}
-		}
-	}
+
 	r.pendingMu.Lock()
 	defer r.pendingMu.Unlock()
-	return r.clearObsoleteHaltLocked(key, rec, confirmedNonce, obsGen, restoreSupersededOther)
+	if r.sendGen[key] != obsGen || r.inFlight[key] > 0 {
+		return nil
+	}
+	_, err = r.clearPendingTxIfMatchesLocked(key, rec)
+	return err
 }
 
 func (r *EvmRpc) lookupPendingTx(key evmTxKey, confirmedNonce, pendingNonce uint64, havePending, otherOwnsLower bool) (*pendingEvmTx, error) {
 	r.pendingMu.Lock()
 	defer r.pendingMu.Unlock()
 
-	r.pruneConfirmedNonceStacksLocked(key.sender, key.contract, confirmedNonce)
-	if _, err := r.loadPendingTxLocked(key); err != nil {
+	cloned, err := r.loadPendingTxLocked(key)
+	if err != nil || cloned == nil {
 		return nil, err
 	}
-	if err := r.retryFailedRollbacksLocked(key.sender, key.contract); err != nil {
-		return nil, err
-	}
-
-	r.txMu.Lock()
-	prev := r.pendingTx[key]
-	if prev == nil {
-		r.txMu.Unlock()
+	if cloned.nonce < confirmedNonce {
+		_, _ = r.clearPendingTxIfMatchesLocked(key, cloned)
 		return nil, nil
 	}
-	cloned := clonePendingEvmTx(prev)
-	r.txMu.Unlock()
-
-	// Clear when already mined OR when a preceding pending transaction was
-	// evicted leaving a nonce gap (pendingNonce < prev.nonce) that is NOT
-	// owned by another persisted tracked action.
-	if cloned.nonce < confirmedNonce || (havePending && pendingNonce < cloned.nonce && !otherOwnsLower) {
-		r.clearPendingTxIfMatchesLocked(key, cloned, confirmedNonce)
+	// When an unconfirmed reservation sits above a verified nonce gap
+	// (pendingNonce < cloned.nonce and not owned by another tracked action),
+	// return nil so the caller builds a gap-filling transaction at pendingNonce
+	// without deleting the unconfirmed durable record.
+	if havePending && pendingNonce < cloned.nonce && !otherOwnsLower {
 		return nil, nil
 	}
 	return cloned, nil
@@ -1851,22 +957,13 @@ func (r *EvmRpc) lookupPendingTx(key evmTxKey, confirmedNonce, pendingNonce uint
 // Storage/decoding errors are propagated so an unreadable halt record can
 // never be mistaken for an absent one. Entries already mined (< confirmedNonce)
 // are cleared.
-func (r *EvmRpc) otherTrackedNonces(key evmTxKey, confirmedNonce uint64) (maxNext uint64, minOwned uint64, atConfirmed *pendingEvmTx, hasOwner bool, err error) {
+func (r *EvmRpc) otherTrackedNonces(key evmTxKey, confirmedNonce uint64) (maxNext uint64, minOwned uint64, atConfirmed *pendingEvmTx, sameContractOther *pendingEvmTx, hasOwner bool, err error) {
 	r.pendingMu.Lock()
 	defer r.pendingMu.Unlock()
 
-	r.pruneConfirmedNonceStacksLocked(key.sender, key.contract, confirmedNonce)
-	for _, otherKind := range []string{evmTxKindHalt, evmTxKindSetTss} {
-		if otherKind == key.kind {
-			continue
-		}
-		otherKey := evmTxKey{sender: key.sender, contract: key.contract, kind: otherKind}
-		if _, loadErr := r.loadPendingTxLocked(otherKey); loadErr != nil {
-			return 0, 0, nil, false, loadErr
-		}
-	}
-	if err := r.retryFailedRollbacksLocked(key.sender, key.contract); err != nil {
-		return 0, 0, nil, false, err
+	otherKey := evmTxKey{sender: key.sender, contract: key.contract, kind: otherEvmTxKind(key.kind)}
+	if _, loadErr := r.loadPendingTxLocked(otherKey); loadErr != nil {
+		return 0, 0, nil, nil, false, loadErr
 	}
 	type staleEntry struct {
 		key evmTxKey
@@ -1888,6 +985,9 @@ func (r *EvmRpc) otherTrackedNonces(key evmTxKey, confirmedNonce uint64) (maxNex
 		if entry.nonce == confirmedNonce && atConfirmed == nil {
 			atConfirmed = clonePendingEvmTx(entry)
 		}
+		if k == otherKey {
+			sameContractOther = clonePendingEvmTx(entry)
+		}
 		if entry.nonce+1 > maxNext {
 			maxNext = entry.nonce + 1
 		}
@@ -1895,9 +995,9 @@ func (r *EvmRpc) otherTrackedNonces(key evmTxKey, confirmedNonce uint64) (maxNex
 	}
 	r.txMu.Unlock()
 	for _, item := range toClear {
-		r.clearPendingTxIfMatchesLocked(item.key, item.rec, confirmedNonce)
+		_, _ = r.clearPendingTxIfMatchesLocked(item.key, item.rec)
 	}
-	return maxNext, minOwned, atConfirmed, hasOwner, nil
+	return maxNext, minOwned, atConfirmed, sameContractOther, hasOwner, nil
 }
 
 func (r *EvmRpc) buildContractTx(sender ecommon.Address, contractAddress *ecommon.Address, kind string, encodedData []byte, label string) (*etypes.Transaction, error) {
@@ -1939,7 +1039,7 @@ func (r *EvmRpc) buildContractTxContext(parent context.Context, sender ecommon.A
 	// BEFORE checking PendingNonceAt so a stale (pending == confirmed) or
 	// unavailable pending nonce RPC can never silently collide with another
 	// action's persisted nonce after an ambiguous broadcast + restart.
-	otherNext, otherMin, otherAtConfirmed, hasOtherOwner, err := r.otherTrackedNonces(key, confirmedNonce)
+	otherNext, otherMin, otherAtConfirmed, sameContractOther, hasOtherOwner, err := r.otherTrackedNonces(key, confirmedNonce)
 	if err != nil {
 		return nil, err
 	}
@@ -1950,7 +1050,26 @@ func (r *EvmRpc) buildContractTxContext(parent context.Context, sender ecommon.A
 	}
 	nonce := confirmedNonce
 	if prev != nil {
-		nonce = prev.nonce
+		if kind == evmTxKindSetTss && sameContractOther != nil && sameContractOther.nonce == prev.nonce {
+			// An active emergency halt is already contesting prev.nonce; do not
+			// overwrite it with setTss. Allocate past the halt reservation.
+			if otherNext > nonce {
+				nonce = otherNext
+			}
+			if havePending && pendingNonce > nonce {
+				nonce = pendingNonce
+			}
+			prev = nil
+		} else {
+			nonce = prev.nonce
+			if kind == evmTxKindHalt && sameContractOther != nil && sameContractOther.nonce == prev.nonce {
+				// Ensure a halt superseding a same-nonce setTss always bumps above
+				// both watermarks.
+				prev.gasPrice = maxBigInt(prev.gasPrice, sameContractOther.gasPrice)
+				prev.tipCap = maxBigInt(prev.tipCap, sameContractOther.tipCap)
+				prev.feeCap = maxBigInt(prev.feeCap, sameContractOther.feeCap)
+			}
+		}
 	} else if kind == evmTxKindHalt && otherAtConfirmed != nil {
 		// An emergency halt must never be stranded behind a dropped or
 		// un-retried key-rotation (setTss) tx at confirmedNonce. Explicitly

@@ -2,16 +2,12 @@ package unwrap
 
 import (
 	"bytes"
-	"encoding/json"
 	"errors"
 	"fmt"
 
 	ecommon "github.com/ethereum/go-ethereum/common"
 	"github.com/syndtr/goleveldb/leveldb"
 	"github.com/syndtr/goleveldb/leveldb/opt"
-	zcommon "github.com/zenon-network/go-zenon/common"
-
-	"orchestrator/common"
 )
 
 // BindContractAddress verifies or binds ldb to contractAddress and reports
@@ -61,108 +57,4 @@ func BindContractAddress(ldb *leveldb.DB, contractAddress ecommon.Address, hasEx
 		return false, fmt.Errorf("corrupt stored EVM contract address length %d", len(stored))
 	}
 	return bytes.Equal(stored, contractAddress.Bytes()), nil
-}
-
-func pendingEvmTxKey(sender, contract ecommon.Address, kind string) []byte {
-	return zcommon.JoinBytes(pendingTxPrefix, sender.Bytes(), contract.Bytes(), []byte(kind))
-}
-
-func (es *evmStorage) LoadPendingEvmTx(sender, contract ecommon.Address, kind string) (*common.PendingEvmTx, error) {
-	es.mu.Lock()
-	defer es.mu.Unlock()
-	key := pendingEvmTxKey(sender, contract, kind)
-	var (
-		raw []byte
-		err error
-	)
-	if es.rawLdb != nil {
-		raw, err = es.rawLdb.Get(key, nil)
-	} else {
-		raw, err = es.DB.Get(key)
-	}
-	if errors.Is(err, leveldb.ErrNotFound) {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, err
-	}
-	var rec common.PendingEvmTx
-	if err := json.Unmarshal(raw, &rec); err != nil {
-		return nil, err
-	}
-	return &rec, nil
-}
-
-func (es *evmStorage) SavePendingEvmTx(sender, contract ecommon.Address, kind string, rec *common.PendingEvmTx) error {
-	if rec == nil {
-		return nil
-	}
-	es.mu.Lock()
-	defer es.mu.Unlock()
-	raw, err := json.Marshal(rec)
-	if err != nil {
-		return err
-	}
-	key := pendingEvmTxKey(sender, contract, kind)
-	if es.rawLdb != nil {
-		return es.rawLdb.Put(key, raw, &opt.WriteOptions{Sync: true})
-	}
-	return es.DB.Put(key, raw)
-}
-
-func (es *evmStorage) DeletePendingEvmTx(sender, contract ecommon.Address, kind string) error {
-	es.mu.Lock()
-	defer es.mu.Unlock()
-	key := pendingEvmTxKey(sender, contract, kind)
-	var err error
-	if es.rawLdb != nil {
-		err = es.rawLdb.Delete(key, &opt.WriteOptions{Sync: true})
-	} else {
-		err = es.DB.Delete(key)
-	}
-	if errors.Is(err, leveldb.ErrNotFound) {
-		return nil
-	}
-	return err
-}
-
-func (es *evmStorage) ApplyPendingEvmTxBatch(ops []common.PendingEvmTxOp) error {
-	if len(ops) == 0 {
-		return nil
-	}
-	es.mu.Lock()
-	defer es.mu.Unlock()
-	if es.rawLdb != nil {
-		batch := new(leveldb.Batch)
-		for _, op := range ops {
-			key := pendingEvmTxKey(op.Sender, op.Contract, op.Kind)
-			if op.Record == nil {
-				batch.Delete(key)
-				continue
-			}
-			raw, err := json.Marshal(op.Record)
-			if err != nil {
-				return err
-			}
-			batch.Put(key, raw)
-		}
-		return es.rawLdb.Write(batch, &opt.WriteOptions{Sync: true})
-	}
-	for _, op := range ops {
-		key := pendingEvmTxKey(op.Sender, op.Contract, op.Kind)
-		if op.Record == nil {
-			if err := es.DB.Delete(key); err != nil && !errors.Is(err, leveldb.ErrNotFound) {
-				return err
-			}
-			continue
-		}
-		raw, err := json.Marshal(op.Record)
-		if err != nil {
-			return err
-		}
-		if err := es.DB.Put(key, raw); err != nil {
-			return err
-		}
-	}
-	return nil
 }

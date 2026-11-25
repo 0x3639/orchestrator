@@ -70,43 +70,21 @@ func (c *chainPendingEvmTxStore) SavePendingEvmTx(sender, contract ecommon.Addre
 	if rec == nil {
 		return nil
 	}
-	return c.ApplyPendingEvmTxBatch([]common.PendingEvmTxOp{{
-		Sender:   sender,
-		Contract: contract,
-		Kind:     kind,
-		Record:   rec,
-	}})
-}
-
-func (c *chainPendingEvmTxStore) DeletePendingEvmTx(sender, contract ecommon.Address, kind string) error {
-	return c.ApplyPendingEvmTxBatch([]common.PendingEvmTxOp{{
-		Sender:   sender,
-		Contract: contract,
-		Kind:     kind,
-		Record:   nil,
-	}})
-}
-
-// ApplyPendingEvmTxBatch commits all puts and deletes in a single fsynced
-// LevelDB batch so ownership transfer and rollback are crash-atomic.
-func (c *chainPendingEvmTxStore) ApplyPendingEvmTxBatch(ops []common.PendingEvmTxOp) error {
-	if len(ops) == 0 {
-		return nil
-	}
-	batch := new(leveldb.Batch)
-	for _, op := range ops {
-		key := pendingEvmTxKey(c.chainID, op.Sender, op.Contract, op.Kind)
-		if op.Record == nil {
-			batch.Delete(key)
-			continue
-		}
-		raw, err := json.Marshal(op.Record)
-		if err != nil {
-			return err
-		}
-		batch.Put(key, raw)
+	raw, err := json.Marshal(rec)
+	if err != nil {
+		return err
 	}
 	c.parent.mu.Lock()
 	defer c.parent.mu.Unlock()
-	return c.parent.db.Write(batch, &opt.WriteOptions{Sync: true})
+	return c.parent.db.Put(pendingEvmTxKey(c.chainID, sender, contract, kind), raw, &opt.WriteOptions{Sync: true})
+}
+
+func (c *chainPendingEvmTxStore) DeletePendingEvmTx(sender, contract ecommon.Address, kind string) error {
+	c.parent.mu.Lock()
+	defer c.parent.mu.Unlock()
+	err := c.parent.db.Delete(pendingEvmTxKey(c.chainID, sender, contract, kind), &opt.WriteOptions{Sync: true})
+	if errors.Is(err, leveldb.ErrNotFound) {
+		return nil
+	}
+	return err
 }

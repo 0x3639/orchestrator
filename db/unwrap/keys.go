@@ -19,8 +19,4 @@ var (
 	// same-name contract rotation isolates new scan cursors and work while
 	// retaining old evidence on disk.
 	contractAddressPrefix = []byte{4}
-
-	// Persisted unconfirmed halt / key-change transaction metadata per
-	// (sender, contract, kind) so retries recover nonce ownership across restarts.
-	pendingTxPrefix = []byte{5}
 )
