@@ -1474,12 +1474,13 @@ func (node *Node) checkZenonAnchorConsistent(anchor reSignChainAnchor, advanceFi
 			return reSignChainAnchor{}, false, false, false
 		}
 		if curAcct.Height == anchor.bridgeBlock.Height {
-			if curAcct.Hash != anchor.bridgeBlock.Hash {
+			if !sameAccountBlockFrontier(anchor.bridgeBlock, curAcct) {
 				return reSignChainAnchor{}, false, false, false
 			}
 		} else {
 			// Bridge account grew forward: verify anchor.bridgeBlock is still
-			// the canonical ancestor at its height (rules out rollback + re-extension).
+			// the confirmed canonical ancestor at its height (rules out rollback
+			// + forward re-extension).
 			ancCtx, ancCancel := context.WithTimeout(node.workers.context(), resignRPCTimeout)
 			blocks, err := node.networksManager.Znn().GetAccountBlocksByHeightContext(ancCtx, types.BridgeContract, anchor.bridgeBlock.Height, 1)
 			ancCancel()
@@ -1491,7 +1492,43 @@ func (node *Node) checkZenonAnchorConsistent(anchor reSignChainAnchor, advanceFi
 				return reSignChainAnchor{}, false, true, false
 			}
 			if blocks == nil || len(blocks.List) == 0 || blocks.List[0] == nil ||
-				blocks.List[0].Height != anchor.bridgeBlock.Height || blocks.List[0].Hash != anchor.bridgeBlock.Hash {
+				!isConfirmedBridgeBlock(blocks.List[0]) || !sameAccountBlockFrontier(anchor.bridgeBlock, blocks.List[0]) {
+				return reSignChainAnchor{}, false, false, false
+			}
+		}
+	}
+
+	// Zenon serves GetFrontierAccountBlock and embedded.bridge RPCs from the
+	// account pool, which can include unconfirmed blocks. Require curAcct to be
+	// momentum-confirmed in the verified canonical momentum chain before
+	// accepting any threshold, membership, or boundary derived from it.
+	if curAcct != nil && curAcct.Height > 0 {
+		if !isConfirmedBridgeBlock(curAcct) {
+			node.logger.Debugf("bridge frontier block %d is unconfirmed in account pool; waiting for momentum confirmation", curAcct.Height)
+			return reSignChainAnchor{}, false, true, false
+		}
+		confMom := curAcct.ConfirmationDetail.MomentumHeight
+		confHash := curAcct.ConfirmationDetail.MomentumHash
+		if confMom > curMom.Height {
+			return reSignChainAnchor{}, false, true, false
+		}
+		if confMom == curMom.Height {
+			if confHash != curMom.Hash {
+				return reSignChainAnchor{}, false, false, false
+			}
+		} else {
+			confCtx, confCancel := context.WithTimeout(node.workers.context(), resignRPCTimeout)
+			confList, err := node.networksManager.Znn().GetMomentumsByHeightContext(confCtx, confMom, 1)
+			confCancel()
+			if node.workerStopping() {
+				return reSignChainAnchor{}, false, false, true
+			}
+			if err != nil {
+				node.logger.Debugf("failed to verify confirming momentum %d for bridge block %d: %v", confMom, curAcct.Height, err)
+				return reSignChainAnchor{}, false, true, false
+			}
+			if confList == nil || len(confList.List) == 0 || confList.List[0] == nil || confList.List[0].Momentum == nil ||
+				confList.List[0].Height != confMom || confList.List[0].Hash != confHash {
 				return reSignChainAnchor{}, false, false, false
 			}
 		}
@@ -1506,11 +1543,26 @@ func (node *Node) checkZenonAnchorConsistent(anchor reSignChainAnchor, advanceFi
 	return next, true, false, false
 }
 
+func isConfirmedBridgeBlock(b *api.AccountBlock) bool {
+	return b != nil &&
+		b.ConfirmationDetail != nil &&
+		b.ConfirmationDetail.NumConfirmations > 0 &&
+		b.ConfirmationDetail.MomentumHeight > 0 &&
+		b.ConfirmationDetail.MomentumHash != types.ZeroHash
+}
+
 func sameAccountBlockFrontier(a, b *api.AccountBlock) bool {
 	if a == nil || b == nil {
 		return a == nil && b == nil
 	}
-	return a.Height == b.Height && a.Hash == b.Hash
+	if a.Height != b.Height || a.Hash != b.Hash {
+		return false
+	}
+	if a.ConfirmationDetail == nil || b.ConfirmationDetail == nil {
+		return a.ConfirmationDetail == nil && b.ConfirmationDetail == nil
+	}
+	return a.ConfirmationDetail.MomentumHeight == b.ConfirmationDetail.MomentumHeight &&
+		a.ConfirmationDetail.MomentumHash == b.ConfirmationDetail.MomentumHash
 }
 
 // wrapFinalizedAtMomentum mirrors go-zenon's BridgeApi.getConfirmationsToFinality
@@ -1801,6 +1853,13 @@ func (node *Node) captureReSignSnapshot(resignNetworkClass, resignChainId uint32
 			}
 			if err != nil {
 				node.logger.Debugf("failed to read bridge account frontier before resign scan: %v", err)
+				if !node.workerSleep(resignRetryDelay) {
+					return nil, reSignChainAnchor{}, false, true
+				}
+				continue
+			}
+			if acct != nil && acct.Height > 0 && (!isConfirmedBridgeBlock(acct) || acct.ConfirmationDetail.MomentumHeight > mom.Height) {
+				node.logger.Debugf("bridge frontier block %d is not yet confirmed in momentum <= %d; waiting before resign scan", acct.Height, mom.Height)
 				if !node.workerSleep(resignRetryDelay) {
 					return nil, reSignChainAnchor{}, false, true
 				}

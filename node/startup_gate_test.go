@@ -85,13 +85,19 @@ func (b *startupBridge) GetWrapTokenRequestById(types.Hash) (*definition.WrapTok
 type startupLedger struct{}
 
 func (*startupLedger) GetFrontierAccountBlock(types.Address) (*api.AccountBlock, error) {
-	return &api.AccountBlock{AccountBlock: nom.AccountBlock{Height: 1, Hash: types.Hash{1}, Amount: big.NewInt(0)}}, nil
+	return &api.AccountBlock{
+		AccountBlock:       nom.AccountBlock{Height: 1, Hash: types.Hash{1}, Amount: big.NewInt(0)},
+		ConfirmationDetail: &api.AccountBlockConfirmationDetail{NumConfirmations: 1, MomentumHeight: 1, MomentumHash: types.Hash{1}},
+	}, nil
 }
 
 func (*startupLedger) GetAccountBlocksByHeight(_ types.Address, height, _ uint64) (*api.AccountBlockList, error) {
 	return &api.AccountBlockList{
 		Count: int(height),
-		List:  []*api.AccountBlock{{AccountBlock: nom.AccountBlock{Height: height, Hash: types.Hash{byte(height)}, Amount: big.NewInt(0)}}},
+		List: []*api.AccountBlock{{
+			AccountBlock:       nom.AccountBlock{Height: height, Hash: types.Hash{byte(height)}, Amount: big.NewInt(0)},
+			ConfirmationDetail: &api.AccountBlockConfirmationDetail{NumConfirmations: 1, MomentumHeight: 1, MomentumHash: types.Hash{1}},
+		}},
 	}, nil
 }
 

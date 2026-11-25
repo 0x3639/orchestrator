@@ -469,6 +469,25 @@ type wrapTestLedger struct {
 }
 
 func testAccountBlock(height uint64, hash types.Hash) *api.AccountBlock {
+	return testAccountBlockAtMom(height, hash, 1, testMomentum(1).Hash)
+}
+
+func testAccountBlockAtMom(height uint64, hash types.Hash, momHeight uint64, momHash types.Hash) *api.AccountBlock {
+	return &api.AccountBlock{
+		AccountBlock: nom.AccountBlock{
+			Height: height,
+			Hash:   hash,
+			Amount: big.NewInt(0),
+		},
+		ConfirmationDetail: &api.AccountBlockConfirmationDetail{
+			NumConfirmations: 1,
+			MomentumHeight:   momHeight,
+			MomentumHash:     momHash,
+		},
+	}
+}
+
+func testUnconfirmedAccountBlock(height uint64, hash types.Hash) *api.AccountBlock {
 	return &api.AccountBlock{
 		AccountBlock: nom.AccountBlock{
 			Height: height,
@@ -2186,20 +2205,20 @@ func TestReSignStateRestartsOnSameCountZenonFrontierRollback(t *testing.T) {
 			}, nil
 		},
 		frontierFn: func(_ context.Context, _ int32) (*api.AccountBlock, error) {
-			hashByte := byte(0x01)
+			hashByte, momByte := byte(0x01), byte(0x11)
 			if epoch.Load() > 0 {
-				hashByte = 0x02
+				hashByte, momByte = 0x02, 0x22
 			}
-			return testAccountBlock(10, types.Hash{hashByte}), nil
+			return testAccountBlockAtMom(10, types.Hash{hashByte}, 1, types.Hash{momByte}), nil
 		},
 		acctByHeightFn: func(_ context.Context, height uint64) (*api.AccountBlockList, error) {
-			hashByte := byte(0x01)
+			hashByte, momByte := byte(0x01), byte(0x11)
 			if epoch.Load() > 0 {
-				hashByte = 0x02
+				hashByte, momByte = 0x02, 0x22
 			}
 			return &api.AccountBlockList{
 				Count: int(height),
-				List:  []*api.AccountBlock{testAccountBlock(height, types.Hash{hashByte})},
+				List:  []*api.AccountBlock{testAccountBlockAtMom(height, types.Hash{hashByte}, 1, types.Hash{momByte})},
 			}, nil
 		},
 		pageHandler: func(pageIndex, pageSize uint32, call int32) *embedded.WrapTokenRequestList {
@@ -2317,9 +2336,9 @@ func TestReSignStateRejectsOrphanedPageWhenReplacementDescendsFromPreviousAnchor
 		},
 		frontierFn: func(_ context.Context, _ int32) (*api.AccountBlock, error) {
 			if stage.Load() == 0 {
-				return testAccountBlock(10, types.Hash{0x01}), nil
+				return testAccountBlockAtMom(10, types.Hash{0x01}, 1, types.Hash{0x11}), nil
 			}
-			return testAccountBlock(11, types.Hash{0x02}), nil
+			return testAccountBlockAtMom(11, types.Hash{0x02}, 1, types.Hash{0x11}), nil
 		},
 		acctByHeightFn: func(_ context.Context, height uint64) (*api.AccountBlockList, error) {
 			// B11_forkB descends from B10, so height 10 STILL has hash 0x01.
@@ -2329,7 +2348,7 @@ func TestReSignStateRejectsOrphanedPageWhenReplacementDescendsFromPreviousAnchor
 			}
 			return &api.AccountBlockList{
 				Count: int(height),
-				List:  []*api.AccountBlock{testAccountBlock(height, types.Hash{hashByte})},
+				List:  []*api.AccountBlock{testAccountBlockAtMom(height, types.Hash{hashByte}, 1, types.Hash{0x11})},
 			}, nil
 		},
 		pageHandler: func(pageIndex, pageSize uint32, call int32) *embedded.WrapTokenRequestList {
@@ -2423,20 +2442,20 @@ func TestReSignStateRevalidatesAnchorAfterFinalityAndEligibilityWaitOnRollback(t
 				}, nil
 			},
 			frontierFn: func(_ context.Context, _ int32) (*api.AccountBlock, error) {
-				hashByte := byte(0x01)
+				hashByte, momByte := byte(0x01), byte(0x11)
 				if epoch.Load() > 0 {
-					hashByte = 0x02
+					hashByte, momByte = 0x02, 0x22
 				}
-				return testAccountBlock(10, types.Hash{hashByte}), nil
+				return testAccountBlockAtMom(10, types.Hash{hashByte}, 1, types.Hash{momByte}), nil
 			},
 			acctByHeightFn: func(_ context.Context, height uint64) (*api.AccountBlockList, error) {
-				hashByte := byte(0x01)
+				hashByte, momByte := byte(0x01), byte(0x11)
 				if epoch.Load() > 0 {
-					hashByte = 0x02
+					hashByte, momByte = 0x02, 0x22
 				}
 				return &api.AccountBlockList{
 					Count: int(height),
-					List:  []*api.AccountBlock{testAccountBlock(height, types.Hash{hashByte})},
+					List:  []*api.AccountBlock{testAccountBlockAtMom(height, types.Hash{hashByte}, 1, types.Hash{momByte})},
 				}, nil
 			},
 			pageHandler: func(pageIndex, pageSize uint32, _ int32) *embedded.WrapTokenRequestList {
@@ -2543,20 +2562,20 @@ func TestReSignStateRevalidatesAnchorAfterFinalityAndEligibilityWaitOnRollback(t
 				}, nil
 			},
 			frontierFn: func(_ context.Context, _ int32) (*api.AccountBlock, error) {
-				hashByte := byte(0x01)
+				hashByte, momByte := byte(0x01), byte(0x11)
 				if epoch.Load() > 0 {
-					hashByte = 0x02
+					hashByte, momByte = 0x02, 0x22
 				}
-				return testAccountBlock(10, types.Hash{hashByte}), nil
+				return testAccountBlockAtMom(10, types.Hash{hashByte}, 1, types.Hash{momByte}), nil
 			},
 			acctByHeightFn: func(_ context.Context, height uint64) (*api.AccountBlockList, error) {
-				hashByte := byte(0x01)
+				hashByte, momByte := byte(0x01), byte(0x11)
 				if epoch.Load() > 0 {
-					hashByte = 0x02
+					hashByte, momByte = 0x02, 0x22
 				}
 				return &api.AccountBlockList{
 					Count: int(height),
-					List:  []*api.AccountBlock{testAccountBlock(height, types.Hash{hashByte})},
+					List:  []*api.AccountBlock{testAccountBlockAtMom(height, types.Hash{hashByte}, 1, types.Hash{momByte})},
 				}, nil
 			},
 			pageHandler: func(pageIndex, pageSize uint32, _ int32) *embedded.WrapTokenRequestList {
@@ -3558,6 +3577,257 @@ func TestReSignStateBindsConfirmationThresholdToPrePublishBridgeSnapshot(t *test
 		st, _ := n.state.GetState()
 		r, err := n.dbManager.ZnnStorage().GetResignStatus(wrapID)
 		return err == nil && r && st == common.LiveState
+	})
+}
+
+func TestReSignStateRequiresMomentumConfirmationForBridgeSnapshot(t *testing.T) {
+	prevDelay := resignRetryDelay
+	resignRetryDelay = 20 * time.Millisecond
+	t.Cleanup(func() { resignRetryDelay = prevDelay })
+
+	t.Run("ignores unconfirmed pool bridge block lowering ConfirmationsToFinality", func(t *testing.T) {
+		evmSrv := fakeEvmRpcServer(t)
+		defer evmSrv.Close()
+
+		// Exact regression for Round 14 Finding 1 (threshold lowering):
+		// - Confirmed bridge block B10 has ConfirmationsToFinality = 20; wrap W
+		//   (CreationMomentumHeight = 99) is deferred at momentum 105 (6 < 20).
+		// - A pending UNCONFIRMED bridge block B11 (ConfirmationDetail == nil)
+		//   enters Zenon's account pool lowering ConfirmationsToFinality to 1,
+		//   so both GetOrchestratorInfo and GetWrapTokenRequestById reflect the
+		//   lowered threshold while GetFrontierAccountBlock returns unconfirmed B11.
+		// - The worker must refuse to accept unconfirmed B11, keep W unmarked in
+		//   ReSignState, and only accept the threshold once B11 is confirmed in
+		//   the verified canonical momentum chain.
+		wrapID := types.Hash{0x64}
+		var stage atomic.Int32 // 0 = confirmed B10 (thresh 20), 1 = unconfirmed B11 in pool (thresh 1), 2 = confirmed B11 (thresh 1)
+		var unconfirmedFrontierReads atomic.Int32
+
+		makeWrap := func(confs uint64) *embedded.WrapTokenRequest {
+			return &embedded.WrapTokenRequest{
+				WrapTokenRequest: &definition.WrapTokenRequest{
+					NetworkClass: definition.EvmClass, ChainId: 1, Id: wrapID,
+					Amount: big.NewInt(10), Fee: big.NewInt(1), CreationMomentumHeight: 99,
+				},
+				ConfirmationsToFinality: confs,
+			}
+		}
+
+		bridge := &wrapTestBridge{
+			networks: &embedded.NetworkInfoList{
+				Count: 1,
+				List: []*definition.NetworkInfo{{
+					NetworkClass: definition.EvmClass, Id: 1, Name: "Ethereum",
+					ContractAddress: "0x0000000000000000000000000000000000000001",
+				}},
+			},
+			orchInfoFn: func(_ int32) *definition.OrchestratorInfo {
+				confs := uint32(20)
+				if stage.Load() >= 1 {
+					confs = 1
+				}
+				return &definition.OrchestratorInfo{WindowSize: 10, KeyGenThreshold: 1, ConfirmationsToFinality: confs, EstimatedMomentumTime: 1}
+			},
+			frontierMomFn: func(_ context.Context, _ int32) (*api.Momentum, error) {
+				return testMomentum(105), nil
+			},
+			frontierFn: func(_ context.Context, _ int32) (*api.AccountBlock, error) {
+				switch stage.Load() {
+				case 0:
+					return testAccountBlock(10, types.Hash{0xaa, 0, 10}), nil
+				case 1:
+					unconfirmedFrontierReads.Add(1)
+					return testUnconfirmedAccountBlock(11, types.Hash{0xaa, 0, 11}), nil
+				default:
+					return testAccountBlockAtMom(11, types.Hash{0xaa, 0, 11}, 105, testMomentum(105).Hash), nil
+				}
+			},
+			pageHandler: func(pageIndex, pageSize uint32, _ int32) *embedded.WrapTokenRequestList {
+				// After initial snapshot captures W deferred on confirmed B10,
+				// inject unconfirmed pool block B11 lowering threshold to 1.
+				stage.CompareAndSwap(0, 1)
+				return paginateZenonWraps([]*embedded.WrapTokenRequest{makeWrap(14)}, pageIndex, pageSize)
+			},
+			byIDHandler: func(_ context.Context, id types.Hash, _ int32) (*embedded.WrapTokenRequest, error) {
+				if id != wrapID {
+					return nil, constants.ErrDataNonExistent
+				}
+				if stage.Load() >= 1 {
+					return makeWrap(0), nil
+				}
+				return makeWrap(14), nil
+			},
+		}
+
+		n := wrapTestNodeWithEvm(t, common.LiveState, bridge, map[string]string{"Ethereum": evmSrv.URL})
+		if activated, err := n.state.ActivateResign(definition.EvmClass, 1); err != nil || !activated {
+			t.Fatalf("ActivateResign failed: activated=%v err=%v", activated, err)
+		}
+		n.state.CompleteStartup()
+
+		n.workers.start(n.processSignatures)
+		t.Cleanup(func() {
+			done := n.workers.shutdown()
+			<-done
+		})
+
+		eventually(t, "worker to observe unconfirmed pool bridge block multiple times", func() bool {
+			return unconfirmedFrontierReads.Load() >= 4
+		})
+		if st, _ := n.state.GetState(); st != common.ReSignState {
+			t.Fatalf("state while pool block B11 is unconfirmed = %d, want ReSignState (%d)", st, common.ReSignState)
+		}
+		if resign, err := n.dbManager.ZnnStorage().GetResignStatus(wrapID); err != nil || resign {
+			t.Fatalf("wrap must not be marked using unconfirmed pool threshold: resign=%v err=%v", resign, err)
+		}
+
+		// Now confirm B11 in verified canonical momentum 105: the worker must
+		// accept the confirmed snapshot, mark W, and enter LiveState.
+		stage.Store(2)
+		eventually(t, "ReSignState to mark wrap and return to LiveState once B11 is confirmed", func() bool {
+			st, _ := n.state.GetState()
+			r, err := n.dbManager.ZnnStorage().GetResignStatus(wrapID)
+			return err == nil && r && st == common.LiveState
+		})
+	})
+
+	t.Run("ignores unconfirmed pool bridge block during straddled by-ID membership check", func(t *testing.T) {
+		prevPageSize := resignPageSize
+		resignPageSize = 2
+		t.Cleanup(func() { resignPageSize = prevPageSize })
+
+		evmSrv := fakeEvmRpcServer(t)
+		defer evmSrv.Close()
+
+		makeEntry := func(id types.Hash, height uint64) *embedded.WrapTokenRequest {
+			return &embedded.WrapTokenRequest{
+				WrapTokenRequest: &definition.WrapTokenRequest{
+					NetworkClass: definition.EvmClass, ChainId: 1, Id: id,
+					Amount: big.NewInt(10), Fee: big.NewInt(1), CreationMomentumHeight: height,
+				},
+				ConfirmationsToFinality: 0,
+			}
+		}
+
+		f1 := types.Hash{0xfb}
+		w2 := types.Hash{0xb1}
+		w1 := types.Hash{0xb2}
+		orphanWrap := types.Hash{0xb3}
+		canonicalWrap := types.Hash{0xb4}
+
+		forkPage := []*embedded.WrapTokenRequest{
+			makeEntry(f1, 101),
+			makeEntry(w2, 99),
+			makeEntry(w1, 99),
+			makeEntry(orphanWrap, 98),
+		}
+		canonicalTable := []*embedded.WrapTokenRequest{
+			makeEntry(f1, 101),
+			makeEntry(w2, 99),
+			makeEntry(w1, 99),
+			makeEntry(canonicalWrap, 98),
+		}
+		sortZenonWraps(forkPage)
+		sortZenonWraps(canonicalTable)
+		canonicalByID := make(map[types.Hash]*embedded.WrapTokenRequest, len(canonicalTable))
+		for _, w := range canonicalTable {
+			canonicalByID[w.Id] = w
+		}
+
+		// Calls 1..4 advance confirmed bridge blocks (10 -> 14) with attempt 1
+		// of page 1 serving orphanWrap on a straddled page. After the boundary
+		// settles at confirmed B14, while verifyStraddledWraps is checking
+		// orphanWrap, an UNCONFIRMED pool block B15 enters the pool and serves
+		// orphanWrap by ID. After 4 unconfirmed reads, B15 is replaced by
+		// confirmed canonical B15 without orphanWrap.
+		var bridgeHeight atomic.Uint64
+		bridgeHeight.Store(10)
+		var page1Calls atomic.Int32
+		var unconfirmedPoolActive atomic.Bool
+		var unconfirmedReads atomic.Int32
+
+		bridge := &wrapTestBridge{
+			networks: &embedded.NetworkInfoList{
+				Count: 1,
+				List: []*definition.NetworkInfo{{
+					NetworkClass: definition.EvmClass, Id: 1, Name: "Ethereum",
+					ContractAddress: "0x0000000000000000000000000000000000000001",
+				}},
+			},
+			frontierMomFn: func(_ context.Context, _ int32) (*api.Momentum, error) {
+				return testMomentum(100), nil
+			},
+			frontierFn: func(_ context.Context, _ int32) (*api.AccountBlock, error) {
+				if unconfirmedPoolActive.Load() {
+					if unconfirmedReads.Add(1) <= 4 {
+						return testUnconfirmedAccountBlock(15, types.Hash{0xee, 0, 15}), nil
+					}
+					unconfirmedPoolActive.Store(false)
+					bridgeHeight.Store(15)
+				}
+				h := bridgeHeight.Load()
+				return testAccountBlock(h, types.Hash{0xaa, byte(h >> 8), byte(h)}), nil
+			},
+			pageHandler: func(pageIndex, pageSize uint32, call int32) *embedded.WrapTokenRequestList {
+				if call <= 4 {
+					bridgeHeight.Add(1)
+				}
+				if pageIndex == 1 && page1Calls.Add(1) == 2 {
+					return paginateZenonWraps(forkPage, pageIndex, pageSize)
+				}
+				if call == 5 {
+					// Right after the non-straddling boundary at B14, activate
+					// the unconfirmed pool block B15 while verifyStraddledWraps
+					// checks orphanWrap.
+					unconfirmedPoolActive.Store(true)
+				}
+				return paginateZenonWraps(canonicalTable, pageIndex, pageSize)
+			},
+			byIDHandler: func(_ context.Context, id types.Hash, _ int32) (*embedded.WrapTokenRequest, error) {
+				if id == orphanWrap {
+					if unconfirmedPoolActive.Load() {
+						return makeEntry(orphanWrap, 98), nil
+					}
+					return nil, constants.ErrDataNonExistent
+				}
+				if w, ok := canonicalByID[id]; ok {
+					return w, nil
+				}
+				return nil, constants.ErrDataNonExistent
+			},
+		}
+
+		n := wrapTestNodeWithEvm(t, common.LiveState, bridge, map[string]string{"Ethereum": evmSrv.URL})
+		if activated, err := n.state.ActivateResign(definition.EvmClass, 1); err != nil || !activated {
+			t.Fatalf("ActivateResign failed: activated=%v err=%v", activated, err)
+		}
+		n.state.CompleteStartup()
+
+		n.workers.start(n.processSignatures)
+		t.Cleanup(func() {
+			done := n.workers.shutdown()
+			<-done
+		})
+
+		eventually(t, "ReSignState to reject unconfirmed pool membership and mark canonicalWrap", func() bool {
+			st, _ := n.state.GetState()
+			for _, id := range []types.Hash{w2, w1, canonicalWrap} {
+				r, err := n.dbManager.ZnnStorage().GetResignStatus(id)
+				if err != nil || !r {
+					return false
+				}
+			}
+			return st == common.LiveState
+		})
+		if unconfirmedReads.Load() < 4 {
+			t.Fatalf("expected unconfirmed pool block to be rejected before confirmation, reads=%d", unconfirmedReads.Load())
+		}
+		if resign, err := n.dbManager.ZnnStorage().GetResignStatus(orphanWrap); err != nil || resign {
+			t.Fatalf("orphanWrap from unconfirmed pool block must not be marked: resign=%v err=%v", resign, err)
+		}
+		if ev, err := n.dbManager.ZnnStorage().GetWrapRequestById(orphanWrap); err != nil || ev != nil {
+			t.Fatalf("orphanWrap from unconfirmed pool block must not be stored: ev=%+v err=%v", ev, err)
+		}
 	})
 }
 
