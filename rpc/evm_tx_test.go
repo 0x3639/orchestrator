@@ -3,10 +3,12 @@ package rpc
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"math/big"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -717,5 +719,317 @@ func TestHaltAndSetTssRestartRecoveryWithAndWithoutStore(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+func TestFirstActionAfterRestartRespectsOtherActionPersistedNonce(t *testing.T) {
+	contract := ecommon.HexToAddress("0xabababababababababababababababababababab")
+	newTss := ecommon.HexToAddress("0xcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd")
+
+	for _, firstAction := range []string{"setTss", "halt"} {
+		secondAction := "halt"
+		if firstAction == "halt" {
+			secondAction = "setTss"
+		}
+		t.Run(firstAction+"_then_restart_then_"+secondAction, func(t *testing.T) {
+			mock, url := newEvmTxMockServer(t)
+			mock.baseFee = big.NewInt(20_000_000_000)
+			mock.tipCap = big.NewInt(2_000_000_000)
+			mock.confirmedNonce = 5
+			mock.pendingNonce = 5
+
+			store := newMemPendingTxStore()
+			makeClient := func() *EvmRpc {
+				c, err := NewEvmRpcClient(config.BaseNetworkConfig{Urls: []string{url}}, "order-"+firstAction, contract)
+				if err != nil {
+					t.Fatal(err)
+				}
+				c.SetChainID(1)
+				c.SetPendingTxStore(store)
+				return c
+			}
+			key, err := crypto.GenerateKey()
+			if err != nil {
+				t.Fatal(err)
+			}
+			sender := crypto.PubkeyToAddress(key.PublicKey)
+			signer := etypes.LatestSignerForChainID(big.NewInt(1))
+
+			build := func(c *EvmRpc, action string) (*etypes.Transaction, error) {
+				if action == "halt" {
+					return c.GetHaltTxEvm(sender, []byte{1, 2, 3}, &contract)
+				}
+				return c.GetSetTssEcdsaPubKeyEvmTx(newTss, sender, []byte{4}, []byte{5}, &contract)
+			}
+
+			// Process 1 submits firstAction at nonce 5, then restarts while confirmed=5, pending=6.
+			c1 := makeClient()
+			tx1, err := build(c1, firstAction)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tx1.Nonce() != 5 {
+				t.Fatalf("firstAction nonce = %d, want 5", tx1.Nonce())
+			}
+			signed1, err := etypes.SignTx(tx1, signer, key)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := c1.SendTransaction(signed1); err != nil {
+				t.Fatal(err)
+			}
+			c1.Stop()
+
+			// Process 2 starts fresh and builds secondAction FIRST.
+			// It MUST load firstAction's persisted ownership of nonce 5 and allocate pendingNonce 6.
+			c2 := makeClient()
+			defer c2.Stop()
+			tx2, err := build(c2, secondAction)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tx2.Nonce() != 6 {
+				t.Fatalf("after restart, %s stole %s's nonce: got %d, want 6", secondAction, firstAction, tx2.Nonce())
+			}
+		})
+	}
+}
+
+type failingPendingTxStore struct {
+	*memPendingTxStore
+	failSave bool
+}
+
+func (s *failingPendingTxStore) SavePendingEvmTx(sender, target ecommon.Address, action string, tx *common.PendingEvmTx) error {
+	if s.failSave {
+		return errors.New("disk full")
+	}
+	return s.memPendingTxStore.SavePendingEvmTx(sender, target, action, tx)
+}
+
+func TestSendTransactionPersistsBeforeBroadcastHandlesEOFAndStoreFailure(t *testing.T) {
+	contract := ecommon.HexToAddress("0x1212121212121212121212121212121212121212")
+	key, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sender := crypto.PubkeyToAddress(key.PublicKey)
+	signer := etypes.LatestSignerForChainID(big.NewInt(1))
+
+	t.Run("persists before broadcast and retains watermark on EOF drop", func(t *testing.T) {
+		store := newMemPendingTxStore()
+		var persistedBeforeSend atomic.Bool
+		var confirmedNonce, pendingNonce atomic.Uint64
+		confirmedNonce.Store(5)
+		pendingNonce.Store(5)
+		var dropNextSend atomic.Bool
+		dropNextSend.Store(true)
+
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			var req struct {
+				ID     json.RawMessage   `json:"id"`
+				Method string            `json:"method"`
+				Params []json.RawMessage `json:"params"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			if req.Method == "eth_sendRawTransaction" {
+				// Verify watermark was ALREADY persisted BEFORE the RPC arrived.
+				if rec, err := store.LoadPendingEvmTx(sender, contract, evmTxKindHalt); err == nil && rec != nil && rec.Nonce == 5 {
+					persistedBeforeSend.Store(true)
+				}
+				// Simulate node accepting tx into mempool then connection dropping (EOF).
+				pendingNonce.Store(6)
+				if dropNextSend.Load() {
+					if hj, ok := w.(http.Hijacker); ok {
+						conn, _, err := hj.Hijack()
+						if err == nil {
+							_ = conn.Close()
+							return
+						}
+					}
+				}
+			}
+			var result interface{}
+			switch req.Method {
+			case "eth_chainId":
+				result = hexutil.EncodeUint64(1)
+			case "eth_blockNumber":
+				result = hexutil.EncodeUint64(100)
+			case "eth_getBalance":
+				result = (*hexutil.Big)(new(big.Int).Mul(big.NewInt(10), big.NewInt(1e18)))
+			case "eth_getTransactionCount":
+				var tag string
+				if len(req.Params) >= 2 {
+					_ = json.Unmarshal(req.Params[1], &tag)
+				}
+				if tag == "pending" {
+					result = hexutil.EncodeUint64(pendingNonce.Load())
+				} else {
+					result = hexutil.EncodeUint64(confirmedNonce.Load())
+				}
+			case "eth_getBlockByNumber":
+				result = map[string]interface{}{
+					"number":        hexutil.EncodeUint64(100),
+					"hash":          ecommon.HexToHash("0x11"),
+					"baseFeePerGas": (*hexutil.Big)(big.NewInt(20_000_000_000)),
+				}
+			case "eth_maxPriorityFeePerGas":
+				result = (*hexutil.Big)(big.NewInt(2_000_000_000))
+			case "eth_estimateGas":
+				result = hexutil.EncodeUint64(100_000)
+			case "eth_sendRawTransaction":
+				result = ecommon.HexToHash("0xbb").Hex()
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"jsonrpc": "2.0", "id": req.ID, "result": result})
+		}))
+		t.Cleanup(srv.Close)
+
+		c1, err := NewEvmRpcClient(config.BaseNetworkConfig{Urls: []string{srv.URL}}, "eof-test", contract)
+		if err != nil {
+			t.Fatal(err)
+		}
+		c1.SetChainID(1)
+		c1.SetPendingTxStore(store)
+
+		tx1, err := c1.GetHaltTxEvm(sender, []byte{1, 2, 3}, &contract)
+		if err != nil {
+			t.Fatal(err)
+		}
+		signed1, err := etypes.SignTx(tx1, signer, key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := c1.SendTransaction(signed1); err == nil {
+			t.Fatal("expected EOF error from dropped connection")
+		}
+		c1.Stop()
+
+		if !persistedBeforeSend.Load() {
+			t.Fatal("pending tx watermark was not persisted before eth_sendRawTransaction reached the server")
+		}
+
+		// Simulate process restart after EOF: fresh client MUST recover nonce 5 and bump >=20%.
+		dropNextSend.Store(false)
+		c2, err := NewEvmRpcClient(config.BaseNetworkConfig{Urls: []string{srv.URL}}, "eof-test", contract)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer c2.Stop()
+		c2.SetChainID(1)
+		c2.SetPendingTxStore(store)
+
+		tx2, err := c2.GetHaltTxEvm(sender, []byte{1, 2, 3}, &contract)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if tx2.Nonce() != 5 {
+			t.Fatalf("after EOF+restart, tx2 nonce = %d, want 5", tx2.Nonce())
+		}
+		if tx2.GasTipCap().Cmp(bumpFee(tx1.GasTipCap())) < 0 || tx2.GasFeeCap().Cmp(bumpFee(tx1.GasFeeCap())) < 0 {
+			t.Fatalf("after EOF+restart, tx2 did not bump >=20%%: tx1=(%s,%s) tx2=(%s,%s)",
+				tx1.GasTipCap(), tx1.GasFeeCap(), tx2.GasTipCap(), tx2.GasFeeCap())
+		}
+	})
+
+	t.Run("definitive pre-mempool rejection rolls back watermark and store failure aborts send", func(t *testing.T) {
+		mock, url := newEvmTxMockServer(t)
+		mock.baseFee = big.NewInt(20_000_000_000)
+		mock.tipCap = big.NewInt(2_000_000_000)
+		mock.confirmedNonce = 5
+		mock.pendingNonce = 5
+		mock.sendErr = "insufficient funds for gas * price + value"
+
+		store := &failingPendingTxStore{memPendingTxStore: newMemPendingTxStore()}
+		client, err := NewEvmRpcClient(config.BaseNetworkConfig{Urls: []string{url}}, "rollback-test", contract)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer client.Stop()
+		client.SetChainID(1)
+		client.SetPendingTxStore(store)
+
+		tx1, err := client.GetHaltTxEvm(sender, []byte{1, 2, 3}, &contract)
+		if err != nil {
+			t.Fatal(err)
+		}
+		signed1, err := etypes.SignTx(tx1, signer, key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := client.SendTransaction(signed1); err == nil {
+			t.Fatal("expected insufficient funds error")
+		}
+		if rec, err := store.LoadPendingEvmTx(sender, contract, evmTxKindHalt); err != nil || rec != nil {
+			t.Fatalf("expected definitive rejection to roll back watermark, got (%+v, %v)", rec, err)
+		}
+
+		// Store persistence failure before broadcast must return error without broadcasting.
+		store.failSave = true
+		beforeCalls := mock.sendCalls.Load()
+		if err := client.SendTransaction(signed1); err == nil {
+			t.Fatal("expected SendTransaction to fail when pending tx store write fails")
+		}
+		if mock.sendCalls.Load() != beforeCalls {
+			t.Fatal("SendTransaction broadcast tx despite failing to persist watermark")
+		}
+	})
+}
+
+func TestSendTransactionRateLimiterWaitCountsTowardSendTimeout(t *testing.T) {
+	mock, url := newEvmTxMockServer(t)
+	contract := ecommon.HexToAddress("0x3434343434343434343434343434343434343434")
+
+	// Deplete the single burst token with a very slow refill rate (1 req / 100s).
+	client, err := NewEvmRpcClient(config.BaseNetworkConfig{
+		Urls:                 []string{url},
+		RpcRequestsPerSecond: 0.01,
+		RpcBurst:             1,
+	}, "rate-limit-send", contract)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Stop()
+	// Consume the 1 initial burst token.
+	if _, err := client.BlockNumber(); err != nil {
+		t.Fatal(err)
+	}
+	client.txMu.Lock()
+	client.sendTimeout = 100 * time.Millisecond
+	client.txMu.Unlock()
+
+	key, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx := etypes.NewTx(&etypes.LegacyTx{
+		Nonce:    0,
+		To:       &contract,
+		Value:    big.NewInt(0),
+		Gas:      21000,
+		GasPrice: big.NewInt(1),
+	})
+	signed, err := etypes.SignTx(tx, etypes.LatestSignerForChainID(big.NewInt(1)), key)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	start := time.Now()
+	err = client.SendTransaction(signed)
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("expected rate-limited SendTransaction to fail with deadline exceeded")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) && !strings.Contains(err.Error(), "exceed") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if elapsed > 2*time.Second {
+		t.Fatalf("SendTransaction took %s waiting on rate limiter instead of honoring sendTimeout", elapsed)
+	}
+	if mock.sendCalls.Load() != 0 {
+		t.Fatalf("expected 0 send calls while rate-limited, got %d", mock.sendCalls.Load())
 	}
 }

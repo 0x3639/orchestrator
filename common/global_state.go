@@ -67,7 +67,9 @@ type GlobalState struct {
 	frontierMomentumHeight uint64
 	frontierMomSemaphore   *semaphore.Weighted
 	lastCeremony           CeremonyWindow
+	roleMu                 sync.RWMutex
 	isAdministratorActive  bool
+	localProducerAddress   string
 	tokensMap              map[uint32]map[string]string
 	affiliateMu            sync.RWMutex
 	// [chainId][token] -> bool
@@ -553,12 +555,36 @@ func (gs *GlobalState) GetTokensMap(chainId uint32, ztsOrToken string) string {
 }
 
 func (gs *GlobalState) SetIsAdministratorActive(value bool) {
+	gs.roleMu.Lock()
 	gs.isAdministratorActive = value
+	gs.roleMu.Unlock()
 	GlobalLogger.Infof("SetAdministratorActive to : %t", value)
 }
 
 func (gs *GlobalState) GetIsAdministratorActive() bool {
+	gs.roleMu.RLock()
+	defer gs.roleMu.RUnlock()
 	return gs.isAdministratorActive
+}
+
+// SetLocalProducerAddress records the local orchestrator's Zenon address so
+// runtime administrator changes can detect when this process gains or loses
+// the administrator role.
+func (gs *GlobalState) SetLocalProducerAddress(addr string) {
+	gs.roleMu.Lock()
+	gs.localProducerAddress = addr
+	gs.roleMu.Unlock()
+}
+
+// AdminRoleChanged reports whether newAdmin changes this node's operational
+// role (gaining or losing administrator status).
+func (gs *GlobalState) AdminRoleChanged(newAdmin string) bool {
+	gs.roleMu.RLock()
+	defer gs.roleMu.RUnlock()
+	if gs.localProducerAddress == "" {
+		return false
+	}
+	return (newAdmin == gs.localProducerAddress) != gs.isAdministratorActive
 }
 
 // SetIsAffiliateProgram applies the bridge metadata's affiliate settings.

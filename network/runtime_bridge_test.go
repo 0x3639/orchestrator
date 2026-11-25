@@ -1197,3 +1197,607 @@ func TestQueueDepthAndCloseQueueRaceFree(t *testing.T) {
 		t.Fatalf("queueDepth after close = (%d, %v), want (0, false)", got, ok)
 	}
 }
+
+func TestSetNetworkLatchesContractChangeBeforeStaleOrUnavailableSettingsRead(t *testing.T) {
+	admin := types.ParseAddressPanic("z1qpp8g8v4hrd5ernfrgsn86jmv09ra6zrvhvmr7")
+	oldContract := ecommon.HexToAddress("0x1111111111111111111111111111111111111111")
+	newContract := ecommon.HexToAddress("0x2222222222222222222222222222222222222222")
+
+	for _, tc := range []struct {
+		name      string
+		failRead  bool
+		staleAddr string
+	}{
+		{"stale getNetworkInfo returns old contract", false, oldContract.Hex()},
+		{"getNetworkInfo unavailable", true, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			url := replayServerWithErrors(t, func(method string, params []json.RawMessage) (interface{}, *replayRPCError) {
+				if method == "embedded.bridge.getNetworkInfo" {
+					if tc.failRead {
+						return nil, &replayRPCError{-32000, "settings RPC unavailable"}
+					}
+					return &definition.NetworkInfo{
+						NetworkClass:    definition.EvmClass,
+						Id:              1,
+						Name:            "eth",
+						ContractAddress: tc.staleAddr,
+					}, nil
+				}
+				t.Errorf("unexpected method %s", method)
+				return nil, nil
+			})
+
+			b := newReplayBridge(t)
+			b.contract = oldContract
+			n, stores := replayNetwork(t, b, url, map[uint32]string{1: url})
+			n.setAdministrator(admin.String())
+			stopChan := make(chan os.Signal, 1)
+			n.stopChan = stopChan
+
+			params, err := config.NewEvmParams(&definition.NetworkInfo{
+				NetworkClass:    definition.EvmClass,
+				Id:              1,
+				Name:            "eth",
+				ContractAddress: oldContract.Hex(),
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			evmNet := &evmNetwork{
+				EvmParams: params,
+				client:    n.rpcManager.Evm(1),
+				done:      make(chan struct{}),
+				state:     n.state,
+				logger:    zap.NewNop().Sugar(),
+			}
+			n.networkManager = &NetworksManager{znnNetwork: n, evmNetworks: []*evmNetwork{evmNet}, logger: zap.NewNop().Sugar()}
+
+			changedData := packBridgeCall(t, definition.SetNetworkMethodName, definition.EvmClass, uint32(1), "eth", newContract.Hex(), "{}")
+			err = n.interpretSendBlockData(context.Background(), makeSendBlock(admin, changedData), liveReceive, true, receiveAccepted, 2, n.refreshSettings)
+			if err == nil || !strings.Contains(err.Error(), "contract address changed") {
+				t.Fatalf("expected immediate contract address change error, got %v", err)
+			}
+			if !n.state.RestartRequired() {
+				t.Fatal("expected RestartRequired to be latched immediately")
+			}
+			if state, _ := n.state.GetState(); state != common.HaltedState {
+				t.Fatalf("state = %s, want HaltedState", common.StateToText(state))
+			}
+			select {
+			case <-evmNet.done:
+			default:
+				t.Fatal("old EVM watcher was not halted")
+			}
+			select {
+			case <-stopChan:
+			default:
+				t.Fatal("clean restart stop signal was not sent")
+			}
+			if h, err := stores.znn.GetLastUpdateHeight(); err != nil || h != 1 {
+				t.Fatalf("checkpoint advanced to %d (err %v), want 1", h, err)
+			}
+		})
+	}
+}
+
+func TestUpgradeWithPopulatedUnmarkedStoreAndQueueIsolatesNewContract(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	stopChan := make(chan os.Signal, 1)
+
+	// Simulate a pre-upgrade node: populate events/eth WITHOUT any contractAddressPrefix
+	// marker and populate queues/eth with an unconfirmed unwrap item.
+	preLdb, err := storage.CreateOrOpenLevelDb("eth")
+	if err != nil {
+		t.Fatal(err)
+	}
+	preStore := unwrap.NewEvmStorage(zdb.NewLevelDBWrapper(preLdb), stopChan, 1000)
+	if err := preStore.SetLastUpdateHeight(2000); err != nil {
+		t.Fatal(err)
+	}
+	oldTx := ecommon.HexToHash("0xdead01")
+	if err := preStore.AddUnwrapRequest(events.UnwrapRequestEvm{
+		ChainId:         1,
+		TransactionHash: oldTx,
+		LogIndex:        0,
+		Amount:          big.NewInt(500),
+		Signature:       "pre-upgrade-sig",
+		RedeemStatus:    common.UnredeemedStatus,
+		BlockNumber:     1800,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := preLdb.Close(); err != nil {
+		t.Fatal(err)
+	}
+	preQ, err := storage.CreateOrOpenQueue(definition.EvmClass, "eth")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := preQ.Enqueue(&events.UnwrapRequestEvm{
+		ChainId:         1,
+		TransactionHash: ecommon.HexToHash("0xdead02"),
+		BlockNumber:     1999,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := preQ.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// First startup after upgrade with a replacement contract: must NOT stamp or reuse
+	// the unmarked pre-upgrade store/queue.
+	dbMgr, err := manager.NewDbManager(stopChan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := common.NewGlobalState(new(uint8))
+	newContract := ecommon.HexToAddress("0x2222222222222222222222222222222222222222")
+	netInfo := &definition.NetworkInfo{
+		NetworkClass:    definition.EvmClass,
+		Id:              1,
+		Name:            "eth",
+		ContractAddress: newContract.Hex(),
+	}
+	net, err := NewEvmNetwork(netInfo, dbMgr, nil, state, stopChan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		net.halt()
+		_ = net.closeQueue()
+		net.rollbackStore()
+	})
+
+	wantScoped := "eth-" + strings.ToLower(strings.TrimPrefix(newContract.Hex(), "0x"))
+	if got := net.StorageName(); got != wantScoped {
+		t.Fatalf("StorageName() = %q, want %q", got, wantScoped)
+	}
+	if h, err := dbMgr.EvmStorage(1).GetLastUpdateHeight(); err != nil || h != 0 {
+		t.Fatalf("isolated store cursor = %d (err %v), want 0", h, err)
+	}
+	if unsent, err := dbMgr.EvmStorage(1).GetUnsentSignedUnwrapRequests(); err != nil || len(unsent) != 0 {
+		t.Fatalf("isolated store unsent signed rows = %d (err %v), want 0", len(unsent), err)
+	}
+	if depth, ok := net.queueDepth(); !ok || depth != 0 {
+		t.Fatalf("isolated queue depth = (%d, %v), want (0, true)", depth, ok)
+	}
+
+	// Verify the unmarked pre-upgrade store was NOT stamped and keeps its old data intact.
+	checkLdb, err := storage.CreateOrOpenLevelDb("eth")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer checkLdb.Close()
+	if _, err := checkLdb.Get([]byte{4}, nil); err == nil {
+		t.Fatal("unmarked pre-upgrade store was stamped with a contract address")
+	}
+	retained := unwrap.NewEvmStorage(zdb.NewLevelDBWrapper(checkLdb), stopChan, 1000)
+	if h, err := retained.GetLastUpdateHeight(); err != nil || h != 2000 {
+		t.Fatalf("retained unmarked cursor = %d (err %v), want 2000", h, err)
+	}
+	if row, err := retained.GetUnwrapRequestByHashAndLog(oldTx, 0); err != nil || row == nil || row.Signature != "pre-upgrade-sig" {
+		t.Fatalf("retained unmarked row = %+v (err %v), want pre-upgrade-sig", row, err)
+	}
+}
+
+func TestRotatedNetworkRemovalPreservesRetainedStoreAndReadditionReusesScopedIdentity(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	admin := types.ParseAddressPanic("z1qpp8g8v4hrd5ernfrgsn86jmv09ra6zrvhvmr7")
+	oldContract := ecommon.HexToAddress("0x1111111111111111111111111111111111111111")
+	newContract := ecommon.HexToAddress("0x2222222222222222222222222222222222222222")
+	scopedName := "eth-" + strings.ToLower(strings.TrimPrefix(newContract.Hex(), "0x"))
+
+	stopChan := make(chan os.Signal, 1)
+	dbMgr, err := manager.NewDbManager(stopChan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := common.NewGlobalState(new(uint8))
+	state.Health = snapshot.New("test", "")
+	t.Cleanup(state.Health.Close)
+
+	// 1. Seed initial contract at events/eth with cursor 2000 and historical row, then close.
+	oldInfo := &definition.NetworkInfo{NetworkClass: definition.EvmClass, Id: 1, Name: "eth", ContractAddress: oldContract.Hex()}
+	oldNet, err := NewEvmNetwork(oldInfo, dbMgr, nil, state, stopChan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := dbMgr.EvmStorage(1).SetLastUpdateHeight(2000); err != nil {
+		t.Fatal(err)
+	}
+	oldTx := ecommon.HexToHash("0xfeed01")
+	if err := dbMgr.EvmStorage(1).AddUnwrapRequest(events.UnwrapRequestEvm{
+		ChainId:         1,
+		TransactionHash: oldTx,
+		LogIndex:        0,
+		Amount:          big.NewInt(123),
+		Signature:       "retained-old-sig",
+		RedeemStatus:    common.UnredeemedStatus,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	oldNet.halt()
+	_ = oldNet.closeQueue()
+	oldNet.rollbackStore()
+
+	// 2. Start rotated contract (resolves to eth-<newContract>) and wire it into managers.
+	var removed atomic.Bool
+	newInfo := &definition.NetworkInfo{NetworkClass: definition.EvmClass, Id: 1, Name: "eth", ContractAddress: newContract.Hex()}
+	var ethCallCount atomic.Int32
+	evmURL := replayServerWithErrors(t, func(method string, params []json.RawMessage) (interface{}, *replayRPCError) {
+		switch method {
+		case "eth_syncing":
+			return false, nil
+		case "eth_call":
+			val := big.NewInt(1)
+			if ethCallCount.Add(1)%3 == 1 {
+				val = big.NewInt(5)
+			}
+			return hexutil.Bytes(ecommon.LeftPadBytes(val.Bytes(), 32)), nil
+		case "eth_blockNumber":
+			return hexutil.EncodeUint64(10), nil
+		case "eth_getBlockByNumber":
+			var number hexutil.Uint64
+			_ = json.Unmarshal(params[0], &number)
+			return map[string]interface{}{"number": number, "hash": ecommon.BigToHash(new(big.Int).SetUint64(uint64(number) + 10))}, nil
+		case "eth_getLogs":
+			return []etypes.Log{}, nil
+		default:
+			return nil, &replayRPCError{-32601, "unsupported " + method}
+		}
+	})
+	znnURL := replayServerWithErrors(t, func(method string, params []json.RawMessage) (interface{}, *replayRPCError) {
+		if method == "embedded.bridge.getNetworkInfo" {
+			if removed.Load() {
+				return nil, nil
+			}
+			return newInfo, nil
+		}
+		t.Errorf("unexpected Zenon method %s", method)
+		return nil, nil
+	})
+	rpcs, err := rpc.NewRpcManager(config.BaseNetworkConfig{Urls: []string{znnURL}}, stopChan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = rpcs.Znn().Stop() })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	n := &znnNetwork{
+		listenerCtx:    ctx,
+		cancelListener: cancel,
+		rpcManager:     rpcs,
+		dbManager:      dbMgr,
+		state:          state,
+		stopChan:       stopChan,
+		startupRead:    make(chan struct{}),
+		networksInfo:   map[string]config.BaseNetworkConfig{"eth": {Urls: []string{evmURL}}},
+		logger:         zap.NewNop().Sugar(),
+	}
+	close(n.startupRead)
+	n.setAdministrator(admin.String())
+	mgr := &NetworksManager{znnNetwork: n, health: state.Health, logger: n.logger}
+	n.networkManager = mgr
+
+	setNetData := packBridgeCall(t, definition.SetNetworkMethodName, definition.EvmClass, uint32(1), "eth", newContract.Hex(), "{}")
+	if err := n.interpretSendBlockData(ctx, makeSendBlock(admin, setNetData), liveReceive, true, receiveAccepted, 2, n.refreshSettings); err != nil {
+		t.Fatalf("initial rotated SetNetwork failed: %v", err)
+	}
+	if active := mgr.LookupEvm(1); active == nil || active.StorageName() != scopedName {
+		t.Fatalf("active StorageName = %v, want %q", active, scopedName)
+	}
+
+	// 3. Remove the rotated network: must delete eth-<newContract> and preserve retained events/eth!
+	removed.Store(true)
+	rmData := packBridgeCall(t, definition.RemoveNetworkMethodName, definition.EvmClass, uint32(1))
+	if err := n.interpretSendBlockData(ctx, makeSendBlock(admin, rmData), liveReceive, true, receiveAccepted, 3, n.refreshSettings); err != nil {
+		t.Fatalf("RemoveNetwork failed: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(common.DefaultDataDir(), common.DefaultEventsDir, scopedName)); !os.IsNotExist(err) {
+		t.Fatalf("expected rotated DB %s to be deleted, stat err = %v", scopedName, err)
+	}
+	if _, err := os.Stat(filepath.Join(common.DefaultDataDir(), common.DefaultEventsDir, "eth")); err != nil {
+		t.Fatalf("retained pre-rotation DB events/eth was deleted: %v", err)
+	}
+
+	// 4. Re-add the rotated contract: must resolve to eth-<newContract> again and keep events/eth untouched.
+	removed.Store(false)
+	if err := n.interpretSendBlockData(ctx, makeSendBlock(admin, setNetData), liveReceive, true, receiveAccepted, 4, n.refreshSettings); err != nil {
+		t.Fatalf("re-added SetNetwork failed: %v", err)
+	}
+	t.Cleanup(func() {
+		mgr.RemoveEvmNetwork(1)
+		_ = dbMgr.RemoveEvmEventStore(1)
+		rpcs.RemoveEvmClient(1)
+	})
+	if active := mgr.LookupEvm(1); active == nil || active.StorageName() != scopedName {
+		t.Fatalf("re-added StorageName = %v, want %q", active, scopedName)
+	}
+	// Verify retained events/eth still has oldTx and cursor 2000.
+	retainedLdb, err := storage.CreateOrOpenLevelDb("eth")
+	if err != nil {
+		t.Fatalf("reopening retained events/eth: %v", err)
+	}
+	defer retainedLdb.Close()
+	retained := unwrap.NewEvmStorage(zdb.NewLevelDBWrapper(retainedLdb), stopChan, 0)
+	if h, err := retained.GetLastUpdateHeight(); err != nil || h != 2000 {
+		t.Fatalf("retained cursor = %d (err %v), want 2000", h, err)
+	}
+	if row, err := retained.GetUnwrapRequestByHashAndLog(oldTx, 0); err != nil || row == nil || row.Signature != "retained-old-sig" {
+		t.Fatalf("retained row = %+v (err %v), want retained-old-sig", row, err)
+	}
+}
+
+func TestLateUnknownUnwrapRechecksSourceAfterCoverageAndCorroboratesSecondaryLogs(t *testing.T) {
+	t.Run("source record arriving during coverage check prevents false emergency halt", func(t *testing.T) {
+		b := newReplayBridge(t)
+		l := &lateNode{t: t, bridge: b}
+		l.ledger.Store(newReplayLedger(t, b, 5000))
+		l.redeemableIn.Store(30)
+
+		sourceLog := b.sourceLog(t, testRecipient)
+		sourceLog.BlockNumber = 150
+		block150Hash := ecommon.BigToHash(big.NewInt(1150))
+		sourceLog.BlockHash = block150Hash
+
+		var injected sync.Once
+		var url string
+		url = replayServerWithErrors(t, func(method string, params []json.RawMessage) (interface{}, *replayRPCError) {
+			switch method {
+			case "stats.syncInfo":
+				return nil, nil
+			case "embedded.bridge.getUnwrapTokenRequestByHashAndLog":
+				return withRedeemDelay(b.request, l.redeemableIn.Load()), nil
+			case "eth_syncing":
+				return false, nil
+			case "eth_blockNumber":
+				// Simulate the scan/queue worker recording the genuine source location
+				// AFTER the initial unwrapSource returned sourceUnknown and BEFORE
+				// lateUnknownUnwrapCovered returns true.
+				injected.Do(func() {
+					if err := l.stores.evm[1].SaveUnwrapSourceLocation(sourceLog.TxHash, uint32(sourceLog.Index), sourceLog.BlockNumber, sourceLog.BlockHash); err != nil {
+						t.Errorf("SaveUnwrapSourceLocation: %v", err)
+					}
+				})
+				return hexutil.EncodeUint64(200), nil
+			case "eth_getBlockByNumber":
+				var number hexutil.Uint64
+				_ = json.Unmarshal(params[0], &number)
+				return map[string]interface{}{"number": number, "hash": ecommon.BigToHash(new(big.Int).SetUint64(uint64(number) + 1000))}, nil
+			case "eth_getTransactionReceipt":
+				return nil, nil
+			case "eth_getLogs":
+				return []etypes.Log{sourceLog}, nil
+			}
+			if result, ok := l.ledger.Load().answer(t, method, params); ok {
+				return result, nil
+			}
+			t.Errorf("unexpected method %s", method)
+			return nil, nil
+		})
+		_ = url
+		l.n, l.stores = replayNetwork(t, b, url, map[uint32]string{1: url})
+		l.n.SetConfirmationsToFinality(5)
+		l.at(5000, acceptedReceive)
+
+		params, err := config.NewEvmParams(&definition.NetworkInfo{
+			NetworkClass:    definition.EvmClass,
+			Id:              1,
+			Name:            "eth",
+			ContractAddress: b.contract.Hex(),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		params.SetConfirmationsToFinality(5)
+		eN := &evmNetwork{
+			EvmParams: params,
+			client:    l.n.rpcManager.Evm(1),
+			done:      make(chan struct{}),
+			state:     l.n.state,
+			logger:    zap.NewNop().Sugar(),
+		}
+		eN.lastScannedThrough.Store(200)
+		eN.scanned.Store(true)
+		l.n.networkManager = &NetworksManager{znnNetwork: l.n, evmNetworks: []*evmNetwork{eN}, logger: zap.NewNop().Sugar()}
+
+		if err := l.listen(); err != nil {
+			t.Fatalf("expected clean match after concurrent source arrival, got err: %v", err)
+		}
+		l.expect("concurrent source matched without halt", common.LiveState, 2)
+	})
+
+	t.Run("receipt-pruned secondary serving source log blocks false emergency halt", func(t *testing.T) {
+		t.Setenv("HOME", t.TempDir())
+		b := newReplayBridge(t)
+		l := &lateNode{t: t, bridge: b}
+		l.ledger.Store(newReplayLedger(t, b, 5000))
+		l.redeemableIn.Store(30)
+
+		headerHash := func(n uint64) ecommon.Hash {
+			return ecommon.BigToHash(new(big.Int).SetUint64(n + 1000))
+		}
+		sourceLog := b.sourceLog(t, testRecipient)
+		sourceLog.BlockNumber = 180
+		sourceLog.BlockHash = headerHash(180)
+
+		// Faulty primary: synced at 205, omits the log in eth_getLogs and has no receipt.
+		primaryURL := replayServerWithErrors(t, func(method string, params []json.RawMessage) (interface{}, *replayRPCError) {
+			switch method {
+			case "eth_syncing":
+				return false, nil
+			case "eth_blockNumber":
+				return hexutil.EncodeUint64(205), nil
+			case "eth_getBlockByNumber":
+				var number hexutil.Uint64
+				_ = json.Unmarshal(params[0], &number)
+				return map[string]interface{}{"number": number, "hash": headerHash(uint64(number))}, nil
+			case "eth_getTransactionReceipt":
+				return nil, nil
+			case "eth_getLogs":
+				return []etypes.Log{}, nil
+			default:
+				t.Errorf("unexpected primary method %s", method)
+				return nil, nil
+			}
+		})
+
+		// Receipt-pruned secondary: synced at 205, returns nil receipt, BUT serves sourceLog via eth_getLogs!
+		secondaryURL := replayServerWithErrors(t, func(method string, params []json.RawMessage) (interface{}, *replayRPCError) {
+			switch method {
+			case "eth_syncing":
+				return false, nil
+			case "eth_blockNumber":
+				return hexutil.EncodeUint64(205), nil
+			case "eth_getBlockByNumber":
+				var number hexutil.Uint64
+				_ = json.Unmarshal(params[0], &number)
+				return map[string]interface{}{"number": number, "hash": headerHash(uint64(number))}, nil
+			case "eth_getTransactionReceipt":
+				return nil, nil
+			case "eth_getLogs":
+				return []etypes.Log{sourceLog}, nil
+			default:
+				t.Errorf("unexpected secondary method %s", method)
+				return nil, nil
+			}
+		})
+
+		znnURL := replayServerWithErrors(t, func(method string, params []json.RawMessage) (interface{}, *replayRPCError) {
+			switch method {
+			case "stats.syncInfo":
+				return nil, nil
+			case "embedded.bridge.getUnwrapTokenRequestByHashAndLog":
+				return withRedeemDelay(b.request, l.redeemableIn.Load()), nil
+			}
+			if result, ok := l.ledger.Load().answer(t, method, params); ok {
+				return result, nil
+			}
+			t.Errorf("unexpected Zenon method %s", method)
+			return nil, nil
+		})
+
+		l.n, l.stores = replayNetwork(t, b, znnURL, map[uint32]string{1: primaryURL})
+		evmClient, err := rpc.NewEvmRpcClient(config.BaseNetworkConfig{Urls: []string{primaryURL, secondaryURL}}, "eth", b.contract)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(evmClient.Stop)
+		l.n.rpcManager.RegisterEvmClient(1, evmClient)
+		l.n.SetConfirmationsToFinality(5)
+		l.at(5000, acceptedReceive)
+
+		params, err := config.NewEvmParams(&definition.NetworkInfo{
+			NetworkClass:    definition.EvmClass,
+			Id:              1,
+			Name:            "eth",
+			ContractAddress: b.contract.Hex(),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		params.SetConfirmationsToFinality(5)
+		params.SetContractDeploymentHeight(1)
+		q, err := storage.CreateOrOpenQueue(definition.EvmClass, "secondary-log-corroboration")
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = q.Close() })
+		eN := &evmNetwork{
+			EvmParams:         params,
+			client:            evmClient,
+			dbManager:         l.stores,
+			rpcManager:        l.n.rpcManager,
+			unconfirmedQueue:  q,
+			queuedBlockCounts: make(map[uint64]int),
+			done:              make(chan struct{}),
+			syncTrigger:       make(chan struct{}, 1),
+			state:             l.n.state,
+			health:            snapshot.New("test", ""),
+			logger:            zap.NewNop().Sugar(),
+		}
+		t.Cleanup(eN.health.Close)
+		l.n.networkManager = &NetworksManager{znnNetwork: l.n, evmNetworks: []*evmNetwork{eN}, logger: zap.NewNop().Sugar()}
+
+		// Primary scan completes without seeing the omitted log.
+		if err := eN.Sync(); err != nil {
+			t.Fatalf("Sync failed: %v", err)
+		}
+		// Secondary log corroboration finds sourceLog and prevents a false emergency halt.
+		if err := l.listen(); err == nil {
+			t.Fatal("expected hold when receipt-pruned secondary still serves the source log")
+		}
+		l.expect("held due to secondary log corroboration", common.LiveState, 1)
+	})
+}
+
+func TestAdministratorRefreshRestartsOnLocalRoleChangeOnly(t *testing.T) {
+	adminA := types.ParseAddressPanic("z1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqsggv2f")
+	adminB := types.ParseAddressPanic("z1qpp8g8v4hrd5ernfrgsn86jmv09ra6zrvhvmr7")
+	otherNode := types.ParseAddressPanic("z1qzal6c5s9rjnnxd2z7dvdhjxpmmj4fmw56a0mz")
+
+	for _, tc := range []struct {
+		name            string
+		localAddr       types.Address
+		initialIsAdmin  bool
+		newBridgeAdmin  types.Address
+		wantRestart     bool
+	}{
+		{"local node loses admin role", adminA, true, adminB, true},
+		{"local node gains admin role", adminB, false, adminB, true},
+		{"third-party admin rotation does not restart signer", otherNode, false, adminB, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			url := replayServerWithErrors(t, func(method string, params []json.RawMessage) (interface{}, *replayRPCError) {
+				if method == "embedded.bridge.getBridgeInfo" {
+					return &definition.BridgeInfoVariable{Administrator: tc.newBridgeAdmin}, nil
+				}
+				t.Errorf("unexpected method %s", method)
+				return nil, nil
+			})
+			b := newReplayBridge(t)
+			n, stores := replayNetwork(t, b, url, nil)
+			stopChan := make(chan os.Signal, 1)
+			n.stopChan = stopChan
+			n.setAdministrator(adminA.String())
+			n.state.SetLocalProducerAddress(tc.localAddr.String())
+			n.state.SetIsAdministratorActive(tc.initialIsAdmin)
+
+			proposeData := packBridgeCall(t, definition.ProposeAdministratorMethodName, tc.newBridgeAdmin)
+			err := n.interpretSendBlockData(context.Background(), makeSendBlock(otherNode, proposeData), liveReceive, true, receiveAccepted, 2, n.refreshSettings)
+			if tc.wantRestart {
+				if err == nil || !strings.Contains(err.Error(), "administrator role changed") {
+					t.Fatalf("expected administrator role change restart error, got %v", err)
+				}
+				if !n.state.RestartRequired() {
+					t.Fatal("expected RestartRequired to be latched")
+				}
+				select {
+				case <-stopChan:
+				default:
+					t.Fatal("expected restart stop signal on local role change")
+				}
+				if h, err := stores.znn.GetLastUpdateHeight(); err != nil || h != 1 {
+					t.Fatalf("checkpoint = %d (err %v), want 1", h, err)
+				}
+			} else {
+				if err != nil {
+					t.Fatalf("unexpected error on third-party admin change: %v", err)
+				}
+				if n.state.RestartRequired() {
+					t.Fatal("unexpected RestartRequired on third-party admin change")
+				}
+				if got := n.getAdministrator(); got != tc.newBridgeAdmin.String() {
+					t.Fatalf("administrator = %s, want %s", got, tc.newBridgeAdmin.String())
+				}
+				select {
+				case sig := <-stopChan:
+					t.Fatalf("unexpected stop signal %v", sig)
+				default:
+				}
+			}
+		})
+	}
+}

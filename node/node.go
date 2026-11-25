@@ -185,6 +185,7 @@ func NewNode(config *oconfig.Config, logger *zap.Logger) (_ *Node, initErr error
 
 	node.logger.Infof("administrator: %s", bridgeInfo.Administrator.String())
 	node.logger.Infof("producer: %s", node.producerKeyPair.Address.String())
+	node.state.SetLocalProducerAddress(node.producerKeyPair.Address.String())
 	if bridgeInfo.Administrator.String() == node.producerKeyPair.Address.String() {
 		node.state.SetIsAdministratorActive(true)
 	}
@@ -1434,7 +1435,12 @@ func (node *Node) processSignaturesWrap(window uint64) (error, bool) {
 			continue
 		}
 
-		msg, err := event.GetMessage(node.networksManager.Evm(event.ChainId).ContractAddress())
+		evmNet := node.networksManager.LookupEvm(event.ChainId)
+		if evmNet == nil || evmNet.ContractAddress() == nil {
+			node.logger.Infof("EVM network %d is no longer listed by the bridge; skipping wrap %s", event.ChainId, event.Id.String())
+			continue
+		}
+		msg, err := event.GetMessage(evmNet.ContractAddress())
 		if err != nil {
 			node.logger.Debug(err)
 			// todo set status to skipped

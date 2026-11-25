@@ -1099,6 +1099,22 @@ func (rC *znnNetwork) interpretSendBlockData(ctx context.Context, sendBlock *api
 		}
 		common.AdministratorLogger.Infof("SetNetworkMethodName NetworkClass: %d, ChainId: %d, Name: %s, ContractAddress: %s, Metadata: %s",
 			param.NetworkClass, param.ChainId, param.Name, param.ContractAddress, param.Metadata)
+		// Immediately detect a contract address change from the ledger-confirmed
+		// receive before reading tip state: a stale or unavailable getNetworkInfo
+		// response must never allow the signer to continue on the old contract or
+		// advance the checkpoint past an accepted rotation.
+		if param.NetworkClass == definition.EvmClass {
+			existingClient, hasClient := rC.rpcManager.LookupEvm(param.ChainId)
+			var existingNet *evmNetwork
+			if rC.networkManager != nil {
+				existingNet = rC.networkManager.LookupEvm(param.ChainId)
+			}
+			if hasClient || existingNet != nil {
+				if err := rC.checkContractAddressChange(ctx, param.ChainId, param.Name, param.ContractAddress, existingNet, existingClient); err != nil {
+					return err
+				}
+			}
+		}
 		read, cancel := context.WithTimeout(rC.readContext(ctx), rpc.ZnnSettingsTimeout)
 		network, err := rC.ZnnRpc().GetNetworkByClassAndIdContext(read, param.NetworkClass, param.ChainId)
 		cancel()
@@ -1119,34 +1135,7 @@ func (rC *znnNetwork) interpretSendBlockData(ctx context.Context, sendBlock *api
 				existingNet = rC.networkManager.LookupEvm(param.ChainId)
 			}
 			if hasClient || existingNet != nil {
-				if !ecommon.IsHexAddress(network.ContractAddress) {
-					err := errors.Errorf("EVM network %d (%s) has invalid contract address %q; halting signing and stopping for a clean restart",
-						network.Id, network.Name, network.ContractAddress)
-					rC.stopForContractChange(ctx, existingNet, existingClient, err)
-					return err
-				}
-				newAddr := ecommon.HexToAddress(network.ContractAddress)
-				var currentAddr ecommon.Address
-				mismatch := false
-				if existingNet != nil && existingNet.ContractAddress() != nil {
-					currentAddr = *existingNet.ContractAddress()
-					if currentAddr != newAddr {
-						mismatch = true
-					}
-				}
-				if hasClient {
-					if currentAddr == (ecommon.Address{}) {
-						currentAddr = existingClient.BridgeAddress()
-					}
-					if existingClient.BridgeAddress() != newAddr {
-						currentAddr = existingClient.BridgeAddress()
-						mismatch = true
-					}
-				}
-				if mismatch {
-					err := errors.Errorf("EVM network %d (%s) contract address changed from %s to %s; halting signing and stopping for a clean restart",
-						network.Id, network.Name, currentAddr.Hex(), newAddr.Hex())
-					rC.stopForContractChange(ctx, existingNet, existingClient, err)
+				if err := rC.checkContractAddressChange(ctx, network.Id, network.Name, network.ContractAddress, existingNet, existingClient); err != nil {
 					return err
 				}
 				rC.logger.Info("network already existent with unchanged contract address")
@@ -1201,6 +1190,11 @@ func (rC *znnNetwork) interpretSendBlockData(ctx context.Context, sendBlock *api
 				// todo integrate these two
 				if rC.networkManager != nil {
 					rC.networkManager.RemoveEvmNetwork(param.ChainId)
+				}
+				if remover, ok := rC.dbManager.(evmStoreRemover); ok {
+					if rmErr := remover.RemoveEvmEventStore(param.ChainId); rmErr != nil {
+						rC.logger.Errorf("failed to close removed EVM network %d store: %v", param.ChainId, rmErr)
+					}
 				}
 				rC.rpcManager.RemoveEvmClient(param.ChainId)
 			}
@@ -1812,13 +1806,26 @@ func (rC *znnNetwork) recordUnwrapRegistration(ctx context.Context, param *defin
 			if redeemableIn != nil {
 				inside, _ = insideRedeemDelay(rpcZnnEvent, redeemableIn)
 			}
-			if !inside || !rC.lateUnknownUnwrapCovered(evm, rpcZnnEvent) {
+			if !inside || !rC.lateUnknownUnwrapCovered(ctx, evm, rpcZnnEvent) {
 				return awaitsSourceRecord{errors.Errorf("unwrap request %s/%d on chainId %d cannot be judged: the endpoint has no receipt for its transaction and this node has no record of the event, "+
 					"and this long after the receive that does not show whether the transaction never existed or lies outside the endpoint's history",
 					param.TransactionHash.String(), param.LogIndex, rpcZnnEvent.ChainId)}
 			}
-			rC.logger.Errorf("late unwrap request %s/%d inside its redeem delay on chainId %d has no receipt and no recorded source event despite completed canonical EVM scan coverage; escalating to emergency",
-				param.TransactionHash.String(), param.LogIndex, rpcZnnEvent.ChainId)
+			// Re-check source evidence AFTER coverage is established so a
+			// genuine source recorded by the scan or queue worker concurrently
+			// with verification cannot trigger a false emergency halt.
+			rechecked, recheckErr := rC.unwrapSource(ctx, param, rpcZnnEvent)
+			if recheckErr != nil {
+				return recheckErr
+			}
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			source = rechecked
+			if source == sourceUnknown {
+				rC.logger.Errorf("late unwrap request %s/%d inside its redeem delay on chainId %d has no receipt and no recorded source event despite completed corroborated EVM scan coverage; escalating to emergency",
+					param.TransactionHash.String(), param.LogIndex, rpcZnnEvent.ChainId)
+			}
 		}
 		rC.clearUnknownUnwrapObs()
 		if source != sourceMatches {
@@ -2018,6 +2025,7 @@ func (rC *znnNetwork) startRuntimeEvmNetwork(network *definition.NetworkInfo) er
 		client.Stop()
 		return err
 	}
+	client.SetStorageName(net.StorageName())
 	if txStore, ok := rC.dbManager.EvmStorage(network.Id).(common.PendingEvmTxStore); ok {
 		client.SetPendingTxStore(txStore)
 	}
@@ -2461,6 +2469,10 @@ func (rC *znnNetwork) setAdministrator(admin string) {
 	rC.administrator = admin
 }
 
+type evmStoreRemover interface {
+	RemoveEvmEventStore(chainId uint32) error
+}
+
 func (rC *znnNetwork) refreshAdministrator(ctx context.Context) error {
 	read, cancel := context.WithTimeout(rC.readContext(ctx), rpc.ZnnSettingsTimeout)
 	defer cancel()
@@ -2471,7 +2483,51 @@ func (rC *znnNetwork) refreshAdministrator(ctx context.Context) error {
 	if bridgeInfo == nil {
 		return errors.New("missing Zenon bridge info")
 	}
-	rC.setAdministrator(bridgeInfo.Administrator.String())
+	newAdmin := bridgeInfo.Administrator.String()
+	rC.setAdministrator(newAdmin)
+	if rC.state != nil && rC.state.AdminRoleChanged(newAdmin) {
+		roleErr := errors.Errorf("local node administrator role changed (bridge administrator is now %s); halting signing and stopping for a clean restart", newAdmin)
+		rC.state.MarkSettingsStale()
+		if haltErr := rC.state.RequireRestart(); haltErr != nil {
+			rC.logger.Errorf("failed to latch restart halt during administrator role change: %v", haltErr)
+		}
+		rC.stopBridgeListener(ctx, roleErr)
+		return roleErr
+	}
+	return nil
+}
+
+func (rC *znnNetwork) checkContractAddressChange(ctx context.Context, chainId uint32, name, contractAddress string, existingNet *evmNetwork, existingClient *rpc.EvmRpc) error {
+	if !ecommon.IsHexAddress(contractAddress) {
+		err := errors.Errorf("EVM network %d (%s) has invalid contract address %q; halting signing and stopping for a clean restart",
+			chainId, name, contractAddress)
+		rC.stopForContractChange(ctx, existingNet, existingClient, err)
+		return err
+	}
+	newAddr := ecommon.HexToAddress(contractAddress)
+	var currentAddr ecommon.Address
+	mismatch := false
+	if existingNet != nil && existingNet.ContractAddress() != nil {
+		currentAddr = *existingNet.ContractAddress()
+		if currentAddr != newAddr {
+			mismatch = true
+		}
+	}
+	if existingClient != nil {
+		if currentAddr == (ecommon.Address{}) {
+			currentAddr = existingClient.BridgeAddress()
+		}
+		if existingClient.BridgeAddress() != newAddr {
+			currentAddr = existingClient.BridgeAddress()
+			mismatch = true
+		}
+	}
+	if mismatch {
+		err := errors.Errorf("EVM network %d (%s) contract address changed from %s to %s; halting signing and stopping for a clean restart",
+			chainId, name, currentAddr.Hex(), newAddr.Hex())
+		rC.stopForContractChange(ctx, existingNet, existingClient, err)
+		return err
+	}
 	return nil
 }
 
@@ -2579,7 +2635,7 @@ func (rC *znnNetwork) clearUnknownUnwrapObs() {
 // below the target height, or endpoint disagreement so pruned or lagging RPCs
 // never trigger a false-positive emergency halt, while newer unrelated queue
 // traffic cannot block escalation.
-func (rC *znnNetwork) lateUnknownUnwrapCovered(evm *rpc.EvmRpc, rpcZnnEvent *definition.UnwrapTokenRequest) bool {
+func (rC *znnNetwork) lateUnknownUnwrapCovered(ctx context.Context, evm *rpc.EvmRpc, rpcZnnEvent *definition.UnwrapTokenRequest) bool {
 	if rC.networkManager == nil || evm == nil {
 		return false
 	}
@@ -2612,6 +2668,16 @@ func (rC *znnNetwork) lateUnknownUnwrapCovered(evm *rpc.EvmRpc, rpcZnnEvent *def
 		return false
 	}
 	if _, err := evm.CanonicalHash(requiredHeight); err != nil {
+		return false
+	}
+	// Corroborate absence of the source log across secondary endpoints (even
+	// receipt-pruned ones that still serve eth_getLogs) so an incomplete
+	// primary log scan cannot trigger a false emergency halt.
+	hasSecondaryLog, err := evm.AnySecondaryHasUnwrapLog(ctx, eN.ContractDeploymentHeight(), maxHead, ecommon.Hash(rpcZnnEvent.TransactionHash), rpcZnnEvent.LogIndex)
+	if err != nil || hasSecondaryLog {
+		if hasSecondaryLog {
+			eN.requestCatchUpSync()
+		}
 		return false
 	}
 	return true

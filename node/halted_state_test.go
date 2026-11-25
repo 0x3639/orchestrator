@@ -2,6 +2,7 @@ package node
 
 import (
 	"encoding/json"
+	"math/big"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -23,13 +24,23 @@ import (
 )
 
 type haltedTestZenon struct {
-	mu           sync.Mutex
-	failInfo     bool
-	halted       bool
-	unhaltedAt   uint64
-	unhaltDur    uint64
-	evmContract  string
-	evmHalted    bool
+	mu            sync.Mutex
+	failInfo      bool
+	halted        bool
+	unhaltedAt    uint64
+	unhaltDur     uint64
+	evmContract   string
+	evmHalted     bool
+	unsignedWraps []*definition.WrapTokenRequest
+}
+
+func (z *haltedTestZenon) GetAllUnsignedWrapTokenRequests(pageIndex, pageSize uint32) map[string]interface{} {
+	z.mu.Lock()
+	defer z.mu.Unlock()
+	if pageIndex > 0 || len(z.unsignedWraps) == 0 {
+		return map[string]interface{}{"count": 0, "list": []*definition.WrapTokenRequest{}}
+	}
+	return map[string]interface{}{"count": len(z.unsignedWraps), "list": z.unsignedWraps}
 }
 
 func (z *haltedTestZenon) GetBridgeInfo() (*definition.BridgeInfoVariable, error) {
@@ -195,5 +206,89 @@ func TestReconcileHaltedStateRetriesTransientZenonRPCErrorsWithoutStopping(t *te
 	node.reconcileHaltedState()
 	if s, _ := gs.GetState(); s != common.LiveState {
 		t.Fatalf("state = %s, want LiveState after unhalt cooldown and EVM unhalt", common.StateToText(s))
+	}
+}
+
+func TestProcessSignaturesWrapSkipsRemovedDestinationNetworkWithoutPanic(t *testing.T) {
+	contract := ecommon.HexToAddress("0x1111111111111111111111111111111111111111")
+	wrapID := types.Hash{7, 8, 9}
+	zMock := &haltedTestZenon{
+		halted:      false,
+		evmContract: contract.Hex(),
+		unsignedWraps: []*definition.WrapTokenRequest{
+			{
+				NetworkClass: definition.EvmClass,
+				ChainId:      1,
+				Id:           wrapID,
+				ToAddress:    "0x2222222222222222222222222222222222222222",
+				TokenAddress: "0x3333333333333333333333333333333333333333",
+				Amount:       big.NewInt(1000),
+				Fee:          big.NewInt(10),
+			},
+		},
+	}
+
+	znnSrv := server.NewServer()
+	if err := znnSrv.RegisterName("embedded.bridge", zMock); err != nil {
+		t.Fatal(err)
+	}
+	znnHTTP := httptest.NewServer(znnSrv.WebsocketHandler([]string{"*"}))
+	t.Cleanup(func() {
+		znnSrv.Stop()
+		znnHTTP.Close()
+	})
+
+	evmHTTP := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			ID json.RawMessage `json:"id"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"jsonrpc": "2.0", "id": req.ID, "result": hexutil.Bytes(make([]byte, 32))})
+	}))
+	t.Cleanup(evmHTTP.Close)
+
+	stopChan := make(chan os.Signal, 1)
+	stateVal := common.LiveState
+	gs := common.NewGlobalState(&stateVal)
+
+	t.Setenv("HOME", t.TempDir())
+	nm, err := network.NewNetworksManager(stopChan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dbMgr, err := manager.NewDbManager(stopChan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nets := map[string]config.BaseNetworkConfig{
+		common.ZenonNetworkName: {Urls: []string{"ws" + strings.TrimPrefix(znnHTTP.URL, "http")}},
+		"eth-halted-test":       {Urls: []string{evmHTTP.URL}},
+	}
+	if err := nm.Init(nets, dbMgr, gs, func(*common.BridgeMetadata) {}); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { nm.Stop() })
+
+	// Remove the destination EVM network before wrap signing runs.
+	nm.RemoveEvmNetwork(1)
+
+	node := &Node{
+		networksManager: nm,
+		dbManager:       dbMgr,
+		state:           gs,
+		stopChan:        stopChan,
+		logger:          zap.NewNop().Sugar(),
+	}
+
+	// Must skip the wrap cleanly without panicking or stopping the node.
+	err, tried := node.processSignaturesWrap(1)
+	if err != nil || tried {
+		t.Fatalf("processSignaturesWrap = (%v, %v), want (nil, false)", err, tried)
+	}
+	select {
+	case sig := <-stopChan:
+		t.Fatalf("processSignaturesWrap requested stop %v for removed network", sig)
+	default:
 	}
 }

@@ -33,6 +33,7 @@ type EvmRpc struct {
 	rpcClient   *ethclient.Client
 	Urls        config.UrlsInfo
 	networkName string
+	storageName string
 
 	bridgeContract  *bridge.Bridge
 	bridgeAddress   ecommon.Address
@@ -61,14 +62,16 @@ type EvmRpc struct {
 	secondary        map[string]*secondaryClient
 	secondaryStopped bool
 
-	// txMu guards chainID, pendingTx, and pendingTxStore, which track the latest
-	// unconfirmed halt or key-change transaction per (sender, contract, action)
-	// so retries reuse the same nonce with bumped fees and recover ownership
-	// across restarts and evicted predecessors.
+	// txMu guards storageName, chainID, pendingTx, pendingTxStore, and
+	// sendTimeout, which track the latest unconfirmed halt or key-change
+	// transaction per (sender, contract, action) so retries reuse the same
+	// nonce with bumped fees and recover ownership across restarts and
+	// evicted predecessors.
 	txMu           sync.Mutex
 	chainID        *big.Int
 	pendingTx      map[evmTxKey]*pendingEvmTx
 	pendingTxStore common.PendingEvmTxStore
+	sendTimeout    time.Duration
 }
 
 type evmTxKey struct {
@@ -236,12 +239,35 @@ func (r *EvmRpc) Stop() {
 	r.closeSecondaryClients()
 }
 
+// SetStorageName binds the resolved storage directory name (e.g.
+// <name>-<contractHex> after a same-name contract rotation) so removal deletes
+// only the active contract's directories and preserves any retained pre-rotation
+// store on disk.
+func (r *EvmRpc) SetStorageName(name string) {
+	r.txMu.Lock()
+	defer r.txMu.Unlock()
+	r.storageName = name
+}
+
+// StorageName returns the resolved directory name used for this client's
+// LevelDB event store and unconfirmed queue.
+func (r *EvmRpc) StorageName() string {
+	r.txMu.Lock()
+	name := r.storageName
+	r.txMu.Unlock()
+	if name != "" {
+		return name
+	}
+	return r.networkName
+}
+
 // todo return an error?
 func (r *EvmRpc) DeleteDirectories() {
-	if errDel := storage.DeleteQueue(r.networkName); errDel != nil {
+	name := r.StorageName()
+	if errDel := storage.DeleteQueue(name); errDel != nil {
 		r.logger.Debug(errDel)
 	}
-	if errDel := storage.DeleteLvlDb(r.networkName); errDel != nil {
+	if errDel := storage.DeleteLvlDb(name); errDel != nil {
 		r.logger.Debug(errDel)
 	}
 }
@@ -356,14 +382,35 @@ func (r *EvmRpc) ChainID() (*big.Int, error) {
 	return id, nil
 }
 
+func (r *EvmRpc) sendCallTimeout() time.Duration {
+	r.txMu.Lock()
+	d := r.sendTimeout
+	r.txMu.Unlock()
+	if d > 0 {
+		return d
+	}
+	return evmCallTimeout
+}
+
 func (r *EvmRpc) SendTransaction(tx *etypes.Transaction) error {
-	ctx, cancel, err := r.callContext(evmCallTimeout)
+	// Start the send deadline BEFORE acquiring a rate-limiter permit so a
+	// depleted limiter cannot stall emergency halt broadcasts (and hold
+	// WhileEmergency's read lock) past evmCallTimeout.
+	ctx, cancel := context.WithTimeout(r.ctx, r.sendCallTimeout())
+	defer cancel()
+	if r.limiter != nil {
+		if err := r.limiter.Wait(ctx); err != nil {
+			return err
+		}
+	}
+	prevSnapshot, tracked, err := r.recordPendingTxAttempt(tx)
 	if err != nil {
 		return err
 	}
-	defer cancel()
 	sendErr := r.rpcClient.SendTransaction(ctx, tx)
-	r.observeSentTx(tx, sendErr)
+	if tracked {
+		r.reconcileSentTx(tx, prevSnapshot, sendErr)
+	}
 	return sendErr
 }
 
@@ -429,19 +476,23 @@ func evmTxKeyFromTx(tx *etypes.Transaction) (evmTxKey, bool) {
 	return evmTxKey{sender: sender, contract: *tx.To(), kind: kind}, true
 }
 
-func shouldTrackPendingTxErr(err error) bool {
+// isDefinitivePreMempoolRejection reports whether err proves the EVM node
+// definitively rejected the transaction before accepting it into the mempool,
+// so rolling back a fresh pre-broadcast watermark is safe. Ambiguous transport
+// failures (EOF, connection reset, timeouts) and mempool pricing/duplicate
+// errors return false so the persisted watermark is preserved.
+func isDefinitivePreMempoolRejection(err error) bool {
 	if err == nil {
-		return true
-	}
-	if errors.Is(err, context.DeadlineExceeded) {
-		return true
+		return false
 	}
 	msg := strings.ToLower(err.Error())
-	return strings.Contains(msg, "replacement transaction underpriced") ||
-		strings.Contains(msg, "already known") ||
-		strings.Contains(msg, "transaction underpriced") ||
-		strings.Contains(msg, "fee cap less than block base fee") ||
-		strings.Contains(msg, "max fee per gas less than block base fee")
+	return strings.Contains(msg, "insufficient funds") ||
+		strings.Contains(msg, "intrinsic gas too low") ||
+		strings.Contains(msg, "exceeds block gas limit") ||
+		strings.Contains(msg, "invalid sender") ||
+		strings.Contains(msg, "oversized data") ||
+		strings.Contains(msg, "nonce too high") ||
+		strings.Contains(msg, "max priority fee per gas higher than max fee per gas")
 }
 
 func isNonceTooLowErr(err error) bool {
@@ -451,37 +502,49 @@ func isNonceTooLowErr(err error) bool {
 	return strings.Contains(strings.ToLower(err.Error()), "nonce too low")
 }
 
-func (r *EvmRpc) observeSentTx(tx *etypes.Transaction, sendErr error) {
+func clonePendingEvmTx(p *pendingEvmTx) *pendingEvmTx {
+	if p == nil {
+		return nil
+	}
+	return &pendingEvmTx{
+		nonce:     p.nonce,
+		gasPrice:  cloneBigInt(p.gasPrice),
+		tipCap:    cloneBigInt(p.tipCap),
+		feeCap:    cloneBigInt(p.feeCap),
+		isDynamic: p.isDynamic,
+	}
+}
+
+func toCommonPendingEvmTx(p *pendingEvmTx) *common.PendingEvmTx {
+	if p == nil {
+		return nil
+	}
+	return &common.PendingEvmTx{
+		Nonce:     p.nonce,
+		GasPrice:  cloneBigInt(p.gasPrice),
+		TipCap:    cloneBigInt(p.tipCap),
+		FeeCap:    cloneBigInt(p.feeCap),
+		IsDynamic: p.isDynamic,
+	}
+}
+
+// recordPendingTxAttempt durably records tx's nonce and fee watermark BEFORE
+// broadcast so a process crash or dropped connection after node acceptance
+// cannot erase the watermark. Returns a snapshot of the previous entry (for
+// rollback on definitive pre-mempool rejections) and whether tx is tracked.
+func (r *EvmRpc) recordPendingTxAttempt(tx *etypes.Transaction) (*pendingEvmTx, bool, error) {
 	key, ok := evmTxKeyFromTx(tx)
 	if !ok {
-		return
+		return nil, false, nil
 	}
-	var store common.PendingEvmTxStore
-	var toSave *common.PendingEvmTx
-	var shouldDelete bool
-
 	r.txMu.Lock()
-	store = r.pendingTxStore
-	if isNonceTooLowErr(sendErr) {
-		if prev := r.pendingTx[key]; prev != nil && prev.nonce <= tx.Nonce() {
-			delete(r.pendingTx, key)
-		}
-		shouldDelete = true
-		r.txMu.Unlock()
-		if store != nil && shouldDelete {
-			if err := store.DeletePendingEvmTx(key.sender, key.contract, key.kind); err != nil {
-				r.logger.Debugf("failed to delete pending EVM tx record: %v", err)
-			}
-		}
-		return
-	}
-	if !shouldTrackPendingTxErr(sendErr) {
-		r.txMu.Unlock()
-		return
-	}
 	if r.pendingTx == nil {
 		r.pendingTx = make(map[evmTxKey]*pendingEvmTx)
 	}
+	prev := r.pendingTx[key]
+	prevSnapshot := clonePendingEvmTx(prev)
+	store := r.pendingTxStore
+
 	entry := &pendingEvmTx{
 		nonce:     tx.Nonce(),
 		isDynamic: tx.Type() == etypes.DynamicFeeTxType,
@@ -492,10 +555,10 @@ func (r *EvmRpc) observeSentTx(tx *etypes.Transaction, sendErr error) {
 	} else {
 		entry.gasPrice = cloneBigInt(tx.GasPrice())
 	}
-	if prev := r.pendingTx[key]; prev != nil {
+	if prev != nil {
 		if prev.nonce > entry.nonce {
 			r.txMu.Unlock()
-			return
+			return prevSnapshot, true, nil
 		}
 		if prev.nonce == entry.nonce {
 			entry.gasPrice = maxBigInt(prev.gasPrice, entry.gasPrice)
@@ -503,21 +566,73 @@ func (r *EvmRpc) observeSentTx(tx *etypes.Transaction, sendErr error) {
 			entry.feeCap = maxBigInt(prev.feeCap, entry.feeCap)
 		}
 	}
+	toSave := toCommonPendingEvmTx(entry)
 	r.pendingTx[key] = entry
-	if store != nil {
-		toSave = &common.PendingEvmTx{
-			Nonce:     entry.nonce,
-			GasPrice:  cloneBigInt(entry.gasPrice),
-			TipCap:    cloneBigInt(entry.tipCap),
-			FeeCap:    cloneBigInt(entry.feeCap),
-			IsDynamic: entry.isDynamic,
-		}
-	}
 	r.txMu.Unlock()
 
-	if store != nil && toSave != nil {
+	if store != nil {
 		if err := store.SavePendingEvmTx(key.sender, key.contract, key.kind, toSave); err != nil {
-			r.logger.Debugf("failed to persist pending EVM tx record: %v", err)
+			r.txMu.Lock()
+			if r.pendingTx[key] == entry {
+				if prevSnapshot != nil {
+					r.pendingTx[key] = prevSnapshot
+				} else {
+					delete(r.pendingTx, key)
+				}
+			}
+			r.txMu.Unlock()
+			r.logger.Errorf("failed to persist pending EVM tx record before broadcast: %v", err)
+			return nil, false, fmt.Errorf("persist pending EVM tx before broadcast: %w", err)
+		}
+	}
+	return prevSnapshot, true, nil
+}
+
+// reconcileSentTx updates or rolls back the pre-broadcast watermark based on
+// the broadcast outcome. Ambiguous failures (EOF, timeouts, connection resets)
+// and mempool pricing/duplicate errors keep the persisted watermark.
+func (r *EvmRpc) reconcileSentTx(tx *etypes.Transaction, prevSnapshot *pendingEvmTx, sendErr error) {
+	if sendErr == nil {
+		return
+	}
+	key, ok := evmTxKeyFromTx(tx)
+	if !ok {
+		return
+	}
+	if isNonceTooLowErr(sendErr) {
+		r.txMu.Lock()
+		store := r.pendingTxStore
+		shouldDelete := false
+		if cur := r.pendingTx[key]; cur != nil && cur.nonce <= tx.Nonce() {
+			delete(r.pendingTx, key)
+			shouldDelete = true
+		}
+		r.txMu.Unlock()
+		if store != nil && shouldDelete {
+			if err := store.DeletePendingEvmTx(key.sender, key.contract, key.kind); err != nil {
+				r.logger.Errorf("failed to delete obsolete pending EVM tx record: %v", err)
+			}
+		}
+		return
+	}
+	if !isDefinitivePreMempoolRejection(sendErr) {
+		return
+	}
+	r.txMu.Lock()
+	store := r.pendingTxStore
+	if prevSnapshot != nil {
+		r.pendingTx[key] = clonePendingEvmTx(prevSnapshot)
+	} else if cur := r.pendingTx[key]; cur != nil && cur.nonce == tx.Nonce() {
+		delete(r.pendingTx, key)
+	}
+	r.txMu.Unlock()
+	if store != nil {
+		if prevSnapshot != nil {
+			if err := store.SavePendingEvmTx(key.sender, key.contract, key.kind, toCommonPendingEvmTx(prevSnapshot)); err != nil {
+				r.logger.Errorf("failed to restore previous pending EVM tx record: %v", err)
+			}
+		} else if err := store.DeletePendingEvmTx(key.sender, key.contract, key.kind); err != nil {
+			r.logger.Errorf("failed to roll back rejected pending EVM tx record: %v", err)
 		}
 	}
 }
@@ -583,15 +698,29 @@ func (r *EvmRpc) lookupPendingTx(key evmTxKey, confirmedNonce, pendingNonce uint
 }
 
 // hasOtherTrackedNonceInRange reports whether another tracked action for the
-// same sender currently owns a pending nonce in [low, high).
-func (r *EvmRpc) hasOtherTrackedNonceInRange(key evmTxKey, low, high uint64) bool {
+// same sender currently owns a pending nonce in [confirmedNonce, pendingNonce).
+// It loads and reconciles persisted records for all tracked action kinds so
+// the first action after a restart cannot steal a nonce owned by another
+// persisted pending action.
+func (r *EvmRpc) hasOtherTrackedNonceInRange(key evmTxKey, confirmedNonce, pendingNonce uint64, havePending bool) bool {
+	for _, otherKind := range []string{evmTxKindHalt, evmTxKindSetTss} {
+		if otherKind == key.kind {
+			continue
+		}
+		otherKey := evmTxKey{sender: key.sender, contract: key.contract, kind: otherKind}
+		if other := r.lookupPendingTx(otherKey, confirmedNonce, pendingNonce, havePending); other != nil {
+			if other.nonce >= confirmedNonce && other.nonce < pendingNonce {
+				return true
+			}
+		}
+	}
 	r.txMu.Lock()
 	defer r.txMu.Unlock()
 	for k, entry := range r.pendingTx {
 		if k == key || k.sender != key.sender || entry == nil {
 			continue
 		}
-		if entry.nonce >= low && entry.nonce < high {
+		if entry.nonce >= confirmedNonce && entry.nonce < pendingNonce {
 			return true
 		}
 	}
@@ -628,12 +757,12 @@ func (r *EvmRpc) buildContractTx(sender ecommon.Address, contractAddress *ecommo
 	if prev != nil {
 		nonce = prev.nonce
 	} else if havePending && pendingNonce > confirmedNonce {
-		// Only advance to pendingNonce when another in-process action for this
-		// sender owns an active nonce in [confirmedNonce, pendingNonce).
-		// Otherwise (e.g. after a restart without a persisted record), recover
-		// ownership of confirmedNonce so we replace rather than queue behind
-		// our own stuck transaction.
-		if r.hasOtherTrackedNonceInRange(key, confirmedNonce, pendingNonce) {
+		// Only advance to pendingNonce when another tracked action (in memory
+		// or persisted across restarts) for this sender owns an active nonce
+		// in [confirmedNonce, pendingNonce). Otherwise recover ownership of
+		// confirmedNonce so we replace rather than queue behind our own stuck
+		// transaction.
+		if r.hasOtherTrackedNonceInRange(key, confirmedNonce, pendingNonce, havePending) {
 			nonce = pendingNonce
 		}
 	}
@@ -1172,6 +1301,97 @@ func (r *EvmRpc) AnySecondaryHasReceipt(txHash ecommon.Hash) (bool, error) {
 		}
 		if res.err != nil {
 			return false, fmt.Errorf("endpoint #%d receipt check failed: %w", idx, res.err)
+		}
+		if res.found {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// AnySecondaryHasUnwrapLog corroborates absence of an Unwrapped source log
+// across every secondary endpoint in [fromBlock, toBlock]. Scanning backwards
+// from toBlock down to fromBlock in FilterQuerySize chunks finds recent logs
+// quickly. Returns (true, nil) if any secondary serves a matching Unwrapped
+// log (even when its receipt index is pruned), (false, err) if any secondary
+// cannot serve the log range definitively, and (false, nil) only when every
+// secondary confirms the log is absent across the full range.
+func (r *EvmRpc) AnySecondaryHasUnwrapLog(parent context.Context, fromBlock, toBlock uint64, txHash ecommon.Hash, logIndex uint32) (bool, error) {
+	if toBlock < fromBlock {
+		return false, nil
+	}
+	baseIndex := logIndex
+	if baseIndex >= common.AffiliateLogIndexAddition {
+		baseIndex -= common.AffiliateLogIndexAddition
+	}
+	step := r.filterQuerySize
+	if step == 0 {
+		step = defaultFilterQuerySize
+	}
+	urls := r.Urls.Urls
+	type logAnswer struct {
+		found bool
+		err   error
+	}
+	results := make([]logAnswer, len(urls))
+	var wg sync.WaitGroup
+	for idx := range urls {
+		if uint32(idx) == r.Urls.CurrentUrlIndex {
+			continue
+		}
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			var found bool
+			var scanErr error
+			for end := toBlock; ; {
+				if parent != nil && parent.Err() != nil {
+					scanErr = parent.Err()
+					break
+				}
+				start := fromBlock
+				if end > fromBlock && end-fromBlock >= step {
+					start = end - step + 1
+				}
+				query := ethereum.FilterQuery{
+					FromBlock: new(big.Int).SetUint64(start),
+					ToBlock:   new(big.Int).SetUint64(end),
+					Addresses: []ecommon.Address{r.bridgeAddress},
+					Topics:    [][]ecommon.Hash{{common.UnwrapSigHash}},
+				}
+				err := r.callEndpoint(idx, func(ctx context.Context, client *ethclient.Client) error {
+					logs, err := client.FilterLogs(ctx, query)
+					if err != nil {
+						return err
+					}
+					for i := range logs {
+						l := &logs[i]
+						if !l.Removed && l.TxHash == txHash && uint32(l.Index) == baseIndex {
+							found = true
+							return nil
+						}
+					}
+					return nil
+				})
+				if err != nil {
+					scanErr = errors.New(config.RedactErrorForURL(err, urls[idx]))
+					break
+				}
+				if found || start == fromBlock {
+					break
+				}
+				end = start - 1
+			}
+			results[idx] = logAnswer{found: found, err: scanErr}
+		}(idx)
+	}
+	wg.Wait()
+	for idx, res := range results {
+		if uint32(idx) == r.Urls.CurrentUrlIndex {
+			continue
+		}
+		if res.err != nil {
+			return false, fmt.Errorf("endpoint #%d unwrap log check failed: %w", idx, res.err)
 		}
 		if res.found {
 			return true, nil

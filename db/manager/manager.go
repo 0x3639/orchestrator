@@ -11,6 +11,7 @@ import (
 	"orchestrator/db/unwrap"
 	"orchestrator/db/wrap"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 )
@@ -21,6 +22,7 @@ type Manager struct {
 	// key is the chainId of the network
 	evmMu      sync.RWMutex
 	evmStorage map[uint32]db.EvmStorage
+	evmClosers map[uint32]func() error
 	stopChan   chan os.Signal
 	logger     *zap.SugaredLogger
 }
@@ -48,10 +50,16 @@ func NewDbManager(stop chan os.Signal) (*Manager, error) {
 		redeemIncidents: redeemIncidents,
 		znnStorage:      znnStorage,
 		evmStorage:      make(map[uint32]db.EvmStorage),
+		evmClosers:      make(map[uint32]func() error),
 		stopChan:        stop,
 		logger:          newLogger,
 	}
 	return newDbManager, nil
+}
+
+func queueDirExists(name string) bool {
+	info, err := os.Stat(filepath.Join(common.DefaultDataDir(), common.DefaultQueuesDirs, name))
+	return err == nil && info.IsDir()
 }
 
 // AddEvmEventStore returns a rollback for a network that fails to start.
@@ -61,25 +69,26 @@ func (m *Manager) AddEvmEventStore(chainId uint32, name string, contractDeployme
 	return rollback, err
 }
 
-// AddEvmEventStoreForContract opens an EVM event store bound to contractAddress.
-// Existing deployments whose contract has not changed keep using events/<name>
-// and queues/<name>. When a same-name network rotates to a new contract address,
-// the previous LevelDB directory is left untouched on disk to retain historical
-// evidence and a fresh contract-scoped directory (<name>-<contractHex>) is opened
-// for both LevelDB and the unconfirmed queue.
+// AddEvmEventStoreForContract opens an EVM event store with verified provenance
+// for contractAddress. Fresh stores or stores already bound to contractAddress
+// keep using events/<name> and queues/<name>. When a same-name network rotates
+// to a new contract address, or when an existing pre-upgrade store/queue is
+// populated without a contract-address marker, the previous LevelDB directory
+// is left untouched on disk to retain historical evidence and a contract-scoped
+// directory (<name>-<contractHex>) is opened for both LevelDB and the queue.
 func (m *Manager) AddEvmEventStoreForContract(chainId uint32, name string, contractDeploymentHeight uint64, contractAddress ecommon.Address) (string, func(), error) {
 	storageName := name
 	ldb, err := storage.CreateOrOpenLevelDb(storageName)
 	if err != nil {
 		return "", nil, err
 	}
-	matches, err := unwrap.BindContractAddress(ldb, contractAddress)
+	matches, err := unwrap.BindContractAddress(ldb, contractAddress, queueDirExists(storageName))
 	if err != nil {
 		_ = ldb.Close()
 		return "", nil, err
 	}
 	if !matches {
-		// Retain the old contract's LevelDB intact on disk and isolate the new
+		// Retain the old or unmarked store intact on disk and isolate the
 		// contract's scan cursor, unwrap rows, and queue under a scoped name.
 		if err := ldb.Close(); err != nil {
 			return "", nil, err
@@ -89,7 +98,7 @@ func (m *Manager) AddEvmEventStoreForContract(chainId uint32, name string, contr
 		if err != nil {
 			return "", nil, err
 		}
-		scopedMatches, err := unwrap.BindContractAddress(ldb, contractAddress)
+		scopedMatches, err := unwrap.BindContractAddress(ldb, contractAddress, false)
 		if err != nil {
 			_ = ldb.Close()
 			return "", nil, err
@@ -98,28 +107,58 @@ func (m *Manager) AddEvmEventStoreForContract(chainId uint32, name string, contr
 			_ = ldb.Close()
 			return "", nil, fmt.Errorf("contract-scoped store %s bound to a different contract address", storageName)
 		}
-		m.logger.Infof("EVM network %s (%d) rotated to bridge contract %s; retaining previous store %s and opening contract-scoped store %s",
-			name, chainId, contractAddress.Hex(), name, storageName)
+		m.logger.Infof("EVM network %s (%d) isolated to contract-scoped store %s for bridge contract %s; previous store %s retained on disk",
+			name, chainId, storageName, contractAddress.Hex(), name)
 	}
 	store := unwrap.NewEvmStorage(zdb.NewLevelDBWrapper(ldb), m.stopChan, contractDeploymentHeight)
+	var closeOnce sync.Once
+	closeDB := func() error {
+		var closeErr error
+		closeOnce.Do(func() {
+			closeErr = ldb.Close()
+		})
+		return closeErr
+	}
 	m.evmMu.Lock()
+	if m.evmClosers == nil {
+		m.evmClosers = make(map[uint32]func() error)
+	}
 	previous := m.evmStorage[chainId]
+	prevCloser := m.evmClosers[chainId]
 	m.evmStorage[chainId] = store
+	m.evmClosers[chainId] = closeDB
 	m.evmMu.Unlock()
 	return storageName, func() {
 		m.evmMu.Lock()
 		if m.evmStorage[chainId] == store {
 			if previous != nil {
 				m.evmStorage[chainId] = previous
+				m.evmClosers[chainId] = prevCloser
 			} else {
 				delete(m.evmStorage, chainId)
+				delete(m.evmClosers, chainId)
 			}
 		}
 		m.evmMu.Unlock()
-		if err := ldb.Close(); err != nil {
+		if err := closeDB(); err != nil {
 			m.logger.Error(err)
 		}
 	}, nil
+}
+
+// RemoveEvmEventStore detaches and closes the active LevelDB handle for
+// chainId so its backing directory can be safely removed without leaving an
+// open handle behind or affecting any retained pre-rotation store.
+func (m *Manager) RemoveEvmEventStore(chainId uint32) error {
+	m.evmMu.Lock()
+	delete(m.evmStorage, chainId)
+	closeDB := m.evmClosers[chainId]
+	delete(m.evmClosers, chainId)
+	m.evmMu.Unlock()
+	if closeDB != nil {
+		return closeDB()
+	}
+	return nil
 }
 
 func (m *Manager) RedeemIncidents() *wrap.RedeemIncidentStore {

@@ -107,6 +107,9 @@ type evmNetwork struct {
 	// finalUnchecked is set when the last Sync held a final registration,
 	// above its redeem checkpoint limit, that it could not check.
 	finalUnchecked atomic.Bool
+	// storageName is the resolved LevelDB and queue directory name for this
+	// network (either network.Name or <name>-<contractHex> after rotation).
+	storageName string
 }
 
 // agreedHashForLog returns the endpoint-agreed canonical hash at number,
@@ -178,6 +181,7 @@ func NewEvmNetwork(network *definition.NetworkInfo, dbManager networkEventStores
 
 	newEvmNetwork := &evmNetwork{
 		rollbackStore:     rollback,
+		storageName:       storageName,
 		EvmParams:         newConfig,
 		health:            state.HealthStore(),
 		dbManager:         dbManager,
@@ -193,6 +197,15 @@ func NewEvmNetwork(network *definition.NetworkInfo, dbManager networkEventStores
 	}
 
 	return newEvmNetwork, nil
+}
+
+// StorageName returns the resolved directory name backing this network's
+// LevelDB event store and unconfirmed queue.
+func (eN *evmNetwork) StorageName() string {
+	if eN.storageName != "" {
+		return eN.storageName
+	}
+	return eN.NetworkName()
 }
 
 // SetBackfillBlocks asks Start to rewind the sync cursor once by the given

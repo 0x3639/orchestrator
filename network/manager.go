@@ -168,6 +168,7 @@ func (m *NetworksManager) Init(networksInfo map[string]config.BaseNetworkConfig,
 			// scanning, its calls fail on the stopped client instead of
 			// finding none.
 			newEvmNetwork.client = newRpcManager.Evm(network.Id)
+			newEvmNetwork.client.SetStorageName(newEvmNetwork.StorageName())
 			if txStore, ok := dbManager.EvmStorage(network.Id).(common.PendingEvmTxStore); ok {
 				newEvmNetwork.client.SetPendingTxStore(txStore)
 			}
