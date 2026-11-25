@@ -687,6 +687,17 @@ func (r *EvmRpc) recordPendingTxAttempt(tx *etypes.Transaction) (*pendingAttempt
 	if r.nonceStack == nil {
 		r.nonceStack = make(map[evmNonceKey][]*pendingAttempt)
 	}
+	if prevSnapshot != nil && prevSnapshot.nonce != entry.nonce {
+		prevNk := evmNonceKey{sender: key.sender, contract: key.contract, nonce: prevSnapshot.nonce}
+		if len(r.nonceStack[prevNk]) == 0 {
+			r.nonceStack[prevNk] = append(r.nonceStack[prevNk], &pendingAttempt{
+				kind:   key.kind,
+				txHash: prevSnapshot.txHash,
+				nonce:  prevSnapshot.nonce,
+				entry:  prevSnapshot,
+			})
+		}
+	}
 	if len(r.nonceStack[nk]) == 0 {
 		if deleteOther && otherSnapshot != nil {
 			r.nonceStack[nk] = append(r.nonceStack[nk], &pendingAttempt{
@@ -721,6 +732,43 @@ func (r *EvmRpc) recordPendingTxAttempt(tx *etypes.Transaction) (*pendingAttempt
 	return attempt, true, nil
 }
 
+// findFallbackOwnerLocked scans r.nonceStack across all nonces != excludeNonce
+// for (sender, contract) and returns the highest-nonce surviving top owner
+// matching kind. Caller must hold r.pendingMu.
+func (r *EvmRpc) findFallbackOwnerLocked(sender, contract ecommon.Address, kind string, excludeNonce uint64) *pendingAttempt {
+	var best *pendingAttempt
+	for nk, st := range r.nonceStack {
+		if nk.sender != sender || nk.contract != contract || nk.nonce == excludeNonce {
+			continue
+		}
+		var top *pendingAttempt
+		for i := len(st) - 1; i >= 0; i-- {
+			if !st[i].rejected {
+				top = st[i]
+				break
+			}
+		}
+		if top == nil || top.kind != kind {
+			continue
+		}
+		if best == nil || top.nonce > best.nonce {
+			best = top
+		}
+	}
+	return best
+}
+
+// pruneConfirmedNonceStacksLocked discards nonce-lineage stacks for nonces
+// already confirmed on-chain so rollbacks never restore a mined transaction.
+// Caller must hold r.pendingMu.
+func (r *EvmRpc) pruneConfirmedNonceStacksLocked(sender, contract ecommon.Address, confirmedNonce uint64) {
+	for nk := range r.nonceStack {
+		if nk.sender == sender && nk.contract == contract && nk.nonce < confirmedNonce {
+			delete(r.nonceStack, nk)
+		}
+	}
+}
+
 // reconcileSentTx updates or rolls back the pre-broadcast watermark based on
 // the broadcast outcome. Both setTss and halt attempts for a nonce share one
 // lineage stack under pendingMu so:
@@ -730,7 +778,7 @@ func (r *EvmRpc) recordPendingTxAttempt(tx *etypes.Transaction) (*pendingAttempt
 //     never mutates durable storage while a newer owner is active.
 //   - When the top attempt is definitively rejected, ALL trailing rejected
 //     attempts across both actions unwind together in one atomic batch,
-//     restoring only the last viable owner (or clearing the nonce if none).
+//     reconciling surviving ownership across nonces before deleting any slot.
 func (r *EvmRpc) reconcileSentTx(tx *etypes.Transaction, attempt *pendingAttempt, sendErr error) {
 	if attempt == nil {
 		return
@@ -756,6 +804,7 @@ func (r *EvmRpc) reconcileSentTx(tx *etypes.Transaction, attempt *pendingAttempt
 
 	if isNonceTooLowErr(sendErr) {
 		attempt.rejected = true
+		r.pruneConfirmedNonceStacksLocked(key.sender, key.contract, tx.Nonce()+1)
 		r.txMu.Lock()
 		store := r.pendingTxStore
 		cur := r.pendingTx[key]
@@ -769,9 +818,6 @@ func (r *EvmRpc) reconcileSentTx(tx *etypes.Transaction, attempt *pendingAttempt
 				r.logger.Errorf("failed to delete obsolete pending EVM tx record: %v", err)
 				return
 			}
-		}
-		if len(stack) > 0 && stack[len(stack)-1] == attempt {
-			delete(r.nonceStack, nk)
 		}
 		r.txMu.Lock()
 		if cur := r.pendingTx[key]; cur != nil && (cur.nonce < tx.Nonce() || (cur.nonce == tx.Nonce() && cur.txHash == tx.Hash())) {
@@ -819,21 +865,28 @@ func (r *EvmRpc) reconcileSentTx(tx *etypes.Transaction, attempt *pendingAttempt
 		return
 	}
 
+	// Reconcile surviving ownership across nonces before deleting key's slot:
+	// if key.kind has no surviving attempt at tx.Nonce(), check whether an
+	// earlier accepted/viable attempt of key.kind still survives at another
+	// nonce (e.g. setTss(5) whose restore was deferred while setTss(6) ran).
+	var keyReplacement *pendingAttempt
+	var otherReplacement *pendingAttempt
+	if surviving != nil && surviving.kind == key.kind {
+		keyReplacement = surviving
+	} else {
+		keyReplacement = r.findFallbackOwnerLocked(key.sender, key.contract, key.kind, tx.Nonce())
+		if surviving != nil && (curOther == nil || curOther.nonce <= surviving.nonce) {
+			otherReplacement = surviving
+		}
+	}
+
 	var ops []common.PendingEvmTxOp
-	restoreOther := false
-	if surviving == nil {
+	if keyReplacement != nil {
 		ops = append(ops, common.PendingEvmTxOp{
 			Sender:   key.sender,
 			Contract: key.contract,
 			Kind:     key.kind,
-			Record:   nil,
-		})
-	} else if surviving.kind == key.kind {
-		ops = append(ops, common.PendingEvmTxOp{
-			Sender:   key.sender,
-			Contract: key.contract,
-			Kind:     key.kind,
-			Record:   toCommonPendingEvmTx(surviving.entry),
+			Record:   toCommonPendingEvmTx(keyReplacement.entry),
 		})
 	} else {
 		ops = append(ops, common.PendingEvmTxOp{
@@ -842,17 +895,14 @@ func (r *EvmRpc) reconcileSentTx(tx *etypes.Transaction, attempt *pendingAttempt
 			Kind:     key.kind,
 			Record:   nil,
 		})
-		// Only restore the competing action key if no newer reservation already
-		// occupies it at a higher nonce.
-		if curOther == nil || curOther.nonce <= surviving.nonce {
-			restoreOther = true
-			ops = append(ops, common.PendingEvmTxOp{
-				Sender:   key.sender,
-				Contract: key.contract,
-				Kind:     surviving.kind,
-				Record:   toCommonPendingEvmTx(surviving.entry),
-			})
-		}
+	}
+	if otherReplacement != nil {
+		ops = append(ops, common.PendingEvmTxOp{
+			Sender:   key.sender,
+			Contract: key.contract,
+			Kind:     otherReplacement.kind,
+			Record:   toCommonPendingEvmTx(otherReplacement.entry),
+		})
 	}
 	if store != nil {
 		if err := store.ApplyPendingEvmTxBatch(ops); err != nil {
@@ -866,15 +916,13 @@ func (r *EvmRpc) reconcileSentTx(tx *etypes.Transaction, attempt *pendingAttempt
 		r.nonceStack[nk] = remaining
 	}
 	r.txMu.Lock()
-	if surviving == nil {
-		delete(r.pendingTx, key)
-	} else if surviving.kind == key.kind {
-		r.pendingTx[key] = clonePendingEvmTx(surviving.entry)
+	if keyReplacement != nil {
+		r.pendingTx[key] = clonePendingEvmTx(keyReplacement.entry)
 	} else {
 		delete(r.pendingTx, key)
-		if restoreOther {
-			r.pendingTx[otherKey] = clonePendingEvmTx(surviving.entry)
-		}
+	}
+	if otherReplacement != nil {
+		r.pendingTx[otherKey] = clonePendingEvmTx(otherReplacement.entry)
 	}
 	r.txMu.Unlock()
 }
@@ -982,7 +1030,10 @@ func (r *EvmRpc) ClearObsoleteHaltTxContext(parent context.Context, sender ecomm
 		return err
 	}
 	if rec.nonce < confirmedNonce {
-		r.clearPendingTxIfMatches(key, rec)
+		r.pendingMu.Lock()
+		r.pruneConfirmedNonceStacksLocked(sender, r.bridgeAddress, confirmedNonce)
+		r.clearPendingTxIfMatchesLocked(key, rec)
+		r.pendingMu.Unlock()
 		return nil
 	}
 	pendingNonce, err := r.PendingNonceAtContext(parent, sender)
@@ -1012,6 +1063,7 @@ func (r *EvmRpc) lookupPendingTx(key evmTxKey, confirmedNonce, pendingNonce uint
 	r.pendingMu.Lock()
 	defer r.pendingMu.Unlock()
 
+	r.pruneConfirmedNonceStacksLocked(key.sender, key.contract, confirmedNonce)
 	if _, err := r.loadPendingTxLocked(key); err != nil {
 		return nil, err
 	}
@@ -1044,6 +1096,7 @@ func (r *EvmRpc) otherTrackedNonces(key evmTxKey, confirmedNonce uint64) (maxNex
 	r.pendingMu.Lock()
 	defer r.pendingMu.Unlock()
 
+	r.pruneConfirmedNonceStacksLocked(key.sender, key.contract, confirmedNonce)
 	for _, otherKind := range []string{evmTxKindHalt, evmTxKindSetTss} {
 		if otherKind == key.kind {
 			continue

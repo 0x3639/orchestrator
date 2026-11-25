@@ -3202,14 +3202,16 @@ func TestLateUnknownUnwrapLowRateLimitCachesPrechecksAndAdvancesLogCorroboration
 
 func TestLateUnknownUnwrapRevalidatesCanonicalAgreementAndHashAfterMultiBatchCorroboration(t *testing.T) {
 	for _, tc := range []struct {
-		name           string
-		disagreeBatch2 bool
-		reorgHash      bool
-		gainReceipt    bool
+		name              string
+		disagreeBatch2    bool
+		reorgHash         bool
+		shallowReorgLog18 bool
+		gainReceipt       bool
 	}{
-		{"endpoints disagree at requiredHeight before second batch", true, false, false},
-		{"reorg changes canonical hash at requiredHeight before second batch", false, true, false},
-		{"secondary gains receipt before second batch finishes", false, false, true},
+		{"endpoints disagree at obsHead before second batch", true, false, false, false},
+		{"reorg changes canonical hash before second batch", false, true, false, false},
+		{"shallow reorg above requiredHeight introduces source log while requiredHeight hash stays unchanged", false, false, true, false},
+		{"secondary gains receipt before second batch finishes", false, false, false, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Setenv("HOME", t.TempDir())
@@ -3219,6 +3221,44 @@ func TestLateUnknownUnwrapRevalidatesCanonicalAgreementAndHashAfterMultiBatchCor
 			l.redeemableIn.Store(30)
 
 			var batch2 atomic.Bool
+			shallowLog := etypes.Log{
+				Address:     b.contract,
+				Topics:      []ecommon.Hash{common.EvmContractAbi.Events["Swapped"].ID},
+				BlockNumber: 18,
+				BlockHash:   ecommon.BigToHash(big.NewInt(18 + 777)),
+				TxHash:      ecommon.Hash(b.request.TransactionHash),
+				Index:       uint(b.request.LogIndex),
+			}
+			blockHashFor := func(num uint64, isSecondary bool) ecommon.Hash {
+				offset := uint64(10)
+				if batch2.Load() {
+					switch {
+					case tc.disagreeBatch2 && isSecondary:
+						offset = 555
+					case tc.reorgHash:
+						offset = 999
+					case tc.shallowReorgLog18 && num >= 18:
+						// Block 15 (requiredHeight) keeps its original hash; only blocks 18..20 reorg.
+						offset = 777
+					}
+				}
+				return ecommon.BigToHash(new(big.Int).SetUint64(num + offset))
+			}
+			logsFor := func(params []json.RawMessage) []etypes.Log {
+				if !tc.shallowReorgLog18 || !batch2.Load() || len(params) == 0 {
+					return []etypes.Log{}
+				}
+				var q struct {
+					FromBlock *hexutil.Uint64 `json:"fromBlock"`
+					ToBlock   *hexutil.Uint64 `json:"toBlock"`
+				}
+				if json.Unmarshal(params[0], &q) == nil && q.FromBlock != nil && q.ToBlock != nil {
+					if uint64(*q.FromBlock) <= 18 && uint64(*q.ToBlock) >= 18 {
+						return []etypes.Log{shallowLog}
+					}
+				}
+				return []etypes.Log{}
+			}
 			primaryURL := replayServerWithErrors(t, func(method string, params []json.RawMessage) (interface{}, *replayRPCError) {
 				switch method {
 				case "stats.syncInfo":
@@ -3232,15 +3272,11 @@ func TestLateUnknownUnwrapRevalidatesCanonicalAgreementAndHashAfterMultiBatchCor
 				case "eth_getBlockByNumber":
 					var number hexutil.Uint64
 					_ = json.Unmarshal(params[0], &number)
-					offset := uint64(10)
-					if tc.reorgHash && batch2.Load() {
-						offset = 999
-					}
-					return map[string]interface{}{"number": number, "hash": ecommon.BigToHash(new(big.Int).SetUint64(uint64(number) + offset))}, nil
+					return map[string]interface{}{"number": number, "hash": blockHashFor(uint64(number), false)}, nil
 				case "eth_getTransactionReceipt":
 					return nil, nil
 				case "eth_getLogs":
-					return []etypes.Log{}, nil
+					return logsFor(params), nil
 				}
 				if result, ok := l.ledger.Load().answer(t, method, params); ok {
 					return result, nil
@@ -3256,15 +3292,7 @@ func TestLateUnknownUnwrapRevalidatesCanonicalAgreementAndHashAfterMultiBatchCor
 				case "eth_getBlockByNumber":
 					var number hexutil.Uint64
 					_ = json.Unmarshal(params[0], &number)
-					offset := uint64(10)
-					if batch2.Load() {
-						if tc.disagreeBatch2 {
-							offset = 555
-						} else if tc.reorgHash {
-							offset = 999
-						}
-					}
-					return map[string]interface{}{"number": number, "hash": ecommon.BigToHash(new(big.Int).SetUint64(uint64(number) + offset))}, nil
+					return map[string]interface{}{"number": number, "hash": blockHashFor(uint64(number), true)}, nil
 				case "eth_getTransactionReceipt":
 					if tc.gainReceipt && batch2.Load() {
 						return map[string]interface{}{
@@ -3277,7 +3305,7 @@ func TestLateUnknownUnwrapRevalidatesCanonicalAgreementAndHashAfterMultiBatchCor
 					}
 					return nil, nil
 				case "eth_getLogs":
-					return []etypes.Log{}, nil
+					return logsFor(params), nil
 				default:
 					return nil, nil
 				}
@@ -3314,21 +3342,29 @@ func TestLateUnknownUnwrapRevalidatesCanonicalAgreementAndHashAfterMultiBatchCor
 			eN.scanned.Store(true)
 			l.n.networkManager = &NetworksManager{znnNetwork: l.n, evmNetworks: []*evmNetwork{eN}, logger: zap.NewNop().Sugar()}
 
-			// Batch 1: endpoints agree at block 15 and complete chunks 1..2.
+			// Batch 1: endpoints agree across [1..20] and complete chunks [11..20].
 			if err := l.listen(); err == nil {
 				t.Fatal("expected batch 1 hold after first 2 chunks")
 			}
 			l.expect("after batch 1", common.LiveState, 1)
 
-			// Mutate endpoint agreement / canonical hash / receipt before batch 2.
+			// Mutate endpoint agreement / canonical hash / shallow reorg / receipt before batch 2.
 			batch2.Store(true)
 
-			// Batch 2 MUST revalidate and hold in LiveState instead of falsely
-			// entering EmergencyState on stale batch-1 agreement.
+			// Batch 2 MUST revalidate at obsHead and hold in LiveState instead of
+			// falsely entering EmergencyState on stale batch-1 coverage.
 			if err := l.listen(); err == nil {
 				t.Fatal("expected batch 2 to hold instead of escalating on stale corroboration")
 			}
 			l.expect("after stale batch 2", common.LiveState, 1)
+
+			if tc.shallowReorgLog18 {
+				// Batch 3 starts fresh from obsHead 20 and discovers the reorged log at block 18!
+				if err := l.listen(); err == nil {
+					t.Fatal("expected batch 3 to detect reorged source log at block 18 and hold")
+				}
+				l.expect("after shallow reorg rescan", common.LiveState, 1)
+			}
 		})
 	}
 }

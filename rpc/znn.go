@@ -216,7 +216,10 @@ func (r *ZnnRpc) prepareTransactionContext(ctx context.Context, tx *nom.AccountB
 		if err != nil {
 			return err
 		}
-		nonceFound := pow.GetPoWNonce(new(big.Int).SetUint64(powResp.RequiredDifficulty), powData)
+		nonceFound, err := getPoWNonceContext(ctx, new(big.Int).SetUint64(powResp.RequiredDifficulty), powData)
+		if err != nil {
+			return err
+		}
 		tx.Nonce = nom.DeSerializeNonce(nonceFound)
 	} else {
 		tx.FusedPlasma = powResp.BasePlasma
@@ -231,6 +234,51 @@ func (r *ZnnRpc) prepareTransactionContext(ctx context.Context, tx *nom.AccountB
 	tx.Hash = tx.ComputeHash()
 	tx.Signature = keyPair.Sign(tx.Hash.Bytes())
 	return nil
+}
+
+// getPoWNonceContext computes the same PoW nonce as go-zenon/pow.GetPoWNonce
+// while polling ctx.Err() periodically so cancelling an emergency halt or key
+// rotation aborts local proof-of-work promptly instead of blocking.
+func getPoWNonceContext(ctx context.Context, difficulty *big.Int, dataHash types.Hash) ([]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	threshold := pow.GetThresholdByDifficulty(difficulty)
+	target := pow.Uint64ToByteArray(threshold)
+	rng := wallet.GetEntropyCSPRNG(8)
+	calc := make([]byte, 40)
+	copy(calc[:8], rng[:8])
+	copy(calc[8:], dataHash[:])
+	for iter := 0; ; iter++ {
+		if iter&0xfff == 0 {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+		}
+		h := zcrypto.Hash(calc)
+		// Same LittleEndian comparison as go-zenon/pow.greaterDifficulty.
+		ge := true
+		for i := 7; i >= 0; i-- {
+			if h[i] > target[i] {
+				break
+			}
+			if h[i] < target[i] {
+				ge = false
+				break
+			}
+		}
+		if ge {
+			out := make([]byte, 8)
+			copy(out, calc[:8])
+			return out, nil
+		}
+		for i := 0; i < 8; i++ {
+			calc[i]++
+			if calc[i] != 0 {
+				break
+			}
+		}
+	}
 }
 
 // PublishTransaction publishes a block that prepareTransaction made.

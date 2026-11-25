@@ -2890,7 +2890,7 @@ func (rC *znnNetwork) lateUnknownUnwrapCovered(ctx context.Context, evm *rpc.Evm
 		return false
 	}
 	if !canonicalOK {
-		hash, err := evm.CanonicalHash(requiredHeight)
+		hash, err := evm.CanonicalHash(obsHead)
 		if err != nil {
 			return false
 		}
@@ -2918,9 +2918,11 @@ func (rC *znnNetwork) lateUnknownUnwrapCovered(ctx context.Context, evm *rpc.Evm
 		}
 	}
 	// Whenever any cached precheck was reused across retries (so low-rate
-	// endpoints never starve log chunks), revalidate canonical hash agreement,
-	// endpoint heads, and receipt absence before escalating. If the canonical
-	// hash changed (reorg), reset corroboration and re-verify.
+	// endpoints never starve log chunks), revalidate canonical hash agreement
+	// at obsHead (covering the full corroborated range, including any shallow
+	// reorg above requiredHeight), endpoint heads, and receipt absence before
+	// escalating. If the canonical hash changed (reorg), reset corroboration
+	// and re-verify.
 	if usedCachedPrechecks {
 		minHead, maxHead, err := evm.EndpointHeads()
 		if err != nil || minHead < obsHead || maxHead-minHead > depth {
@@ -2929,7 +2931,7 @@ func (rC *znnNetwork) lateUnknownUnwrapCovered(ctx context.Context, evm *rpc.Evm
 			}
 			return false
 		}
-		currentHash, err := evm.CanonicalHash(requiredHeight)
+		currentHash, err := evm.CanonicalHash(obsHead)
 		if err != nil {
 			return false
 		}

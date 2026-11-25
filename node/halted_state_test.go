@@ -1838,3 +1838,178 @@ func TestSignKeyGenMessagesContextSkipsCeremonyIfCancelledBeforeStart(t *testing
 		t.Fatalf("cancelled keygen signing goroutine invoked ceremony %d times, want 0", hookCalls.Load())
 	}
 }
+
+func TestUnsignedStaleEvmSlotDoesNotBlockSignedEvmHalt(t *testing.T) {
+	oldKey, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	newKey, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldAddr := crypto.PubkeyToAddress(oldKey.PublicKey)
+	newAddr := crypto.PubkeyToAddress(newKey.PublicKey)
+	oldCompressed := base64.StdEncoding.EncodeToString(crypto.CompressPubkey(&oldKey.PublicKey))
+	newCompressed := base64.StdEncoding.EncodeToString(crypto.CompressPubkey(&newKey.PublicKey))
+
+	c1 := ecommon.HexToAddress("0x8181818181818181818181818181818181818181")
+	c2 := ecommon.HexToAddress("0x8282828282828282828282828282828282828282")
+
+	zMock := &partialRotateZenon{
+		compressedTss: newCompressed,
+		evmContracts: []*definition.NetworkInfo{
+			{NetworkClass: definition.EvmClass, Id: 1, Name: "eth-unsigned-first", ContractAddress: c1.Hex()},
+			{NetworkClass: definition.EvmClass, Id: 2, Name: "eth-signed-second", ContractAddress: c2.Hex()},
+		},
+	}
+	znnSrv := server.NewServer()
+	if err := znnSrv.RegisterName("embedded.bridge", zMock); err != nil {
+		t.Fatal(err)
+	}
+	znnHTTP := httptest.NewServer(znnSrv.WebsocketHandler([]string{"*"}))
+	t.Cleanup(func() { znnSrv.Stop(); znnHTTP.Close() })
+
+	var chain1Nonce atomic.Uint64
+	chain1Nonce.Store(4)
+	var chain2Halted atomic.Bool
+	var chain2Sends atomic.Int32
+
+	makeEvm := func(chainID uint64, tssAddr ecommon.Address, nonceFn func() uint64, halted *atomic.Bool, sends *atomic.Int32) *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			var req struct {
+				ID     json.RawMessage   `json:"id"`
+				Method string            `json:"method"`
+				Params []json.RawMessage `json:"params"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&req)
+			resp := map[string]interface{}{"jsonrpc": "2.0", "id": req.ID}
+			switch req.Method {
+			case "eth_chainId":
+				resp["result"] = hexutil.EncodeUint64(chainID)
+			case "eth_blockNumber":
+				resp["result"] = hexutil.EncodeUint64(100)
+			case "eth_getBalance":
+				resp["result"] = (*hexutil.Big)(new(big.Int).Mul(big.NewInt(10), big.NewInt(1e18)))
+			case "eth_getTransactionCount":
+				resp["result"] = hexutil.EncodeUint64(1)
+			case "eth_getBlockByNumber":
+				resp["result"] = map[string]interface{}{
+					"number":        hexutil.EncodeUint64(100),
+					"hash":          ecommon.HexToHash("0x11"),
+					"baseFeePerGas": (*hexutil.Big)(big.NewInt(20_000_000_000)),
+				}
+			case "eth_maxPriorityFeePerGas":
+				resp["result"] = (*hexutil.Big)(big.NewInt(2_000_000_000))
+			case "eth_estimateGas":
+				resp["result"] = hexutil.EncodeUint64(100_000)
+			case "eth_sendRawTransaction":
+				if sends != nil {
+					sends.Add(1)
+				}
+				if halted != nil {
+					halted.Store(true)
+				}
+				resp["result"] = ecommon.HexToHash("0xbeef").Hex()
+			case "eth_call":
+				var call struct {
+					Data  hexutil.Bytes `json:"data"`
+					Input hexutil.Bytes `json:"input"`
+				}
+				_ = json.Unmarshal(req.Params[0], &call)
+				sel := append(call.Data, call.Input...)
+				switch {
+				case len(sel) >= 4 && string(sel[:4]) == string(common.EvmContractAbi.Methods["tss"].ID):
+					resp["result"] = ecommon.BytesToHash(tssAddr.Bytes()).Hex()
+				case len(sel) >= 4 && string(sel[:4]) == string(common.EvmContractAbi.Methods["actionsNonce"].ID):
+					resp["result"] = ecommon.BigToHash(new(big.Int).SetUint64(nonceFn())).Hex()
+				default:
+					if halted != nil && halted.Load() {
+						resp["result"] = "0x" + strings.Repeat("0", 63) + "1"
+					} else {
+						resp["result"] = "0x" + strings.Repeat("0", 64)
+					}
+				}
+			default:
+				resp["result"] = "0x" + strings.Repeat("0", 64)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(resp)
+		}))
+	}
+	// Slot 0 holds newAddr (failed/unsigned group); slot 1 holds oldAddr (signed group).
+	evm1 := makeEvm(1, newAddr, chain1Nonce.Load, nil, nil)
+	t.Cleanup(evm1.Close)
+	evm2 := makeEvm(2, oldAddr, func() uint64 { return 7 }, &chain2Halted, &chain2Sends)
+	t.Cleanup(evm2.Close)
+
+	stopChan := make(chan os.Signal, 1)
+	stateVal := common.EmergencyState
+	gs := common.NewGlobalState(&stateVal)
+	t.Setenv("HOME", t.TempDir())
+	nm, err := network.NewNetworksManager(stopChan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dbMgr, err := manager.NewDbManager(stopChan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nets := map[string]config.BaseNetworkConfig{
+		common.ZenonNetworkName: {Urls: []string{"ws" + strings.TrimPrefix(znnHTTP.URL, "http")}},
+		"eth-unsigned-first":    {Urls: []string{evm1.URL}},
+		"eth-signed-second":     {Urls: []string{evm2.URL}},
+	}
+	if err := nm.Init(nets, dbMgr, gs, func(*common.BridgeMetadata) {}); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { nm.Stop() })
+
+	evmBatch, _, signedEvmNonces, signedEvmTss, err := nm.GetHaltMessagesWithState()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Mutate slot 0's (unsigned) action nonce BEFORE sending slot 1's signed halt!
+	chain1Nonce.Store(5)
+
+	producerPub := []byte("test-producer-pubkey-32-bytes!!!")
+	producerPubB64 := base64.StdEncoding.EncodeToString(producerPub)
+	node := &Node{
+		config:          &config.Config{TssConfig: config.TssManagerConfig{PublicKey: oldCompressed, LocalPubKeys: []string{producerPubB64}}},
+		networksManager: nm,
+		dbManager:       dbMgr,
+		producerKeyPair: &wallet.KeyPair{Public: producerPub},
+		ecdsaPrivateKey: oldKey,
+		evmAddress:      oldAddr,
+		state:           gs,
+		stopChan:        stopChan,
+		logger:          zap.NewNop().Sugar(),
+	}
+	// Slot 0 is unsigned (failed group); slot 1 is signed.
+	plan := &emergencyHaltPlan{
+		evmFullSignatures: [][]byte{nil, make([]byte, 65)},
+		evmParticipants:   [][]string{nil, {producerPubB64}},
+		hasFailedGroups:   true,
+	}
+	// Ensure signed slot is at index 1 regardless of map iteration order in batch.
+	if signedEvmTss[0] == oldAddr {
+		plan.evmFullSignatures = [][]byte{make([]byte, 65), nil}
+		plan.evmParticipants = [][]string{{producerPubB64}, nil}
+	}
+
+	done := make(chan bool, 1)
+	go func() {
+		done <- node.publishEmergencyHalt(evmBatch, plan, newCompressed, 1, signedEvmTss, signedEvmNonces)
+	}()
+	select {
+	case aborted := <-done:
+		if !aborted {
+			t.Fatal("expected publishEmergencyHalt to return aborted=true to retry failed group")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("publishEmergencyHalt timed out")
+	}
+	if chain2Sends.Load() == 0 || !chain2Halted.Load() {
+		t.Fatalf("unsigned slot 0's nonce change blocked signed slot 1 from halting: sends=%d halted=%v", chain2Sends.Load(), chain2Halted.Load())
+	}
+}

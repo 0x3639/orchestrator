@@ -1163,9 +1163,8 @@ func (m *NetworksManager) SendHaltEvmWithExpected(batch EvmBatch, signatures [][
 
 // SendHaltEvmWithExpectedContext behaves like SendHaltEvmWithExpected while
 // propagating ctx through every RPC read, transaction build, and broadcast.
-// Any network whose signature slot is empty (because this node does not hold
-// that chain's active TSS key during a split rotation) is checked for halt
-// status and key/nonce staleness without attempting a submission.
+// Staleness checks are applied per signed target so an unsigned or stale slot
+// in the batch never blocks another signed target from sending its halt.
 func (m *NetworksManager) SendHaltEvmWithExpectedContext(ctx context.Context, batch EvmBatch, signatures [][]byte, expectedTss []ecommon.Address, expectedNonces []*big.Int, ecdsaPrivateKey *ecdsa.PrivateKey, evmAddress ecommon.Address, while WhileEmergency) (bool, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -1179,6 +1178,7 @@ func (m *NetworksManager) SendHaltEvmWithExpectedContext(ctx context.Context, ba
 	}
 	// true means that all evm networks are halted
 	ok := true
+	var staleErr error
 	for _, target := range targets {
 		if err := ctx.Err(); err != nil {
 			return false, err
@@ -1200,6 +1200,10 @@ func (m *NetworksManager) SendHaltEvmWithExpectedContext(ctx context.Context, ba
 			}
 			continue
 		}
+		ok = false
+		if len(signatures[idx]) == 0 {
+			continue
+		}
 		if idx < len(expectedTss) && expectedTss[idx] != (ecommon.Address{}) {
 			curTss, err := network.GetCurrentTssContext(ctx)
 			if err != nil {
@@ -1207,11 +1211,13 @@ func (m *NetworksManager) SendHaltEvmWithExpectedContext(ctx context.Context, ba
 					return false, ctx.Err()
 				}
 				m.logger.Errorf("cannot read current TSS of EVM network %d: %v", network.ChainId(), err)
-				ok = false
 				continue
 			}
 			if curTss != expectedTss[idx] {
-				return false, fmt.Errorf("%w: EVM network %d TSS changed from %s to %s", ErrHaltSignaturesStale, network.ChainId(), expectedTss[idx].Hex(), curTss.Hex())
+				if staleErr == nil {
+					staleErr = fmt.Errorf("%w: EVM network %d TSS changed from %s to %s", ErrHaltSignaturesStale, network.ChainId(), expectedTss[idx].Hex(), curTss.Hex())
+				}
+				continue
 			}
 		}
 		if idx < len(expectedNonces) && expectedNonces[idx] != nil {
@@ -1221,16 +1227,14 @@ func (m *NetworksManager) SendHaltEvmWithExpectedContext(ctx context.Context, ba
 					return false, ctx.Err()
 				}
 				m.logger.Errorf("cannot read action nonce of EVM network %d: %v", network.ChainId(), err)
-				ok = false
 				continue
 			}
 			if curNonce.Cmp(expectedNonces[idx]) != 0 {
-				return false, fmt.Errorf("%w: EVM network %d action nonce changed from %s to %s", ErrHaltSignaturesStale, network.ChainId(), expectedNonces[idx].String(), curNonce.String())
+				if staleErr == nil {
+					staleErr = fmt.Errorf("%w: EVM network %d action nonce changed from %s to %s", ErrHaltSignaturesStale, network.ChainId(), expectedNonces[idx].String(), curNonce.String())
+				}
+				continue
 			}
-		}
-		ok = false
-		if len(signatures[idx]) == 0 {
-			continue
 		}
 		tx, err := network.GetHaltEvmTxContext(ctx, signatures[idx], evmAddress)
 		if err != nil {
@@ -1259,6 +1263,9 @@ func (m *NetworksManager) SendHaltEvmWithExpectedContext(ctx context.Context, ba
 			return false, ErrEmergencyEnded
 		}
 		break
+	}
+	if staleErr != nil {
+		return false, staleErr
 	}
 	return ok, nil
 }
