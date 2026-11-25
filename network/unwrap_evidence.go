@@ -40,6 +40,53 @@ func (eN *evmNetwork) verifyUnwrapTransfer(req *events.UnwrapRequestEvm, restore
 	return err
 }
 
+// verifyUnwrapForSigning checks one row selected for a signing ceremony
+// against the source chain, and fills in the block and sender of a row
+// restored without them. The signing loop runs outside this network's
+// workers, so useMu is held for the whole check: a runtime RemoveNetwork
+// waits for it before it closes the store and removes the client, and a check
+// that starts after the network was detached returns context.Canceled instead
+// of reading or writing a closed store. Nothing called from here may take
+// useMu again, or it would wait behind the removal that waits for this check.
+func (eN *evmNetwork) verifyUnwrapForSigning(req *events.UnwrapRequestEvm) error {
+	eN.useMu.RLock()
+	defer eN.useMu.RUnlock()
+	if eN.detached {
+		return fmt.Errorf("unwrap %s/%d cannot be signed: %w", req.TransactionHash, req.LogIndex, context.Canceled)
+	}
+	candidate := *req
+	if candidate.BlockHash == (ecommon.Hash{}) {
+		// A receipt is a locator only. The canonical hash, finality depth and
+		// transfer below still require agreement from all configured endpoints.
+		receipt, err := eN.EvmRpc().TransactionReceipt(candidate.TransactionHash)
+		if err != nil {
+			return fmt.Errorf("unwrap %s/%d cannot be signed: locating its source block: %w", req.TransactionHash, req.LogIndex, err)
+		}
+		if receipt == nil || receipt.TxHash != candidate.TransactionHash || receipt.BlockNumber == nil || !receipt.BlockNumber.IsUint64() ||
+			receipt.BlockHash == (ecommon.Hash{}) || (candidate.BlockNumber != 0 && candidate.BlockNumber != receipt.BlockNumber.Uint64()) {
+			return fmt.Errorf("unwrap %s/%d cannot be signed: no matching source block", req.TransactionHash, req.LogIndex)
+		}
+		candidate.BlockNumber, candidate.BlockHash = receipt.BlockNumber.Uint64(), receipt.BlockHash
+	}
+	canonical, err := eN.EvmRpc().CanonicalHash(candidate.BlockNumber)
+	if err != nil {
+		return fmt.Errorf("unwrap %s/%d cannot be signed: %w", req.TransactionHash, req.LogIndex, err)
+	}
+	if canonical != candidate.BlockHash {
+		return fmt.Errorf("unwrap %s/%d cannot be signed: its block was replaced", req.TransactionHash, req.LogIndex)
+	}
+	if err := eN.verifyUnwrapTransfer(&candidate, true); err != nil {
+		return fmt.Errorf("unwrap %s/%d cannot be signed: %w", req.TransactionHash, req.LogIndex, err)
+	}
+	if candidate.BlockHash != req.BlockHash || candidate.From != req.From {
+		if err := eN.eventsStore().HydrateUnsignedUnwrap(*req, candidate); err != nil {
+			return err
+		}
+		*req = candidate
+	}
+	return nil
+}
+
 // Bind the decision to the block and the entire event so that it cannot be
 // reused for a replacement block or a different transfer payload.
 func affiliateEvidenceKey(log etypes.Log) ecommon.Hash {
