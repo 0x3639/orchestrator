@@ -2179,6 +2179,10 @@ func (rC *znnNetwork) GetFrontierMomentum() (*api.Momentum, error) {
 	return rC.ZnnRpc().GetFrontierMomentum()
 }
 
+func (rC *znnNetwork) GetFrontierMomentumContext(ctx context.Context) (*api.Momentum, error) {
+	return rC.ZnnRpc().GetFrontierMomentumContext(ctx)
+}
+
 func (rC *znnNetwork) GetAllPillars() (*embedded.PillarInfoList, error) {
 	return rC.ZnnRpc().GetAllPillars()
 }
@@ -2193,10 +2197,6 @@ func (rC *znnNetwork) GetAllWrapTokenRequests(pageIndex, pageSize uint32) (*embe
 
 func (rC *znnNetwork) GetAllWrapTokenRequestsContext(ctx context.Context, pageIndex, pageSize uint32) (*embedded.WrapTokenRequestList, error) {
 	return rC.ZnnRpc().GetAllWrapTokenRequestsContext(ctx, pageIndex, pageSize)
-}
-
-func (rC *znnNetwork) GetFrontierAccountBlockContext(ctx context.Context, address types.Address) (*api.AccountBlock, error) {
-	return rC.ZnnRpc().GetFrontierAccountBlockContext(ctx, address)
 }
 
 func (rC *znnNetwork) GetUnwrapTokenRequestByHashAndLog(txHash types.Hash, logIndex uint32) (*definition.UnwrapTokenRequest, error) {
@@ -2327,6 +2327,20 @@ func (rC *znnNetwork) MarkWrapRequestSignatureSent(id types.Hash, expectedSignat
 
 func (rC *znnNetwork) SetResignStatus(id types.Hash, status bool) error {
 	return rC.eventsStore().SetResignStatus(id, status)
+}
+
+func (rC *znnNetwork) PublishResignWraps(wraps []*definition.WrapTokenRequest) error {
+	if len(wraps) == 0 {
+		return nil
+	}
+	eventsBatch := make([]events.WrapRequestZnn, 0, len(wraps))
+	for _, w := range wraps {
+		if w == nil {
+			continue
+		}
+		eventsBatch = append(eventsBatch, wrapEvent(w))
+	}
+	return rC.eventsStore().PublishResignWraps(eventsBatch)
 }
 
 func (rC *znnNetwork) GetResignStatus(id types.Hash) (bool, error) {

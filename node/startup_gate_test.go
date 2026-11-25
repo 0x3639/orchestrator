@@ -88,6 +88,10 @@ func (*startupLedger) GetFrontierAccountBlock(types.Address) (*api.AccountBlock,
 	return &api.AccountBlock{AccountBlock: nom.AccountBlock{Height: 1, Hash: types.Hash{1}, Amount: big.NewInt(0)}}, nil
 }
 
+func (*startupLedger) GetFrontierMomentum() (*api.Momentum, error) {
+	return &api.Momentum{Momentum: &nom.Momentum{Height: 100, Hash: types.Hash{1}}}, nil
+}
+
 // startupNode is a signer with the bridge above and no EVM network, in the
 // given state, whose startup is not complete.
 func startupNode(t *testing.T, state uint8) (*Node, *startupBridge) {

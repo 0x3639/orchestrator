@@ -856,6 +856,10 @@ func (m *NetworksManager) SetResignStatus(id types.Hash, status bool) error {
 	return m.znnNetwork.SetResignStatus(id, status)
 }
 
+func (m *NetworksManager) PublishResignWraps(wraps []*definition.WrapTokenRequest) error {
+	return m.znnNetwork.PublishResignWraps(wraps)
+}
+
 func (m *NetworksManager) GetResignStatus(id types.Hash) (bool, error) {
 	return m.znnNetwork.GetResignStatus(id)
 }

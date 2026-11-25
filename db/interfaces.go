@@ -97,4 +97,7 @@ type ZnnStorage interface {
 
 	GetResignStatus(types.Hash) (bool, error)
 	SetResignStatus(types.Hash, bool) error
+	// PublishResignWraps atomically stores any missing wrap rows and marks all
+	// still-unredeemed wraps in the batch for re-signing in one durable write.
+	PublishResignWraps([]events.WrapRequestZnn) error
 }

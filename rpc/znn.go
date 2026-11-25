@@ -263,16 +263,7 @@ func (r *ZnnRpc) GetWrapTokenRequestById(id types.Hash) (*definition.WrapTokenRe
 	return r.rpcClient.BridgeApi.GetWrapTokenRequestById(id)
 }
 
-// GetWrapTokenRequestByIdContext reads one wrap request by ID using a
-// context-bound connection and preserves ConfirmationsToFinality from the RPC
-// reply. A null reply decodes as (nil, nil); a reply missing
-// confirmationsToFinality or required wrap fields returns an error so an
-// unfinalized or malformed record is never treated as finalized.
-func (r *ZnnRpc) GetWrapTokenRequestByIdContext(ctx context.Context, id types.Hash) (*embedded.WrapTokenRequest, error) {
-	var raw json.RawMessage
-	if err := r.settingsClient.CallContext(ctx, &raw, "embedded.bridge.getWrapTokenRequestById", id); err != nil {
-		return nil, err
-	}
+func decodeWrapTokenRequestWithFinality(raw json.RawMessage) (*embedded.WrapTokenRequest, error) {
 	if len(raw) == 0 || string(raw) == "null" {
 		return nil, nil
 	}
@@ -296,6 +287,19 @@ func (r *ZnnRpc) GetWrapTokenRequestByIdContext(ctx context.Context, id types.Ha
 		WrapTokenRequest:        wrap,
 		ConfirmationsToFinality: *finality.ConfirmationsToFinality,
 	}, nil
+}
+
+// GetWrapTokenRequestByIdContext reads one wrap request by ID using a
+// context-bound connection and preserves ConfirmationsToFinality from the RPC
+// reply. A null reply decodes as (nil, nil); a reply missing or nulling
+// confirmationsToFinality or required wrap fields returns an error so an
+// unfinalized or malformed record is never treated as finalized.
+func (r *ZnnRpc) GetWrapTokenRequestByIdContext(ctx context.Context, id types.Hash) (*embedded.WrapTokenRequest, error) {
+	var raw json.RawMessage
+	if err := r.settingsClient.CallContext(ctx, &raw, "embedded.bridge.getWrapTokenRequestById", id); err != nil {
+		return nil, err
+	}
+	return decodeWrapTokenRequestWithFinality(raw)
 }
 
 // RedeemWrapRequestById is the source lookup of the redeem check. That check
@@ -345,20 +349,43 @@ func (r *ZnnRpc) GetAllWrapTokenRequests(pageIndex, pageSize uint32) (*embedded.
 	return r.rpcClient.BridgeApi.GetAllWrapTokenRequests(pageIndex, pageSize)
 }
 
+// GetAllWrapTokenRequestsContext reads one page of wrap requests using a
+// context-bound connection with strict decoding: null pages, missing/negative
+// counts, null entries, and entries with omitted or null
+// confirmationsToFinality are rejected as errors.
 func (r *ZnnRpc) GetAllWrapTokenRequestsContext(ctx context.Context, pageIndex, pageSize uint32) (*embedded.WrapTokenRequestList, error) {
-	var list *embedded.WrapTokenRequestList
-	if err := r.settingsClient.CallContext(ctx, &list, "embedded.bridge.getAllWrapTokenRequests", pageIndex, pageSize); err != nil {
+	var raw json.RawMessage
+	if err := r.settingsClient.CallContext(ctx, &raw, "embedded.bridge.getAllWrapTokenRequests", pageIndex, pageSize); err != nil {
 		return nil, err
 	}
-	return list, nil
-}
-
-func (r *ZnnRpc) GetFrontierAccountBlockContext(ctx context.Context, address types.Address) (*api.AccountBlock, error) {
-	var block *api.AccountBlock
-	if err := r.settingsClient.CallContext(ctx, &block, "ledger.getFrontierAccountBlock", address); err != nil {
+	if len(raw) == 0 || string(raw) == "null" {
+		return nil, errors.New("missing Zenon wrap token request page")
+	}
+	var page struct {
+		Count *int              `json:"count"`
+		List  []json.RawMessage `json:"list"`
+	}
+	if err := json.Unmarshal(raw, &page); err != nil {
 		return nil, err
 	}
-	return block, nil
+	if page.Count == nil || *page.Count < 0 {
+		return nil, errors.New("wrap token request page with missing or negative count")
+	}
+	list := make([]*embedded.WrapTokenRequest, 0, len(page.List))
+	for _, itemRaw := range page.List {
+		wrap, err := decodeWrapTokenRequestWithFinality(itemRaw)
+		if err != nil {
+			return nil, err
+		}
+		if wrap == nil {
+			return nil, errors.New("wrap token request page contains null entry")
+		}
+		list = append(list, wrap)
+	}
+	return &embedded.WrapTokenRequestList{
+		Count: *page.Count,
+		List:  list,
+	}, nil
 }
 
 func (r *ZnnRpc) GetAccountBlockByHash(hash types.Hash) (*api.AccountBlock, error) {

@@ -643,10 +643,23 @@ func (gs *GlobalState) DeactivateResign() (bool, error) {
 // CompleteResign leaves ReSignState for LiveState only if the node is still in
 // ReSignState for the exact request generation that ran the scan.
 func (gs *GlobalState) CompleteResign(generation uint64) (bool, error) {
+	return gs.CompleteResignWith(generation, nil)
+}
+
+// CompleteResignWith runs publish (if non-nil) and leaves ReSignState for
+// LiveState atomically under stateMu only if the node is still in ReSignState
+// for the exact request generation that ran the scan. If publish returns an
+// error, the node stays in ReSignState.
+func (gs *GlobalState) CompleteResignWith(generation uint64, publish func() error) (bool, error) {
 	gs.stateMu.Lock()
 	defer gs.stateMu.Unlock()
 	if gs.RedeemHaltGeneration() != 0 || *gs.state != ReSignState || gs.resignGeneration != generation {
 		return false, nil
+	}
+	if publish != nil {
+		if err := publish(); err != nil {
+			return false, err
+		}
 	}
 	gs.pendingResign = false
 	gs.resignGeneration++

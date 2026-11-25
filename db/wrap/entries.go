@@ -450,3 +450,78 @@ func (es *eventStore) SetResignStatus(id types.Hash, status bool) error {
 	}
 	return nil
 }
+
+// PublishResignWraps atomically persists any missing wrap records and sets
+// their resign flags in a single durable batch. Existing rows keep their stored
+// fields (only filling in a missing signature), and rows that have already
+// moved past UnredeemedStatus are skipped.
+func (es *eventStore) PublishResignWraps(wraps []events.WrapRequestZnn) error {
+	if len(wraps) == 0 {
+		return nil
+	}
+	es.mu.Lock()
+	defer es.mu.Unlock()
+
+	var resignTrue [4]byte
+	binary.LittleEndian.PutUint32(resignTrue[:], 1)
+
+	entries := make([]kvEntry, 0, len(wraps)*2)
+	seen := make(map[types.Hash]struct{}, len(wraps))
+	for _, wrap := range wraps {
+		if _, dup := seen[wrap.Id]; dup {
+			continue
+		}
+		seen[wrap.Id] = struct{}{}
+
+		key := getWrapEventKey(wrap.Id)
+		data, err := es.DB.Get(key)
+		if errors.Is(err, leveldb.ErrNotFound) {
+			serialized, serErr := wrap.Serialize()
+			if serErr != nil {
+				es.SendSigInt()
+				return serErr
+			}
+			entries = append(entries,
+				kvEntry{key: key, value: serialized},
+				kvEntry{key: getResignedStatusKey(wrap.Id), value: resignTrue[:]},
+			)
+			continue
+		}
+		if err != nil {
+			es.SendSigInt()
+			return err
+		}
+		existing, err := es.decodeWrap(data)
+		if err != nil {
+			es.SendSigInt()
+			return err
+		}
+		if existing.RedeemStatus != common.UnredeemedStatus {
+			continue
+		}
+		if existing.Signature == "" && wrap.Signature != "" {
+			rawExisting, err := events.DeserializeWrapEventZnn(data)
+			if err != nil {
+				es.SendSigInt()
+				return err
+			}
+			rawExisting.Signature = wrap.Signature
+			rawExisting.SentSignature = rawExisting.SentSignature || wrap.SentSignature
+			serialized, serErr := rawExisting.Serialize()
+			if serErr != nil {
+				es.SendSigInt()
+				return serErr
+			}
+			entries = append(entries, kvEntry{key: key, value: serialized})
+		}
+		entries = append(entries, kvEntry{key: getResignedStatusKey(wrap.Id), value: resignTrue[:]})
+	}
+	if len(entries) == 0 {
+		return nil
+	}
+	if err := es.putBatchDurable(entries...); err != nil {
+		es.SendSigInt()
+		return err
+	}
+	return nil
+}
