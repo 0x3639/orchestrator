@@ -889,12 +889,28 @@ func (m *NetworksManager) SetWrapRequestSentSignature(id types.Hash, sent bool) 
 	return m.znnNetwork.SetWrapRequestSentSignature(id, sent)
 }
 
+func (m *NetworksManager) SaveSignedWrapRequest(expected events.WrapRequestZnn, signature string) (bool, error) {
+	return m.znnNetwork.SaveSignedWrapRequest(expected, signature)
+}
+
+func (m *NetworksManager) MarkWrapRequestSignatureSent(id types.Hash, expectedSignature string) (bool, error) {
+	return m.znnNetwork.MarkWrapRequestSignatureSent(id, expectedSignature)
+}
+
 func (m *NetworksManager) SetResignStatus(id types.Hash, status bool) error {
 	return m.znnNetwork.SetResignStatus(id, status)
 }
 
+func (m *NetworksManager) PublishResignWraps(wraps []*definition.WrapTokenRequest) error {
+	return m.znnNetwork.PublishResignWraps(wraps)
+}
+
 func (m *NetworksManager) GetResignStatus(id types.Hash) (bool, error) {
 	return m.znnNetwork.GetResignStatus(id)
+}
+
+func (m *NetworksManager) IsPublishedResignWrap(id types.Hash) (bool, error) {
+	return m.znnNetwork.IsPublishedResignWrap(id)
 }
 
 func (m *NetworksManager) GetWrapEventById(id types.Hash) (*events.WrapRequestZnn, error) {
@@ -914,7 +930,7 @@ func (m *NetworksManager) GetUnsentSignedWrapRequests() ([]*events.WrapRequestZn
 }
 
 func (m *NetworksManager) GetUnredeemedWrapRequests() ([]*events.WrapRequestZnn, error) {
-	return m.Znn().GetUnsentSignedWrapRequests()
+	return m.Znn().GetUnredeemedWrapRequests()
 }
 
 func (m *NetworksManager) GetUnsignedWrapRequests() ([]*definition.WrapTokenRequest, error) {
@@ -1764,12 +1780,10 @@ func (m *NetworksManager) SetEvmBackfillBlocks(blocks uint64) {
 func (m *NetworksManager) SetEvmUnwrapRequestSignature(event *events.UnwrapRequestEvm) error {
 	for _, network := range m.networks() {
 		if network.ChainId() == event.ChainId {
-			if err := network.SetUnwrapRequestSignature(event.TransactionHash, event.LogIndex, event.Signature); err != nil {
-				return err
-			}
+			return network.SetUnwrapRequestSignature(event.TransactionHash, event.LogIndex, event.Signature)
 		}
 	}
-	return nil
+	return fmt.Errorf("evm network %d not found", event.ChainId)
 }
 
 func (m *NetworksManager) AddEvmUnwrapRequest(event events.UnwrapRequestEvm) error {

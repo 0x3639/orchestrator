@@ -1,6 +1,11 @@
 package common
 
-import "testing"
+import (
+	"runtime"
+	"sync"
+	"testing"
+	"time"
+)
 
 // A transition that depends on the current state compares and changes it in
 // one step, so it cannot replace a state set in between.
@@ -216,5 +221,261 @@ func TestHaltSigningLeavesAnEmergency(t *testing.T) {
 		if err != nil || halted != tc.halted || state != tc.want {
 			t.Errorf("from %s: halted %v, state %s, err %v; want %s", StateToText(tc.from), halted, StateToText(state), err, StateToText(tc.want))
 		}
+	}
+}
+
+func TestGlobalStateConcurrencyResignAdminAndPoolSize(t *testing.T) {
+	prevPool := GetSignCeremonyPoolSize()
+	t.Cleanup(func() { SetSignCeremonyPoolSize(prevPool) })
+
+	state := LiveState
+	gs := NewGlobalState(&state)
+
+	const workers = 8
+	const iters = 200
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		w := w
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < iters; i++ {
+				if (w+i)%2 == 0 {
+					gs.SetResignNetwork(1, 100)
+					gs.SetIsAdministratorActive(true)
+					SetSignCeremonyPoolSize(25)
+				} else {
+					gs.SetResignNetwork(2, 200)
+					gs.SetIsAdministratorActive(false)
+					SetSignCeremonyPoolSize(50)
+				}
+				class, chain := gs.GetResignNetwork()
+				if !((class == 0 && chain == 0) || (class == 1 && chain == 100) || (class == 2 && chain == 200)) {
+					t.Errorf("torn resign network pair: (%d, %d)", class, chain)
+					return
+				}
+				_ = gs.GetIsAdministratorActive()
+				if got := GetSignCeremonyPoolSize(); got != 25 && got != 50 && got != prevPool {
+					t.Errorf("unexpected pool size: %d", got)
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+
+	// Non-positive pool sizes must be ignored.
+	SetSignCeremonyPoolSize(33)
+	SetSignCeremonyPoolSize(0)
+	SetSignCeremonyPoolSize(-5)
+	if got := GetSignCeremonyPoolSize(); got != 33 {
+		t.Fatalf("non-positive SetSignCeremonyPoolSize changed value to %d, want 33", got)
+	}
+}
+
+func TestResignGenerationPreventsStaleCompletion(t *testing.T) {
+	state := LiveState
+	gs := NewGlobalState(&state)
+
+	if activated, err := gs.ActivateResign(2, 1); err != nil || !activated || state != ReSignState {
+		t.Fatalf("ActivateResign: activated=%v err=%v state=%s", activated, err, StateToText(state))
+	}
+	class, chain, gen1 := gs.GetResignTarget()
+	if class != 2 || chain != 1 || gen1 == 0 {
+		t.Fatalf("target=(%d,%d,%d)", class, chain, gen1)
+	}
+
+	// Retargeting bumps generation so gen1 cannot complete the new request.
+	if _, err := gs.ActivateResign(2, 56); err != nil {
+		t.Fatal(err)
+	}
+	if gs.IsResignGenerationCurrent(gen1) {
+		t.Fatal("gen1 must be stale after retarget")
+	}
+	if completed, err := gs.CompleteResign(gen1); err != nil || completed || state != ReSignState {
+		t.Fatalf("stale gen1 completed retargeted resign: completed=%v err=%v state=%s", completed, err, StateToText(state))
+	}
+
+	_, chain2, gen2 := gs.GetResignTarget()
+	if chain2 != 56 || gen2 == gen1 {
+		t.Fatalf("retarget target chain=%d gen=%d", chain2, gen2)
+	}
+
+	// Deactivate + reactivate on the SAME target bumps generation again.
+	if deactivated, err := gs.DeactivateResign(); err != nil || !deactivated || state != LiveState {
+		t.Fatalf("DeactivateResign: deactivated=%v err=%v state=%s", deactivated, err, StateToText(state))
+	}
+	if activated, err := gs.ActivateResign(2, 56); err != nil || !activated || state != ReSignState {
+		t.Fatalf("reactivate: activated=%v err=%v state=%s", activated, err, StateToText(state))
+	}
+	if gs.IsResignGenerationCurrent(gen2) {
+		t.Fatal("gen2 must be stale after deactivate/reactivate")
+	}
+	if completed, err := gs.CompleteResign(gen2); err != nil || completed || state != ReSignState {
+		t.Fatalf("stale gen2 completed reactivated resign: completed=%v err=%v state=%s", completed, err, StateToText(state))
+	}
+
+	_, _, gen3 := gs.GetResignTarget()
+	if completed, err := gs.CompleteResign(gen3); err != nil || !completed || state != LiveState {
+		t.Fatalf("current gen3 failed to complete: completed=%v err=%v state=%s", completed, err, StateToText(state))
+	}
+}
+
+func TestPendingResignPreservedAcrossProtectedStatesAndInterruptions(t *testing.T) {
+	// 1. ActivateResign during HaltedState is preserved and applied on resume.
+	state := HaltedState
+	gs := NewGlobalState(&state)
+	if activated, err := gs.ActivateResign(2, 56); err != nil || activated || state != HaltedState {
+		t.Fatalf("during HaltedState: activated=%v err=%v state=%s", activated, err, StateToText(state))
+	}
+	if changed, err := gs.SetStateIf(HaltedState, LiveState); err != nil || !changed || state != ReSignState {
+		t.Fatalf("resume from HaltedState: changed=%v err=%v state=%s, want ReSignState", changed, err, StateToText(state))
+	}
+	if class, chain := gs.GetResignNetwork(); class != 2 || chain != 56 {
+		t.Fatalf("preserved resign target = (%d, %d), want (2, 56)", class, chain)
+	}
+
+	// 2. Halt interrupting active ReSignState preserves it until unhalted.
+	if err := gs.SetState(HaltedState); err != nil {
+		t.Fatal(err)
+	}
+	if changed, err := gs.SetStateIf(HaltedState, LiveState); err != nil || !changed || state != ReSignState {
+		t.Fatalf("resume after interrupted ReSignState: changed=%v err=%v state=%s, want ReSignState", changed, err, StateToText(state))
+	}
+
+	// 3. DeactivateResign during KeyGenState cancels a pending resign.
+	state = KeyGenState
+	gs = NewGlobalState(&state)
+	if _, err := gs.ActivateResign(2, 1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := gs.DeactivateResign(); err != nil {
+		t.Fatal(err)
+	}
+	if changed, err := gs.SetStateIf(KeyGenState, LiveState); err != nil || !changed || state != LiveState {
+		t.Fatalf("after cancelled pending resign: changed=%v err=%v state=%s, want LiveState", changed, err, StateToText(state))
+	}
+
+	// 4. ActivateResign during KeyGenState enters ReSignState when KeyGen finishes.
+	state = KeyGenState
+	gs = NewGlobalState(&state)
+	if _, err := gs.ActivateResign(2, 42); err != nil {
+		t.Fatal(err)
+	}
+	if changed, err := gs.SetStateIf(KeyGenState, LiveState); err != nil || !changed || state != ReSignState {
+		t.Fatalf("after KeyGen with pending resign: changed=%v err=%v state=%s, want ReSignState", changed, err, StateToText(state))
+	}
+	if class, chain := gs.GetResignNetwork(); class != 2 || chain != 42 {
+		t.Fatalf("preserved resign target after KeyGen = (%d, %d), want (2, 42)", class, chain)
+	}
+}
+
+func TestWhileResignGenerationIsSerializesWriteBoundary(t *testing.T) {
+	state := LiveState
+	gs := NewGlobalState(&state)
+	if _, err := gs.ActivateResign(2, 1); err != nil {
+		t.Fatal(err)
+	}
+	_, _, gen1 := gs.GetResignTarget()
+
+	retargetDone := make(chan struct{})
+
+	ran, err := gs.WhileResignGenerationIs(gen1, func() error {
+		// Assert directly that WhileResignGenerationIs holds stateMu during do.
+		if gs.stateMu.TryLock() {
+			gs.stateMu.Unlock()
+			t.Fatal("WhileResignGenerationIs did not hold stateMu during callback")
+		}
+
+		go func() {
+			_, _ = gs.ActivateResign(2, 56)
+			close(retargetDone)
+		}()
+
+		// ActivateResign acquires transferSendMu before blocking on stateMu.
+		// Once transferSendMu.TryLock() fails, ActivateResign is deterministically
+		// inside its critical section waiting on the stateMu held by this callback.
+		deadline := time.Now().Add(5 * time.Second)
+		for gs.transferSendMu.TryLock() {
+			gs.transferSendMu.Unlock()
+			if time.Now().After(deadline) {
+				t.Fatal("timed out waiting for ActivateResign to acquire transferSendMu")
+			}
+			runtime.Gosched()
+		}
+
+		select {
+		case <-retargetDone:
+			t.Fatal("retarget completed while WhileResignGenerationIs callback held stateMu")
+		default:
+		}
+		return nil
+	})
+	if err != nil || !ran {
+		t.Fatalf("first WhileResignGenerationIs: ran=%v err=%v", ran, err)
+	}
+	<-retargetDone
+
+	// Once retarget completed, the stale generation must NOT run the write.
+	staleRan := false
+	ran, err = gs.WhileResignGenerationIs(gen1, func() error {
+		staleRan = true
+		return nil
+	})
+	if err != nil || ran || staleRan {
+		t.Fatalf("stale generation ran write: ran=%v staleRan=%v err=%v", ran, staleRan, err)
+	}
+	if class, chain, gen2 := gs.GetResignTarget(); class != 2 || chain != 56 || gen2 == gen1 {
+		t.Fatalf("post-retarget target = (%d, %d, gen=%d), want (2, 56, !=%d)", class, chain, gen2, gen1)
+	}
+}
+
+func TestRedeemIncidentInterruptsAndResumesReSignWithFreshGeneration(t *testing.T) {
+	state := LiveState
+	gs := NewGlobalState(&state)
+	if err := gs.RestoreRedeemIncidents(&lossyIncidentStore{}); err != nil {
+		t.Fatal(err)
+	}
+	if activated, err := gs.ActivateResign(2, 56); err != nil || !activated || state != ReSignState {
+		t.Fatalf("ActivateResign: activated=%v err=%v state=%s", activated, err, StateToText(state))
+	}
+	_, _, gen1 := gs.GetResignTarget()
+
+	// Report a redeem incident during the active ReSignState scan.
+	if err := gs.ReportRedeemIncident(RedeemIncident{ChainID: 56}); err != nil {
+		t.Fatalf("ReportRedeemIncident failed: %v", err)
+	}
+	if got, _ := gs.GetState(); got != EmergencyState {
+		t.Fatalf("state during redeem incident = %s, want EmergencyState", StateToText(got))
+	}
+	if gs.IsResignGenerationCurrent(gen1) {
+		t.Fatal("gen1 must be invalidated when redeem incident interrupts ReSignState")
+	}
+
+	// Confirm the redeem halt -> HaltedState.
+	redeemGen := gs.RedeemHaltGeneration()
+	if completed, err := gs.CompleteEmergencyHalt(redeemGen, map[uint32]bool{56: true}); err != nil || !completed {
+		t.Fatalf("CompleteEmergencyHalt: completed=%v err=%v", completed, err)
+	}
+	if got, _ := gs.GetState(); got != HaltedState {
+		t.Fatalf("state after confirming redeem halt = %s, want HaltedState", StateToText(got))
+	}
+
+	// Unhalting must resume ReSignState with the same target and a fresh generation.
+	if changed, err := gs.SetStateIf(HaltedState, LiveState); err != nil || !changed {
+		t.Fatalf("unhalt failed: changed=%v err=%v", changed, err)
+	}
+	if got, _ := gs.GetState(); got != ReSignState {
+		t.Fatalf("state after unhalt = %s, want ReSignState", StateToText(got))
+	}
+	class, chain, gen2 := gs.GetResignTarget()
+	if class != 2 || chain != 56 {
+		t.Fatalf("resumed resign target = (%d, %d), want (2, 56)", class, chain)
+	}
+	if gen2 == gen1 {
+		t.Fatalf("expected fresh resign generation after redeem halt resume, still got %d", gen2)
+	}
+	if !gs.IsResignGenerationCurrent(gen2) {
+		t.Fatal("fresh generation gen2 must be current")
 	}
 }

@@ -9,5 +9,8 @@ import (
 // and participant set instead of reading shared mutable fields from TssManager,
 // preventing races with concurrent cancellation or emergency signing.
 func (m *TssManager) BulkSignWithKey(pubKey string, signers []string, messagesBytes [][]byte, algo messages.Algo) (*keysign.Response, error) {
+	if len(signers) == 0 {
+		signers = m.signersForKey(pubKey)
+	}
 	return m.bulkSignWithKey(pubKey, messagesBytes, algo, signers, m.GetJoinPartyVersion())
 }

@@ -1102,6 +1102,8 @@ func TestRuntimeSetNetworkInstallsTokenMappingsBeforeInitialScanAndRollsBackOnEr
 			return nil, &replayRPCError{-32601, "unsupported " + method}
 		}
 	})
+	replayChainIDs.Store(evmOK, uint32(2))
+	t.Cleanup(func() { replayChainIDs.Delete(evmOK) })
 	evmFail := replayServerWithErrors(t, func(method string, params []json.RawMessage) (interface{}, *replayRPCError) {
 		if method == "eth_syncing" {
 			return false, nil

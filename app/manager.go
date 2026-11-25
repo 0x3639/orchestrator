@@ -61,7 +61,7 @@ func (nodeManager *Manager) Start() error {
 	// Listening event closes the node
 	go func() {
 		c := make(chan os.Signal, 1)
-		signal.Notify(c, syscall.SIGINT, syscall.SIGTERM, syscall.SIGKILL)
+		signal.Notify(c, syscall.SIGINT, syscall.SIGTERM)
 		defer signal.Stop(c)
 		<-c
 		nodeManager.logger.Info("Shutting down orchestrator from go func")
@@ -75,7 +75,7 @@ func (nodeManager *Manager) Start() error {
 		for i := 10; i > 0; i-- {
 			<-c
 			if i > 1 {
-				nodeManager.logger.Warn("Please DO NOT interrupt the shutdown process, panic may occur.", zap.String("times", string(rune(i-1))))
+				nodeManager.logger.Warn("Please DO NOT interrupt the shutdown process, panic may occur.", zap.Int("times", i-1))
 			}
 		}
 	}()

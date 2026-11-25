@@ -169,6 +169,8 @@ func TestInterpretUnwrapSelectsLogByIdentity(t *testing.T) {
 				}
 				var result interface{}
 				switch call.Method {
+				case "eth_chainId":
+					result = "0x1"
 				case "stats.syncInfo":
 					result = &protocol.SyncInfo{State: protocol.SyncDone}
 				case "embedded.bridge.getUnwrapTokenRequestByHashAndLog":

@@ -257,10 +257,15 @@ func TestProcessSignaturesWrapSkipsRemovedDestinationNetworkWithoutPanic(t *test
 
 	evmHTTP := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var req struct {
-			ID json.RawMessage `json:"id"`
+			ID     json.RawMessage `json:"id"`
+			Method string          `json:"method"`
 		}
 		_ = json.NewDecoder(r.Body).Decode(&req)
 		w.Header().Set("Content-Type", "application/json")
+		if req.Method == "eth_chainId" {
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"jsonrpc": "2.0", "id": req.ID, "result": "0x1"})
+			return
+		}
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{"jsonrpc": "2.0", "id": req.ID, "result": hexutil.Bytes(make([]byte, 32))})
 	}))
 	t.Cleanup(evmHTTP.Close)

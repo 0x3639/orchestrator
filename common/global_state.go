@@ -70,7 +70,7 @@ type GlobalState struct {
 	frontierMomSemaphore   *semaphore.Weighted
 	lastCeremony           CeremonyWindow
 	roleMu                 sync.RWMutex
-	isAdministratorActive  bool
+	isAdministratorActive  atomic.Bool
 	localProducerAddress   string
 	tokensMap              map[uint32]map[string]string
 	affiliateMu            sync.RWMutex
@@ -87,8 +87,10 @@ type GlobalState struct {
 	// Last applied affiliate network settings per chain, retained across
 	// partial updates so runtime token-pair refreshes can recompute flags.
 	affiliateNetworks    map[uint32]AffiliateNetwork
-	resignNetworkClass   uint32
-	resignNetworkChainId uint32
+	resignNetworkClass   uint32 // guarded by stateMu
+	resignNetworkChainId uint32 // guarded by stateMu
+	resignGeneration     uint64 // guarded by stateMu
+	pendingResign        bool   // guarded by stateMu; set when ActivateResign arrives in a protected state or halt interrupts ReSignState
 }
 
 func NewGlobalState(state *uint8) *GlobalState {
@@ -105,7 +107,6 @@ func NewPersistentGlobalState(state *uint8, persistEmergency func(uint8) error) 
 		state:                    state,
 		frontierMomentumHeight:   0,
 		frontierMomSemaphore:     semaphore.NewWeighted(1),
-		isAdministratorActive:    false,
 		tokensMap:                make(map[uint32]map[string]string),
 		isAffiliateProgramActive: make(map[uint32]map[string]bool),
 		affiliateStartingHeight:  make(map[uint32]uint64),
@@ -138,8 +139,9 @@ func (gs *GlobalState) SetStateIf(expected, newState uint8) (bool, error) {
 	if *gs.state != expected {
 		return false, nil
 	}
+	previous := *gs.state
 	err := gs.setStateLocked(newState)
-	return expected != newState && *gs.state == newState, err
+	return *gs.state != previous, err
 }
 
 func (gs *GlobalState) setStateLocked(newState uint8) error {
@@ -151,18 +153,36 @@ func (gs *GlobalState) setStateLocked(newState uint8) error {
 	if previous == EmergencyState && newState != EmergencyState && newState != HaltedState {
 		return errors.New("emergency halt is still pending")
 	}
+	// If an active re-sign request arrived during KeyGen/Halted/Emergency (or
+	// was interrupted by a halt), enter ReSignState when signing resumes.
+	targetState := newState
+	promotedResign := false
+	if newState == LiveState && (previous == KeyGenState || previous == HaltedState) && gs.pendingResign {
+		targetState = ReSignState
+		promotedResign = true
+	}
 	// A failed write must stop signing in this process and prevent the caller
 	// from checkpointing the receive. A repeated emergency retries persistence.
 	var persistErr error
-	if gs.persistEmergency != nil && (newState == EmergencyState || previous == EmergencyState) {
-		persistErr = gs.persistEmergency(newState)
+	if gs.persistEmergency != nil && (targetState == EmergencyState || previous == EmergencyState) {
+		persistErr = gs.persistEmergency(targetState)
 
-		if persistErr != nil && newState != EmergencyState {
+		if persistErr != nil && targetState != EmergencyState {
 			return persistErr
 		}
 	}
 	gs.emergencyWritePending = persistErr != nil
-	*gs.state = newState
+	if previous == ReSignState && (targetState == HaltedState || targetState == EmergencyState) {
+		// Preserve the interrupted re-sign request so it resumes once unhalted
+		// unless explicitly deactivated meanwhile.
+		gs.pendingResign = true
+		gs.resignGeneration++
+	}
+	if promotedResign {
+		gs.pendingResign = false
+		gs.resignGeneration++
+	}
+	*gs.state = targetState
 	gs.publishStateLocked(oldEffective)
 	return persistErr
 }
@@ -609,15 +629,13 @@ func (gs *GlobalState) GetTokensMap(chainId uint32, ztsOrToken string) string {
 
 func (gs *GlobalState) SetIsAdministratorActive(value bool) {
 	gs.roleMu.Lock()
-	gs.isAdministratorActive = value
+	gs.isAdministratorActive.Store(value)
 	gs.roleMu.Unlock()
 	GlobalLogger.Infof("SetAdministratorActive to : %t", value)
 }
 
 func (gs *GlobalState) GetIsAdministratorActive() bool {
-	gs.roleMu.RLock()
-	defer gs.roleMu.RUnlock()
-	return gs.isAdministratorActive
+	return gs.isAdministratorActive.Load()
 }
 
 // SetLocalProducerAddress records the local orchestrator's Zenon address so
@@ -637,7 +655,7 @@ func (gs *GlobalState) AdminRoleChanged(newAdmin string) bool {
 	if gs.localProducerAddress == "" {
 		return false
 	}
-	return (newAdmin == gs.localProducerAddress) != gs.isAdministratorActive
+	return (newAdmin == gs.localProducerAddress) != gs.isAdministratorActive.Load()
 }
 
 // SetIsAffiliateProgram applies the bridge metadata's affiliate settings.
@@ -783,12 +801,137 @@ func (gs *GlobalState) WhileAffiliateSettingsAre(generation uint64, do func() er
 }
 
 func (gs *GlobalState) GetResignNetwork() (uint32, uint32) {
+	gs.stateMu.Lock()
+	defer gs.stateMu.Unlock()
 	return gs.resignNetworkClass, gs.resignNetworkChainId
 }
 
 func (gs *GlobalState) SetResignNetwork(networkClass, chainId uint32) {
-	gs.resignNetworkClass = networkClass
-	gs.resignNetworkChainId = chainId
+	gs.stateMu.Lock()
+	defer gs.stateMu.Unlock()
+	if gs.resignNetworkClass != networkClass || gs.resignNetworkChainId != chainId {
+		gs.resignNetworkClass = networkClass
+		gs.resignNetworkChainId = chainId
+		gs.resignGeneration++
+	}
+}
+
+// GetResignTarget returns the active re-sign target network and its request
+// generation atomically.
+func (gs *GlobalState) GetResignTarget() (uint32, uint32, uint64) {
+	gs.stateMu.Lock()
+	defer gs.stateMu.Unlock()
+	return gs.resignNetworkClass, gs.resignNetworkChainId, gs.resignGeneration
+}
+
+// IsResignGenerationCurrent reports whether the node is still in ReSignState
+// for the exact request generation that started a scan.
+func (gs *GlobalState) IsResignGenerationCurrent(generation uint64) bool {
+	gs.stateMu.Lock()
+	defer gs.stateMu.Unlock()
+	return gs.effectiveStateLocked() == ReSignState && gs.resignGeneration == generation
+}
+
+// WhileResignGenerationIs runs do under stateMu only if the node is still in
+// ReSignState for generation, and reports whether it ran. A retarget,
+// cancellation, or halt waits for do to finish, so no obsolete re-sign flag
+// can be written after the request changes or ends.
+func (gs *GlobalState) WhileResignGenerationIs(generation uint64, do func() error) (bool, error) {
+	gs.stateMu.Lock()
+	defer gs.stateMu.Unlock()
+	if gs.effectiveStateLocked() != ReSignState || gs.resignGeneration != generation {
+		return false, nil
+	}
+	return true, do()
+}
+
+// ActivateResign enters ReSignState from LiveState (setting the target network
+// and bumping the request generation atomically), or retargets an active
+// ReSignState request by updating the target and bumping the generation.
+// When called in a protected state (HaltedState, KeyGenState, EmergencyState),
+// the current state is preserved and the request is remembered so it applies
+// when signing resumes.
+func (gs *GlobalState) ActivateResign(networkClass, chainId uint32) (bool, error) {
+	unlock := gs.lockTransfersFor(ReSignState)
+	defer unlock()
+	gs.stateMu.Lock()
+	defer gs.stateMu.Unlock()
+	if gs.RedeemHaltGeneration() != 0 {
+		gs.pendingResign = true
+		if gs.resignNetworkClass != networkClass || gs.resignNetworkChainId != chainId {
+			gs.resignNetworkClass = networkClass
+			gs.resignNetworkChainId = chainId
+			gs.resignGeneration++
+		}
+		return false, nil
+	}
+	switch *gs.state {
+	case LiveState:
+		gs.pendingResign = false
+		gs.resignNetworkClass = networkClass
+		gs.resignNetworkChainId = chainId
+		gs.resignGeneration++
+		err := gs.setStateLocked(ReSignState)
+		return *gs.state == ReSignState, err
+	case ReSignState:
+		gs.pendingResign = false
+		if gs.resignNetworkClass != networkClass || gs.resignNetworkChainId != chainId {
+			gs.resignNetworkClass = networkClass
+			gs.resignNetworkChainId = chainId
+			gs.resignGeneration++
+		}
+		return false, nil
+	default:
+		gs.pendingResign = true
+		if gs.resignNetworkClass != networkClass || gs.resignNetworkChainId != chainId {
+			gs.resignNetworkClass = networkClass
+			gs.resignNetworkChainId = chainId
+			gs.resignGeneration++
+		}
+		return false, nil
+	}
+}
+
+// DeactivateResign cancels any pending or active re-sign request, leaving
+// ReSignState for LiveState and bumping the request generation so any
+// in-flight scan stops acting on the ended request.
+func (gs *GlobalState) DeactivateResign() (bool, error) {
+	gs.stateMu.Lock()
+	defer gs.stateMu.Unlock()
+	gs.pendingResign = false
+	if gs.RedeemHaltGeneration() != 0 || *gs.state != ReSignState {
+		return false, nil
+	}
+	gs.resignGeneration++
+	err := gs.setStateLocked(LiveState)
+	return *gs.state == LiveState, err
+}
+
+// CompleteResign leaves ReSignState for LiveState only if the node is still in
+// ReSignState for the exact request generation that ran the scan.
+func (gs *GlobalState) CompleteResign(generation uint64) (bool, error) {
+	return gs.CompleteResignWith(generation, nil)
+}
+
+// CompleteResignWith runs publish (if non-nil) and leaves ReSignState for
+// LiveState atomically under stateMu only if the node is still in ReSignState
+// for the exact request generation that ran the scan. If publish returns an
+// error, the node stays in ReSignState.
+func (gs *GlobalState) CompleteResignWith(generation uint64, publish func() error) (bool, error) {
+	gs.stateMu.Lock()
+	defer gs.stateMu.Unlock()
+	if gs.RedeemHaltGeneration() != 0 || *gs.state != ReSignState || gs.resignGeneration != generation {
+		return false, nil
+	}
+	if publish != nil {
+		if err := publish(); err != nil {
+			return false, err
+		}
+	}
+	gs.pendingResign = false
+	gs.resignGeneration++
+	err := gs.setStateLocked(LiveState)
+	return *gs.state == LiveState, err
 }
 
 // HealthStore returns the optional observer for callers that run without node state.

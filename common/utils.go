@@ -124,15 +124,21 @@ func ZnnUnwrapToOrchestatorUnwrap(event *definition.UnwrapTokenRequest) events.U
 	}
 }
 
-func GetPublicKeyFilePath(dataDir, pubKey string) (string, error) {
+func GetPublicKeyFileName(pubKey string) (string, error) {
 	pubKeyBytes, err := base64.StdEncoding.DecodeString(pubKey)
 	if err != nil {
 		return "", err
 	}
 	pubKeyHex := hex.EncodeToString(pubKeyBytes)
-	fileName := fmt.Sprintf("localstate-%s.json", pubKeyHex)
-	path := filepath.Join(dataDir, fileName)
-	return path, nil
+	return fmt.Sprintf("localstate-%s.json", pubKeyHex), nil
+}
+
+func GetPublicKeyFilePath(dataDir, pubKey string) (string, error) {
+	fileName, err := GetPublicKeyFileName(pubKey)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dataDir, fileName), nil
 }
 
 func DeletePubKeyFile(dataDir, pubKey string) error {

@@ -462,6 +462,7 @@ func subscriptionServer(t *testing.T, answer func(string, []json.RawMessage) (in
 	subscribe func(n int32) (result interface{}, rpcErr *replayRPCError, ok bool)) (string, *atomic.Int32) {
 	t.Helper()
 	subscribes := new(atomic.Int32)
+	var wsURL atomic.Pointer[string]
 	var upgrader websocket.Upgrader
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		conn, err := upgrader.Upgrade(w, r, nil)
@@ -481,6 +482,14 @@ func subscriptionServer(t *testing.T, answer func(string, []json.RawMessage) (in
 			reply := map[string]interface{}{"jsonrpc": "2.0", "id": call.ID}
 			result, rpcErr := interface{}(nil), (*replayRPCError)(nil)
 			switch call.Method {
+			case "eth_chainId":
+				id := uint32(1)
+				if u := wsURL.Load(); u != nil {
+					if v, ok := replayChainIDs.Load(*u); ok {
+						id = v.(uint32)
+					}
+				}
+				result = fmt.Sprintf("0x%x", id)
 			case "eth_subscribe":
 				var ok bool
 				if result, rpcErr, ok = subscribe(subscribes.Add(1)); !ok {
@@ -501,8 +510,14 @@ func subscriptionServer(t *testing.T, answer func(string, []json.RawMessage) (in
 			}
 		}
 	}))
-	t.Cleanup(func() { server.CloseClientConnections(); server.Close() })
-	return "ws" + strings.TrimPrefix(server.URL, "http"), subscribes
+	u := "ws" + strings.TrimPrefix(server.URL, "http")
+	wsURL.Store(&u)
+	t.Cleanup(func() {
+		replayChainIDs.Delete(u)
+		server.CloseClientConnections()
+		server.Close()
+	})
+	return u, subscribes
 }
 
 var heldAdministrator = types.Address{7}
@@ -587,6 +602,7 @@ func (h *heldStart) watch() uint64 {
 // id, as Init does for a network the bridge lists.
 func (h *heldStart) addEvmNetwork(id uint32, url string) *evmNetwork {
 	h.t.Helper()
+	replayChainIDs.Store(url, id)
 	name := fmt.Sprintf("held-start-%d", id)
 	if err := h.n.rpcManager.AddEvmClient(config.BaseNetworkConfig{Urls: []string{url}}, id, name, h.bridge.contract); err != nil {
 		h.t.Fatal(err)
@@ -1734,6 +1750,7 @@ func TestNetworkAddedDuringTheFirstReadIsStartedOnce(t *testing.T) {
 	added := &definition.NetworkInfo{NetworkClass: definition.EvmClass, Id: 2, Name: "held-start-2", ContractAddress: h.bridge.contract.Hex()}
 	h.zenon.change(func(z *heldZenon) { z.networks = map[uint32]*definition.NetworkInfo{2: added} })
 	h.n.dbManager = runtimeHeldStores{h.stores, h.stop}
+	replayChainIDs.Store(second.url, added.Id)
 	h.n.networksInfo = map[string]config.BaseNetworkConfig{added.Name: {Urls: []string{second.url}}}
 	data, err := definition.ABIBridge.PackMethod(definition.SetNetworkMethodName, added.NetworkClass, added.Id, added.Name, added.ContractAddress, "")
 	if err != nil {

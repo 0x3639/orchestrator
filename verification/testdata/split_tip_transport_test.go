@@ -135,9 +135,9 @@ func checkBridgeRequests(t *testing.T, tips []byte) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	previous := common.SignCeremonyPoolSize
-	common.SignCeremonyPoolSize = 4
-	defer func() { common.SignCeremonyPoolSize = previous }()
+	previous := common.GetSignCeremonyPoolSize()
+	common.SetSignCeremonyPoolSize(4)
+	defer func() { common.SetSignCeremonyPoolSize(previous) }()
 	var peers []*signingPeer
 	identities := map[string]*signingPeer{}
 	support := map[byte]int{}
@@ -604,9 +604,9 @@ func TestNetworkLoadOrderAtSigningTransport(t *testing.T) {
 		t.Fatal(err)
 	}
 	pub := base64.StdEncoding.EncodeToString(crypto.CompressPubkey(&key.PublicKey))
-	previous := common.SignCeremonyPoolSize
-	common.SignCeremonyPoolSize = 3
-	t.Cleanup(func() { common.SignCeremonyPoolSize = previous; signtransport.Receive = nil })
+	previous := common.GetSignCeremonyPoolSize()
+	common.SetSignCeremonyPoolSize(3)
+	t.Cleanup(func() { common.SetSignCeremonyPoolSize(previous); signtransport.Receive = nil })
 
 	candidatesByChain := map[uint32][]*events.UnwrapRequestEvm{1: candidates(4), 2: candidates(4)}
 	for chain, requests := range candidatesByChain {

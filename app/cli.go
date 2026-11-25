@@ -2,11 +2,14 @@ package app
 
 import (
 	"fmt"
+	"net"
 	"net/http"
+	_ "net/http/pprof"
 	"os"
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"time"
 
 	"orchestrator/common"
@@ -16,9 +19,21 @@ import (
 )
 
 var (
-	app         = cli.NewApp()
-	nodeManager *Manager
+	app          = cli.NewApp()
+	nodeManager  *Manager
+	startPprof   = startPprofServer
+	onPprofError = func(address string, err error) {
+		common.GlobalLogger.Errorf("pprof server failed on %s: %v", address, err)
+	}
 )
+
+func startPprofServer(address string) {
+	go func() {
+		if err := http.ListenAndServe(address, nil); err != nil {
+			onPprofError(address, err)
+		}
+	}()
+}
 
 func Run() {
 	err := app.Run(os.Args)
@@ -64,18 +79,15 @@ func beforeAction(ctx *cli.Context) error {
 	runtime.GOMAXPROCS(max)
 
 	// pprof server
-	if ctx.GlobalIsSet(PprofFlag.Name) {
-		listenHost := ctx.String(PprofAddrFlag.Name)
+	if ctx.GlobalBool(PprofFlag.Name) {
+		listenHost := ctx.GlobalString(PprofAddrFlag.Name)
+		port := ctx.GlobalUint64(PprofPortFlag.Name)
+		if port == 0 || port > 65535 {
+			return fmt.Errorf("invalid pprof port %d: must be between 1 and 65535", port)
+		}
 
-		port := ctx.Int(PprofPortFlag.Name)
-
-		address := fmt.Sprintf("%s:%d", listenHost, port)
-
-		go func() {
-			if err := http.ListenAndServe(address, nil); err != nil {
-				nodeManager.logger.Error(err.Error())
-			}
-		}()
+		address := net.JoinHostPort(listenHost, strconv.FormatUint(port, 10))
+		startPprof(address)
 	}
 
 	return nil

@@ -75,6 +75,18 @@ type ZnnStorage interface {
 	SetWrapRequestStatus(types.Hash, uint32) error
 	SetWrapRequestSignature(types.Hash, string) error
 	SetWrapRequestSentSignature(types.Hash, bool) error
+	// SaveSignedWrapRequest atomically installs signature, clears SentSignature,
+	// and clears the re-sign flag in a single durable write only when the stored
+	// row is still unredeemed and its signing payload matches expected.
+	SaveSignedWrapRequest(events.WrapRequestZnn, string) (bool, error)
+	// MarkWrapRequestSignatureSent marks SentSignature=true only if the stored
+	// wrap request still holds expectedSignature, reporting whether it matched.
+	MarkWrapRequestSignatureSent(types.Hash, string) (bool, error)
+	// AcknowledgeWrapRequestSignature atomically records an on-chain signature
+	// update for wrap: stores the row as sent if missing, fills an empty
+	// signature, or marks a matching signature as sent, while preserving any
+	// newer local signature and any pending re-sign flag.
+	AcknowledgeWrapRequestSignature(events.WrapRequestZnn, string) error
 	GetWrapRequestById(types.Hash) (*events.WrapRequestZnn, error)
 	GetUnsentSignedWrapRequests() ([]*events.WrapRequestZnn, error)
 	GetUnredeemedWrapRequests() ([]*events.WrapRequestZnn, error)
@@ -90,5 +102,12 @@ type ZnnStorage interface {
 	SaveBridgeWatchFrom(uint64) error
 
 	GetResignStatus(types.Hash) (bool, error)
+	// IsPublishedResignWrap reports whether the wrap's resign marker was written
+	// by PublishResignWraps after finality verification (as opposed to a legacy
+	// pre-upgrade SetResignStatus flag).
+	IsPublishedResignWrap(types.Hash) (bool, error)
 	SetResignStatus(types.Hash, bool) error
+	// PublishResignWraps atomically stores any missing wrap rows and marks all
+	// still-unredeemed wraps in the batch for re-signing in one durable write.
+	PublishResignWraps([]events.WrapRequestZnn) error
 }

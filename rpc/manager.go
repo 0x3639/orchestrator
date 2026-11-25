@@ -29,7 +29,7 @@ func NewRpcManager(networkConfig config.BaseNetworkConfig, stop chan os.Signal) 
 }
 
 func (m *Manager) AddEvmClient(networkConfig config.BaseNetworkConfig, chainId uint32, networkName string, address ecommon.Address) error {
-	if newClient, err := NewEvmRpcClient(networkConfig, networkName, address); err != nil {
+	if newClient, err := NewEvmRpcClientForChain(networkConfig, chainId, networkName, address); err != nil {
 		return err
 	} else {
 		m.RegisterEvmClient(chainId, newClient)
