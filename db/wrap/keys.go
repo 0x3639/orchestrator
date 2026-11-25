@@ -20,6 +20,11 @@ const redeemEvidencePrefix byte = 8
 // released the incident.
 const redeemHaltConfirmedPrefix byte = 9
 
+// Persisted pending EVM halt / setTss transaction ownership and fee watermarks,
+// keyed by (chainId, sender, contract, kind). Kept in the Zenon LevelDB so
+// nonce ownership survives runtime EVM network removal and re-addition.
+const pendingEvmTxPrefix byte = 10
+
 var (
 	wrapEventPrefix = []byte{0}
 

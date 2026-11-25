@@ -18,6 +18,7 @@ import (
 type Manager struct {
 	znnStorage      db.ZnnStorage
 	redeemIncidents *wrap.RedeemIncidentStore
+	pendingEvmTxs   *wrap.PendingEvmTxStore
 	// key is the chainId of the network
 	evmMu      sync.RWMutex
 	evmStorage map[uint32]db.EvmStorage
@@ -47,6 +48,7 @@ func NewDbManager(stop chan os.Signal) (*Manager, error) {
 	znnStorage, redeemIncidents := wrap.NewZenonStores(newZnnLdb, stop)
 	newDbManager := &Manager{
 		redeemIncidents: redeemIncidents,
+		pendingEvmTxs:   wrap.NewPendingEvmTxStore(newZnnLdb),
 		znnStorage:      znnStorage,
 		evmStorage:      make(map[uint32]db.EvmStorage),
 		evmClosers:      make(map[uint32]func() error),
@@ -54,6 +56,16 @@ func NewDbManager(stop chan os.Signal) (*Manager, error) {
 		logger:          newLogger,
 	}
 	return newDbManager, nil
+}
+
+// PendingEvmTxStore returns a crash-atomic, chain-scoped pending transaction
+// store backed by the persistent Zenon LevelDB so nonce ownership and fee
+// watermarks survive runtime EVM network removals and re-additions.
+func (m *Manager) PendingEvmTxStore(chainId uint32) common.PendingEvmTxStore {
+	if m == nil || m.pendingEvmTxs == nil {
+		return nil
+	}
+	return m.pendingEvmTxs.ForChain(chainId)
 }
 
 func queueDirExists(name string) bool {

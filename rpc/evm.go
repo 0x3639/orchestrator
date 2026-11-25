@@ -67,11 +67,12 @@ type EvmRpc struct {
 	// transaction per (sender, contract, action) so retries reuse the same
 	// nonce with bumped fees and recover ownership across restarts and
 	// evicted predecessors.
-	txMu           sync.Mutex
-	chainID        *big.Int
-	pendingTx      map[evmTxKey]*pendingEvmTx
-	pendingTxStore common.PendingEvmTxStore
-	sendTimeout    time.Duration
+	txMu                sync.Mutex
+	chainID             *big.Int
+	pendingTx           map[evmTxKey]*pendingEvmTx
+	pendingTxStore      common.PendingEvmTxStore
+	sendTimeout         time.Duration
+	secondaryLogTimeout time.Duration
 }
 
 type evmTxKey struct {
@@ -82,6 +83,7 @@ type evmTxKey struct {
 
 type pendingEvmTx struct {
 	nonce     uint64
+	txHash    ecommon.Hash
 	gasPrice  *big.Int
 	tipCap    *big.Int
 	feeCap    *big.Int
@@ -508,6 +510,7 @@ func clonePendingEvmTx(p *pendingEvmTx) *pendingEvmTx {
 	}
 	return &pendingEvmTx{
 		nonce:     p.nonce,
+		txHash:    p.txHash,
 		gasPrice:  cloneBigInt(p.gasPrice),
 		tipCap:    cloneBigInt(p.tipCap),
 		feeCap:    cloneBigInt(p.feeCap),
@@ -521,6 +524,7 @@ func toCommonPendingEvmTx(p *pendingEvmTx) *common.PendingEvmTx {
 	}
 	return &common.PendingEvmTx{
 		Nonce:     p.nonce,
+		TxHash:    p.txHash,
 		GasPrice:  cloneBigInt(p.gasPrice),
 		TipCap:    cloneBigInt(p.tipCap),
 		FeeCap:    cloneBigInt(p.feeCap),
@@ -536,16 +540,20 @@ type supersededTx struct {
 // recordPendingTxAttempt durably records tx's nonce and fee watermark BEFORE
 // broadcast so a process crash or dropped connection after node acceptance
 // cannot erase the watermark. When an emergency halt supersedes an unconfirmed
-// setTss at the same nonce, ownership is explicitly transferred (deleting the
-// superseded setTss record and returning it for rollback on definitive
-// pre-mempool rejection).
+// setTss at the same nonce, ownership is explicitly transferred in one atomic
+// fsynced batch (saving halt and deleting setTss together).
 func (r *EvmRpc) recordPendingTxAttempt(tx *etypes.Transaction) (*pendingEvmTx, *supersededTx, bool, error) {
 	key, ok := evmTxKeyFromTx(tx)
 	if !ok {
 		return nil, nil, false, nil
 	}
+	if _, err := r.loadPendingTx(key); err != nil {
+		return nil, nil, false, fmt.Errorf("load pending EVM tx record before broadcast: %w", err)
+	}
 	if key.kind == evmTxKindHalt {
-		_ = r.loadPendingTx(evmTxKey{sender: key.sender, contract: key.contract, kind: evmTxKindSetTss})
+		if _, err := r.loadPendingTx(evmTxKey{sender: key.sender, contract: key.contract, kind: evmTxKindSetTss}); err != nil {
+			return nil, nil, false, fmt.Errorf("load superseded setTss record before broadcast: %w", err)
+		}
 	}
 	r.txMu.Lock()
 	if r.pendingTx == nil {
@@ -565,6 +573,7 @@ func (r *EvmRpc) recordPendingTxAttempt(tx *etypes.Transaction) (*pendingEvmTx, 
 
 	entry := &pendingEvmTx{
 		nonce:     tx.Nonce(),
+		txHash:    tx.Hash(),
 		isDynamic: tx.Type() == etypes.DynamicFeeTxType,
 	}
 	if entry.isDynamic {
@@ -584,7 +593,20 @@ func (r *EvmRpc) recordPendingTxAttempt(tx *etypes.Transaction) (*pendingEvmTx, 
 			entry.feeCap = maxBigInt(prev.feeCap, entry.feeCap)
 		}
 	}
-	toSave := toCommonPendingEvmTx(entry)
+	ops := []common.PendingEvmTxOp{{
+		Sender:   key.sender,
+		Contract: key.contract,
+		Kind:     key.kind,
+		Record:   toCommonPendingEvmTx(entry),
+	}}
+	if superseded != nil {
+		ops = append(ops, common.PendingEvmTxOp{
+			Sender:   superseded.key.sender,
+			Contract: superseded.key.contract,
+			Kind:     superseded.key.kind,
+			Record:   nil,
+		})
+	}
 	r.pendingTx[key] = entry
 	if superseded != nil {
 		delete(r.pendingTx, superseded.key)
@@ -592,7 +614,7 @@ func (r *EvmRpc) recordPendingTxAttempt(tx *etypes.Transaction) (*pendingEvmTx, 
 	r.txMu.Unlock()
 
 	if store != nil {
-		if err := store.SavePendingEvmTx(key.sender, key.contract, key.kind, toSave); err != nil {
+		if err := store.ApplyPendingEvmTxBatch(ops); err != nil {
 			r.txMu.Lock()
 			if r.pendingTx[key] == entry {
 				if prevSnapshot != nil {
@@ -608,18 +630,15 @@ func (r *EvmRpc) recordPendingTxAttempt(tx *etypes.Transaction) (*pendingEvmTx, 
 			r.logger.Errorf("failed to persist pending EVM tx record before broadcast: %v", err)
 			return nil, nil, false, fmt.Errorf("persist pending EVM tx before broadcast: %w", err)
 		}
-		if superseded != nil {
-			if err := store.DeletePendingEvmTx(superseded.key.sender, superseded.key.contract, superseded.key.kind); err != nil {
-				r.logger.Errorf("failed to clear superseded pending EVM tx record: %v", err)
-			}
-		}
 	}
 	return prevSnapshot, superseded, true, nil
 }
 
 // reconcileSentTx updates or rolls back the pre-broadcast watermark based on
 // the broadcast outcome. Ambiguous failures (EOF, timeouts, connection resets)
-// and mempool pricing/duplicate errors keep the persisted watermark.
+// and mempool pricing/duplicate errors keep the persisted watermark. Rollback
+// of a superseded ownership transfer executes in a single atomic batch so a
+// crash or write error can never erase both records.
 func (r *EvmRpc) reconcileSentTx(tx *etypes.Transaction, prevSnapshot *pendingEvmTx, superseded *supersededTx, sendErr error) {
 	if sendErr == nil {
 		return
@@ -649,6 +668,29 @@ func (r *EvmRpc) reconcileSentTx(tx *etypes.Transaction, prevSnapshot *pendingEv
 	}
 	r.txMu.Lock()
 	store := r.pendingTxStore
+	r.txMu.Unlock()
+
+	ops := []common.PendingEvmTxOp{{
+		Sender:   key.sender,
+		Contract: key.contract,
+		Kind:     key.kind,
+		Record:   toCommonPendingEvmTx(prevSnapshot),
+	}}
+	if superseded != nil {
+		ops = append(ops, common.PendingEvmTxOp{
+			Sender:   superseded.key.sender,
+			Contract: superseded.key.contract,
+			Kind:     superseded.key.kind,
+			Record:   toCommonPendingEvmTx(superseded.entry),
+		})
+	}
+	if store != nil {
+		if err := store.ApplyPendingEvmTxBatch(ops); err != nil {
+			r.logger.Errorf("failed to atomically roll back rejected pending EVM tx record: %v", err)
+			return
+		}
+	}
+	r.txMu.Lock()
 	if prevSnapshot != nil {
 		r.pendingTx[key] = clonePendingEvmTx(prevSnapshot)
 	} else if cur := r.pendingTx[key]; cur != nil && cur.nonce == tx.Nonce() {
@@ -658,23 +700,9 @@ func (r *EvmRpc) reconcileSentTx(tx *etypes.Transaction, prevSnapshot *pendingEv
 		r.pendingTx[superseded.key] = clonePendingEvmTx(superseded.entry)
 	}
 	r.txMu.Unlock()
-	if store != nil {
-		if prevSnapshot != nil {
-			if err := store.SavePendingEvmTx(key.sender, key.contract, key.kind, toCommonPendingEvmTx(prevSnapshot)); err != nil {
-				r.logger.Errorf("failed to restore previous pending EVM tx record: %v", err)
-			}
-		} else if err := store.DeletePendingEvmTx(key.sender, key.contract, key.kind); err != nil {
-			r.logger.Errorf("failed to roll back rejected pending EVM tx record: %v", err)
-		}
-		if superseded != nil {
-			if err := store.SavePendingEvmTx(superseded.key.sender, superseded.key.contract, superseded.key.kind, toCommonPendingEvmTx(superseded.entry)); err != nil {
-				r.logger.Errorf("failed to restore superseded pending EVM tx record: %v", err)
-			}
-		}
-	}
 }
 
-func (r *EvmRpc) loadPendingTx(key evmTxKey) *pendingEvmTx {
+func (r *EvmRpc) loadPendingTx(key evmTxKey) (*pendingEvmTx, error) {
 	r.txMu.Lock()
 	prev := r.pendingTx[key]
 	store := r.pendingTxStore
@@ -683,10 +711,13 @@ func (r *EvmRpc) loadPendingTx(key evmTxKey) *pendingEvmTx {
 	if prev == nil && store != nil {
 		rec, err := store.LoadPendingEvmTx(key.sender, key.contract, key.kind)
 		if err != nil {
-			r.logger.Debugf("failed to load persisted pending EVM tx record: %v", err)
-		} else if rec != nil {
+			r.logger.Errorf("failed to load persisted pending EVM tx record (%s): %v", key.kind, err)
+			return nil, fmt.Errorf("load pending %s EVM tx record: %w", key.kind, err)
+		}
+		if rec != nil {
 			loaded := &pendingEvmTx{
 				nonce:     rec.Nonce,
+				txHash:    rec.TxHash,
 				gasPrice:  cloneBigInt(rec.GasPrice),
 				tipCap:    cloneBigInt(rec.TipCap),
 				feeCap:    cloneBigInt(rec.FeeCap),
@@ -703,7 +734,7 @@ func (r *EvmRpc) loadPendingTx(key evmTxKey) *pendingEvmTx {
 			r.txMu.Unlock()
 		}
 	}
-	return prev
+	return prev, nil
 }
 
 func (r *EvmRpc) clearPendingTx(key evmTxKey) {
@@ -713,19 +744,70 @@ func (r *EvmRpc) clearPendingTx(key evmTxKey) {
 	r.txMu.Unlock()
 	if store != nil {
 		if err := store.DeletePendingEvmTx(key.sender, key.contract, key.kind); err != nil {
-			r.logger.Debugf("failed to clear stale pending EVM tx record: %v", err)
+			r.logger.Errorf("failed to clear stale pending EVM tx record: %v", err)
 		}
 	}
 }
 
-func (r *EvmRpc) lookupPendingTx(key evmTxKey, confirmedNonce, pendingNonce uint64, havePending, otherOwnsLower bool) *pendingEvmTx {
-	_ = r.loadPendingTx(key)
+// ClearObsoleteHaltTx clears a persisted halt reservation once the emergency
+// has completed (e.g. another signer's halt won on-chain) and this sender's
+// dropped halt transaction is verified absent from the EVM mempool. Live halt
+// transactions still pending in the mempool (or unreadable pending state) are
+// preserved so later key rotations never collide with them.
+func (r *EvmRpc) ClearObsoleteHaltTx(sender ecommon.Address) error {
+	key := evmTxKey{sender: sender, contract: r.bridgeAddress, kind: evmTxKindHalt}
+	rec, err := r.loadPendingTx(key)
+	if err != nil {
+		return err
+	}
+	if rec == nil {
+		return nil
+	}
+	blockHeight, err := r.BlockNumber()
+	if err != nil {
+		return err
+	}
+	confirmedNonce, err := r.NonceAt(sender, blockHeight)
+	if err != nil {
+		return err
+	}
+	if rec.nonce < confirmedNonce {
+		r.clearPendingTx(key)
+		return nil
+	}
+	pendingNonce, err := r.PendingNonceAt(sender)
+	if err != nil {
+		// Fail safe: keep halt ownership when mempool state is unreadable.
+		return err
+	}
+	if pendingNonce > confirmedNonce {
+		// A transaction from this sender is still pending in the mempool; keep ownership.
+		return nil
+	}
+	if rec.txHash != (ecommon.Hash{}) {
+		tx, _, txErr := r.TransactionByHash(rec.txHash)
+		if txErr == nil && tx != nil {
+			// Still known to the node; keep ownership.
+			return nil
+		}
+		if txErr != nil && !errors.Is(txErr, ethereum.NotFound) {
+			return txErr
+		}
+	}
+	r.clearPendingTx(key)
+	return nil
+}
+
+func (r *EvmRpc) lookupPendingTx(key evmTxKey, confirmedNonce, pendingNonce uint64, havePending, otherOwnsLower bool) (*pendingEvmTx, error) {
+	if _, err := r.loadPendingTx(key); err != nil {
+		return nil, err
+	}
 
 	r.txMu.Lock()
 	prev := r.pendingTx[key]
 	if prev == nil {
 		r.txMu.Unlock()
-		return nil
+		return nil, nil
 	}
 	// Clear when already mined OR when a preceding pending transaction was
 	// evicted leaving a nonce gap (pendingNonce < prev.nonce) that is NOT
@@ -733,26 +815,27 @@ func (r *EvmRpc) lookupPendingTx(key evmTxKey, confirmedNonce, pendingNonce uint
 	if prev.nonce < confirmedNonce || (havePending && pendingNonce < prev.nonce && !otherOwnsLower) {
 		r.txMu.Unlock()
 		r.clearPendingTx(key)
-		return nil
+		return nil, nil
 	}
 	cloned := clonePendingEvmTx(prev)
 	r.txMu.Unlock()
-	return cloned
+	return cloned, nil
 }
 
 // otherTrackedNonces loads and reconciles persisted and in-memory ownership
 // for all other tracked actions of key.sender independently of PendingNonceAt.
-// Entries already mined (< confirmedNonce) are cleared. It returns the highest
-// nonce+1 owned by another tracked action at or above confirmedNonce, the
-// lowest such owned nonce, any entry owning confirmedNonce itself, and whether
-// any such owner exists.
-func (r *EvmRpc) otherTrackedNonces(key evmTxKey, confirmedNonce uint64) (maxNext uint64, minOwned uint64, atConfirmed *pendingEvmTx, hasOwner bool) {
+// Storage/decoding errors are propagated so an unreadable halt record can
+// never be mistaken for an absent one. Entries already mined (< confirmedNonce)
+// are cleared.
+func (r *EvmRpc) otherTrackedNonces(key evmTxKey, confirmedNonce uint64) (maxNext uint64, minOwned uint64, atConfirmed *pendingEvmTx, hasOwner bool, err error) {
 	for _, otherKind := range []string{evmTxKindHalt, evmTxKindSetTss} {
 		if otherKind == key.kind {
 			continue
 		}
 		otherKey := evmTxKey{sender: key.sender, contract: key.contract, kind: otherKind}
-		_ = r.loadPendingTx(otherKey)
+		if _, loadErr := r.loadPendingTx(otherKey); loadErr != nil {
+			return 0, 0, nil, false, loadErr
+		}
 	}
 	var toClear []evmTxKey
 	r.txMu.Lock()
@@ -779,7 +862,7 @@ func (r *EvmRpc) otherTrackedNonces(key evmTxKey, confirmedNonce uint64) (maxNex
 	for _, k := range toClear {
 		r.clearPendingTx(k)
 	}
-	return maxNext, minOwned, atConfirmed, hasOwner
+	return maxNext, minOwned, atConfirmed, hasOwner, nil
 }
 
 func (r *EvmRpc) buildContractTx(sender ecommon.Address, contractAddress *ecommon.Address, kind string, encodedData []byte, label string) (*etypes.Transaction, error) {
@@ -811,9 +894,15 @@ func (r *EvmRpc) buildContractTx(sender ecommon.Address, contractAddress *ecommo
 	// BEFORE checking PendingNonceAt so a stale (pending == confirmed) or
 	// unavailable pending nonce RPC can never silently collide with another
 	// action's persisted nonce after an ambiguous broadcast + restart.
-	otherNext, otherMin, otherAtConfirmed, hasOtherOwner := r.otherTrackedNonces(key, confirmedNonce)
+	otherNext, otherMin, otherAtConfirmed, hasOtherOwner, err := r.otherTrackedNonces(key, confirmedNonce)
+	if err != nil {
+		return nil, err
+	}
 	otherOwnsLower := hasOtherOwner && otherMin >= confirmedNonce && (!havePending || otherMin <= pendingNonce)
-	prev := r.lookupPendingTx(key, confirmedNonce, pendingNonce, havePending, otherOwnsLower)
+	prev, err := r.lookupPendingTx(key, confirmedNonce, pendingNonce, havePending, otherOwnsLower)
+	if err != nil {
+		return nil, err
+	}
 	nonce := confirmedNonce
 	if prev != nil {
 		nonce = prev.nonce
@@ -1432,15 +1521,23 @@ func (r *EvmRpc) AnySecondaryHasUnwrapLogChunked(parent context.Context, fromBlo
 	if parent == nil {
 		parent = context.Background()
 	}
-	attemptCtx, cancel := context.WithTimeout(parent, secondaryLogAttemptTimeout)
+	r.txMu.Lock()
+	budget := r.secondaryLogTimeout
+	r.txMu.Unlock()
+	if budget <= 0 {
+		budget = secondaryLogAttemptTimeout
+	}
+	attemptCtx, cancel := context.WithTimeout(parent, budget)
 	defer cancel()
 
 	primaryURL := r.Urls.GetCurrentUrl()
 	urls := r.Urls.Urls
 	type logAnswer struct {
-		checked bool
-		found   bool
-		err     error
+		checked        bool
+		found          bool
+		completedAny   bool
+		lowestVerified uint64
+		err            error
 	}
 	results := make([]logAnswer, len(urls))
 	var wg sync.WaitGroup
@@ -1452,13 +1549,21 @@ func (r *EvmRpc) AnySecondaryHasUnwrapLogChunked(parent context.Context, fromBlo
 		go func(idx int) {
 			defer wg.Done()
 			var found bool
+			var completedAny bool
+			var lowestVerified uint64
 			var scanErr error
 			// Verify the secondary's head covers targetHead so it cannot clip logs.
 			if err := r.callEndpoint(idx, func(ctx context.Context, client *ethclient.Client) error {
 				if attemptCtx.Err() != nil {
 					return attemptCtx.Err()
 				}
-				head, err := client.BlockNumber(ctx)
+				callCtx, stop := context.WithCancel(ctx)
+				unlink := context.AfterFunc(attemptCtx, stop)
+				defer func() {
+					unlink()
+					stop()
+				}()
+				head, err := client.BlockNumber(callCtx)
 				if err != nil {
 					return err
 				}
@@ -1472,7 +1577,9 @@ func (r *EvmRpc) AnySecondaryHasUnwrapLogChunked(parent context.Context, fromBlo
 			}
 			for end := resumeEnd; ; {
 				if attemptCtx.Err() != nil {
-					scanErr = attemptCtx.Err()
+					if parent.Err() != nil || !completedAny {
+						scanErr = attemptCtx.Err()
+					}
 					break
 				}
 				start := windowFrom
@@ -1506,35 +1613,56 @@ func (r *EvmRpc) AnySecondaryHasUnwrapLogChunked(parent context.Context, fromBlo
 					return nil
 				})
 				if err != nil {
+					// If the per-attempt time budget expired after completing at
+					// least one chunk (and parent was not cancelled), retain the
+					// partial progress so low-rate-limit nodes advance across retries.
+					if completedAny && attemptCtx.Err() != nil && parent.Err() == nil && (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) {
+						break
+					}
 					scanErr = errors.New(config.RedactErrorForURL(err, urls[idx]))
 					break
 				}
+				completedAny = true
+				lowestVerified = start
 				if found || start == windowFrom {
 					break
 				}
 				end = start - 1
 			}
-			results[idx] = logAnswer{checked: true, found: found, err: scanErr}
+			results[idx] = logAnswer{
+				checked:        true,
+				found:          found,
+				completedAny:   completedAny,
+				lowestVerified: lowestVerified,
+				err:            scanErr,
+			}
 		}(idx)
 	}
 	wg.Wait()
 	checkedAny := false
+	var agreedLowest uint64
 	for idx, res := range results {
 		if !res.checked {
 			continue
 		}
-		checkedAny = true
 		if res.err != nil {
 			return false, 0, false, fmt.Errorf("endpoint #%d unwrap log check failed: %w", idx, res.err)
 		}
 		if res.found {
 			return true, 0, false, nil
 		}
+		if !res.completedAny {
+			return false, 0, false, fmt.Errorf("endpoint #%d completed no unwrap log chunks within attempt budget", idx)
+		}
+		if !checkedAny || res.lowestVerified > agreedLowest {
+			agreedLowest = res.lowestVerified
+		}
+		checkedAny = true
 	}
 	if !checkedAny {
 		return false, 0, false, errors.New("no independent secondary EVM endpoint checked")
 	}
-	return false, windowFrom, windowFrom == fromBlock, nil
+	return false, agreedLowest, agreedLowest == fromBlock, nil
 }
 
 // agreeCanonicalHash reduces per-endpoint answers to one hash, or an error

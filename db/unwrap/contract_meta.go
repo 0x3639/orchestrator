@@ -125,3 +125,44 @@ func (es *evmStorage) DeletePendingEvmTx(sender, contract ecommon.Address, kind 
 	}
 	return err
 }
+
+func (es *evmStorage) ApplyPendingEvmTxBatch(ops []common.PendingEvmTxOp) error {
+	if len(ops) == 0 {
+		return nil
+	}
+	es.mu.Lock()
+	defer es.mu.Unlock()
+	if es.rawLdb != nil {
+		batch := new(leveldb.Batch)
+		for _, op := range ops {
+			key := pendingEvmTxKey(op.Sender, op.Contract, op.Kind)
+			if op.Record == nil {
+				batch.Delete(key)
+				continue
+			}
+			raw, err := json.Marshal(op.Record)
+			if err != nil {
+				return err
+			}
+			batch.Put(key, raw)
+		}
+		return es.rawLdb.Write(batch, &opt.WriteOptions{Sync: true})
+	}
+	for _, op := range ops {
+		key := pendingEvmTxKey(op.Sender, op.Contract, op.Kind)
+		if op.Record == nil {
+			if err := es.DB.Delete(key); err != nil && !errors.Is(err, leveldb.ErrNotFound) {
+				return err
+			}
+			continue
+		}
+		raw, err := json.Marshal(op.Record)
+		if err != nil {
+			return err
+		}
+		if err := es.DB.Put(key, raw); err != nil {
+			return err
+		}
+	}
+	return nil
+}

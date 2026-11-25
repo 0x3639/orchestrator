@@ -169,7 +169,7 @@ func (m *NetworksManager) Init(networksInfo map[string]config.BaseNetworkConfig,
 			// finding none.
 			newEvmNetwork.client = newRpcManager.Evm(network.Id)
 			newEvmNetwork.client.SetStorageName(newEvmNetwork.StorageName())
-			if txStore, ok := dbManager.EvmStorage(network.Id).(common.PendingEvmTxStore); ok {
+			if txStore := dbManager.PendingEvmTxStore(network.Id); txStore != nil {
 				newEvmNetwork.client.SetPendingTxStore(txStore)
 			}
 
@@ -237,6 +237,10 @@ func (m *NetworksManager) Start() error {
 			continue
 		}
 		if err := eNetwork.Start(); err != nil {
+			// The bridge may have removed the network while its initial scan ran.
+			if !m.hasNetwork(eNetwork) {
+				continue
+			}
 			return err
 		}
 	}
@@ -1061,6 +1065,9 @@ func (m *NetworksManager) SendHaltEvm(batch EvmBatch, signatures [][]byte, ecdsa
 		}
 		if halted {
 			m.logger.Infof("network with chainId %d already halted\n", network.ChainId())
+			if clrErr := network.EvmRpc().ClearObsoleteHaltTx(evmAddress); clrErr != nil {
+				m.logger.Debugf("clear obsolete halt tx on chainId %d: %v", network.ChainId(), clrErr)
+			}
 			continue
 		}
 		ok = false
@@ -1127,6 +1134,20 @@ func (m *NetworksManager) RecordConfirmedHalt(state *common.GlobalState) (bool, 
 	return state.SetStateIf(common.EmergencyState, common.HaltedState)
 }
 
+// ClearObsoleteHaltTx reconciles and clears obsolete halt reservations across
+// all active EVM networks for sender once an emergency has ended, preserving
+// any halt transaction still live in the EVM mempool.
+func (m *NetworksManager) ClearObsoleteHaltTx(sender ecommon.Address) {
+	if sender == (ecommon.Address{}) {
+		return
+	}
+	for _, network := range m.networks() {
+		if err := network.EvmRpc().ClearObsoleteHaltTx(sender); err != nil {
+			m.logger.Debugf("clear obsolete halt tx on chainId %d: %v", network.ChainId(), err)
+		}
+	}
+}
+
 // GetHaltMessages returns the halt message of every EVM network the bridge
 // lists, and the batch of those networks, in the same order.
 func (m *NetworksManager) GetHaltMessages() (EvmBatch, [][]byte, error) {
@@ -1178,6 +1199,9 @@ func (m *NetworksManager) SendHaltEvmAdministrator(batch EvmBatch, idx int, ecds
 	}
 	if halted {
 		m.logger.Infof("network with chainId %d already halted\n", network.ChainId())
+		if clrErr := network.EvmRpc().ClearObsoleteHaltTx(evmAddress); clrErr != nil {
+			m.logger.Debugf("clear obsolete halt tx on chainId %d: %v", network.ChainId(), clrErr)
+		}
 		return true, nil
 	}
 

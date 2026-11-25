@@ -827,88 +827,13 @@ func (node *Node) processSignatures() {
 				}
 				node.logger.Debug("Signatures generated from the old key are valid!")
 
-				var senders sync.WaitGroup
-				senders.Add(2)
-				//we send the account block on the znn network
-				go func() {
-					defer senders.Done()
-					// we take the first base64 char of the signature and transform it to its ascii value
-					index := uint32(int(znnOldKeySignature[0])) % node.getParticipantsLength()
-					for {
-						index = (index + 1) % node.getParticipantsLength()
-						producerPubKey := base64.StdEncoding.EncodeToString(node.producerKeyPair.Public)
-						bridgeInfo, err := node.networksManager.GetBridgeInfo()
-						if err != nil {
-							node.logger.Debug(err)
-							if !node.workerSleep(5 * time.Second) {
-								return
-							}
-							continue
-						}
-						// The pubKey was changed
-						if bridgeInfo.CompressedTssECDSAPubKey == keyGenResponse.PubKey {
-							break
-						}
-						if producerPubKey == node.getParticipant(index) {
-							node.logger.Debug("[sendZnnTx PubKey] this is me")
-							err = node.networksManager.ChangeTssEcdsaPubKeyZnn(keyGenResponse.PubKey, znnOldKeySignature, znnNewKeySignature, node.producerKeyPair)
-							if err != nil {
-								node.logger.Debug(err)
-								if !node.workerSleep(5 * time.Second) {
-									return
-								}
-								continue
-							}
-							node.logger.Debug("[sendZnnTx PubKey] sent tx")
-							// we wait 2 momentums so that the send and receive block are inserted and the pubKey changes
-							// todo use constants
-							if !node.workerSleep(20 * time.Second) {
-								return
-							}
-
-						}
-						if !node.workerSleep(20 * time.Second) {
-							return
-						}
-					}
-				}()
-
-				go func() {
-					defer senders.Done()
-					index := uint32(int(znnOldKeySignature[0])) % node.getParticipantsLength()
-					for {
-						index = (index + 1) % node.getParticipantsLength()
-						producerPubKey := base64.StdEncoding.EncodeToString(node.producerKeyPair.Public)
-						if producerPubKey == node.getParticipant(index) {
-							node.logger.Debug("[send set tss ecdsa pub key evm tx] this is me")
-							changed, err := node.networksManager.SetTssEcdsaPubKeyEvm(evmBatch, oldKeyFullSignatures, newKeyFullSignatures, keyGenResponse.PubKey, node.ecdsaPrivateKey, node.evmAddress)
-							// Read after senders.Wait.
-							keyNotSet = nil
-							if errors.Is(err, network.ErrNetworksChanged) {
-								keyNotSet = err
-								// The networks the round was signed for still
-								// get the new key; the one added since is
-								// not changed by this round.
-								node.logger.Errorf("the key change round has no signature for a network the bridge added: %v", err)
-							} else if err != nil {
-								// Retry after the pause below; an immediate
-								// retry would spin, and with a single
-								// participant it would never see a stop.
-								node.logger.Debug(err)
-							}
-							if changed {
-								break
-							}
-						}
-						// todo use estimatedBlockTime / TimeToFinality
-						if !node.workerSleep(20 * time.Second) {
-							return
-						}
-					}
-				}()
-				senders.Wait()
+				var aborted bool
+				keyNotSet, aborted = node.publishKeyGenTss(evmBatch, keyGenResponse.PubKey, znnOldKeySignature, znnNewKeySignature, oldKeyFullSignatures, newKeyFullSignatures)
 				if node.workerStopping() {
 					return
+				}
+				if aborted {
+					continue
 				}
 			} else {
 				// We wait for the key to be set
@@ -917,11 +842,11 @@ func (node *Node) processSignatures() {
 
 				go func() {
 					defer waiters.Done()
-					for {
+					for node.keyGenActive() {
 						bridgeInfo, err := node.networksManager.GetBridgeInfo()
 						if err != nil {
 							node.logger.Debug(err)
-							if !node.workerSleep(10 * time.Second) {
+							if !node.sleepWhileKeyGen(10 * time.Second) {
 								return
 							}
 							continue
@@ -930,7 +855,7 @@ func (node *Node) processSignatures() {
 						if bridgeInfo.CompressedTssECDSAPubKey == keyGenResponse.PubKey {
 							break
 						}
-						if !node.workerSleep(20 * time.Second) {
+						if !node.sleepWhileKeyGen(20 * time.Second) {
 							return
 						}
 					}
@@ -938,17 +863,17 @@ func (node *Node) processSignatures() {
 
 				go func() {
 					defer waiters.Done()
-					for {
+					for node.keyGenActive() {
 						if changed, err := node.networksManager.CheckNewTssEcdsaPubKeyEvm(keyGenResponse.PubKey); err != nil {
 							node.logger.Debug(err)
-							if !node.workerSleep(10 * time.Second) {
+							if !node.sleepWhileKeyGen(10 * time.Second) {
 								return
 							}
 							continue
 						} else if changed {
 							break
 						}
-						if !node.workerSleep(20 * time.Second) {
+						if !node.sleepWhileKeyGen(20 * time.Second) {
 							return
 						}
 					}
@@ -957,6 +882,9 @@ func (node *Node) processSignatures() {
 				waiters.Wait()
 				if node.workerStopping() {
 					return
+				}
+				if !node.keyGenActive() {
+					continue
 				}
 			}
 
@@ -1894,8 +1822,131 @@ func (node *Node) reconcileHaltedState() {
 	if halted == 0 {
 		if err := node.state.SetState(common.LiveState); err != nil {
 			node.logger.Debug(err)
+		} else {
+			node.networksManager.ClearObsoleteHaltTx(node.evmAddress)
 		}
 	}
+}
+
+func (node *Node) keyGenActive() bool {
+	if node.workerStopping() || node.state.RestartRequired() {
+		return false
+	}
+	st, err := node.state.GetState()
+	return err == nil && st == common.KeyGenState
+}
+
+func (node *Node) sleepWhileKeyGen(d time.Duration) bool {
+	const poll = 200 * time.Millisecond
+	deadline := time.Now().Add(d)
+	for {
+		if !node.keyGenActive() {
+			return false
+		}
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return true
+		}
+		step := poll
+		if remaining < step {
+			step = remaining
+		}
+		if !node.workerSleep(step) {
+			return false
+		}
+	}
+}
+
+// publishKeyGenTss submits the signed Zenon and EVM key-rotation transactions
+// until both chains reflect newPubKey or key generation loses ownership (e.g.
+// EmergencyState, HaltedState, RestartRequired, or node shutdown). Exiting
+// promptly when leaving KeyGenState ensures processSignatures can immediately
+// enter the emergency halt handler instead of blocking behind a stalled setTss.
+func (node *Node) publishKeyGenTss(evmBatch network.EvmBatch, newPubKey, znnOldKeySignature, znnNewKeySignature string, oldKeyFullSignatures, newKeyFullSignatures [][]byte) (keyNotSet error, aborted bool) {
+	node.networksManager.ClearObsoleteHaltTx(node.evmAddress)
+	var senders sync.WaitGroup
+	senders.Add(2)
+	// we send the account block on the znn network
+	go func() {
+		defer senders.Done()
+		// we take the first base64 char of the signature and transform it to its ascii value
+		index := uint32(int(znnOldKeySignature[0])) % node.getParticipantsLength()
+		for node.keyGenActive() {
+			index = (index + 1) % node.getParticipantsLength()
+			producerPubKey := base64.StdEncoding.EncodeToString(node.producerKeyPair.Public)
+			bridgeInfo, err := node.networksManager.GetBridgeInfo()
+			if err != nil {
+				node.logger.Debug(err)
+				if !node.sleepWhileKeyGen(5 * time.Second) {
+					return
+				}
+				continue
+			}
+			// The pubKey was changed
+			if bridgeInfo.CompressedTssECDSAPubKey == newPubKey {
+				break
+			}
+			if !node.keyGenActive() {
+				return
+			}
+			if producerPubKey == node.getParticipant(index) {
+				node.logger.Debug("[sendZnnTx PubKey] this is me")
+				err = node.networksManager.ChangeTssEcdsaPubKeyZnn(newPubKey, znnOldKeySignature, znnNewKeySignature, node.producerKeyPair)
+				if err != nil {
+					node.logger.Debug(err)
+					if !node.sleepWhileKeyGen(5 * time.Second) {
+						return
+					}
+					continue
+				}
+				node.logger.Debug("[sendZnnTx PubKey] sent tx")
+				// we wait 2 momentums so that the send and receive block are inserted and the pubKey changes
+				// todo use constants
+				if !node.sleepWhileKeyGen(20 * time.Second) {
+					return
+				}
+			}
+			if !node.sleepWhileKeyGen(20 * time.Second) {
+				return
+			}
+		}
+	}()
+
+	go func() {
+		defer senders.Done()
+		index := uint32(int(znnOldKeySignature[0])) % node.getParticipantsLength()
+		for node.keyGenActive() {
+			index = (index + 1) % node.getParticipantsLength()
+			producerPubKey := base64.StdEncoding.EncodeToString(node.producerKeyPair.Public)
+			if producerPubKey == node.getParticipant(index) {
+				node.logger.Debug("[send set tss ecdsa pub key evm tx] this is me")
+				changed, err := node.networksManager.SetTssEcdsaPubKeyEvm(evmBatch, oldKeyFullSignatures, newKeyFullSignatures, newPubKey, node.ecdsaPrivateKey, node.evmAddress)
+				// Read after senders.Wait.
+				keyNotSet = nil
+				if errors.Is(err, network.ErrNetworksChanged) {
+					keyNotSet = err
+					// The networks the round was signed for still
+					// get the new key; the one added since is
+					// not changed by this round.
+					node.logger.Errorf("the key change round has no signature for a network the bridge added: %v", err)
+				} else if err != nil {
+					// Retry after the pause below; an immediate
+					// retry would spin, and with a single
+					// participant it would never see a stop.
+					node.logger.Debug(err)
+				}
+				if changed {
+					break
+				}
+			}
+			// todo use estimatedBlockTime / TimeToFinality
+			if !node.sleepWhileKeyGen(20 * time.Second) {
+				return
+			}
+		}
+	}()
+	senders.Wait()
+	return keyNotSet, !node.keyGenActive()
 }
 
 // activeKeyCanSign reports whether a key change signed with the active key

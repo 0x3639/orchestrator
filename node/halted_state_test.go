@@ -1,6 +1,7 @@
 package node
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"math/big"
 	"net/http"
@@ -9,12 +10,15 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	ecommon "github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/hexutil"
+	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/zenon-network/go-zenon/common/types"
 	"github.com/zenon-network/go-zenon/rpc/server"
 	"github.com/zenon-network/go-zenon/vm/embedded/definition"
+	"github.com/zenon-network/go-zenon/wallet"
 	"go.uber.org/zap"
 
 	"orchestrator/common"
@@ -290,5 +294,136 @@ func TestProcessSignaturesWrapSkipsRemovedDestinationNetworkWithoutPanic(t *test
 	case sig := <-stopChan:
 		t.Fatalf("processSignaturesWrap requested stop %v for removed network", sig)
 	default:
+	}
+}
+
+func TestPublishKeyGenTssExitsPromptlyOnEmergencyState(t *testing.T) {
+	contract := ecommon.HexToAddress("0x1111111111111111111111111111111111111111")
+	zMock := &haltedTestZenon{
+		halted:      false,
+		evmContract: contract.Hex(),
+		evmHalted:   false,
+	}
+
+	znnSrv := server.NewServer()
+	if err := znnSrv.RegisterName("embedded.bridge", zMock); err != nil {
+		t.Fatal(err)
+	}
+	znnHTTP := httptest.NewServer(znnSrv.WebsocketHandler([]string{"*"}))
+	t.Cleanup(func() {
+		znnSrv.Stop()
+		znnHTTP.Close()
+	})
+
+	// EVM endpoint keeps returning the old TSS address and errors on sends so
+	// setTss remains stalled indefinitely unless KeyGenState exit interrupts it.
+	evmAttempted := make(chan struct{})
+	var evmOnce sync.Once
+	evmHTTP := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			ID     json.RawMessage `json:"id"`
+			Method string          `json:"method"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		resp := map[string]interface{}{"jsonrpc": "2.0", "id": req.ID}
+		switch req.Method {
+		case "eth_chainId":
+			resp["result"] = hexutil.EncodeUint64(1)
+		case "eth_call":
+			evmOnce.Do(func() { close(evmAttempted) })
+			// Old/zero TSS address (never matches newPubKey).
+			resp["result"] = "0x" + strings.Repeat("0", 64)
+		default:
+			resp["error"] = map[string]interface{}{"code": -32000, "message": "stalled setTss rpc"}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	t.Cleanup(evmHTTP.Close)
+
+	stopChan := make(chan os.Signal, 1)
+	stateVal := common.KeyGenState
+	gs := common.NewGlobalState(&stateVal)
+
+	t.Setenv("HOME", t.TempDir())
+	nm, err := network.NewNetworksManager(stopChan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dbMgr, err := manager.NewDbManager(stopChan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nets := map[string]config.BaseNetworkConfig{
+		common.ZenonNetworkName: {Urls: []string{"ws" + strings.TrimPrefix(znnHTTP.URL, "http")}},
+		"eth-halted-test":       {Urls: []string{evmHTTP.URL}},
+	}
+	if err := nm.Init(nets, dbMgr, gs, func(*common.BridgeMetadata) {}); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { nm.Stop() })
+
+	ecdsaKey, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	producerPub := []byte("test-producer-pubkey-32-bytes!!!")
+	producerPubB64 := base64.StdEncoding.EncodeToString(producerPub)
+	newPubKeyBytes := crypto.CompressPubkey(&ecdsaKey.PublicKey)
+	newPubKeyB64 := base64.StdEncoding.EncodeToString(newPubKeyBytes)
+
+	cfg := &config.Config{
+		TssConfig: config.TssManagerConfig{
+			LocalPubKeys: []string{producerPubB64},
+		},
+	}
+	node := &Node{
+		config:          cfg,
+		networksManager: nm,
+		dbManager:       dbMgr,
+		producerKeyPair: &wallet.KeyPair{Public: producerPub},
+		ecdsaPrivateKey: ecdsaKey,
+		evmAddress:      crypto.PubkeyToAddress(ecdsaKey.PublicKey),
+		state:           gs,
+		stopChan:        stopChan,
+		logger:          zap.NewNop().Sugar(),
+	}
+
+	evmBatch, _, err := nm.GetHaltMessages()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	type publishResult struct {
+		err     error
+		aborted bool
+	}
+	done := make(chan publishResult, 1)
+	go func() {
+		kErr, aborted := node.publishKeyGenTss(evmBatch, newPubKeyB64, "AAAA", "BBBB", [][]byte{{1}}, [][]byte{{2}})
+		done <- publishResult{err: kErr, aborted: aborted}
+	}()
+
+	// Wait until the EVM setTss sender has entered its stalled retry cycle.
+	select {
+	case <-evmAttempted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("EVM setTss sender did not start")
+	}
+
+	// Listener detects an incident and transitions state to EmergencyState.
+	if err := gs.SetState(common.EmergencyState); err != nil {
+		t.Fatal(err)
+	}
+
+	// publishKeyGenTss MUST exit promptly with aborted=true so processSignatures
+	// can immediately enter the EmergencyState halt handler.
+	select {
+	case res := <-done:
+		if !res.aborted {
+			t.Fatalf("publishKeyGenTss aborted = false, want true when leaving KeyGenState (err=%v)", res.err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("publishKeyGenTss stayed blocked behind stalled setTss after entering EmergencyState")
 	}
 }

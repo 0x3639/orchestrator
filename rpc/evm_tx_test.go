@@ -39,6 +39,8 @@ type evmTxMockServer struct {
 	sendErr         string
 	hangSend        chan struct{}
 	sentTxs         []*etypes.Transaction
+	knownTxs        map[ecommon.Hash]*etypes.Transaction
+	txByHashErr     string
 	sendCalls       atomic.Int32
 }
 
@@ -51,6 +53,7 @@ func newEvmTxMockServer(t *testing.T) (*evmTxMockServer, string) {
 		gasPrice:    big.NewInt(10_000_000_000), // 10 gwei
 		balance:     big.NewInt(0).Mul(big.NewInt(10), big.NewInt(1e18)),
 		estimateGas: 100_000,
+		knownTxs:    make(map[ecommon.Hash]*etypes.Transaction),
 	}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var req struct {
@@ -114,6 +117,35 @@ func (m *evmTxMockServer) handle(ctx context.Context, method string, params []js
 		return (*hexutil.Big)(new(big.Int).Set(m.gasPrice)), nil
 	case "eth_estimateGas":
 		return hexutil.EncodeUint64(m.estimateGas), nil
+	case "eth_getTransactionByHash":
+		if m.txByHashErr != "" {
+			return nil, map[string]interface{}{"code": -32000, "message": m.txByHashErr}
+		}
+		var hash ecommon.Hash
+		if len(params) >= 1 {
+			_ = json.Unmarshal(params[0], &hash)
+		}
+		tx, ok := m.knownTxs[hash]
+		if !ok || tx == nil {
+			return nil, nil
+		}
+		return map[string]interface{}{
+			"hash":                 tx.Hash().Hex(),
+			"nonce":                hexutil.EncodeUint64(tx.Nonce()),
+			"from":                 ecommon.HexToAddress("0x1111111111111111111111111111111111111111").Hex(),
+			"to":                   tx.To().Hex(),
+			"value":                (*hexutil.Big)(tx.Value()),
+			"gas":                  hexutil.EncodeUint64(tx.Gas()),
+			"gasPrice":             (*hexutil.Big)(tx.GasPrice()),
+			"maxFeePerGas":         (*hexutil.Big)(tx.GasFeeCap()),
+			"maxPriorityFeePerGas": (*hexutil.Big)(tx.GasTipCap()),
+			"input":                hexutil.Bytes(tx.Data()),
+			"type":                 hexutil.EncodeUint64(uint64(tx.Type())),
+			"chainId":              (*hexutil.Big)(tx.ChainId()),
+			"v":                    "0x0",
+			"r":                    "0x1",
+			"s":                    "0x1",
+		}, nil
 	case "eth_sendRawTransaction":
 		m.sendCalls.Add(1)
 		if m.hangSend != nil {
@@ -134,6 +166,7 @@ func (m *evmTxMockServer) handle(ctx context.Context, method string, params []js
 			var tx etypes.Transaction
 			if err := tx.UnmarshalBinary(raw); err == nil {
 				m.sentTxs = append(m.sentTxs, &tx)
+				m.knownTxs[tx.Hash()] = &tx
 				if tx.Nonce() >= m.pendingNonce {
 					m.pendingNonce = tx.Nonce() + 1
 				}
@@ -455,8 +488,9 @@ func TestLookupEvmConcurrentAddRemoveDoesNotStopOrPanic(t *testing.T) {
 }
 
 type memPendingTxStore struct {
-	mu   sync.Mutex
-	rows map[string]*common.PendingEvmTx
+	mu      sync.Mutex
+	rows    map[string]*common.PendingEvmTx
+	batches [][]common.PendingEvmTxOp
 }
 
 func newMemPendingTxStore() *memPendingTxStore {
@@ -467,29 +501,10 @@ func (s *memPendingTxStore) key(sender, target ecommon.Address, action string) s
 	return sender.Hex() + ":" + target.Hex() + ":" + action
 }
 
-func (s *memPendingTxStore) LoadPendingEvmTx(sender, target ecommon.Address, action string) (*common.PendingEvmTx, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	row, ok := s.rows[s.key(sender, target, action)]
-	if !ok || row == nil {
-		return nil, nil
+func cloneCommonPending(tx *common.PendingEvmTx) *common.PendingEvmTx {
+	if tx == nil {
+		return nil
 	}
-	cp := *row
-	if row.GasPrice != nil {
-		cp.GasPrice = new(big.Int).Set(row.GasPrice)
-	}
-	if row.TipCap != nil {
-		cp.TipCap = new(big.Int).Set(row.TipCap)
-	}
-	if row.FeeCap != nil {
-		cp.FeeCap = new(big.Int).Set(row.FeeCap)
-	}
-	return &cp, nil
-}
-
-func (s *memPendingTxStore) SavePendingEvmTx(sender, target ecommon.Address, action string, tx *common.PendingEvmTx) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	cp := *tx
 	if tx.GasPrice != nil {
 		cp.GasPrice = new(big.Int).Set(tx.GasPrice)
@@ -500,7 +515,23 @@ func (s *memPendingTxStore) SavePendingEvmTx(sender, target ecommon.Address, act
 	if tx.FeeCap != nil {
 		cp.FeeCap = new(big.Int).Set(tx.FeeCap)
 	}
-	s.rows[s.key(sender, target, action)] = &cp
+	return &cp
+}
+
+func (s *memPendingTxStore) LoadPendingEvmTx(sender, target ecommon.Address, action string) (*common.PendingEvmTx, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	row, ok := s.rows[s.key(sender, target, action)]
+	if !ok || row == nil {
+		return nil, nil
+	}
+	return cloneCommonPending(row), nil
+}
+
+func (s *memPendingTxStore) SavePendingEvmTx(sender, target ecommon.Address, action string, tx *common.PendingEvmTx) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.rows[s.key(sender, target, action)] = cloneCommonPending(tx)
 	return nil
 }
 
@@ -508,6 +539,27 @@ func (s *memPendingTxStore) DeletePendingEvmTx(sender, target ecommon.Address, a
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.rows, s.key(sender, target, action))
+	return nil
+}
+
+func (s *memPendingTxStore) ApplyPendingEvmTxBatch(ops []common.PendingEvmTxOp) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	copied := make([]common.PendingEvmTxOp, len(ops))
+	for i, op := range ops {
+		copied[i] = common.PendingEvmTxOp{
+			Sender:   op.Sender,
+			Contract: op.Contract,
+			Kind:     op.Kind,
+			Record:   cloneCommonPending(op.Record),
+		}
+		if op.Record == nil {
+			delete(s.rows, s.key(op.Sender, op.Contract, op.Kind))
+		} else {
+			s.rows[s.key(op.Sender, op.Contract, op.Kind)] = cloneCommonPending(op.Record)
+		}
+	}
+	s.batches = append(s.batches, copied)
 	return nil
 }
 
@@ -786,7 +838,17 @@ func TestFirstActionAfterRestartRespectsOtherActionPersistedNonce(t *testing.T) 
 
 type failingPendingTxStore struct {
 	*memPendingTxStore
-	failSave bool
+	failSave        bool
+	failLoadKind    string
+	failBatchOnCall int // 1-based batch call to fail (0 = disabled)
+	batchCalls      int
+}
+
+func (s *failingPendingTxStore) LoadPendingEvmTx(sender, target ecommon.Address, action string) (*common.PendingEvmTx, error) {
+	if s.failLoadKind != "" && (s.failLoadKind == "*" || s.failLoadKind == action) {
+		return nil, errors.New("corrupt pending tx record")
+	}
+	return s.memPendingTxStore.LoadPendingEvmTx(sender, target, action)
 }
 
 func (s *failingPendingTxStore) SavePendingEvmTx(sender, target ecommon.Address, action string, tx *common.PendingEvmTx) error {
@@ -794,6 +856,14 @@ func (s *failingPendingTxStore) SavePendingEvmTx(sender, target ecommon.Address,
 		return errors.New("disk full")
 	}
 	return s.memPendingTxStore.SavePendingEvmTx(sender, target, action, tx)
+}
+
+func (s *failingPendingTxStore) ApplyPendingEvmTxBatch(ops []common.PendingEvmTxOp) error {
+	s.batchCalls++
+	if s.failSave || (s.failBatchOnCall > 0 && s.batchCalls == s.failBatchOnCall) {
+		return errors.New("disk full")
+	}
+	return s.memPendingTxStore.ApplyPendingEvmTxBatch(ops)
 }
 
 func TestSendTransactionPersistsBeforeBroadcastHandlesEOFAndStoreFailure(t *testing.T) {
@@ -1183,5 +1253,376 @@ func TestAmbiguousBroadcastPersistedOwnerRespectedWithStaleOrFailingPendingNonce
 				}
 			})
 		}
+	}
+}
+
+func TestHaltSupersedingSetTssTransferAndRollbackAreAtomic(t *testing.T) {
+	contract := ecommon.HexToAddress("0x6161616161616161616161616161616161616161")
+	newTss := ecommon.HexToAddress("0x6262626262626262626262626262626262626262")
+	key, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sender := crypto.PubkeyToAddress(key.PublicKey)
+	signer := etypes.LatestSignerForChainID(big.NewInt(1))
+
+	t.Run("definitive rejection rolls back superseded setTss atomically", func(t *testing.T) {
+		mock, url := newEvmTxMockServer(t)
+		mock.baseFee = big.NewInt(20_000_000_000)
+		mock.tipCap = big.NewInt(2_000_000_000)
+		mock.confirmedNonce = 5
+		mock.pendingNonce = 5
+
+		store := &failingPendingTxStore{memPendingTxStore: newMemPendingTxStore()}
+		client, err := NewEvmRpcClient(config.BaseNetworkConfig{Urls: []string{url}}, "atomic-rollback", contract)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer client.Stop()
+		client.SetChainID(1)
+		client.SetPendingTxStore(store)
+
+		// 1. Send setTss at nonce 5.
+		setTssTx, err := client.GetSetTssEcdsaPubKeyEvmTx(newTss, sender, []byte{4}, []byte{5}, &contract)
+		if err != nil {
+			t.Fatal(err)
+		}
+		signedSetTss, err := etypes.SignTx(setTssTx, signer, key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := client.SendTransaction(signedSetTss); err != nil {
+			t.Fatal(err)
+		}
+
+		// 2. Build emergency halt superseding setTss at nonce 5, then fail broadcast with definitive rejection.
+		mock.mu.Lock()
+		mock.sendErr = "insufficient funds for gas * price + value"
+		mock.mu.Unlock()
+		haltTx, err := client.GetHaltTxEvm(sender, []byte{1, 2, 3}, &contract)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if haltTx.Nonce() != 5 {
+			t.Fatalf("superseding halt nonce = %d, want 5", haltTx.Nonce())
+		}
+		signedHalt, err := etypes.SignTx(haltTx, signer, key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := client.SendTransaction(signedHalt); err == nil {
+			t.Fatal("expected insufficient funds rejection")
+		}
+
+		// Verify ownership transfer (batch 2) and rollback (batch 3) each committed
+		// both keys together in one atomic batch.
+		store.mu.Lock()
+		batches := append([][]common.PendingEvmTxOp(nil), store.batches...)
+		store.mu.Unlock()
+		if len(batches) != 3 {
+			t.Fatalf("batch count = %d, want 3 (setTss save, halt transfer, atomic rollback)", len(batches))
+		}
+		if len(batches[1]) != 2 || len(batches[2]) != 2 {
+			t.Fatalf("transfer/rollback batch lengths = (%d, %d), want (2, 2)", len(batches[1]), len(batches[2]))
+		}
+		if haltRec, err := store.LoadPendingEvmTx(sender, contract, evmTxKindHalt); err != nil || haltRec != nil {
+			t.Fatalf("after rollback, halt = (%+v, %v), want nil", haltRec, err)
+		}
+		restored, err := store.LoadPendingEvmTx(sender, contract, evmTxKindSetTss)
+		if err != nil || restored == nil || restored.Nonce != 5 || restored.TxHash != signedSetTss.Hash() {
+			t.Fatalf("after rollback, setTss = (%+v, %v), want restored nonce 5 hash %s", restored, err, signedSetTss.Hash())
+		}
+	})
+
+	t.Run("interrupted rollback batch never erases both records", func(t *testing.T) {
+		mock, url := newEvmTxMockServer(t)
+		mock.baseFee = big.NewInt(20_000_000_000)
+		mock.tipCap = big.NewInt(2_000_000_000)
+		mock.confirmedNonce = 5
+		mock.pendingNonce = 5
+
+		store := &failingPendingTxStore{
+			memPendingTxStore: newMemPendingTxStore(),
+			failBatchOnCall:   3, // fail the rollback batch
+		}
+		client, err := NewEvmRpcClient(config.BaseNetworkConfig{Urls: []string{url}}, "atomic-rollback-fail", contract)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer client.Stop()
+		client.SetChainID(1)
+		client.SetPendingTxStore(store)
+
+		setTssTx, err := client.GetSetTssEcdsaPubKeyEvmTx(newTss, sender, []byte{4}, []byte{5}, &contract)
+		if err != nil {
+			t.Fatal(err)
+		}
+		signedSetTss, err := etypes.SignTx(setTssTx, signer, key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := client.SendTransaction(signedSetTss); err != nil {
+			t.Fatal(err)
+		}
+
+		mock.mu.Lock()
+		mock.sendErr = "insufficient funds for gas * price + value"
+		mock.mu.Unlock()
+		haltTx, err := client.GetHaltTxEvm(sender, []byte{1, 2, 3}, &contract)
+		if err != nil {
+			t.Fatal(err)
+		}
+		signedHalt, err := etypes.SignTx(haltTx, signer, key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := client.SendTransaction(signedHalt); err == nil {
+			t.Fatal("expected insufficient funds rejection")
+		}
+
+		// Because the atomic rollback batch failed, durable state MUST still hold
+		// the committed halt ownership + bumped fee watermark (never both empty).
+		haltRec, err := store.LoadPendingEvmTx(sender, contract, evmTxKindHalt)
+		if err != nil || haltRec == nil || haltRec.Nonce != 5 {
+			t.Fatalf("after failed rollback batch, durable halt record = (%+v, %v), want nonce 5 preserved", haltRec, err)
+		}
+	})
+}
+
+func TestPendingTxStoreReadErrorFailsClosed(t *testing.T) {
+	mock, url := newEvmTxMockServer(t)
+	mock.baseFee = big.NewInt(20_000_000_000)
+	mock.tipCap = big.NewInt(2_000_000_000)
+	mock.confirmedNonce = 5
+	mock.pendingNonce = 5
+
+	contract := ecommon.HexToAddress("0x6363636363636363636363636363636363636363")
+	newTss := ecommon.HexToAddress("0x6464646464646464646464646464646464646464")
+	key, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sender := crypto.PubkeyToAddress(key.PublicKey)
+	signer := etypes.LatestSignerForChainID(big.NewInt(1))
+
+	store := &failingPendingTxStore{
+		memPendingTxStore: newMemPendingTxStore(),
+		failLoadKind:      evmTxKindHalt,
+	}
+	client, err := NewEvmRpcClient(config.BaseNetworkConfig{Urls: []string{url}}, "read-err-closed", contract)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Stop()
+	client.SetChainID(1)
+	client.SetPendingTxStore(store)
+
+	// Unreadable halt record MUST fail GetSetTssEcdsaPubKeyEvmTx instead of
+	// treating halt as absent and allocating confirmedNonce 5.
+	if _, err := client.GetSetTssEcdsaPubKeyEvmTx(newTss, sender, []byte{4}, []byte{5}, &contract); err == nil {
+		t.Fatal("expected GetSetTssEcdsaPubKeyEvmTx to fail when halt pending record is unreadable")
+	}
+	// Unreadable halt record MUST also fail SendTransaction for halt before broadcast.
+	rawTx := etypes.NewTx(&etypes.LegacyTx{
+		Nonce:    5,
+		To:       &contract,
+		Value:    big.NewInt(0),
+		Gas:      100_000,
+		GasPrice: big.NewInt(10_000_000_000),
+		Data:     common.EvmContractAbi.Methods["halt"].ID,
+	})
+	signed, err := etypes.SignTx(rawTx, signer, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := client.SendTransaction(signed); err == nil {
+		t.Fatal("expected SendTransaction to fail when halt pending record is unreadable")
+	}
+	if mock.sendCalls.Load() != 0 {
+		t.Fatalf("SendTransaction broadcast despite unreadable pending tx record: calls=%d", mock.sendCalls.Load())
+	}
+}
+
+func TestClearObsoleteHaltTxClearsDroppedAndPreservesLiveMempoolHalt(t *testing.T) {
+	contract := ecommon.HexToAddress("0x6565656565656565656565656565656565656565")
+	newTss := ecommon.HexToAddress("0x6666666666666666666666666666666666666666")
+	key, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sender := crypto.PubkeyToAddress(key.PublicKey)
+	signer := etypes.LatestSignerForChainID(big.NewInt(1))
+
+	t.Run("dropped halt is cleared after emergency ends so setTss reuses confirmed nonce", func(t *testing.T) {
+		mock, url := newEvmTxMockServer(t)
+		mock.baseFee = big.NewInt(20_000_000_000)
+		mock.tipCap = big.NewInt(2_000_000_000)
+		mock.confirmedNonce = 5
+		mock.pendingNonce = 5
+
+		store := newMemPendingTxStore()
+		client, err := NewEvmRpcClient(config.BaseNetworkConfig{Urls: []string{url}}, "clear-dropped-halt", contract)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer client.Stop()
+		client.SetChainID(1)
+		client.SetPendingTxStore(store)
+
+		// Ambiguous halt submission that never entered the mempool (or was evicted).
+		mock.mu.Lock()
+		mock.sendErr = "connection reset by peer"
+		mock.mu.Unlock()
+		haltTx, err := client.GetHaltTxEvm(sender, []byte{1, 2, 3}, &contract)
+		if err != nil {
+			t.Fatal(err)
+		}
+		signedHalt, err := etypes.SignTx(haltTx, signer, key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := client.SendTransaction(signedHalt); err == nil {
+			t.Fatal("expected ambiguous transport error")
+		}
+		mock.mu.Lock()
+		mock.sendErr = ""
+		mock.mu.Unlock()
+
+		// Before clearing, setTss respects the halt reservation and picks nonce 6.
+		beforeSetTss, err := client.GetSetTssEcdsaPubKeyEvmTx(newTss, sender, []byte{4}, []byte{5}, &contract)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if beforeSetTss.Nonce() != 6 {
+			t.Fatalf("before clear, setTss nonce = %d, want 6", beforeSetTss.Nonce())
+		}
+
+		// After emergency ends, ClearObsoleteHaltTx sees confirmed=5, pending=5,
+		// and TransactionByHash == NotFound, so it clears the obsolete halt record.
+		if err := client.ClearObsoleteHaltTx(sender); err != nil {
+			t.Fatalf("ClearObsoleteHaltTx: %v", err)
+		}
+		afterSetTss, err := client.GetSetTssEcdsaPubKeyEvmTx(newTss, sender, []byte{4}, []byte{5}, &contract)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if afterSetTss.Nonce() != 5 {
+			t.Fatalf("after ClearObsoleteHaltTx, setTss nonce = %d, want 5 (not stranded at 6)", afterSetTss.Nonce())
+		}
+	})
+
+	t.Run("live mempool halt is preserved by ClearObsoleteHaltTx", func(t *testing.T) {
+		mock, url := newEvmTxMockServer(t)
+		mock.baseFee = big.NewInt(20_000_000_000)
+		mock.tipCap = big.NewInt(2_000_000_000)
+		mock.confirmedNonce = 5
+		mock.pendingNonce = 5
+
+		store := newMemPendingTxStore()
+		client, err := NewEvmRpcClient(config.BaseNetworkConfig{Urls: []string{url}}, "keep-live-halt", contract)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer client.Stop()
+		client.SetChainID(1)
+		client.SetPendingTxStore(store)
+
+		haltTx, err := client.GetHaltTxEvm(sender, []byte{1, 2, 3}, &contract)
+		if err != nil {
+			t.Fatal(err)
+		}
+		signedHalt, err := etypes.SignTx(haltTx, signer, key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := client.SendTransaction(signedHalt); err != nil {
+			t.Fatal(err)
+		}
+
+		// Even if pendingNonce is reported stale as 5 while eth_getTransactionByHash
+		// still knows signedHalt, ClearObsoleteHaltTx MUST keep halt ownership.
+		mock.mu.Lock()
+		mock.pendingNonce = 5
+		mock.mu.Unlock()
+		if err := client.ClearObsoleteHaltTx(sender); err != nil {
+			t.Fatalf("ClearObsoleteHaltTx: %v", err)
+		}
+		setTssTx, err := client.GetSetTssEcdsaPubKeyEvmTx(newTss, sender, []byte{4}, []byte{5}, &contract)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if setTssTx.Nonce() != 6 {
+			t.Fatalf("setTss after ClearObsoleteHaltTx on live halt got nonce %d, want 6", setTssTx.Nonce())
+		}
+	})
+}
+
+func TestAnySecondaryHasUnwrapLogChunkedRetainsPartialProgressOnTimeout(t *testing.T) {
+	contract := ecommon.HexToAddress("0x6767676767676767676767676767676767676767")
+	txHash := ecommon.HexToHash("0x9999")
+
+	primarySrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			ID json.RawMessage `json:"id"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"jsonrpc": "2.0", "id": req.ID, "result": hexutil.EncodeUint64(100)})
+	}))
+	t.Cleanup(primarySrv.Close)
+
+	var logCalls atomic.Int32
+	secondarySrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			ID     json.RawMessage   `json:"id"`
+			Method string            `json:"method"`
+			Params []json.RawMessage `json:"params"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		resp := map[string]interface{}{"jsonrpc": "2.0", "id": req.ID}
+		switch req.Method {
+		case "eth_blockNumber":
+			resp["result"] = hexutil.EncodeUint64(100)
+		case "eth_getLogs":
+			call := logCalls.Add(1)
+			if call >= 3 {
+				// Block the 3rd chunk until the per-attempt timeout expires.
+				select {
+				case <-r.Context().Done():
+					return
+				case <-time.After(2 * time.Second):
+				}
+			}
+			resp["result"] = []etypes.Log{}
+		default:
+			resp["result"] = hexutil.EncodeUint64(1)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	t.Cleanup(secondarySrv.Close)
+
+	client, err := NewEvmRpcClient(config.BaseNetworkConfig{
+		Urls:            []string{primarySrv.URL, secondarySrv.URL},
+		FilterQuerySize: 5,
+	}, "partial-progress", contract)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Stop()
+	client.txMu.Lock()
+	client.secondaryLogTimeout = 150 * time.Millisecond
+	client.txMu.Unlock()
+
+	found, lowest, complete, err := client.AnySecondaryHasUnwrapLogChunked(context.Background(), 1, 100, 100, txHash, 0, 10)
+	if err != nil {
+		t.Fatalf("expected partial progress retention instead of error, got err=%v", err)
+	}
+	if found || complete {
+		t.Fatalf("got (found=%v, complete=%v), want (false, false)", found, complete)
+	}
+	// Chunks 1 ([96..100]) and 2 ([91..95]) completed before chunk 3 timed out.
+	if lowest != 91 {
+		t.Fatalf("lowestVerified = %d, want 91", lowest)
 	}
 }

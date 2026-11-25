@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"math/big"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -15,6 +17,7 @@ import (
 	ecommon "github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/hexutil"
 	etypes "github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/crypto"
 	zdb "github.com/zenon-network/go-zenon/common/db"
 	"github.com/zenon-network/go-zenon/chain/nom"
 	"github.com/zenon-network/go-zenon/common/types"
@@ -2056,7 +2059,11 @@ func TestRemovalDrainsInitialStartScanAndExternalStatusReadersSafely(t *testing.
 			}
 			return hexutil.Bytes(ecommon.LeftPadBytes(val.Bytes(), 32)), nil
 		case "eth_blockNumber":
-			return hexutil.EncodeUint64(50), nil
+			return hexutil.EncodeUint64(200), nil
+		case "eth_getBlockByNumber":
+			var number hexutil.Uint64
+			_ = json.Unmarshal(params[0], &number)
+			return map[string]interface{}{"number": number, "hash": ecommon.BigToHash(new(big.Int).SetUint64(uint64(number) + 10))}, nil
 		case "eth_getLogs":
 			scanOnce.Do(func() { close(inInitialScan) })
 			time.Sleep(50 * time.Millisecond)
@@ -2574,4 +2581,313 @@ func TestSecondaryLogCorroborationIsBoundedAndResumesAcrossRetries(t *testing.T)
 		t.Fatalf("queried endpoints first=%v last=%v, want [96 100] and [1 5]", firstRange, lastRange)
 	}
 	l.expect("corroboration complete escalation", common.EmergencyState, 2)
+}
+
+func TestPendingEvmTxOwnershipSurvivesRuntimeNetworkRemovalAndReaddition(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	stopChan := make(chan os.Signal, 1)
+	dbMgr, err := manager.NewDbManager(stopChan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := common.NewGlobalState(new(uint8))
+	state.Health = snapshot.New("test", "")
+	t.Cleanup(state.Health.Close)
+
+	contract := ecommon.HexToAddress("0x1111111111111111111111111111111111111111")
+	newTss := ecommon.HexToAddress("0x2222222222222222222222222222222222222222")
+	key, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sender := crypto.PubkeyToAddress(key.PublicKey)
+	signer := etypes.LatestSignerForChainID(big.NewInt(1))
+
+	var dropSend atomic.Bool
+	dropSend.Store(true)
+	evmSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			ID     json.RawMessage   `json:"id"`
+			Method string            `json:"method"`
+			Params []json.RawMessage `json:"params"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		if req.Method == "eth_sendRawTransaction" && dropSend.Load() {
+			if hj, ok := w.(http.Hijacker); ok {
+				if conn, _, err := hj.Hijack(); err == nil {
+					_ = conn.Close()
+					return
+				}
+			}
+		}
+		resp := map[string]interface{}{"jsonrpc": "2.0", "id": req.ID}
+		switch req.Method {
+		case "eth_chainId":
+			resp["result"] = hexutil.EncodeUint64(1)
+		case "eth_blockNumber":
+			resp["result"] = hexutil.EncodeUint64(100)
+		case "eth_getBalance":
+			resp["result"] = (*hexutil.Big)(new(big.Int).Mul(big.NewInt(10), big.NewInt(1e18)))
+		case "eth_getTransactionCount":
+			// Stale endpoint reports confirmed == pending == 5 after EOF.
+			resp["result"] = hexutil.EncodeUint64(5)
+		case "eth_getBlockByNumber":
+			resp["result"] = map[string]interface{}{
+				"number":        hexutil.EncodeUint64(100),
+				"hash":          ecommon.HexToHash("0x11"),
+				"baseFeePerGas": (*hexutil.Big)(big.NewInt(20_000_000_000)),
+			}
+		case "eth_maxPriorityFeePerGas":
+			resp["result"] = (*hexutil.Big)(big.NewInt(2_000_000_000))
+		case "eth_estimateGas":
+			resp["result"] = hexutil.EncodeUint64(100_000)
+		default:
+			resp["result"] = ecommon.HexToHash("0xdd").Hex()
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	t.Cleanup(evmSrv.Close)
+
+	// 1. First EVM network instance sends halt at nonce 5 and hits an ambiguous EOF.
+	info := &definition.NetworkInfo{NetworkClass: definition.EvmClass, Id: 1, Name: "eth", ContractAddress: contract.Hex()}
+	net1, err := NewEvmNetwork(info, dbMgr, nil, state, stopChan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client1, err := rpc.NewEvmRpcClient(config.BaseNetworkConfig{Urls: []string{evmSrv.URL}}, "eth", contract)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client1.SetChainID(1)
+	client1.SetStorageName(net1.StorageName())
+	client1.SetPendingTxStore(dbMgr.PendingEvmTxStore(1))
+	net1.client = client1
+
+	mgr := &NetworksManager{health: state.Health, logger: zap.NewNop().Sugar()}
+	mgr.AddEvmNetwork(net1)
+
+	tx1, err := client1.GetHaltTxEvm(sender, []byte{1, 2, 3}, &contract)
+	if err != nil {
+		t.Fatal(err)
+	}
+	signed1, err := etypes.SignTx(tx1, signer, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := client1.SendTransaction(signed1); err == nil {
+		t.Fatal("expected ambiguous EOF error")
+	}
+
+	// 2. Runtime network removal destroys chain 1's EVM event store and directories.
+	mgr.RemoveEvmNetwork(1)
+	if err := dbMgr.RemoveEvmEventStore(1); err != nil {
+		t.Fatalf("RemoveEvmEventStore: %v", err)
+	}
+	client1.DeleteDirectories()
+
+	// 3. Re-add chain 1 with the same contract and wire dbMgr.PendingEvmTxStore(1).
+	dropSend.Store(false)
+	net2, err := NewEvmNetwork(info, dbMgr, nil, state, stopChan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client2, err := rpc.NewEvmRpcClient(config.BaseNetworkConfig{Urls: []string{evmSrv.URL}}, "eth", contract)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		net2.drainWorkers(true)
+		_ = dbMgr.RemoveEvmEventStore(1)
+	})
+	client2.SetChainID(1)
+	client2.SetStorageName(net2.StorageName())
+	client2.SetPendingTxStore(dbMgr.PendingEvmTxStore(1))
+	net2.client = client2
+
+	// Replacement client MUST still recover halt's nonce 5 and bump >=20%,
+	// and setTss MUST NOT collide with halt's nonce 5!
+	tx2, err := client2.GetHaltTxEvm(sender, []byte{1, 2, 3}, &contract)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tx2.Nonce() != 5 {
+		t.Fatalf("after remove+readd, halt nonce = %d, want 5", tx2.Nonce())
+	}
+	wantMinTip := new(big.Int).Div(new(big.Int).Mul(tx1.GasTipCap(), big.NewInt(120)), big.NewInt(100))
+	if tx2.GasTipCap().Cmp(wantMinTip) < 0 {
+		t.Fatalf("after remove+readd, halt tip = %s, want >= %s", tx2.GasTipCap(), wantMinTip)
+	}
+	setTssTx, err := client2.GetSetTssEcdsaPubKeyEvmTx(newTss, sender, []byte{4}, []byte{5}, &contract)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if setTssTx.Nonce() != 6 {
+		t.Fatalf("after remove+readd, setTss stole halt nonce: got %d, want 6", setTssTx.Nonce())
+	}
+}
+
+func TestLateUnknownUnwrapHoldsWhenMatchingEventQueuedDuringSecondaryCorroboration(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	b := newReplayBridge(t)
+	l := &lateNode{t: t, bridge: b}
+	l.ledger.Store(newReplayLedger(t, b, 5000))
+	l.redeemableIn.Store(30)
+
+	var eN *evmNetwork
+	var enqueueOnce sync.Once
+
+	primaryURL := replayServerWithErrors(t, func(method string, params []json.RawMessage) (interface{}, *replayRPCError) {
+		switch method {
+		case "stats.syncInfo":
+			return nil, nil
+		case "embedded.bridge.getUnwrapTokenRequestByHashAndLog":
+			return withRedeemDelay(b.request, l.redeemableIn.Load()), nil
+		case "eth_syncing":
+			return false, nil
+		case "eth_blockNumber":
+			return hexutil.EncodeUint64(200), nil
+		case "eth_getBlockByNumber":
+			var number hexutil.Uint64
+			_ = json.Unmarshal(params[0], &number)
+			return map[string]interface{}{"number": number, "hash": ecommon.BigToHash(new(big.Int).SetUint64(uint64(number) + 10))}, nil
+		case "eth_getTransactionReceipt":
+			return nil, nil
+		case "eth_getLogs":
+			return []etypes.Log{}, nil
+		}
+		if result, ok := l.ledger.Load().answer(t, method, params); ok {
+			return result, nil
+		}
+		return nil, nil
+	})
+	secondaryURL := replayServerWithErrors(t, func(method string, params []json.RawMessage) (interface{}, *replayRPCError) {
+		switch method {
+		case "eth_syncing":
+			return false, nil
+		case "eth_blockNumber":
+			return hexutil.EncodeUint64(200), nil
+		case "eth_getBlockByNumber":
+			var number hexutil.Uint64
+			_ = json.Unmarshal(params[0], &number)
+			return map[string]interface{}{"number": number, "hash": ecommon.BigToHash(new(big.Int).SetUint64(uint64(number) + 10))}, nil
+		case "eth_getTransactionReceipt":
+			return nil, nil
+		case "eth_getLogs":
+			// While the final secondary log check runs, the EVM scanner enqueues
+			// the matching unconfirmed event into eN.unconfirmedQueue!
+			enqueueOnce.Do(func() {
+				_ = eN.enqueueUnconfirmed(&events.UnwrapRequestEvm{
+					ChainId:         1,
+					TransactionHash: ecommon.Hash(b.request.TransactionHash),
+					LogIndex:        b.request.LogIndex,
+					BlockNumber:     198,
+				})
+			})
+			return []etypes.Log{}, nil
+		default:
+			return nil, nil
+		}
+	})
+
+	l.n, l.stores = replayNetwork(t, b, primaryURL, map[uint32]string{1: primaryURL})
+	evmClient, err := rpc.NewEvmRpcClient(config.BaseNetworkConfig{Urls: []string{primaryURL, secondaryURL}}, "eth", b.contract)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(evmClient.Stop)
+	l.n.rpcManager.RegisterEvmClient(1, evmClient)
+	l.n.SetConfirmationsToFinality(5)
+	l.at(5000, acceptedReceive)
+
+	params, err := config.NewEvmParams(&definition.NetworkInfo{NetworkClass: definition.EvmClass, Id: 1, Name: "eth", ContractAddress: b.contract.Hex()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	params.SetConfirmationsToFinality(5)
+	params.SetContractDeploymentHeight(1)
+	q, err := storage.CreateOrOpenQueue(definition.EvmClass, "queued-during-secondary-corroboration")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = q.Close() })
+	eN = &evmNetwork{
+		EvmParams:         params,
+		client:            evmClient,
+		unconfirmedQueue:  q,
+		queuedBlockCounts: make(map[uint64]int),
+		queuedTxKeys:      make(map[queuedUnwrapKey]int),
+		done:              make(chan struct{}),
+		syncTrigger:       make(chan struct{}, 1),
+		state:             l.n.state,
+		logger:            zap.NewNop().Sugar(),
+	}
+	eN.lastScannedThrough.Store(200)
+	eN.scanned.Store(true)
+	l.n.networkManager = &NetworksManager{znnNetwork: l.n, evmNetworks: []*evmNetwork{eN}, logger: zap.NewNop().Sugar()}
+
+	// Must HOLD instead of escalating to EmergencyState because the matching
+	// event was enqueued during the secondary log check.
+	if err := l.listen(); err == nil {
+		t.Fatal("expected hold when matching event arrived in queue during secondary corroboration")
+	}
+	l.expect("concurrent queued event held", common.LiveState, 1)
+}
+
+func TestNetworksManagerStartIgnoresNetworkRemovedDuringInitialScan(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	h := newHeldStart(t)
+	h.evm.open()
+
+	inInitialScan := make(chan struct{})
+	var scanOnce sync.Once
+	var ethCallCount atomic.Int32
+	removedEvmURL := replayServerWithErrors(t, func(method string, params []json.RawMessage) (interface{}, *replayRPCError) {
+		switch method {
+		case "eth_syncing":
+			return false, nil
+		case "eth_call":
+			val := big.NewInt(1)
+			if ethCallCount.Add(1)%3 == 1 {
+				val = big.NewInt(5)
+			}
+			return hexutil.Bytes(ecommon.LeftPadBytes(val.Bytes(), 32)), nil
+		case "eth_blockNumber":
+			return hexutil.EncodeUint64(200), nil
+		case "eth_getBlockByNumber":
+			var number hexutil.Uint64
+			_ = json.Unmarshal(params[0], &number)
+			return map[string]interface{}{"number": number, "hash": ecommon.BigToHash(new(big.Int).SetUint64(uint64(number) + 10))}, nil
+		case "eth_getLogs":
+			scanOnce.Do(func() { close(inInitialScan) })
+			time.Sleep(300 * time.Millisecond)
+			return nil, &replayRPCError{-32000, "scan interrupted by removal"}
+		default:
+			return nil, &replayRPCError{-32601, "unsupported " + method}
+		}
+	})
+	_ = h.addEvmNetwork(2, removedEvmURL)
+
+	startErr := make(chan error, 1)
+	go func() { startErr <- h.m.Start() }()
+
+	select {
+	case <-inInitialScan:
+	case err := <-startErr:
+		t.Fatalf("NetworksManager.Start exited before reaching chain 2 initial scan: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("NetworksManager.Start did not reach EVM initial scan")
+	}
+
+	// Remove chain 2 while NetworksManager.Start() is running its synchronous initial scan.
+	h.m.RemoveEvmNetwork(2)
+
+	select {
+	case err := <-startErr:
+		if err != nil {
+			t.Fatalf("NetworksManager.Start returned error after runtime removal during initial scan: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("NetworksManager.Start hung after runtime removal during initial scan")
+	}
 }

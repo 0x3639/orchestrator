@@ -1847,6 +1847,15 @@ func (rC *znnNetwork) recordUnwrapRegistration(ctx context.Context, param *defin
 			}
 			source = rechecked
 			if source == sourceUnknown {
+				// Recheck the unconfirmed queue after corroboration and source
+				// recheck so a matching event enqueued during secondary log
+				// queries is never missed while awaiting confirmation.
+				if rC.networkManager != nil {
+					if eN := rC.networkManager.LookupEvm(rpcZnnEvent.ChainId); eN != nil && eN.hasQueuedEvent(ecommon.Hash(rpcZnnEvent.TransactionHash), rpcZnnEvent.LogIndex) {
+						return awaitsSourceRecord{errors.Errorf("unwrap request %s/%d on chainId %d has matching queued evidence awaiting confirmation",
+							param.TransactionHash.String(), param.LogIndex, rpcZnnEvent.ChainId)}
+					}
+				}
 				rC.logger.Errorf("late unwrap request %s/%d inside its redeem delay on chainId %d has no receipt and no recorded source event despite completed corroborated EVM scan coverage; escalating to emergency",
 					param.TransactionHash.String(), param.LogIndex, rpcZnnEvent.ChainId)
 			}
@@ -2050,7 +2059,11 @@ func (rC *znnNetwork) startRuntimeEvmNetwork(network *definition.NetworkInfo) er
 		return err
 	}
 	client.SetStorageName(net.StorageName())
-	if txStore, ok := rC.dbManager.EvmStorage(network.Id).(common.PendingEvmTxStore); ok {
+	if provider, ok := rC.dbManager.(pendingTxStoreProvider); ok {
+		if txStore := provider.PendingEvmTxStore(network.Id); txStore != nil {
+			client.SetPendingTxStore(txStore)
+		}
+	} else if txStore, ok := rC.dbManager.EvmStorage(network.Id).(common.PendingEvmTxStore); ok {
 		client.SetPendingTxStore(txStore)
 	}
 	rollbackTokens := rC.applyNetworkTokenPairsWithRollback(network)
@@ -2497,6 +2510,10 @@ type evmStoreRemover interface {
 	RemoveEvmEventStore(chainId uint32) error
 }
 
+type pendingTxStoreProvider interface {
+	PendingEvmTxStore(chainId uint32) common.PendingEvmTxStore
+}
+
 // readSettingsAtOrAfter brackets a Zenon bridge settings RPC with frontier
 // momentum checks so a lagging or load-balanced endpoint behind minMomentum
 // cannot return stale pre-receive state and cause the listener to checkpoint
@@ -2806,6 +2823,11 @@ func (rC *znnNetwork) lateUnknownUnwrapCovered(ctx context.Context, evm *rpc.Evm
 		if !complete {
 			return false
 		}
+	}
+	// Recheck the queue after corroboration completes so a matching event
+	// enqueued while secondary queries ran is treated as pending evidence.
+	if eN.hasQueuedEvent(ecommon.Hash(rpcZnnEvent.TransactionHash), rpcZnnEvent.LogIndex) || eN.hasQueuedAtOrBelow(requiredHeight) {
+		return false
 	}
 	return true
 }
