@@ -39,7 +39,8 @@ type evmNetwork struct {
 	// aheadOfBridgeAccount.
 	bridgeRead    <-chan struct{}
 	rollbackStore func()
-	// Start sets it while Stop may already be running.
+	// stopHealth is set by Start and read by Stop and by a runtime removal,
+	// which can run on other goroutines; healthMu guards it.
 	healthMu   sync.Mutex
 	stopHealth func()
 	health     *snapshot.Store
@@ -214,13 +215,13 @@ func (eN *evmNetwork) Start() (startErr error) {
 		}
 	}
 	if eN.health != nil {
-		stopHealth := eN.health.Poll(func(ctx context.Context) {
+		stopHealth, ok := eN.startHealthPoll(func(ctx context.Context) {
 			eN.observeQueueDepth()
 			eN.recordSync(client.SampleSyncState(ctx))
 		})
-		eN.healthMu.Lock()
-		eN.stopHealth = stopHealth
-		eN.healthMu.Unlock()
+		if !ok {
+			return context.Canceled
+		}
 		defer func() {
 			if startErr != nil {
 				stopHealth()
@@ -234,7 +235,7 @@ func (eN *evmNetwork) Start() (startErr error) {
 	lastUpdateHeight, err := eN.dbManager.EvmStorage(eN.ChainId()).GetLastUpdateHeight()
 	if err != nil {
 		eN.logger.Debug(err)
-		return err
+		return errors.Wrapf(err, "read sync cursor for chainId %d", eN.ChainId())
 	}
 	if lastUpdateHeight == 0 {
 		if err := eN.dbManager.EvmStorage(eN.ChainId()).SetLastUpdateHeight(eN.ContractDeploymentHeight()); err != nil {
@@ -386,7 +387,7 @@ func (eN *evmNetwork) sync() error {
 	eN.settleChecked.Store(true)
 	startHeight, redeemFrom, legacy, err := eN.eventsStore().GetScanHeights(eN.ConfirmationsToFinality())
 	if err != nil {
-		return err
+		return errors.Wrapf(err, "read sync cursor for chainId %d", eN.ChainId())
 	}
 	eN.logger.Info("updateHeight: ", startHeight)
 
@@ -866,7 +867,9 @@ const (
 // refreshes it every subscriptionRefreshInterval after a catch-up Sync, and
 // re-establishes it with backoff when the provider drops it. A failed Sync
 // is logged and retried at the next refresh; it never leaves the node
-// without a subscription. Registrations whose live check gave no answer are
+// without a subscription. The exception is a corrupt local sync cursor,
+// which retrying cannot repair: the store has already requested a stop,
+// and the loop logs the cursor and returns. Registrations whose live check gave no answer are
 // rechecked beside it, at their own pace, while a Sync or a resubscribe waits.
 func (eN *evmNetwork) SubscribeToEvents() {
 	eN.withRedeemWatch(eN.subscribeToEvents)
@@ -906,24 +909,35 @@ func (eN *evmNetwork) subscribeToEvents() {
 	eN.logger.Infof("SubscribeToEvents for network with chainId: %d", eN.ChainId())
 	resubscribeBackoff := processEventsBaseBackoff
 	var nextCatchUp time.Time
-	catchUp := func() {
-		if err := eN.Sync(); err != nil {
-			eN.logger.Errorf("Sync for chainId %d failed and will be retried: %v", eN.ChainId(), err)
+	// catchUp reports false when the loop must stop: a corrupt local sync
+	// cursor cannot be repaired by retrying, and the store has already
+	// requested a stop and kept the bad value.
+	catchUp := func() bool {
+		if err := eN.Sync(); errors.Is(err, db.ErrCorruptCursor) {
+			eN.logger.Errorf("Stopping EVM sync for chainId %d: %v", eN.ChainId(), err)
+			return false
+		} else if err != nil {
+			eN.logger.Errorf("Sync for chainId %d failed and will be retried; the sync cursor did not advance: %v", eN.ChainId(), err)
 		}
 		nextCatchUp = time.Now().Add(eN.refreshInterval())
+		return true
 	}
 
 	for {
 		// A catch-up that fell due during a pause runs first, so the setup
 		// below always has until the next one.
 		if !nextCatchUp.IsZero() && !time.Now().Before(nextCatchUp) {
-			catchUp()
+			if !catchUp() {
+				return
+			}
 		}
 		logSub, logChan, err := eN.subscribeToLogs(nextCatchUp)
 		if err != nil {
 			// HTTP range queries may still work while subscriptions are down.
 			if !time.Now().Before(nextCatchUp) {
-				catchUp()
+				if !catchUp() {
+					return
+				}
 			}
 			eN.logger.Errorf("cannot subscribe to logs for chainId %d: %v; retrying in %s", eN.ChainId(), err, resubscribeBackoff)
 			if !eN.sleep(min(resubscribeBackoff, eN.refreshInterval())) {
@@ -968,7 +982,9 @@ func (eN *evmNetwork) subscribeToEvents() {
 		refresh.Stop()
 		logSub.Unsubscribe()
 
-		catchUp()
+		if !catchUp() {
+			return
+		}
 
 		if dropped && time.Since(started) < subscriptionHealthyAfter {
 			// The provider accepted the subscription and dropped it almost
@@ -1181,9 +1197,25 @@ func (eN *evmNetwork) observeQueueDepth() {
 	eN.health.UpdateNetwork(eN.ChainId(), func(n *snapshot.Network) { n.Unwrap.AwaitingFinality = snapshot.Measure(depth) })
 }
 
-// endHealthPoll stops the health sampler Start began, if it has begun one.
-func (eN *evmNetwork) endHealthPoll() {
+// startHealthPoll starts the health poller unless the network was already
+// stopped or removed, so a removal during Start never leaves a poller behind.
+func (eN *evmNetwork) startHealthPoll(sample func(context.Context)) (func(), bool) {
 	eN.healthMu.Lock()
+	defer eN.healthMu.Unlock()
+	select {
+	case <-eN.done:
+		return nil, false
+	default:
+	}
+	eN.stopHealth = eN.health.Poll(sample)
+	return eN.stopHealth, true
+}
+
+// halt closes done and stops the health poller. It is safe to call more than
+// once and from any goroutine. It waits for an in-flight health sample.
+func (eN *evmNetwork) halt() {
+	eN.healthMu.Lock()
+	eN.stopOnce.Do(func() { close(eN.done) })
 	stopHealth := eN.stopHealth
 	eN.healthMu.Unlock()
 	if stopHealth != nil {
@@ -1192,8 +1224,7 @@ func (eN *evmNetwork) endHealthPoll() {
 }
 
 func (eN *evmNetwork) Stop() {
-	eN.endHealthPoll()
-	eN.stopOnce.Do(func() { close(eN.done) })
+	eN.halt()
 	eN.EvmRpc().Stop()
 	_ = eN.unconfirmedQueue.Close()
 }

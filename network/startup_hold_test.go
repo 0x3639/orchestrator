@@ -279,6 +279,11 @@ type heldEvm struct {
 	haltedFails atomic.Bool
 	// Runs, once, when the signer first asks for the halt flag.
 	onHaltedRead atomic.Pointer[func()]
+	// Runs, once, when the halt senders next read the halt flag itself.
+	onFlagRead atomic.Pointer[func()]
+	// Every transaction sent to this chain is rejected.
+	sendFails atomic.Bool
+	rejected  atomic.Int32 // transactions this chain rejected
 	// The TSS address the contract holds, when one is set.
 	tss atomic.Pointer[ecommon.Address]
 	// Runs, once, when the TSS address is read.
@@ -359,6 +364,8 @@ func (e *heldEvm) answer(method string, params []json.RawMessage) (interface{}, 
 				if hook := e.onHaltedRead.Swap(nil); hook != nil {
 					(*hook)()
 				}
+			} else if hook := e.onFlagRead.Swap(nil); hook != nil {
+				(*hook)()
 			}
 			if e.haltedFails.Load() {
 				return nil, &replayRPCError{-32000, "upstream timeout"}
@@ -387,6 +394,10 @@ func (e *heldEvm) answer(method string, params []json.RawMessage) (interface{}, 
 	case "eth_estimateGas":
 		return "0x5208", nil
 	case "eth_sendRawTransaction":
+		if e.sendFails.Load() {
+			e.rejected.Add(1)
+			return nil, &replayRPCError{-32000, "nonce too low"}
+		}
 		e.sent.Add(1)
 		return ecommon.Hash{1}.Hex(), nil
 	case "eth_blockNumber":

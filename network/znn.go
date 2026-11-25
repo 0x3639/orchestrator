@@ -216,6 +216,11 @@ func (e awaitsSourceRecord) Unwrap() error { return e.error }
 // once startup lets it, and for a signer in EmergencyState or HaltedState,
 // which has the halt to sign or to keep and signs no transfer either way.
 func (rC *znnNetwork) startupHolds(err error) bool {
+	// A damaged checkpoint does not mend itself: retrying would only read it
+	// again. The start ends and the operator restores it.
+	if errors.Is(err, db.ErrCorruptCursor) {
+		return false
+	}
 	if rC.listenerCtx.Err() != nil {
 		return false
 	}
@@ -468,6 +473,11 @@ func (rC *znnNetwork) finishStartup(ctx context.Context, reached uint64, err err
 			continue
 		}
 		reached, err = rC.readBridgeAccount(ctx)
+		// Before the context: the stop a damaged checkpoint requests may
+		// already have cancelled it, and the reason must still be logged.
+		if rC.stopOnCorruptCursor(err) {
+			return false
+		}
 		if ctx.Err() != nil {
 			return false
 		}
@@ -1890,10 +1900,27 @@ func (rC *znnNetwork) stopBridgeListener(ctx context.Context, err error) {
 	common.RequestStop(rC.stopChan)
 }
 
+// stopOnCorruptCursor reports whether err is a corrupt local sync cursor.
+// Retrying cannot repair it, so the listener stops and keeps it for
+// recovery. The store has already requested a stop, which may have cancelled
+// the listener's context; the line is logged anyway because it explains why
+// the node stopped.
+func (rC *znnNetwork) stopOnCorruptCursor(err error) bool {
+	if !errors.Is(err, db.ErrCorruptCursor) {
+		return false
+	}
+	rC.logger.Errorf("Stopping Zenon bridge listener: %v", err)
+	common.RequestStop(rC.stopChan)
+	return true
+}
+
 func (rC *znnNetwork) followBridgeAccount(ctx context.Context, hints <-chan []subscribe.AccountBlock, subscriptionErrors <-chan error, refresh func() error) {
 	// Notifications can arrive before confirmation, out of order, or alongside
 	// a reconnect. Always take work from the next ledger height.
 	height, err := rC.eventsStore().GetLastUpdateHeight()
+	if rC.stopOnCorruptCursor(err) {
+		return
+	}
 	if err != nil {
 		rC.stopBridgeListener(ctx, errors.Wrap(err, "read bridge account checkpoint"))
 		return
@@ -1902,6 +1929,10 @@ func (rC *znnNetwork) followBridgeAccount(ctx context.Context, hints <-chan []su
 	for ctx.Err() == nil {
 		next, fullPage, err := rC.processBridgeAccountPage(ctx, height, refresh)
 		height = next
+		// Checked before ctx: the store's stop request can cancel ctx first.
+		if rC.stopOnCorruptCursor(err) {
+			return
+		}
 		if ctx.Err() != nil {
 			return
 		}

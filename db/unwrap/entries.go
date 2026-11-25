@@ -3,11 +3,13 @@ package unwrap
 import (
 	"encoding/binary"
 	"errors"
+	"fmt"
 	ecommon "github.com/ethereum/go-ethereum/common"
 	"github.com/syndtr/goleveldb/leveldb"
 	zcommon "github.com/zenon-network/go-zenon/common"
 	"orchestrator/common"
 	"orchestrator/common/events"
+	"orchestrator/db"
 )
 
 func getUnwrapRequestPrefix() []byte {
@@ -412,20 +414,64 @@ func (es *evmStorage) GetScanHeights(depth uint64) (through, redeem uint64, lega
 		es.SendSigInt()
 		return 0, 0, false, err
 	}
+	through, redeem, err = decodeScanCheckpoint(data)
+	if err != nil {
+		es.SendSigInt()
+		return 0, 0, false, err
+	}
+	if len(data) == 8 {
+		return through, min(through, max(es.contractDeploymentHeight, through-min(through, depth))), true, nil
+	}
+	return through, redeem, false, nil
+}
+
+// decodeScanCheckpoint reads a stored EVM scan checkpoint: the single height
+// that earlier builds wrote (redeem is then equal to it), or the scan height
+// followed by the finalized redeem height. Any other length, or a redeem
+// height above the scan height, is a damaged checkpoint.
+func decodeScanCheckpoint(data []byte) (through, redeem uint64, err error) {
 	switch len(data) {
 	case 8:
 		through = binary.LittleEndian.Uint64(data)
-		return through, min(through, max(es.contractDeploymentHeight, through-min(through, depth))), true, nil
+		return through, through, nil
 	case 16:
 		through, redeem = binary.LittleEndian.Uint64(data), binary.LittleEndian.Uint64(data[8:])
 		if redeem <= through {
-			return through, redeem, false, nil
+			return through, redeem, nil
 		}
+		return 0, 0, fmt.Errorf("%w: EVM scan checkpoint (key 0x01) has redeem height %d above scan height %d. "+
+			"The stored value was left unchanged; keep the orchestrator stopped and restore a known-good local sync checkpoint "+
+			"(operator guide: Local sync checkpoints)", db.ErrCorruptCursor, redeem, through)
 	}
-	return 0, 0, false, errors.New("invalid EVM scan checkpoint")
+	return 0, 0, &db.CorruptCursorError{Key: "EVM scan checkpoint (key 0x01)", Got: len(data), Want: 16}
+}
+
+// storedScanCheckpoint returns the checkpoint on disk, or nil when there is
+// none. A damaged checkpoint is an error, so writers leave it in place for the
+// operator to inspect instead of overwriting it.
+func (es *evmStorage) storedScanCheckpoint() ([]byte, error) {
+	stored, err := es.DB.Get(getLastUpdateKey())
+	if errors.Is(err, leveldb.ErrNotFound) {
+		return nil, nil
+	}
+	if err == nil {
+		_, _, err = decodeScanCheckpoint(stored)
+	}
+	if err != nil {
+		es.SendSigInt()
+		return nil, err
+	}
+	return stored, nil
 }
 
 func (es *evmStorage) SetScanHeights(through, redeem uint64) error {
+	if redeem > through {
+		es.SendSigInt()
+		return fmt.Errorf("refusing to store EVM scan checkpoint with redeem height %d above scan height %d", redeem, through)
+	}
+	if _, err := es.storedScanCheckpoint(); err != nil {
+		return err
+	}
 	data := binary.LittleEndian.AppendUint64(nil, through)
 	err := es.DB.Put(getLastUpdateKey(), binary.LittleEndian.AppendUint64(data, redeem))
 	if err != nil {
@@ -441,12 +487,11 @@ func (es *evmStorage) SetScanHeights(through, redeem uint64) error {
 // redeem scan yet. Only a database without the pair gets the single-height
 // record that earlier builds wrote.
 func (es *evmStorage) SetLastUpdateHeight(height uint64) error {
-	data := binary.LittleEndian.AppendUint64(nil, height)
-	stored, err := es.DB.Get(getLastUpdateKey())
-	if err != nil && !errors.Is(err, leveldb.ErrNotFound) {
-		es.SendSigInt()
+	stored, err := es.storedScanCheckpoint()
+	if err != nil {
 		return err
 	}
+	data := binary.LittleEndian.AppendUint64(nil, height)
 	if len(stored) == 16 {
 		redeem := binary.LittleEndian.Uint64(stored[8:])
 		data = binary.LittleEndian.AppendUint64(data, min(redeem, height))

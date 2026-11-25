@@ -493,8 +493,10 @@ func (m *NetworksManager) RemoveEvmNetwork(chainId uint32) {
 	defer m.evmMu.Unlock()
 	for idx, network := range m.evmNetworks {
 		if network.ChainId() == chainId {
-			network.endHealthPoll()
-			network.stopOnce.Do(func() { close(network.done) })
+			// halt closes done and stops the health poller under one lock,
+			// so a Start running beside this removal cannot begin a poller
+			// after it.
+			network.halt()
 			// A worker waiting on the queue returns, and the queue is free for
 			// a network added again under the same name. With done closed, a
 			// worker that finds the queue closed does not stop the node.
@@ -877,6 +879,17 @@ func (m *NetworksManager) GetUnsignedWrapRequests() ([]*definition.WrapTokenRequ
 }
 
 // / Evm
+// LookupEvm returns the EVM network with chainId that the bridge lists now,
+// or nil. Unlike Evm it does not panic for a network the bridge removed.
+func (m *NetworksManager) LookupEvm(chainId uint32) *evmNetwork {
+	for _, network := range m.networks() {
+		if network.ChainId() == chainId {
+			return network
+		}
+	}
+	return nil
+}
+
 func (m *NetworksManager) Evm(chainId uint32) *evmNetwork {
 	networks := m.networks()
 	if networks == nil {
@@ -909,8 +922,8 @@ func (m *NetworksManager) SetTssEcdsaPubKeyEvm(batch EvmBatch, oldKeySignatures,
 	}
 	newPubKey, errDecompress := crypto.DecompressPubkey(newCompressedPubKeyBytes)
 	if errDecompress != nil {
-		m.logger.Debug(err)
-		return false, err
+		m.logger.Debug(errDecompress)
+		return false, errDecompress
 	}
 	newTss := crypto.PubkeyToAddress(*newPubKey)
 	m.logger.Debugf("New tss address: %s", newTss.String())
@@ -979,8 +992,8 @@ func (m *NetworksManager) CheckNewTssEcdsaPubKeyEvm(newCompressedPubKey string) 
 	}
 	newPubKey, errDecompress := crypto.DecompressPubkey(newCompressedPubKeyBytes)
 	if errDecompress != nil {
-		m.logger.Debug(err)
-		return false, err
+		m.logger.Debug(errDecompress)
+		return false, errDecompress
 	}
 	newTss := crypto.PubkeyToAddress(*newPubKey)
 	m.logger.Debugf("New tss address: %s", newTss.String())
@@ -1003,10 +1016,35 @@ func (m *NetworksManager) CheckNewTssEcdsaPubKeyEvm(newCompressedPubKey string) 
 	return ok, nil
 }
 
+// NetworksWithoutKey returns the chain ids of the EVM networks the bridge
+// lists now that are not seen to hold the key: their TSS address is another,
+// or it cannot be read.
+func (m *NetworksManager) NetworksWithoutKey(newCompressedPubKey string) ([]uint32, error) {
+	newCompressedPubKeyBytes, err := base64.StdEncoding.DecodeString(newCompressedPubKey)
+	if err != nil {
+		return nil, err
+	}
+	newPubKey, err := crypto.DecompressPubkey(newCompressedPubKeyBytes)
+	if err != nil {
+		return nil, err
+	}
+	newTss := crypto.PubkeyToAddress(*newPubKey)
+	var missing []uint32
+	for _, network := range m.networks() {
+		if tss, err := network.GetCurrentTss(); err != nil || tss != newTss {
+			missing = append(missing, network.ChainId())
+		}
+	}
+	return missing, nil
+}
+
 // SendHaltEvm sends the halt, signed for the networks in batch, to the first
-// of them that the bridge still lists and whose halt flag is not set yet. The
-// transaction is submitted through while; ErrEmergencyEnded is returned when
-// while did not run it.
+// of them that the bridge still lists and whose halt flag is not set yet. It
+// reports whether every one of them has its flag set. A network whose flag
+// cannot be read, or whose halt cannot be built or sent, does not keep the
+// networks after it from getting theirs: the call goes on to the next one.
+// The transaction is submitted through while; ErrEmergencyEnded is returned
+// when while did not run it.
 func (m *NetworksManager) SendHaltEvm(batch EvmBatch, signatures [][]byte, ecdsaPrivateKey *ecdsa.PrivateKey, evmAddress ecommon.Address, while WhileEmergency) (bool, error) {
 	targets, err := m.targets(batch, signatures)
 	if err != nil {
@@ -1018,14 +1056,15 @@ func (m *NetworksManager) SendHaltEvm(batch EvmBatch, signatures [][]byte, ecdsa
 		network, idx := target.network, target.index
 		halted, err := network.EvmRpc().HaltFlagSet()
 		if err != nil {
-			return false, err
+			m.logger.Errorf("cannot read the halt flag of EVM network %d: %v", network.ChainId(), err)
+			ok = false
+			continue
 		}
 		if halted {
 			m.logger.Infof("network with chainId %d already halted\n", network.ChainId())
 			continue
-		} else {
-			ok = false
 		}
+		ok = false
 		tx, err := network.GetHaltEvmTx(signatures[idx], evmAddress)
 		if err != nil {
 			m.logger.Error(err)
@@ -1039,12 +1078,54 @@ func (m *NetworksManager) SendHaltEvm(batch EvmBatch, signatures [][]byte, ecdsa
 		sent, err := submit(while, func() error { return network.SendTransaction(tx) })
 		if err != nil {
 			m.logger.Error(err)
-		} else if !sent {
+			continue
+		}
+		if !sent {
 			return false, ErrEmergencyEnded
 		}
 		break
 	}
 	return ok, nil
+}
+
+// ErrHaltFlagsUnreadable is returned by RecordConfirmedHalt when a halt flag
+// could not be read. Nothing was recorded; the caller may try again.
+var ErrHaltFlagsUnreadable = errors.New("cannot read the bridge's halt flags")
+
+// RecordConfirmedHalt moves state from EmergencyState to HaltedState, and
+// reports whether it did, only after one read shows the explicit halt flag
+// set on Zenon and on every EVM network the bridge lists. The senders of a
+// halt finish at different times, so a flag one of them saw earlier may have
+// been cleared since, and a network may have been added, or removed and added
+// again, after its sender ended. The list must still be the one that was read
+// when the state changes: a network is added under the same lock.
+func (m *NetworksManager) RecordConfirmedHalt(state *common.GlobalState) (bool, error) {
+	networks := m.networks()
+	halted, err := m.znnNetwork.HaltFlagSet()
+	if err != nil {
+		return false, fmt.Errorf("%w: Zenon: %w", ErrHaltFlagsUnreadable, err)
+	}
+	if !halted {
+		m.logger.Info("the Zenon bridge does not have its halt flag set; the halt is not recorded")
+		return false, nil
+	}
+	for _, network := range networks {
+		halted, err := network.EvmRpc().HaltFlagSet()
+		if err != nil {
+			return false, fmt.Errorf("%w: EVM network %d: %w", ErrHaltFlagsUnreadable, network.ChainId(), err)
+		}
+		if !halted {
+			m.logger.Infof("EVM network %d does not have its halt flag set; the halt is not recorded", network.ChainId())
+			return false, nil
+		}
+	}
+	m.evmMu.RLock()
+	defer m.evmMu.RUnlock()
+	if !slices.Equal(m.evmNetworks, networks) {
+		m.logger.Info("the bridge's EVM networks changed while the halt flags were read; the halt is not recorded")
+		return false, nil
+	}
+	return state.SetStateIf(common.EmergencyState, common.HaltedState)
 }
 
 // GetHaltMessages returns the halt message of every EVM network the bridge
@@ -1177,8 +1258,8 @@ func (m *NetworksManager) GetSetTssEcdsaPubKeysEvmMessages(newCompressedPubKey s
 	}
 	newPubKey, errDecompress := crypto.DecompressPubkey(newCompressedPubKeyBytes)
 	if errDecompress != nil {
-		m.logger.Debug(err)
-		return EvmBatch{}, nil, err
+		m.logger.Debug(errDecompress)
+		return EvmBatch{}, nil, errDecompress
 	}
 	newTss := crypto.PubkeyToAddress(*newPubKey)
 
