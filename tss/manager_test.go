@@ -3,10 +3,16 @@ package tss
 import (
 	"crypto/ed25519"
 	"encoding/base64"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
 
+	tcommon "github.com/HyperCore-Team/go-tss/common"
+	"github.com/HyperCore-Team/go-tss/keygen"
+	"github.com/HyperCore-Team/go-tss/messages"
+
+	"orchestrator/common"
 	oconfig "orchestrator/common/config"
 )
 
@@ -102,5 +108,87 @@ func TestNewTssManagerRejectsSymlinkedKeyShareFile(t *testing.T) {
 	if err == nil {
 		mgr.Stop()
 		t.Fatal("expected NewTssManager to reject symlinked localstate file")
+	}
+}
+
+func TestKeyGenHardensNewShareAndFailsOnMissingOrUnsafeShare(t *testing.T) {
+	pubKey := base64.StdEncoding.EncodeToString(make([]byte, 33))
+	expectedFile, err := common.GetPublicKeyFileName(pubKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Successful KeyGen normalizes 0644 share to 0600 and 0500 dir to 0700.
+	dir := filepath.Join(t.TempDir(), "tss-keygen")
+	if err := os.Mkdir(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0700) })
+
+	mgr := &TssManager{
+		keyShareDir: dir,
+		preParamsFn: func() error { return nil },
+		partyConfig: func() tcommon.TssConfig { return tcommon.TssConfig{} },
+		keygenFn: func(keygen.Request) (keygen.Response, error) {
+			sharePath := filepath.Join(dir, expectedFile)
+			if err := os.WriteFile(sharePath, []byte(`{"participant_keys":["k1"]}`), 0644); err != nil {
+				return keygen.Response{}, err
+			}
+			if err := os.Chmod(sharePath, 0644); err != nil {
+				return keygen.Response{}, err
+			}
+			if err := os.Chmod(dir, 0500); err != nil {
+				return keygen.Response{}, err
+			}
+			return keygen.Response{PubKey: pubKey, Status: tcommon.Success}, nil
+		},
+	}
+
+	resp, err := mgr.KeyGen(messages.ECDSAKEYGEN)
+	if err != nil {
+		t.Fatalf("KeyGen failed: %v", err)
+	}
+	if resp == nil || resp.PubKey != pubKey {
+		t.Fatalf("unexpected response: %+v", resp)
+	}
+	if info, err := os.Stat(dir); err != nil || info.Mode().Perm() != oconfig.DataDirPerm {
+		t.Fatalf("dir mode after KeyGen = %v (err %v), want %04o", info.Mode().Perm(), err, oconfig.DataDirPerm)
+	}
+	if info, err := os.Stat(filepath.Join(dir, expectedFile)); err != nil || info.Mode().Perm() != oconfig.KeyShareFilePerm {
+		t.Fatalf("share mode after KeyGen = %v (err %v), want %04o", info.Mode().Perm(), err, oconfig.KeyShareFilePerm)
+	}
+
+	// 2. Missing expected share file returns ErrKeyShareSecurity.
+	emptyDir := t.TempDir()
+	mgrMissing := &TssManager{
+		keyShareDir: emptyDir,
+		preParamsFn: func() error { return nil },
+		partyConfig: func() tcommon.TssConfig { return tcommon.TssConfig{} },
+		keygenFn: func(keygen.Request) (keygen.Response, error) {
+			return keygen.Response{PubKey: pubKey, Status: tcommon.Success}, nil
+		},
+	}
+	if _, err := mgrMissing.KeyGen(messages.ECDSAKEYGEN); !errors.Is(err, ErrKeyShareSecurity) {
+		t.Fatalf("missing share err = %v, want ErrKeyShareSecurity", err)
+	}
+
+	// 3. Symlinked share file returns ErrKeyShareSecurity.
+	symlinkDir := t.TempDir()
+	target := filepath.Join(symlinkDir, "real.json")
+	if err := os.WriteFile(target, []byte(`{}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, filepath.Join(symlinkDir, expectedFile)); err == nil {
+		mgrSym := &TssManager{
+			keyShareDir: symlinkDir,
+			preParamsFn: func() error { return nil },
+			partyConfig: func() tcommon.TssConfig { return tcommon.TssConfig{} },
+			keygenFn: func(keygen.Request) (keygen.Response, error) {
+				return keygen.Response{PubKey: pubKey, Status: tcommon.Success}, nil
+			},
+		}
+		if _, err := mgrSym.KeyGen(messages.ECDSAKEYGEN); !errors.Is(err, ErrKeyShareSecurity) {
+			t.Fatalf("symlink share err = %v, want ErrKeyShareSecurity", err)
+		}
 	}
 }

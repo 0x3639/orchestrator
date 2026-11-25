@@ -436,14 +436,55 @@ func TestWriteConfigLeavesNoTempFiles(t *testing.T) {
 	}
 }
 
+func TestEnsureDataDirRejectsEmptySymlinkAndNormalizesMode(t *testing.T) {
+	if err := EnsureDataDir(""); err == nil {
+		t.Fatal("expected error for empty data dir")
+	}
+	if err := EnsureDataDir("   "); err == nil {
+		t.Fatal("expected error for whitespace data dir")
+	}
+
+	// Restrictive 0500 mode must be normalized to exact 0700.
+	dir := filepath.Join(t.TempDir(), "restricted")
+	if err := os.Mkdir(dir, 0500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0700) })
+	if err := os.Chmod(dir, 0500); err != nil {
+		t.Fatal(err)
+	}
+	if err := EnsureDataDir(dir); err != nil {
+		t.Fatalf("EnsureDataDir on 0500 dir failed: %v", err)
+	}
+	info, err := os.Stat(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != DataDirPerm {
+		t.Fatalf("mode = %04o, want %04o", info.Mode().Perm(), DataDirPerm)
+	}
+
+	// Symlinked directory must be rejected.
+	linkDir := filepath.Join(t.TempDir(), "link-dir")
+	if err := os.Symlink(dir, linkDir); err == nil {
+		if err := EnsureDataDir(linkDir); err == nil {
+			t.Fatal("expected error for symlinked data dir")
+		}
+	}
+}
+
 func TestSecureKeyShareFilesTightensPermissionsAndRejectsUnsafeEntries(t *testing.T) {
+	if err := SecureKeyShareFiles(""); err == nil {
+		t.Fatal("expected error for empty baseDir")
+	}
+
 	dir := t.TempDir()
 	shareA := filepath.Join(dir, "localstate-aaaa.json")
 	shareB := filepath.Join(dir, "localstate-bbbb.json")
 	readOnlyShare := filepath.Join(dir, "localstate-cccc.json")
 	otherFile := filepath.Join(dir, "other.json")
 
-	if err := os.WriteFile(shareA, []byte(`{}`), 0644); err != nil {
+	if err := os.WriteFile(shareA, []byte(`{"participant_keys":["k1"]}`), 0644); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.Chmod(shareA, 0644); err != nil {
@@ -472,7 +513,7 @@ func TestSecureKeyShareFilesTightensPermissionsAndRejectsUnsafeEntries(t *testin
 		t.Fatalf("SecureKeyShareFiles failed: %v", err)
 	}
 
-	for _, path := range []string{shareA, shareB} {
+	for _, path := range []string{shareA, shareB, readOnlyShare} {
 		info, err := os.Stat(path)
 		if err != nil {
 			t.Fatal(err)
@@ -481,15 +522,30 @@ func TestSecureKeyShareFilesTightensPermissionsAndRejectsUnsafeEntries(t *testin
 			t.Fatalf("%s mode = %04o, want %04o", path, info.Mode().Perm(), KeyShareFilePerm)
 		}
 	}
-	if info, err := os.Stat(readOnlyShare); err != nil {
-		t.Fatal(err)
-	} else if info.Mode().Perm() != 0400 {
-		t.Fatalf("read-only share mode = %04o, want 0400 (must not widen)", info.Mode().Perm())
-	}
 	if info, err := os.Stat(otherFile); err != nil {
 		t.Fatal(err)
 	} else if info.Mode().Perm() != 0644 {
 		t.Fatalf("non-share file mode = %04o, want unchanged 0644", info.Mode().Perm())
+	}
+
+	// SecureKeyShareFilesExpecting verifies required file presence.
+	if err := SecureKeyShareFilesExpecting(dir, "localstate-aaaa.json"); err != nil {
+		t.Fatalf("expected present share to succeed: %v", err)
+	}
+	if err := SecureKeyShareFilesExpecting(dir, "localstate-missing.json"); err == nil {
+		t.Fatal("expected error when required key share file is missing")
+	}
+
+	// ReadKeyShareFile reads anchored to the directory descriptor.
+	raw, found, err := ReadKeyShareFile(dir, "localstate-aaaa.json")
+	if err != nil || !found || !strings.Contains(string(raw), "participant_keys") {
+		t.Fatalf("ReadKeyShareFile present: found=%v err=%v raw=%q", found, err, raw)
+	}
+	if _, found, err := ReadKeyShareFile(dir, "localstate-missing.json"); err != nil || found {
+		t.Fatalf("ReadKeyShareFile missing: found=%v err=%v", found, err)
+	}
+	if _, _, err := ReadKeyShareFile("", "localstate-aaaa.json"); err == nil {
+		t.Fatal("expected error for ReadKeyShareFile with empty baseDir")
 	}
 
 	// Symlinked key share must be rejected.

@@ -77,9 +77,9 @@ type GlobalState struct {
 	// The networks of the affiliate program SetIsAffiliateProgram applied
 	// last.
 	appliedAffiliate     map[uint32]AffiliateNetwork
-	resignMu             sync.RWMutex
-	resignNetworkClass   uint32
-	resignNetworkChainId uint32
+	resignNetworkClass   uint32 // guarded by stateMu
+	resignNetworkChainId uint32 // guarded by stateMu
+	resignGeneration     uint64 // guarded by stateMu
 }
 
 func NewGlobalState(state *uint8) *GlobalState {
@@ -514,16 +514,92 @@ func (gs *GlobalState) WhileAffiliateSettingsAre(generation uint64, do func() er
 }
 
 func (gs *GlobalState) GetResignNetwork() (uint32, uint32) {
-	gs.resignMu.RLock()
-	defer gs.resignMu.RUnlock()
+	gs.stateMu.Lock()
+	defer gs.stateMu.Unlock()
 	return gs.resignNetworkClass, gs.resignNetworkChainId
 }
 
 func (gs *GlobalState) SetResignNetwork(networkClass, chainId uint32) {
-	gs.resignMu.Lock()
-	defer gs.resignMu.Unlock()
-	gs.resignNetworkClass = networkClass
-	gs.resignNetworkChainId = chainId
+	gs.stateMu.Lock()
+	defer gs.stateMu.Unlock()
+	if gs.resignNetworkClass != networkClass || gs.resignNetworkChainId != chainId {
+		gs.resignNetworkClass = networkClass
+		gs.resignNetworkChainId = chainId
+		gs.resignGeneration++
+	}
+}
+
+// GetResignTarget returns the active re-sign target network and its request
+// generation atomically.
+func (gs *GlobalState) GetResignTarget() (uint32, uint32, uint64) {
+	gs.stateMu.Lock()
+	defer gs.stateMu.Unlock()
+	return gs.resignNetworkClass, gs.resignNetworkChainId, gs.resignGeneration
+}
+
+// IsResignGenerationCurrent reports whether the node is still in ReSignState
+// for the exact request generation that started a scan.
+func (gs *GlobalState) IsResignGenerationCurrent(generation uint64) bool {
+	gs.stateMu.Lock()
+	defer gs.stateMu.Unlock()
+	return gs.effectiveStateLocked() == ReSignState && gs.resignGeneration == generation
+}
+
+// ActivateResign enters ReSignState from LiveState (setting the target network
+// and bumping the request generation atomically), or retargets an active
+// ReSignState request by updating the target and bumping the generation.
+// Protected states (HaltedState, KeyGenState, EmergencyState) are left untouched.
+func (gs *GlobalState) ActivateResign(networkClass, chainId uint32) (bool, error) {
+	unlock := gs.lockTransfersFor(ReSignState)
+	defer unlock()
+	gs.stateMu.Lock()
+	defer gs.stateMu.Unlock()
+	if gs.RedeemHaltGeneration() != 0 {
+		return false, nil
+	}
+	switch *gs.state {
+	case LiveState:
+		gs.resignNetworkClass = networkClass
+		gs.resignNetworkChainId = chainId
+		gs.resignGeneration++
+		err := gs.setStateLocked(ReSignState)
+		return *gs.state == ReSignState, err
+	case ReSignState:
+		if gs.resignNetworkClass != networkClass || gs.resignNetworkChainId != chainId {
+			gs.resignNetworkClass = networkClass
+			gs.resignNetworkChainId = chainId
+			gs.resignGeneration++
+		}
+		return false, nil
+	default:
+		return false, nil
+	}
+}
+
+// DeactivateResign leaves ReSignState for LiveState and bumps the request
+// generation so any in-flight scan stops acting on the ended request.
+func (gs *GlobalState) DeactivateResign() (bool, error) {
+	gs.stateMu.Lock()
+	defer gs.stateMu.Unlock()
+	if gs.RedeemHaltGeneration() != 0 || *gs.state != ReSignState {
+		return false, nil
+	}
+	gs.resignGeneration++
+	err := gs.setStateLocked(LiveState)
+	return *gs.state == LiveState, err
+}
+
+// CompleteResign leaves ReSignState for LiveState only if the node is still in
+// ReSignState for the exact request generation that ran the scan.
+func (gs *GlobalState) CompleteResign(generation uint64) (bool, error) {
+	gs.stateMu.Lock()
+	defer gs.stateMu.Unlock()
+	if gs.RedeemHaltGeneration() != 0 || *gs.state != ReSignState || gs.resignGeneration != generation {
+		return false, nil
+	}
+	gs.resignGeneration++
+	err := gs.setStateLocked(LiveState)
+	return *gs.state == LiveState, err
 }
 
 // HealthStore returns the optional observer for callers that run without node state.

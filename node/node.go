@@ -8,7 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	wallet2 "github.com/MoonBaZZe/znn-sdk-go/wallet"
-	"io"
+	"math"
 	"math/big"
 	"net/http"
 	"orchestrator/common"
@@ -173,13 +173,8 @@ func NewNode(config *oconfig.Config, logger *zap.Logger) (_ *Node, initErr error
 		node.logger.Info("node is syncing, will wait for it to finish")
 		time.Sleep(15 * time.Second)
 	}
-	if node.config.TssConfig.BaseDir != "" {
-		if err := oconfig.EnsureDataDir(node.config.TssConfig.BaseDir); err != nil {
-			return nil, err
-		}
-		if err := oconfig.SecureKeyShareFiles(node.config.TssConfig.BaseDir); err != nil {
-			return nil, err
-		}
+	if err := oconfig.SecureKeyShareFiles(node.config.TssConfig.BaseDir); err != nil {
+		return nil, err
 	}
 	if err := node.configurePubKey(); err != nil {
 		return nil, err
@@ -645,6 +640,11 @@ func (node *Node) processSignatures() {
 				node.logger.Infof("Set party timeout to old value: %f minutes", node.config.TssConfig.BaseConfig.PartyTimeout.Minutes())
 
 				if err != nil {
+					if errors.Is(err, tss.ErrKeyShareSecurity) {
+						node.logger.Errorf("fatal key share security failure after KeyGen: %v", err)
+						common.RequestStop(node.stopChan)
+						return
+					}
 					node.logger.Debug(err)
 					continue
 				}
@@ -690,10 +690,16 @@ func (node *Node) processSignatures() {
 
 				// key gen was generated
 				if keyGenResponse.Status == tcommon.Success {
-					if err := oconfig.SecureKeyShareFiles(node.config.TssConfig.BaseDir); err != nil {
-						node.logger.Errorf("failed to secure key share files after KeyGen: %v", err)
-						keyGenResponse = nil
-						break
+					expectedFile, nameErr := common.GetPublicKeyFileName(keyGenResponse.PubKey)
+					if nameErr != nil {
+						node.logger.Errorf("fatal key share name failure after KeyGen: %v", nameErr)
+						common.RequestStop(node.stopChan)
+						return
+					}
+					if err := oconfig.SecureKeyShareFilesExpecting(node.config.TssConfig.BaseDir, expectedFile); err != nil {
+						node.logger.Errorf("fatal key share security failure after KeyGen: %v", err)
+						common.RequestStop(node.stopChan)
+						return
 					}
 					node.logger.Infof("Generated key: %s", keyGenResponse.PubKey)
 					break
@@ -996,11 +1002,13 @@ func (node *Node) processSignatures() {
 			node.config.TssConfig.PublicKey = keyGenResponse.PubKey
 			node.config.TssConfig.DecompressedPublicKey = decompressedKeyGenPubKey
 			node.tssManager.SetPubKey(keyGenResponse.PubKey)
-			if stateErr := node.state.SetState(common.LiveState); stateErr != nil {
+			if changed, stateErr := node.state.SetStateIf(common.KeyGenState, common.LiveState); stateErr != nil {
 				node.logger.Info("Could not set state to live after key gen")
 				node.logger.Debug(stateErr)
 				common.RequestStop(node.stopChan)
 				return
+			} else if !changed {
+				node.logger.Info("State is no longer KeyGenState after key gen; keeping current state")
 			}
 			// todo delete it?
 			//if len(oldKey) > 0 {
@@ -1286,13 +1294,19 @@ func (node *Node) processSignatures() {
 			pageIndex := uint32(0)
 			pageSize := uint32(100)
 
-			resignNetworkClass, resignChainId := node.state.GetResignNetwork()
+			resignNetworkClass, resignChainId, resignGen := node.state.GetResignTarget()
+			deferredUnfinalized := false
+			staleResign := false
 			// Gather all wraps that need to be resigned
 			node.logger.Debug("Parsing all the wraps in resign state")
 			for {
 				// Returning keeps ReSignState; the next start resumes the scan.
 				if node.workerStopping() {
 					return
+				}
+				if !node.state.IsResignGenerationCurrent(resignGen) {
+					staleResign = true
+					break
 				}
 				wrapRequests, err := node.networksManager.Znn().GetAllWrapTokenRequests(pageIndex, pageSize)
 				if err != nil {
@@ -1304,13 +1318,18 @@ func (node *Node) processSignatures() {
 				} else {
 					node.logger.Debugf("len(wrapRequests.List): %d, pageIndex: %d", len(wrapRequests.List), pageIndex)
 					for _, wrap := range wrapRequests.List {
+						if !node.state.IsResignGenerationCurrent(resignGen) {
+							staleResign = true
+							break
+						}
 						if wrap == nil || wrap.WrapTokenRequest == nil {
 							continue
 						}
-						if wrap.ConfirmationsToFinality != 0 {
+						if wrap.NetworkClass != resignNetworkClass || wrap.ChainId != resignChainId {
 							continue
 						}
-						if wrap.NetworkClass != resignNetworkClass || wrap.ChainId != resignChainId {
+						if wrap.ConfirmationsToFinality != 0 {
+							deferredUnfinalized = true
 							continue
 						}
 						// A storage failure stops the node and leaves it in
@@ -1349,6 +1368,10 @@ func (node *Node) processSignatures() {
 						if !node.workerSleep(50 * time.Millisecond) {
 							return
 						}
+						if !node.state.IsResignGenerationCurrent(resignGen) {
+							staleResign = true
+							break
+						}
 						evmNetwork := node.networksManager.LookupEvm(wrap.ChainId)
 						if evmNetwork == nil {
 							node.logger.Infof("EVM network %d is no longer listed by the bridge; its wraps are not re-signed", wrap.ChainId)
@@ -1358,6 +1381,10 @@ func (node *Node) processSignatures() {
 						if err != nil {
 							node.logger.Debug(err.Error())
 							continue
+						}
+						if !node.state.IsResignGenerationCurrent(resignGen) {
+							staleResign = true
+							break
 						}
 						// The wrap is not redeemed or in pendingRedeem so we resign it
 						if redeemStatus.BlockNumber.Cmp(big.NewInt(0)) == 0 {
@@ -1371,11 +1398,22 @@ func (node *Node) processSignatures() {
 						// A positive latest-state lookup suppresses re-signing. Only the
 						// finalized EVM events distinguish redemption from revocation.
 					}
+					if staleResign {
+						break
+					}
 				}
 				pageIndex++
 			}
+			if staleResign || !node.state.IsResignGenerationCurrent(resignGen) {
+				node.logger.Debug("ReSignState target or state changed during scan; skipping completion")
+				continue
+			}
+			if deferredUnfinalized {
+				node.logger.Debug("Deferring ReSignState completion while matching wraps await NoM finality")
+				continue
+			}
 			node.logger.Debug("Finished parsing all the wraps in resign state")
-			if _, err := node.state.SetStateIf(common.ReSignState, common.LiveState); err != nil {
+			if _, err := node.state.CompleteResign(resignGen); err != nil {
 				node.logger.Debug(err.Error())
 			}
 		}
@@ -1495,7 +1533,7 @@ func (node *Node) processSignaturesWrap(window uint64) (error, bool) {
 
 	poolSize := common.GetSignCeremonyPoolSize()
 	right := len(messagesToSign)
-	if right > poolSize {
+	if poolSize > 0 && right > poolSize {
 		right = poolSize
 	}
 	messagesToSign = messagesToSign[:right]
@@ -1557,24 +1595,13 @@ func (node *Node) applyWrapSignatures(response *keysign.Response, wrapRequestsId
 			continue
 		}
 
-		if err = node.networksManager.SetWrapRequestSignature(wrapRequestsIds[reqIdx].Id, fullSignatureStr); err != nil {
+		if err = node.networksManager.SaveSignedWrapRequest(wrapRequestsIds[reqIdx].Id, fullSignatureStr); err != nil {
 			node.logger.Debug(err)
 			continue
 		}
 		applied[sig.Msg] = true
 
 		store.Signed(snapshot.Wrap, wrapRequestsIds[reqIdx].ChainId, window)
-
-		// Set it as unsent after setting the new signature for resigned requests
-		if err = node.networksManager.SetWrapRequestSentSignature(wrapRequestsIds[reqIdx].Id, false); err != nil {
-			node.logger.Debug(err)
-			continue
-		}
-
-		if err = node.networksManager.Znn().SetResignStatus(wrapRequestsIds[reqIdx].Id, false); err != nil {
-			node.logger.Debug(err)
-			continue
-		}
 
 		node.logger.Infof("%d. msg: %s sig: %s\n", reqIdx, sig.Msg, sig.Signature)
 	}
@@ -1585,12 +1612,13 @@ func (node *Node) applyWrapSignatures(response *keysign.Response, wrapRequestsId
 func (node *Node) processSignaturesUnwrap(number, size uint64) (error, bool) {
 	store := node.state.HealthStore()
 	store.Selected(snapshot.Unwrap, number, nil)
+	poolSize := common.GetSignCeremonyPoolSize()
 	// todo discuss what requests should the orchestrator sign in a ceremony
 	requests, err := node.networksManager.GetUnsignedUnwrapRequests()
 	if err != nil {
 		return err, true
 	}
-	requests, complete, err := node.reconcileUnsignedUnwrapRequests(requests)
+	requests, complete, err := node.reconcileUnsignedUnwrapRequestsWithPoolSize(requests, poolSize)
 	if err != nil {
 		return err, true
 	}
@@ -1636,9 +1664,8 @@ func (node *Node) processSignaturesUnwrap(number, size uint64) (error, bool) {
 		return nil, false
 	}
 
-	poolSize := common.GetSignCeremonyPoolSize()
 	right := len(messagesToSign)
-	if right > poolSize {
+	if poolSize > 0 && right > poolSize {
 		right = poolSize
 	}
 	messagesToSign = messagesToSign[:right]
@@ -1710,11 +1737,13 @@ func (node *Node) applyUnwrapSignatures(response *keysign.Response, requests []*
 		}
 
 		req := requests[reqIdx]
-		req.Signature = fullSignatureStr
-		if err = node.networksManager.SetEvmUnwrapRequestSignature(req); err != nil {
+		updated := *req
+		updated.Signature = fullSignatureStr
+		if err = node.networksManager.SetEvmUnwrapRequestSignature(&updated); err != nil {
 			node.logger.Debug(err.Error())
 			continue
 		}
+		req.Signature = fullSignatureStr
 		applied[sig.Msg] = true
 		store.Signed(snapshot.Unwrap, req.ChainId, number)
 
@@ -1745,9 +1774,20 @@ const reconcileLookupsPerPool = 4
 // backlog off. Any Zenon RPC failure aborts the ceremony for this node:
 // guessing would produce a pool its peers do not share.
 func (node *Node) reconcileUnsignedUnwrapRequests(requests []*events.UnwrapRequestEvm) ([]*events.UnwrapRequestEvm, bool, error) {
-	poolSize := common.GetSignCeremonyPoolSize()
-	lookupCap := reconcileLookupsPerPool * poolSize
-	remaining := make([]*events.UnwrapRequestEvm, 0, poolSize)
+	return node.reconcileUnsignedUnwrapRequestsWithPoolSize(requests, common.GetSignCeremonyPoolSize())
+}
+
+func (node *Node) reconcileUnsignedUnwrapRequestsWithPoolSize(requests []*events.UnwrapRequestEvm, poolSize int) ([]*events.UnwrapRequestEvm, bool, error) {
+	if poolSize <= 0 {
+		poolSize = common.DefaultSignCeremonyPoolSize
+	}
+	var lookupCap int
+	if poolSize > math.MaxInt/reconcileLookupsPerPool {
+		lookupCap = math.MaxInt
+	} else {
+		lookupCap = reconcileLookupsPerPool * poolSize
+	}
+	remaining := make([]*events.UnwrapRequestEvm, 0, min(poolSize, len(requests)))
 	reconciled := 0
 	lookups := 0
 	complete := true
@@ -1837,10 +1877,10 @@ func (node *Node) sendSignaturesWrap(seenEventsCount map[string]uint32) {
 			node.logger.Debug(err)
 			continue
 		} else if req.Signature == rpcRequest.Signature {
-			if errSet := node.networksManager.Znn().SetWrapRequestSentSignature(req.Id, true); errSet != nil {
+			if marked, errSet := node.networksManager.MarkWrapRequestSignatureSent(req.Id, req.Signature); errSet != nil {
 				node.logger.Debug(errSet)
-			} else {
-				//node.logger.Debugf("Set wrap %s as sent", req.Id.String())
+			} else if !marked {
+				node.logger.Debugf("wrap %s signature changed locally before poll acknowledgement; keeping new signature unsent", req.Id.String())
 			}
 			delete(seenEventsCount, req.Id.String())
 			continue
@@ -2105,13 +2145,11 @@ func (node *Node) SetBridgeMetadata(metadata *common.BridgeMetadata) {
 			resignNetworkClass, resignChainId := node.state.GetResignNetwork()
 			node.logger.Infof("ResignState NetworkClass - old: %d, new: %d", resignNetworkClass, metadata.ResignState.NetworkClass)
 			node.logger.Infof("ResignState ChainId - old: %d, new: %d", resignChainId, metadata.ResignState.ChainId)
-			node.state.SetResignNetwork(metadata.ResignState.NetworkClass, metadata.ResignState.ChainId)
-
-			if _, err := node.state.SetStateIf(common.LiveState, common.ReSignState); err != nil {
+			if _, err := node.state.ActivateResign(metadata.ResignState.NetworkClass, metadata.ResignState.ChainId); err != nil {
 				node.logger.Debug(err)
 			}
 		} else {
-			if _, err := node.state.SetStateIf(common.ReSignState, common.LiveState); err != nil {
+			if _, err := node.state.DeactivateResign(); err != nil {
 				node.logger.Debug(err)
 			}
 		}
@@ -2349,23 +2387,24 @@ func (node *Node) configurePubKey() error {
 	}
 
 	// just try to load the path of the pub key coming from the rpc
-	pubKeyPath, err := common.GetPublicKeyFilePath(node.config.TssConfig.BaseDir, bridgeInfo.CompressedTssECDSAPubKey)
+	pubKeyFileName, err := common.GetPublicKeyFileName(bridgeInfo.CompressedTssECDSAPubKey)
 	if err != nil {
 		return err
 	}
-	if _, err := os.Stat(pubKeyPath); err != nil {
-		if !os.IsNotExist(err) {
-			return err
-		}
+	bytesValue, found, err := oconfig.ReadKeyShareFile(node.config.TssConfig.BaseDir, pubKeyFileName)
+	if err != nil {
+		return err
+	}
+	if !found {
 		// 1. we had a hard reset, in this case we can no longer sign be cause we don't have the pubKey files
 		// 2. we have not participated yet in a keyGen ceremony
 		// 3. there was no key gen (bootstrap), in this case participatingPubKeys will be empty
 		// pub key file does not exist, we can only wait for a new key gen
-		node.logger.Info(err.Error())
+		node.logger.Infof("key share file %s not found in %s", pubKeyFileName, node.config.TssConfig.BaseDir)
 		node.config.TssConfig.PublicKey = ""
 		node.config.TssConfig.DecompressedPublicKey = ""
 	} else {
-		participantKeys, err := readLocalStateParticipantKeys(pubKeyPath)
+		participantKeys, err := parseLocalStateParticipantKeys(bytesValue, pubKeyFileName)
 		if err != nil {
 			return err
 		}
@@ -2400,23 +2439,13 @@ type localStateFile struct {
 	ParticipantKeys []string `json:"participant_keys"`
 }
 
-func readLocalStateParticipantKeys(pubKeyPath string) ([]string, error) {
-	jsonFile, err := os.Open(pubKeyPath)
-	if err != nil {
-		return nil, err
-	}
-	bytesValue, readErr := io.ReadAll(jsonFile)
-	closeErr := jsonFile.Close()
-	if readErr != nil {
-		return nil, readErr
-	}
-	if closeErr != nil {
-		return nil, closeErr
-	}
-
+func parseLocalStateParticipantKeys(bytesValue []byte, name string) ([]string, error) {
 	var localState localStateFile
 	if err := json.Unmarshal(bytesValue, &localState); err != nil {
 		return nil, err
+	}
+	if len(localState.ParticipantKeys) == 0 {
+		return nil, fmt.Errorf("localstate file %s has no participant_keys", name)
 	}
 	return localState.ParticipantKeys, nil
 }

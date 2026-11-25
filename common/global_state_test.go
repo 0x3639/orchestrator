@@ -270,3 +270,51 @@ func TestGlobalStateConcurrencyResignAdminAndPoolSize(t *testing.T) {
 		t.Fatalf("non-positive SetSignCeremonyPoolSize changed value to %d, want 33", got)
 	}
 }
+
+func TestResignGenerationPreventsStaleCompletion(t *testing.T) {
+	state := LiveState
+	gs := NewGlobalState(&state)
+
+	if activated, err := gs.ActivateResign(2, 1); err != nil || !activated || state != ReSignState {
+		t.Fatalf("ActivateResign: activated=%v err=%v state=%s", activated, err, StateToText(state))
+	}
+	class, chain, gen1 := gs.GetResignTarget()
+	if class != 2 || chain != 1 || gen1 == 0 {
+		t.Fatalf("target=(%d,%d,%d)", class, chain, gen1)
+	}
+
+	// Retargeting bumps generation so gen1 cannot complete the new request.
+	if _, err := gs.ActivateResign(2, 56); err != nil {
+		t.Fatal(err)
+	}
+	if gs.IsResignGenerationCurrent(gen1) {
+		t.Fatal("gen1 must be stale after retarget")
+	}
+	if completed, err := gs.CompleteResign(gen1); err != nil || completed || state != ReSignState {
+		t.Fatalf("stale gen1 completed retargeted resign: completed=%v err=%v state=%s", completed, err, StateToText(state))
+	}
+
+	_, chain2, gen2 := gs.GetResignTarget()
+	if chain2 != 56 || gen2 == gen1 {
+		t.Fatalf("retarget target chain=%d gen=%d", chain2, gen2)
+	}
+
+	// Deactivate + reactivate on the SAME target bumps generation again.
+	if deactivated, err := gs.DeactivateResign(); err != nil || !deactivated || state != LiveState {
+		t.Fatalf("DeactivateResign: deactivated=%v err=%v state=%s", deactivated, err, StateToText(state))
+	}
+	if activated, err := gs.ActivateResign(2, 56); err != nil || !activated || state != ReSignState {
+		t.Fatalf("reactivate: activated=%v err=%v state=%s", activated, err, StateToText(state))
+	}
+	if gs.IsResignGenerationCurrent(gen2) {
+		t.Fatal("gen2 must be stale after deactivate/reactivate")
+	}
+	if completed, err := gs.CompleteResign(gen2); err != nil || completed || state != ReSignState {
+		t.Fatalf("stale gen2 completed reactivated resign: completed=%v err=%v state=%s", completed, err, StateToText(state))
+	}
+
+	_, _, gen3 := gs.GetResignTarget()
+	if completed, err := gs.CompleteResign(gen3); err != nil || !completed || state != LiveState {
+		t.Fatalf("current gen3 failed to complete: completed=%v err=%v state=%s", completed, err, StateToText(state))
+	}
+}

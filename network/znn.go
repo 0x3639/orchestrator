@@ -2305,6 +2305,14 @@ func (rC *znnNetwork) SetWrapRequestSentSignature(id types.Hash, sent bool) erro
 	return rC.eventsStore().SetWrapRequestSentSignature(id, sent)
 }
 
+func (rC *znnNetwork) SaveSignedWrapRequest(id types.Hash, signature string) error {
+	return rC.eventsStore().SaveSignedWrapRequest(id, signature)
+}
+
+func (rC *znnNetwork) MarkWrapRequestSignatureSent(id types.Hash, expectedSignature string) (bool, error) {
+	return rC.eventsStore().MarkWrapRequestSignatureSent(id, expectedSignature)
+}
+
 func (rC *znnNetwork) SetResignStatus(id types.Hash, status bool) error {
 	return rC.eventsStore().SetResignStatus(id, status)
 }

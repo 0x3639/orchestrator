@@ -75,6 +75,12 @@ type ZnnStorage interface {
 	SetWrapRequestStatus(types.Hash, uint32) error
 	SetWrapRequestSignature(types.Hash, string) error
 	SetWrapRequestSentSignature(types.Hash, bool) error
+	// SaveSignedWrapRequest atomically installs signature, clears SentSignature,
+	// and clears the re-sign flag in a single durable write.
+	SaveSignedWrapRequest(types.Hash, string) error
+	// MarkWrapRequestSignatureSent marks SentSignature=true only if the stored
+	// wrap request still holds expectedSignature, reporting whether it matched.
+	MarkWrapRequestSignatureSent(types.Hash, string) (bool, error)
 	GetWrapRequestById(types.Hash) (*events.WrapRequestZnn, error)
 	GetUnsentSignedWrapRequests() ([]*events.WrapRequestZnn, error)
 	GetUnredeemedWrapRequests() ([]*events.WrapRequestZnn, error)

@@ -844,6 +844,14 @@ func (m *NetworksManager) SetWrapRequestSentSignature(id types.Hash, sent bool) 
 	return m.znnNetwork.SetWrapRequestSentSignature(id, sent)
 }
 
+func (m *NetworksManager) SaveSignedWrapRequest(id types.Hash, signature string) error {
+	return m.znnNetwork.SaveSignedWrapRequest(id, signature)
+}
+
+func (m *NetworksManager) MarkWrapRequestSignatureSent(id types.Hash, expectedSignature string) (bool, error) {
+	return m.znnNetwork.MarkWrapRequestSignatureSent(id, expectedSignature)
+}
+
 func (m *NetworksManager) SetResignStatus(id types.Hash, status bool) error {
 	return m.znnNetwork.SetResignStatus(id, status)
 }
@@ -1426,12 +1434,10 @@ func (m *NetworksManager) SetEvmBackfillBlocks(blocks uint64) {
 func (m *NetworksManager) SetEvmUnwrapRequestSignature(event *events.UnwrapRequestEvm) error {
 	for _, network := range m.networks() {
 		if network.ChainId() == event.ChainId {
-			if err := network.SetUnwrapRequestSignature(event.TransactionHash, event.LogIndex, event.Signature); err != nil {
-				return err
-			}
+			return network.SetUnwrapRequestSignature(event.TransactionHash, event.LogIndex, event.Signature)
 		}
 	}
-	return nil
+	return fmt.Errorf("evm network %d not found", event.ChainId)
 }
 
 func (m *NetworksManager) AddEvmUnwrapRequest(event events.UnwrapRequestEvm) error {

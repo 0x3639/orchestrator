@@ -5,7 +5,10 @@ package config
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"syscall"
+
+	"golang.org/x/sys/unix"
 )
 
 // VerifyOwnedPath returns an error if path exists and is not owned by the
@@ -36,8 +39,24 @@ func verifyOwnedInfo(path string, info os.FileInfo) error {
 	return nil
 }
 
-// openNoFollow opens path read-only and refuses to follow a symlink at the
-// final path component.
+// openNoFollow opens path read-only without blocking (e.g. on FIFOs) and
+// refuses to follow a symlink at the final path component.
 func openNoFollow(path string) (*os.File, error) {
-	return os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	return os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
+}
+
+// openDirNoFollow opens path as a directory without following a symlink at the
+// final path component.
+func openDirNoFollow(path string) (*os.File, error) {
+	return os.OpenFile(path, os.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
+}
+
+// openAtNoFollow opens name relative to the open directory descriptor dir
+// without following symlinks or blocking on special files.
+func openAtNoFollow(dir *os.File, name string) (*os.File, error) {
+	fd, err := unix.Openat(int(dir.Fd()), name, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return nil, &os.PathError{Op: "openat", Path: filepath.Join(dir.Name(), name), Err: err}
+	}
+	return os.NewFile(uintptr(fd), filepath.Join(dir.Name(), name)), nil
 }

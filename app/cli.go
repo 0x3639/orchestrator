@@ -67,12 +67,14 @@ func beforeAction(ctx *cli.Context) error {
 	runtime.GOMAXPROCS(max)
 
 	// pprof server
-	if ctx.GlobalIsSet(PprofFlag.Name) {
-		listenHost := ctx.String(PprofAddrFlag.Name)
+	if ctx.GlobalBool(PprofFlag.Name) {
+		listenHost := ctx.GlobalString(PprofAddrFlag.Name)
+		port := ctx.GlobalUint64(PprofPortFlag.Name)
+		if port == 0 || port > 65535 {
+			return fmt.Errorf("invalid pprof port %d: must be between 1 and 65535", port)
+		}
 
-		port := ctx.Int(PprofPortFlag.Name)
-
-		address := net.JoinHostPort(listenHost, strconv.Itoa(port))
+		address := net.JoinHostPort(listenHost, strconv.FormatUint(port, 10))
 
 		go func() {
 			if err := http.ListenAndServe(address, nil); err != nil {

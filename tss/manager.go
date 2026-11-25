@@ -23,6 +23,10 @@ import (
 	"time"
 )
 
+// ErrKeyShareSecurity indicates that TSS key share directory or file
+// ownership/permission hardening failed after key generation.
+var ErrKeyShareSecurity = errors.New("key share file security check failed")
+
 type TssManager struct {
 	settingsMu        sync.RWMutex
 	voteMu            sync.Mutex
@@ -37,6 +41,11 @@ type TssManager struct {
 	localPubKeys      []string
 	joinPartyVersion  string
 	leaderBlockHeight int64
+
+	// Test hooks; nil in production.
+	preParamsFn func() error
+	keygenFn    func(keygen.Request) (keygen.Response, error)
+	partyConfig func() tcommon.TssConfig
 }
 
 func NewTssManager(conf oconfig.TssManagerConfig, privateKey string) (*TssManager, error) {
@@ -172,7 +181,13 @@ func (m *TssManager) KeyGen(algo messages.Algo) (*keygen.Response, error) {
 
 	start := time.Now()
 	// we reset pre params so we always generate it before a keyGen
-	if errPrecompute := m.server.GeneratePreParams(); errPrecompute != nil {
+	var errPrecompute error
+	if m.preParamsFn != nil {
+		errPrecompute = m.preParamsFn()
+	} else {
+		errPrecompute = m.server.GeneratePreParams()
+	}
+	if errPrecompute != nil {
 		return nil, errPrecompute
 	}
 	elapsed := time.Since(start)
@@ -188,13 +203,23 @@ func (m *TssManager) KeyGen(algo messages.Algo) (*keygen.Response, error) {
 	var req keygen.Request
 	if algo == messages.ECDSAKEYGEN {
 		req = keygen.NewRequest(m.GetLocalPubKeys(), m.GetLeaderBlockHeight(), m.GetJoinPartyVersion(), algorithm)
-		response, err := m.server.Keygen(req)
+		var response keygen.Response
+		var err error
+		if m.keygenFn != nil {
+			response, err = m.keygenFn(req)
+		} else {
+			response, err = m.server.Keygen(req)
+		}
 		if err != nil {
 			return nil, err
 		}
 		if response.Status == tcommon.Success {
-			if err := oconfig.SecureKeyShareFiles(m.keyShareDir); err != nil {
-				return nil, err
+			expectedFile, nameErr := common.GetPublicKeyFileName(response.PubKey)
+			if nameErr != nil {
+				return nil, fmt.Errorf("%w: invalid generated pubKey: %w", ErrKeyShareSecurity, nameErr)
+			}
+			if secErr := oconfig.SecureKeyShareFilesExpecting(m.keyShareDir, expectedFile); secErr != nil {
+				return nil, fmt.Errorf("%w: %w", ErrKeyShareSecurity, secErr)
 			}
 		}
 
@@ -251,6 +276,9 @@ func (m *TssManager) SetPubKey(pubKey string) {
 }
 
 func (m *TssManager) Config() tcommon.TssConfig {
+	if m.partyConfig != nil {
+		return m.partyConfig()
+	}
 	return m.server.Config()
 }
 

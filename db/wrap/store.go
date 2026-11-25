@@ -120,3 +120,25 @@ func (es *eventStore) putDurable(key, value []byte) error {
 		return es.raw.Put(key, storedValue(value), &opt.WriteOptions{Sync: true})
 	})
 }
+
+type kvEntry struct {
+	key   []byte
+	value []byte
+}
+
+func (es *eventStore) putBatchDurable(entries ...kvEntry) error {
+	if es.raw == nil {
+		patch := zdb.NewPatch()
+		for _, entry := range entries {
+			patch.Put(entry.key, entry.value)
+		}
+		return es.DB.Apply(patch)
+	}
+	batch := new(leveldb.Batch)
+	for _, entry := range entries {
+		batch.Put(entry.key, storedValue(entry.value))
+	}
+	return es.guard.write(func() error {
+		return es.raw.Write(batch, &opt.WriteOptions{Sync: true})
+	})
+}

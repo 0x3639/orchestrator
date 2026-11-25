@@ -138,6 +138,64 @@ func (es *eventStore) SetWrapRequestSentSignature(id types.Hash, value bool) err
 	return es.updateWrap(id, func(event *events.WrapRequestZnn) { event.SentSignature = value })
 }
 
+func (es *eventStore) SaveSignedWrapRequest(id types.Hash, signature string) error {
+	es.mu.Lock()
+	defer es.mu.Unlock()
+	data, err := es.DB.Get(getWrapEventKey(id))
+	if err != nil {
+		if !errors.Is(err, leveldb.ErrNotFound) {
+			es.SendSigInt()
+		}
+		return err
+	}
+	event, err := events.DeserializeWrapEventZnn(data)
+	if err != nil {
+		es.SendSigInt()
+		return err
+	}
+	event.Signature = signature
+	event.SentSignature = false
+	serialized, err := event.Serialize()
+	if err != nil {
+		es.SendSigInt()
+		return err
+	}
+	var clearResign [4]byte
+	if err := es.putBatchDurable(
+		kvEntry{key: getWrapEventKey(id), value: serialized},
+		kvEntry{key: getResignedStatusKey(id), value: clearResign[:]},
+	); err != nil {
+		es.SendSigInt()
+		return err
+	}
+	return nil
+}
+
+func (es *eventStore) MarkWrapRequestSignatureSent(id types.Hash, expectedSignature string) (bool, error) {
+	es.mu.Lock()
+	defer es.mu.Unlock()
+	data, err := es.DB.Get(getWrapEventKey(id))
+	if err != nil {
+		if !errors.Is(err, leveldb.ErrNotFound) {
+			es.SendSigInt()
+		}
+		return false, err
+	}
+	event, err := events.DeserializeWrapEventZnn(data)
+	if err != nil {
+		es.SendSigInt()
+		return false, err
+	}
+	if event.Signature != expectedSignature {
+		return false, nil
+	}
+	event.SentSignature = true
+	if err := es.putWrap(event); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 func (es *eventStore) GetUnsentSignedWrapRequests() ([]*events.WrapRequestZnn, error) {
 	iterator := es.DB.NewIterator(getWrapEventPrefix())
 	defer iterator.Release()

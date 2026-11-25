@@ -3,10 +3,12 @@ package node
 import (
 	"crypto/ecdsa"
 	"encoding/base64"
+	"encoding/json"
+	"math"
 	"math/big"
+	"net/http"
 	"net/http/httptest"
 	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -21,12 +23,14 @@ import (
 	"github.com/zenon-network/go-zenon/rpc/server"
 	"github.com/zenon-network/go-zenon/vm/constants"
 	"github.com/zenon-network/go-zenon/vm/embedded/definition"
+	"github.com/zenon-network/go-zenon/wallet"
 	"go.uber.org/zap"
 
 	"orchestrator/common"
 	oconfig "orchestrator/common/config"
 	"orchestrator/common/events"
 	dbmanager "orchestrator/db/manager"
+	"orchestrator/health/snapshot"
 	"orchestrator/network"
 )
 
@@ -55,6 +59,24 @@ func signTestMsg(t *testing.T, priv *ecdsa.PrivateKey, msg []byte) keysign.Signa
 		Signature:  base64.StdEncoding.EncodeToString(sigBytes[:64]),
 		RecoveryID: base64.StdEncoding.EncodeToString(sigBytes[64:65]),
 	}
+}
+
+func fakeEvmRpcServer(t *testing.T) *httptest.Server {
+	t.Helper()
+	// Answers eth_call (e.g. redeemsInfo) with 64 zero bytes (blockNumber=0, paramsHash=0).
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			ID     json.RawMessage `json:"id"`
+			Method string          `json:"method"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		w.Header().Set("Content-Type", "application/json")
+		result := `"0x` + strings.Repeat("00", 64) + `"`
+		if req.Method == "eth_getCode" {
+			result = `"0x01"`
+		}
+		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":` + string(req.ID) + `,"result":` + result + `}`))
+	}))
 }
 
 func TestSetBridgeMetadataRestrictsReSignTransitionsAndSetsNetworkFirst(t *testing.T) {
@@ -231,16 +253,19 @@ func TestValidateSignaturesChecksCountMsgAndRecoveryID(t *testing.T) {
 	}
 }
 
-func TestApplyWrapSignaturesVerifiesBySigMsgAndRejectsBadEntries(t *testing.T) {
+func TestApplyWrapSignaturesVerifiesBySigMsgAndAtomicallyClearsSentAndResign(t *testing.T) {
 	priv, decompressedPub := generateTestSigningKey(t)
 	n, _ := startupNode(t, common.LiveState)
 	n.config.TssConfig.DecompressedPublicKey = decompressedPub
 
 	idA := types.Hash{0xaa}
 	idB := types.Hash{0xbb}
-	reqA := &definition.WrapTokenRequest{NetworkClass: definition.EvmClass, ChainId: 1, Id: idA, Amount: big.NewInt(100), Fee: big.NewInt(1)}
+	reqA := &definition.WrapTokenRequest{NetworkClass: definition.EvmClass, ChainId: 1, Id: idA, Amount: big.NewInt(100), Fee: big.NewInt(1), Signature: "old-sig-a"}
 	reqB := &definition.WrapTokenRequest{NetworkClass: definition.EvmClass, ChainId: 1, Id: idB, Amount: big.NewInt(200), Fee: big.NewInt(2)}
 	if err := n.dbManager.ZnnStorage().AddWrapRequest(common.ZnnWrapToOrchestratorWrap(reqA)); err != nil {
+		t.Fatal(err)
+	}
+	if err := n.dbManager.ZnnStorage().SetResignStatus(idA, true); err != nil {
 		t.Fatal(err)
 	}
 	if err := n.dbManager.ZnnStorage().AddWrapRequest(common.ZnnWrapToOrchestratorWrap(reqB)); err != nil {
@@ -272,7 +297,7 @@ func TestApplyWrapSignaturesVerifiesBySigMsgAndRejectsBadEntries(t *testing.T) {
 		oobMsg:   99,
 	}
 
-	// Note: sigA is at index 3 (not index 0), verifying lookup is by sig.Msg, not slice idx.
+	// Note: sigA is at index 4 (not index 0), verifying lookup is by sig.Msg, not slice idx.
 	resp := &keysign.Response{
 		Signatures: []keysign.Signature{
 			sigUnknown,
@@ -289,8 +314,11 @@ func TestApplyWrapSignaturesVerifiesBySigMsgAndRejectsBadEntries(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if gotA == nil || gotA.Signature == "" {
-		t.Fatalf("expected valid out-of-order signature for reqA to be stored, got %+v", gotA)
+	if gotA == nil || gotA.Signature == "" || gotA.Signature == "old-sig-a" || gotA.SentSignature {
+		t.Fatalf("expected new unsent signature for reqA, got %+v", gotA)
+	}
+	if resign, err := n.dbManager.ZnnStorage().GetResignStatus(idA); err != nil || resign {
+		t.Fatalf("expected resign status cleared for reqA, got resign=%v err=%v", resign, err)
 	}
 	gotB, err := n.dbManager.ZnnStorage().GetWrapRequestById(idB)
 	if err != nil {
@@ -301,51 +329,119 @@ func TestApplyWrapSignaturesVerifiesBySigMsgAndRejectsBadEntries(t *testing.T) {
 	}
 }
 
-func TestApplyUnwrapSignaturesVerifiesBySigMsgAndPreservesOnFailure(t *testing.T) {
+func TestApplyUnwrapSignaturesPersistsToStoreAndRejectsMissingChain(t *testing.T) {
 	priv, decompressedPub := generateTestSigningKey(t)
-	n, _ := startupNode(t, common.LiveState)
+	evmSrv := fakeEvmRpcServer(t)
+	defer evmSrv.Close()
+
+	bridge := &wrapTestBridge{
+		networks: &embedded.NetworkInfoList{
+			Count: 1,
+			List: []*definition.NetworkInfo{{
+				NetworkClass:    definition.EvmClass,
+				Id:              1,
+				Name:            "Ethereum",
+				ContractAddress: "0x0000000000000000000000000000000000000001",
+			}},
+		},
+	}
+	n := wrapTestNodeWithEvm(t, common.LiveState, bridge, map[string]string{"Ethereum": evmSrv.URL})
+	n.state.Health = snapshot.New("test", "test")
+	n.state.Health.AddNetwork(definition.EvmClass, 1)
+	n.state.Health.AddNetwork(definition.EvmClass, 999)
 	n.config.TssConfig.DecompressedPublicKey = decompressedPub
 
-	reqA := &events.UnwrapRequestEvm{ChainId: 1, TransactionHash: ecommon.Hash{1}, LogIndex: 0, Amount: big.NewInt(50)}
-	reqB := &events.UnwrapRequestEvm{ChainId: 1, TransactionHash: ecommon.Hash{2}, LogIndex: 1, Amount: big.NewInt(60)}
+	reqA := &events.UnwrapRequestEvm{
+		NetworkClass:    definition.EvmClass,
+		ChainId:         1,
+		TransactionHash: ecommon.Hash{1},
+		LogIndex:        0,
+		To:              types.ZeroAddress.String(),
+		Amount:          big.NewInt(50),
+	}
+	reqB := &events.UnwrapRequestEvm{
+		NetworkClass:    definition.EvmClass,
+		ChainId:         1,
+		TransactionHash: ecommon.Hash{2},
+		LogIndex:        1,
+		To:              types.ZeroAddress.String(),
+		Amount:          big.NewInt(60),
+	}
+	reqMissingChain := &events.UnwrapRequestEvm{
+		NetworkClass:    definition.EvmClass,
+		ChainId:         999,
+		TransactionHash: ecommon.Hash{3},
+		LogIndex:        2,
+		To:              types.ZeroAddress.String(),
+		Amount:          big.NewInt(70),
+	}
+	if err := n.dbManager.EvmStorage(1).AddUnwrapRequest(*reqA); err != nil {
+		t.Fatal(err)
+	}
+	if err := n.dbManager.EvmStorage(1).AddUnwrapRequest(*reqB); err != nil {
+		t.Fatal(err)
+	}
 
 	msgA := crypto.Keccak256([]byte("unwrap-msg-a"))
 	msgB := crypto.Keccak256([]byte("unwrap-msg-b"))
+	msgMissing := crypto.Keccak256([]byte("unwrap-msg-missing"))
 	sigA := signTestMsg(t, priv, msgA)
 	sigB := signTestMsg(t, priv, msgB)
+	sigMissing := signTestMsg(t, priv, msgMissing)
 
 	badRecB := sigB
 	badRecB.RecoveryID = "not*valid*base64"
 
 	msgsIndexes := map[string]int{
-		sigA.Msg: 0,
-		sigB.Msg: 1,
+		sigA.Msg:       0,
+		sigB.Msg:       1,
+		sigMissing.Msg: 2,
 	}
 
-	// Put badRecB first and valid sigA second (mismatching slice positions).
 	resp := &keysign.Response{
 		Signatures: []keysign.Signature{
 			badRecB,
 			{Msg: base64.StdEncoding.EncodeToString([]byte("unknown")), Signature: sigA.Signature, RecoveryID: sigA.RecoveryID},
+			sigMissing,
 			sigA,
 		},
 	}
 
-	n.applyUnwrapSignatures(resp, []*events.UnwrapRequestEvm{reqA, reqB}, msgsIndexes, 1)
+	n.applyUnwrapSignatures(resp, []*events.UnwrapRequestEvm{reqA, reqB, reqMissingChain}, msgsIndexes, 1)
 
-	if reqA.Signature == "" {
-		t.Fatal("expected valid sigA to populate reqA.Signature")
+	// Assert against the stored row in EvmStorage, not just the in-memory struct.
+	storedA, err := n.dbManager.EvmStorage(1).GetUnwrapRequestByHashAndLog(reqA.TransactionHash, reqA.LogIndex)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if reqB.Signature != "" {
-		t.Fatalf("expected invalid sigB to leave reqB.Signature empty, got %q", reqB.Signature)
+	if storedA == nil || storedA.Signature == "" || storedA.Signature != reqA.Signature {
+		t.Fatalf("expected stored reqA signature to match, stored=%+v req=%+v", storedA, reqA)
+	}
+	storedB, err := n.dbManager.EvmStorage(1).GetUnwrapRequestByHashAndLog(reqB.TransactionHash, reqB.LogIndex)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if storedB == nil || storedB.Signature != "" || reqB.Signature != "" {
+		t.Fatalf("expected invalid sigB to leave stored and in-memory signature empty, stored=%+v req=%+v", storedB, reqB)
+	}
+	// Missing chain must fail persistence and NOT mutate in-memory reqMissingChain.Signature.
+	if reqMissingChain.Signature != "" {
+		t.Fatalf("expected missing-chain unwrap to keep Signature empty, got %q", reqMissingChain.Signature)
+	}
+	// Missing chain must also return an error directly from SetEvmUnwrapRequestSignature.
+	if err := n.networksManager.SetEvmUnwrapRequestSignature(&events.UnwrapRequestEvm{ChainId: 999, Signature: "sig"}); err == nil {
+		t.Fatal("expected error from SetEvmUnwrapRequestSignature for missing chain")
 	}
 }
 
 type wrapTestBridge struct {
+	mu       sync.Mutex
+	networks *embedded.NetworkInfoList
 	unsigned *embedded.WrapTokenRequestList
 	allWraps *embedded.WrapTokenRequestList
+	byID     map[types.Hash]*definition.WrapTokenRequest
 	pages    atomic.Int32
-	onPage   func()
+	onPage   func(page int32)
 }
 
 func (b *wrapTestBridge) GetBridgeInfo() (*definition.BridgeInfoVariable, error) {
@@ -360,11 +456,16 @@ func (b *wrapTestBridge) GetOrchestratorInfo() *definition.OrchestratorInfo {
 	return &definition.OrchestratorInfo{WindowSize: 10, KeyGenThreshold: 1, ConfirmationsToFinality: 1, EstimatedMomentumTime: 1}
 }
 
-func (b *wrapTestBridge) GetAllNetworks(uint32, uint32) *embedded.NetworkInfoList {
-	return &embedded.NetworkInfoList{}
+func (b *wrapTestBridge) GetAllNetworks(pageIndex, _ uint32) *embedded.NetworkInfoList {
+	if pageIndex > 0 || b.networks == nil {
+		return &embedded.NetworkInfoList{}
+	}
+	return b.networks
 }
 
 func (b *wrapTestBridge) GetAllUnsignedWrapTokenRequests(uint32, uint32) *embedded.WrapTokenRequestList {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	if b.unsigned == nil {
 		return &embedded.WrapTokenRequestList{}
 	}
@@ -372,17 +473,39 @@ func (b *wrapTestBridge) GetAllUnsignedWrapTokenRequests(uint32, uint32) *embedd
 }
 
 func (b *wrapTestBridge) GetAllWrapTokenRequests(pageIndex, _ uint32) *embedded.WrapTokenRequestList {
-	b.pages.Add(1)
+	n := b.pages.Add(1)
 	if b.onPage != nil {
-		b.onPage()
+		b.onPage(n)
 	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	if pageIndex > 0 || b.allWraps == nil {
 		return &embedded.WrapTokenRequestList{}
 	}
 	return b.allWraps
 }
 
+func (b *wrapTestBridge) GetWrapTokenRequestById(id types.Hash) (*definition.WrapTokenRequest, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.byID != nil {
+		if req, ok := b.byID[id]; ok {
+			return req, nil
+		}
+	}
+	return nil, constants.ErrDataNonExistent
+}
+
+func (b *wrapTestBridge) GetUnwrapTokenRequestByHashAndLog(types.Hash, uint32) (*definition.UnwrapTokenRequest, error) {
+	return nil, constants.ErrDataNonExistent
+}
+
 func wrapTestNode(t *testing.T, state uint8, bridge *wrapTestBridge) *Node {
+	t.Helper()
+	return wrapTestNodeWithEvm(t, state, bridge, nil)
+}
+
+func wrapTestNodeWithEvm(t *testing.T, state uint8, bridge *wrapTestBridge, evmURLs map[string]string) *Node {
 	t.Helper()
 	t.Setenv("HOME", t.TempDir())
 	srv := server.NewServer()
@@ -403,10 +526,17 @@ func wrapTestNode(t *testing.T, state uint8, bridge *wrapTestBridge) *Node {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cfg := oconfig.BaseNetworkConfig{Urls: []string{endpoint.URL}}
-	if err := networks.Init(map[string]oconfig.BaseNetworkConfig{common.ZenonNetworkName: cfg, "unused": cfg}, stores, gs, nil); err != nil {
+	cfgMap := map[string]oconfig.BaseNetworkConfig{
+		common.ZenonNetworkName: {Urls: []string{endpoint.URL}},
+		"unused":                {Urls: []string{endpoint.URL}},
+	}
+	for name, url := range evmURLs {
+		cfgMap[name] = oconfig.BaseNetworkConfig{Urls: []string{url}}
+	}
+	if err := networks.Init(cfgMap, stores, gs, nil); err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(networks.Stop)
 	if err := gs.SetState(state); err != nil {
 		t.Fatal(err)
 	}
@@ -447,11 +577,118 @@ func TestProcessSignaturesWrapSkipsUnknownChainWithoutPanic(t *testing.T) {
 	}
 }
 
-func TestReSignStateSkipsUnfinalizedWrapsAndRespectsHaltedState(t *testing.T) {
-	unfinalizedID := types.Hash{0x11}
-	finalizedID := types.Hash{0x22}
+func TestReSignStateRetriesDeferredSignedWrapAfterFinality(t *testing.T) {
+	evmSrv := fakeEvmRpcServer(t)
+	defer evmSrv.Close()
+
+	signedWrapID := types.Hash{0x77}
+	makeWrap := func(confirmations uint64) *embedded.WrapTokenRequestList {
+		return &embedded.WrapTokenRequestList{
+			Count: 1,
+			List: []*embedded.WrapTokenRequest{{
+				WrapTokenRequest: &definition.WrapTokenRequest{
+					NetworkClass: definition.EvmClass,
+					ChainId:      1,
+					Id:           signedWrapID,
+					Amount:       big.NewInt(100),
+					Fee:          big.NewInt(1),
+					Signature:    "already-signed-old-key",
+				},
+				ConfirmationsToFinality: confirmations,
+			}},
+		}
+	}
 
 	bridge := &wrapTestBridge{
+		networks: &embedded.NetworkInfoList{
+			Count: 1,
+			List: []*definition.NetworkInfo{{
+				NetworkClass:    definition.EvmClass,
+				Id:              1,
+				Name:            "Ethereum",
+				ContractAddress: "0x0000000000000000000000000000000000000001",
+			}},
+		},
+		allWraps: makeWrap(2),
+	}
+
+	n := wrapTestNodeWithEvm(t, common.LiveState, bridge, map[string]string{"Ethereum": evmSrv.URL})
+	if activated, err := n.state.ActivateResign(definition.EvmClass, 1); err != nil || !activated {
+		t.Fatalf("ActivateResign failed: activated=%v err=%v", activated, err)
+	}
+	n.state.CompleteStartup()
+
+	// After the first full scan (page 0 + empty page 1), flip the wrap to finalized.
+	var finalizedOnce sync.Once
+	scan1Finished := make(chan struct{})
+	bridge.onPage = func(call int32) {
+		if call == 2 {
+			close(scan1Finished)
+		}
+	}
+
+	n.workers.start(n.processSignatures)
+	t.Cleanup(func() {
+		done := n.workers.shutdown()
+		<-done
+	})
+
+	select {
+	case <-scan1Finished:
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for first ReSignState scan")
+	}
+
+	// Give the worker a moment after finishing scan 1: it must still be in
+	// ReSignState and must NOT have stored or marked the unfinalized wrap yet.
+	time.Sleep(150 * time.Millisecond)
+	if st, _ := n.state.GetState(); st != common.ReSignState {
+		t.Fatalf("left ReSignState while matching signed wrap was unfinalized: got %s", common.StateToText(st))
+	}
+	if ev, err := n.dbManager.ZnnStorage().GetWrapRequestById(signedWrapID); err != nil || ev != nil {
+		t.Fatalf("unfinalized wrap was stored prematurely: ev=%+v err=%v", ev, err)
+	}
+
+	// Now finalize the wrap; the next pass must pick it up, mark it for re-signing,
+	// and only then complete ReSignState -> LiveState.
+	finalizedOnce.Do(func() {
+		bridge.mu.Lock()
+		bridge.allWraps = makeWrap(0)
+		bridge.mu.Unlock()
+	})
+
+	eventually(t, "deferred signed wrap to be marked for resign and state to return to LiveState", func() bool {
+		st, _ := n.state.GetState()
+		resign, err := n.dbManager.ZnnStorage().GetResignStatus(signedWrapID)
+		return err == nil && resign && st == common.LiveState
+	})
+}
+
+func TestReSignStateIgnoresStaleScanAfterRetargetAndRespectsHaltedState(t *testing.T) {
+	evmSrv := fakeEvmRpcServer(t)
+	defer evmSrv.Close()
+
+	wrapChain1 := types.Hash{0x11}
+	wrapChain2 := types.Hash{0x22}
+
+	bridge := &wrapTestBridge{
+		networks: &embedded.NetworkInfoList{
+			Count: 2,
+			List: []*definition.NetworkInfo{
+				{
+					NetworkClass:    definition.EvmClass,
+					Id:              1,
+					Name:            "Ethereum",
+					ContractAddress: "0x0000000000000000000000000000000000000001",
+				},
+				{
+					NetworkClass:    definition.EvmClass,
+					Id:              2,
+					Name:            "BSC",
+					ContractAddress: "0x0000000000000000000000000000000000000002",
+				},
+			},
+		},
 		allWraps: &embedded.WrapTokenRequestList{
 			Count: 2,
 			List: []*embedded.WrapTokenRequest{
@@ -459,17 +696,17 @@ func TestReSignStateSkipsUnfinalizedWrapsAndRespectsHaltedState(t *testing.T) {
 					WrapTokenRequest: &definition.WrapTokenRequest{
 						NetworkClass: definition.EvmClass,
 						ChainId:      1,
-						Id:           unfinalizedID,
+						Id:           wrapChain1,
 						Amount:       big.NewInt(10),
 						Fee:          big.NewInt(1),
 					},
-					ConfirmationsToFinality: 2,
+					ConfirmationsToFinality: 0,
 				},
 				{
 					WrapTokenRequest: &definition.WrapTokenRequest{
 						NetworkClass: definition.EvmClass,
-						ChainId:      1,
-						Id:           finalizedID,
+						ChainId:      2,
+						Id:           wrapChain2,
 						Amount:       big.NewInt(20),
 						Fee:          big.NewInt(1),
 					},
@@ -479,17 +716,24 @@ func TestReSignStateSkipsUnfinalizedWrapsAndRespectsHaltedState(t *testing.T) {
 		},
 	}
 
-	n := wrapTestNode(t, common.ReSignState, bridge)
-	n.state.SetResignNetwork(definition.EvmClass, 1)
+	n := wrapTestNodeWithEvm(t, common.LiveState, bridge, map[string]string{
+		"Ethereum": evmSrv.URL,
+		"BSC":      evmSrv.URL,
+	})
+	if activated, err := n.state.ActivateResign(definition.EvmClass, 1); err != nil || !activated {
+		t.Fatalf("ActivateResign failed: activated=%v err=%v", activated, err)
+	}
 	n.state.CompleteStartup()
 
-	// Simulate a concurrent halt arriving while ReSignState is scanning wraps:
-	// finishing the scan must NOT overwrite HaltedState with LiveState.
-	var haltedOnce sync.Once
-	bridge.onPage = func() {
-		haltedOnce.Do(func() {
-			_ = n.state.SetState(common.HaltedState)
-		})
+	// On the first page fetch of chain 1's scan, retarget ReSignState to chain 2.
+	// The stale chain 1 scan must stop without marking chain 1 or completing chain 2's request.
+	var retargetOnce sync.Once
+	bridge.onPage = func(call int32) {
+		if call == 1 {
+			retargetOnce.Do(func() {
+				_, _ = n.state.ActivateResign(definition.EvmClass, 2)
+			})
+		}
 	}
 
 	n.workers.start(n.processSignatures)
@@ -498,69 +742,100 @@ func TestReSignStateSkipsUnfinalizedWrapsAndRespectsHaltedState(t *testing.T) {
 		<-done
 	})
 
-	eventually(t, "ReSignState scan to finish", func() bool {
-		return bridge.pages.Load() >= 2
+	eventually(t, "retargeted chain 2 resign to complete", func() bool {
+		st, _ := n.state.GetState()
+		resign2, err := n.dbManager.ZnnStorage().GetResignStatus(wrapChain2)
+		return err == nil && resign2 && st == common.LiveState
 	})
-	// Give the loop a moment after finishing the scan.
-	time.Sleep(150 * time.Millisecond)
 
-	// Unfinalized wrap must have been skipped (never stored).
-	if ev, err := n.dbManager.ZnnStorage().GetWrapRequestById(unfinalizedID); err != nil {
-		t.Fatal(err)
-	} else if ev != nil {
-		t.Fatalf("unfinalized wrap %s was stored during ReSignState: %+v", unfinalizedID, ev)
-	}
-	// Finalized wrap must have been processed (added locally before LookupEvm skip).
-	if ev, err := n.dbManager.ZnnStorage().GetWrapRequestById(finalizedID); err != nil {
-		t.Fatal(err)
-	} else if ev == nil {
-		t.Fatalf("finalized wrap %s was not processed during ReSignState", finalizedID)
-	}
-	// HaltedState set during the scan must not have been overwritten with LiveState.
-	if st, _ := n.state.GetState(); st != common.HaltedState {
-		t.Fatalf("state after ReSignState scan = %s, want HaltedState", common.StateToText(st))
+	if resign1, err := n.dbManager.ZnnStorage().GetResignStatus(wrapChain1); err != nil || resign1 {
+		t.Fatalf("stale chain 1 scan marked wrapChain1 for resign: resign=%v err=%v", resign1, err)
 	}
 }
 
-func TestReadLocalStateParticipantKeysHandlesValidAndMalformedInput(t *testing.T) {
-	dir := t.TempDir()
+func TestSendSignaturesWrapDoesNotMarkReplacedSignatureSent(t *testing.T) {
+	wrapID := types.Hash{0x91}
+	bridge := &wrapTestBridge{
+		byID: map[types.Hash]*definition.WrapTokenRequest{
+			wrapID: {
+				Id:        wrapID,
+				Signature: "old-sig",
+			},
+		},
+	}
+	n := wrapTestNode(t, common.LiveState, bridge)
+	n.producerKeyPair = &wallet.KeyPair{Public: make([]byte, 32)}
+	n.config.TssConfig.LocalPubKeys = []string{"other-participant"}
 
-	// Valid file.
-	validPath := filepath.Join(dir, "valid.json")
-	if err := os.WriteFile(validPath, []byte(`{"participant_keys":["k1","k2"]}`), 0600); err != nil {
+	if err := n.dbManager.ZnnStorage().AddWrapRequest(events.WrapRequestZnn{
+		NetworkClass:  definition.EvmClass,
+		ChainId:       1,
+		Id:            wrapID,
+		Amount:        big.NewInt(10),
+		Fee:           big.NewInt(1),
+		Signature:     "old-sig",
+		SentSignature: false,
+		RedeemStatus:  common.UnredeemedStatus,
+	}); err != nil {
 		t.Fatal(err)
 	}
-	keys, err := readLocalStateParticipantKeys(validPath)
+
+	// Simulate replacement signature installed concurrently while RPC still serves old-sig.
+	if err := n.networksManager.SaveSignedWrapRequest(wrapID, "new-sig"); err != nil {
+		t.Fatal(err)
+	}
+	// Verify stale poll with old-sig cannot mark new-sig as sent.
+	if marked, err := n.networksManager.MarkWrapRequestSignatureSent(wrapID, "old-sig"); err != nil || marked {
+		t.Fatalf("expected stale poll not to mark replaced signature sent: marked=%v err=%v", marked, err)
+	}
+	got, err := n.dbManager.ZnnStorage().GetWrapRequestById(wrapID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Signature != "new-sig" || got.SentSignature {
+		t.Fatalf("expected new-sig to remain unsent, got %+v", got)
+	}
+}
+
+func TestReconcileUnsignedUnwrapRequestsLargePoolSizeNoOverflow(t *testing.T) {
+	n := wrapTestNode(t, common.LiveState, &wrapTestBridge{})
+	candidates := []*events.UnwrapRequestEvm{
+		{ChainId: 1, TransactionHash: ecommon.Hash{1}, LogIndex: 0},
+		{ChainId: 1, TransactionHash: ecommon.Hash{2}, LogIndex: 1},
+	}
+	selected, complete, err := n.reconcileUnsignedUnwrapRequestsWithPoolSize(candidates, math.MaxInt)
+	if err != nil || !complete || len(selected) != 2 {
+		t.Fatalf("large pool size gave selected=%d complete=%v err=%v", len(selected), complete, err)
+	}
+}
+
+func TestParseLocalStateParticipantKeysAndEmptyBaseDir(t *testing.T) {
+	// Valid file.
+	keys, err := parseLocalStateParticipantKeys([]byte(`{"participant_keys":["k1","k2"]}`), "localstate-aa.json")
 	if err != nil || len(keys) != 2 || keys[0] != "k1" || keys[1] != "k2" {
 		t.Fatalf("valid file: keys=%v err=%v", keys, err)
 	}
 
-	// Missing participant_keys must not panic.
-	missingPath := filepath.Join(dir, "missing.json")
-	if err := os.WriteFile(missingPath, []byte(`{}`), 0600); err != nil {
-		t.Fatal(err)
-	}
-	if keys, err := readLocalStateParticipantKeys(missingPath); err != nil || len(keys) != 0 {
-		t.Fatalf("missing key: keys=%v err=%v", keys, err)
-	}
-
-	// Wrong type for participant_keys or element must return error, not panic.
+	// Missing, null, empty, and malformed participant_keys must all return errors.
 	for name, content := range map[string]string{
+		"missing":         `{}`,
+		"null":            `{"participant_keys":null}`,
+		"empty":           `{"participant_keys":[]}`,
 		"non-array":       `{"participant_keys":"not-an-array"}`,
 		"non-string-item": `{"participant_keys":["ok", 123]}`,
+		"invalid-json":    `{bad`,
 	} {
-		p := filepath.Join(dir, name+".json")
-		if err := os.WriteFile(p, []byte(content), 0600); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := readLocalStateParticipantKeys(p); err == nil {
-			t.Errorf("%s: expected unmarshal error", name)
+		if _, err := parseLocalStateParticipantKeys([]byte(content), name+".json"); err == nil {
+			t.Errorf("%s: expected error for invalid participant_keys", name)
 		}
 	}
 
-	// Directory path exercises io.ReadAll error handling.
-	if _, err := readLocalStateParticipantKeys(dir); err == nil {
-		t.Fatal("expected read error for directory path")
+	// Empty TssConfig.BaseDir must fail configurePubKey instead of reading from cwd.
+	bridge := &wrapTestBridge{}
+	n := wrapTestNode(t, common.LiveState, bridge)
+	n.config.TssConfig.BaseDir = ""
+	if err := n.configurePubKey(); err == nil {
+		t.Fatal("expected configurePubKey to fail when TssConfig.BaseDir is empty")
 	}
 }
 
