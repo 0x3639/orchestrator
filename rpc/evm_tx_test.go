@@ -4369,4 +4369,275 @@ func TestClearObsoleteHaltAtomicAcrossNoncesPrunesConsumedAndPropagatesErrors(t 
 			t.Fatalf("durable setTss = (%+v, %v), want nil (must not restore consumed nonce 5)", gotSetTss, err)
 		}
 	})
+
+	t.Run("cleanup defers while superseded halt A remains in flight under timed-out replacement B", func(t *testing.T) {
+		key, err := crypto.GenerateKey()
+		if err != nil {
+			t.Fatal(err)
+		}
+		sender := crypto.PubkeyToAddress(key.PublicKey)
+		signer := etypes.LatestSignerForChainID(big.NewInt(1))
+		store := newMemPendingTxStore()
+
+		var haltAHash, haltBHash ecommon.Hash
+		haltAEntered := make(chan struct{})
+		releaseHaltA := make(chan struct{})
+		var releaseOnce sync.Once
+		release := func() { releaseOnce.Do(func() { close(releaseHaltA) }) }
+		var confirmedNonce, pendingNonce atomic.Uint64
+		confirmedNonce.Store(5)
+		pendingNonce.Store(5)
+
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			var req struct {
+				ID     json.RawMessage   `json:"id"`
+				Method string            `json:"method"`
+				Params []json.RawMessage `json:"params"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&req)
+			resp := map[string]interface{}{"jsonrpc": "2.0", "id": req.ID}
+			switch req.Method {
+			case "eth_chainId":
+				resp["result"] = hexutil.EncodeUint64(1)
+			case "eth_blockNumber":
+				resp["result"] = hexutil.EncodeUint64(100)
+			case "eth_getBalance":
+				resp["result"] = (*hexutil.Big)(new(big.Int).Mul(big.NewInt(10), big.NewInt(1e18)))
+			case "eth_getTransactionCount":
+				var tag string
+				if len(req.Params) >= 2 {
+					_ = json.Unmarshal(req.Params[1], &tag)
+				}
+				if tag == "pending" {
+					resp["result"] = hexutil.EncodeUint64(pendingNonce.Load())
+				} else {
+					resp["result"] = hexutil.EncodeUint64(confirmedNonce.Load())
+				}
+			case "eth_getBlockByNumber":
+				resp["result"] = map[string]interface{}{
+					"number":        hexutil.EncodeUint64(100),
+					"hash":          ecommon.HexToHash("0x11"),
+					"baseFeePerGas": (*hexutil.Big)(big.NewInt(20_000_000_000)),
+				}
+			case "eth_maxPriorityFeePerGas":
+				resp["result"] = (*hexutil.Big)(big.NewInt(2_000_000_000))
+			case "eth_estimateGas":
+				resp["result"] = hexutil.EncodeUint64(100_000)
+			case "eth_getTransactionByHash":
+				resp["result"] = nil
+			case "eth_sendRawTransaction":
+				var raw hexutil.Bytes
+				_ = json.Unmarshal(req.Params[0], &raw)
+				var tx etypes.Transaction
+				_ = tx.UnmarshalBinary(raw)
+				switch tx.Hash() {
+				case haltAHash:
+					close(haltAEntered)
+					select {
+					case <-releaseHaltA:
+					case <-r.Context().Done():
+						return
+					}
+					pendingNonce.Store(6)
+					resp["result"] = tx.Hash().Hex()
+				case haltBHash:
+					// Ambiguous timeout/failure for replacement B.
+					resp["error"] = map[string]interface{}{"code": -32000, "message": "replacement transaction underpriced"}
+				default:
+					resp["result"] = tx.Hash().Hex()
+				}
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(resp)
+		}))
+		t.Cleanup(func() {
+			release()
+			srv.Close()
+		})
+
+		client, err := NewEvmRpcClient(config.BaseNetworkConfig{Urls: []string{srv.URL}}, "clear-defers-superseded-inflight", contract)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer client.Stop()
+		client.SetChainID(1)
+		client.SetPendingTxStore(store)
+
+		// 1. Start halt A at nonce 5 paused in flight.
+		haltA, err := client.GetHaltTxEvm(sender, []byte{1, 2, 3}, &contract)
+		if err != nil {
+			t.Fatal(err)
+		}
+		signedHaltA, err := etypes.SignTx(haltA, signer, key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		haltAHash = signedHaltA.Hash()
+		haltADone := make(chan error, 1)
+		go func() { haltADone <- client.SendTransaction(signedHaltA) }()
+		select {
+		case <-haltAEntered:
+		case <-time.After(2 * time.Second):
+			t.Fatal("timed out waiting for halt A to reach server")
+		}
+
+		// 2. Replacement halt B at nonce 5 returns an ambiguous error while halt A is still in flight.
+		haltB, err := client.GetHaltTxEvm(sender, []byte{1, 2, 3}, &contract)
+		if err != nil {
+			t.Fatal(err)
+		}
+		signedHaltB, err := etypes.SignTx(haltB, signer, key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		haltBHash = signedHaltB.Hash()
+		if err := client.SendTransaction(signedHaltB); err == nil {
+			t.Fatal("expected ambiguous error for halt B")
+		}
+
+		// 3. Cleanup MUST defer while superseded halt A is still broadcasting!
+		if err := client.ClearObsoleteHaltTx(sender); err != nil {
+			t.Fatalf("ClearObsoleteHaltTx error: %v", err)
+		}
+		release()
+		if err := <-haltADone; err != nil {
+			t.Fatalf("halt A broadcast failed: %v", err)
+		}
+		gotHalt, err := store.LoadPendingEvmTx(sender, contract, evmTxKindHalt)
+		if err != nil || gotHalt == nil || gotHalt.Nonce != 5 {
+			t.Fatalf("after cleanup while superseded halt A was in flight, durable halt = (%+v, %v), want nonce 5 preserved", gotHalt, err)
+		}
+	})
+
+	t.Run("same-hash rebroadcast during cleanup invalidates stale lookup snapshot", func(t *testing.T) {
+		key, err := crypto.GenerateKey()
+		if err != nil {
+			t.Fatal(err)
+		}
+		sender := crypto.PubkeyToAddress(key.PublicKey)
+		signer := etypes.LatestSignerForChainID(big.NewInt(1))
+		store := newMemPendingTxStore()
+
+		lookupEntered := make(chan struct{})
+		releaseLookup := make(chan struct{})
+		var releaseOnce sync.Once
+		release := func() { releaseOnce.Do(func() { close(releaseLookup) }) }
+		var sendCalls atomic.Int32
+		var confirmedNonce, pendingNonce atomic.Uint64
+		confirmedNonce.Store(5)
+		pendingNonce.Store(5)
+
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			var req struct {
+				ID     json.RawMessage   `json:"id"`
+				Method string            `json:"method"`
+				Params []json.RawMessage `json:"params"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&req)
+			resp := map[string]interface{}{"jsonrpc": "2.0", "id": req.ID}
+			switch req.Method {
+			case "eth_chainId":
+				resp["result"] = hexutil.EncodeUint64(1)
+			case "eth_blockNumber":
+				resp["result"] = hexutil.EncodeUint64(100)
+			case "eth_getBalance":
+				resp["result"] = (*hexutil.Big)(new(big.Int).Mul(big.NewInt(10), big.NewInt(1e18)))
+			case "eth_getTransactionCount":
+				var tag string
+				if len(req.Params) >= 2 {
+					_ = json.Unmarshal(req.Params[1], &tag)
+				}
+				if tag == "pending" {
+					resp["result"] = hexutil.EncodeUint64(pendingNonce.Load())
+				} else {
+					resp["result"] = hexutil.EncodeUint64(confirmedNonce.Load())
+				}
+			case "eth_getBlockByNumber":
+				resp["result"] = map[string]interface{}{
+					"number":        hexutil.EncodeUint64(100),
+					"hash":          ecommon.HexToHash("0x11"),
+					"baseFeePerGas": (*hexutil.Big)(big.NewInt(20_000_000_000)),
+				}
+			case "eth_maxPriorityFeePerGas":
+				resp["result"] = (*hexutil.Big)(big.NewInt(2_000_000_000))
+			case "eth_estimateGas":
+				resp["result"] = hexutil.EncodeUint64(100_000)
+			case "eth_getTransactionByHash":
+				close(lookupEntered)
+				select {
+				case <-releaseLookup:
+				case <-r.Context().Done():
+					return
+				}
+				// Negative snapshot taken before same-hash rebroadcast.
+				resp["result"] = nil
+			case "eth_sendRawTransaction":
+				var raw hexutil.Bytes
+				_ = json.Unmarshal(req.Params[0], &raw)
+				var tx etypes.Transaction
+				_ = tx.UnmarshalBinary(raw)
+				if sendCalls.Add(1) == 1 {
+					// Initial broadcast returns an ambiguous error so halt stays tracked.
+					resp["error"] = map[string]interface{}{"code": -32000, "message": "replacement transaction underpriced"}
+				} else {
+					// Identical same-hash rebroadcast succeeds!
+					pendingNonce.Store(6)
+					resp["result"] = tx.Hash().Hex()
+				}
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(resp)
+		}))
+		t.Cleanup(func() {
+			release()
+			srv.Close()
+		})
+
+		client, err := NewEvmRpcClient(config.BaseNetworkConfig{Urls: []string{srv.URL}}, "clear-invalidated-by-same-hash-rebroadcast", contract)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer client.Stop()
+		client.SetChainID(1)
+		client.SetPendingTxStore(store)
+
+		// 1. Initial broadcast fails ambiguously so signedHalt5 is persisted.
+		halt5, err := client.GetHaltTxEvm(sender, []byte{1, 2, 3}, &contract)
+		if err != nil {
+			t.Fatal(err)
+		}
+		signedHalt5, err := etypes.SignTx(halt5, signer, key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := client.SendTransaction(signedHalt5); err == nil {
+			t.Fatal("expected initial ambiguous error")
+		}
+
+		// 2. Start ClearObsoleteHaltTx and pause right inside eth_getTransactionByHash.
+		clearDone := make(chan error, 1)
+		go func() { clearDone <- client.ClearObsoleteHaltTx(sender) }()
+		select {
+		case <-lookupEntered:
+		case <-time.After(2 * time.Second):
+			t.Fatal("timed out waiting for cleanup hash lookup")
+		}
+
+		// 3. Rebroadcast the IDENTICAL signedHalt5 and let it succeed completely
+		// (so inFlight is already false again before cleanup resumes!).
+		if err := client.SendTransaction(signedHalt5); err != nil {
+			t.Fatalf("same-hash rebroadcast failed: %v", err)
+		}
+
+		// 4. Resume cleanup with its stale negative lookup: MUST see sendGen changed
+		// and preserve the accepted durable halt(5) reservation!
+		release()
+		if err := <-clearDone; err != nil {
+			t.Fatalf("ClearObsoleteHaltTx error: %v", err)
+		}
+		gotHalt, err := store.LoadPendingEvmTx(sender, contract, evmTxKindHalt)
+		if err != nil || gotHalt == nil || gotHalt.Nonce != 5 || gotHalt.TxHash != signedHalt5.Hash() {
+			t.Fatalf("stale cleanup erased accepted same-hash rebroadcast: durable halt = (%+v, %v), want halt(5) %s", gotHalt, err, signedHalt5.Hash())
+		}
+	})
 }

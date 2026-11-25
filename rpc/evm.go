@@ -63,11 +63,12 @@ type EvmRpc struct {
 	secondaryStopped bool
 
 	// pendingMu serializes durable pendingTxStore read/modify/write batches
-	// with in-memory pendingTx, nonceStack, and failedRollbacks updates
-	// (never held across network RPCs).
+	// with in-memory pendingTx, nonceStack, failedRollbacks, and sendGen
+	// updates (never held across network RPCs).
 	pendingMu       sync.Mutex
 	nonceStack      map[evmNonceKey][]*pendingAttempt
 	failedRollbacks map[evmNonceKey]struct{}
+	sendGen         map[evmTxKey]uint64
 	// txMu guards storageName, chainID, pendingTx, pendingTxStore, and
 	// sendTimeout, which track the latest unconfirmed halt or key-change
 	// transaction per (sender, contract, action) so retries reuse the same
@@ -616,6 +617,14 @@ func (r *EvmRpc) recordPendingTxAttempt(tx *etypes.Transaction) (*pendingAttempt
 	r.pendingMu.Lock()
 	defer r.pendingMu.Unlock()
 
+	if r.sendGen == nil {
+		r.sendGen = make(map[evmTxKey]uint64)
+	}
+	// Advance sendGen before checking/persisting so any concurrent
+	// ClearObsoleteHaltTx lookup snapshot (including for a same-hash
+	// rebroadcast) is immediately invalidated.
+	r.sendGen[key]++
+
 	otherKey := evmTxKey{sender: key.sender, contract: key.contract, kind: otherEvmTxKind(key.kind)}
 	if _, err := r.loadPendingTxLocked(key); err != nil {
 		return nil, false, fmt.Errorf("load pending EVM tx record before broadcast: %w", err)
@@ -1145,16 +1154,19 @@ func (r *EvmRpc) clearPendingTxIfMatchesLocked(key evmTxKey, expected *pendingEv
 	return cleared, nil
 }
 
-// isInFlightLocked reports whether an attempt matching key and rec currently
-// has an in-flight eth_sendRawTransaction RPC. Caller must hold r.pendingMu.
-func (r *EvmRpc) isInFlightLocked(key evmTxKey, rec *pendingEvmTx) bool {
-	if rec == nil {
-		return false
-	}
-	nk := evmNonceKey{sender: key.sender, contract: key.contract, nonce: rec.nonce}
-	for _, a := range r.nonceStack[nk] {
-		if a.inFlight && a.kind == key.kind && a.txHash == rec.txHash {
-			return true
+// hasInFlightKindLocked reports whether any attempt of kind for (sender,
+// contract) at nonce <= maxNonce currently has an in-flight
+// eth_sendRawTransaction RPC (including superseded attempts beneath the latest
+// tracked record). Caller must hold r.pendingMu.
+func (r *EvmRpc) hasInFlightKindLocked(sender, contract ecommon.Address, kind string, maxNonce uint64) bool {
+	for nk, st := range r.nonceStack {
+		if nk.sender != sender || nk.contract != contract || nk.nonce > maxNonce {
+			continue
+		}
+		for _, a := range st {
+			if a.inFlight && a.kind == kind {
+				return true
+			}
 		}
 	}
 	return false
@@ -1172,14 +1184,21 @@ func (r *EvmRpc) hasFailedRollbacksLocked(sender, contract ecommon.Address) bool
 }
 
 // clearObsoleteHaltLocked atomically clears an obsolete halt reservation if it
-// still matches expected (and is not currently in flight), prunes confirmed
-// stacks below confirmedNonce first, and commits both the halt deletion and
-// any surviving unconfirmed rotation uncovered across nonces <= expected.nonce
-// in a single ApplyPendingEvmTxBatch. Caller must hold r.pendingMu.
-func (r *EvmRpc) clearObsoleteHaltLocked(key evmTxKey, expected *pendingEvmTx, confirmedNonce uint64) error {
+// still matches expected, no new send for key began after obsGen, and no
+// affected halt broadcast at nonce <= expected.nonce remains in flight. It
+// prunes confirmed stacks below confirmedNonce first, resolves pending failed
+// rollbacks, and commits both the halt deletion and any surviving unconfirmed
+// rotation uncovered across nonces <= expected.nonce in a single
+// ApplyPendingEvmTxBatch. Caller must hold r.pendingMu.
+func (r *EvmRpc) clearObsoleteHaltLocked(key evmTxKey, expected *pendingEvmTx, confirmedNonce uint64, obsGen uint64) error {
 	r.pruneConfirmedNonceStacksLocked(key.sender, key.contract, confirmedNonce)
 	if err := r.retryFailedRollbacksLocked(key.sender, key.contract); err != nil {
 		return err
+	}
+	if r.sendGen[key] != obsGen {
+		// A new send (including a same-hash rebroadcast) started after the
+		// mempool lookup snapshot was taken; defer cleanup.
+		return nil
 	}
 	otherKey := evmTxKey{sender: key.sender, contract: key.contract, kind: evmTxKindSetTss}
 	r.txMu.Lock()
@@ -1190,9 +1209,10 @@ func (r *EvmRpc) clearObsoleteHaltLocked(key evmTxKey, expected *pendingEvmTx, c
 	if cur == nil || cur.nonce != expected.nonce || cur.txHash != expected.txHash {
 		return nil
 	}
-	if r.isInFlightLocked(key, cur) {
-		// Defer cleanup while the matching halt broadcast is still in flight so
-		// a subsequent acceptance never loses its durable reservation.
+	if r.hasInFlightKindLocked(key.sender, key.contract, key.kind, cur.nonce) {
+		// Defer cleanup while any affected halt broadcast (including a
+		// superseded halt underneath cur) remains in flight so subsequent
+		// acceptance never loses its durable reservation.
 		return nil
 	}
 
@@ -1208,9 +1228,6 @@ func (r *EvmRpc) clearObsoleteHaltLocked(key evmTxKey, expected *pendingEvmTx, c
 		}
 		cut := len(st)
 		for cut > 0 && (st[cut-1].kind == evmTxKindHalt || st[cut-1].rejected) {
-			if st[cut-1].inFlight && st[cut-1].kind == evmTxKindHalt {
-				break
-			}
 			cut--
 		}
 		if cut == len(st) {
@@ -1328,10 +1345,11 @@ func (r *EvmRpc) ClearObsoleteHaltTxContext(parent context.Context, sender ecomm
 		r.pendingMu.Unlock()
 		return clrErr
 	}
-	if r.isInFlightLocked(key, rec) {
+	if r.hasInFlightKindLocked(key.sender, key.contract, key.kind, rec.nonce) {
 		r.pendingMu.Unlock()
 		return nil
 	}
+	obsGen := r.sendGen[key]
 	r.pendingMu.Unlock()
 
 	pendingNonce, err := r.PendingNonceAtContext(parent, sender)
@@ -1355,7 +1373,7 @@ func (r *EvmRpc) ClearObsoleteHaltTxContext(parent context.Context, sender ecomm
 	}
 	r.pendingMu.Lock()
 	defer r.pendingMu.Unlock()
-	return r.clearObsoleteHaltLocked(key, rec, confirmedNonce)
+	return r.clearObsoleteHaltLocked(key, rec, confirmedNonce, obsGen)
 }
 
 func (r *EvmRpc) lookupPendingTx(key evmTxKey, confirmedNonce, pendingNonce uint64, havePending, otherOwnsLower bool) (*pendingEvmTx, error) {
