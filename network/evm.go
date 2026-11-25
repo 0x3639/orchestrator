@@ -91,6 +91,11 @@ type evmNetwork struct {
 	// pending redeem halt and without a final registration left unchecked.
 	// Startup completes only after that.
 	scanned atomic.Bool
+	// lastScannedThrough records the highest block reached by the most recent
+	// completed canonical Sync pass (updated right before scanned becomes true).
+	lastScannedThrough atomic.Uint64
+	// syncTrigger wakes subscribeToEvents to run a catch-up Sync immediately.
+	syncTrigger chan struct{}
 	// finalUnchecked is set when the last Sync held a final registration,
 	// above its redeem checkpoint limit, that it could not check.
 	finalUnchecked atomic.Bool
@@ -161,6 +166,7 @@ func NewEvmNetwork(network *definition.NetworkInfo, dbManager networkEventStores
 		stopChan:         stop,
 		logger:           newLogger,
 		done:             make(chan struct{}),
+		syncTrigger:      make(chan struct{}, 1),
 	}
 
 	return newEvmNetwork, nil
@@ -360,20 +366,46 @@ const (
 	syncProgressEvery = 25
 )
 
+// canonicalScanCoverage reports whether this network has completed a full
+// canonical Sync pass, the block height that pass reached, and whether its
+// unconfirmed event queue is empty.
+func (eN *evmNetwork) canonicalScanCoverage() (bool, uint64, bool) {
+	if !eN.scanned.Load() {
+		return false, 0, false
+	}
+	queueEmpty := true
+	if eN.unconfirmedQueue != nil && eN.unconfirmedQueue.Size() > 0 {
+		queueEmpty = false
+	}
+	return true, eN.lastScannedThrough.Load(), queueEmpty
+}
+
+// requestCatchUpSync nudges subscribeToEvents to run a catch-up Sync promptly.
+func (eN *evmNetwork) requestCatchUpSync() {
+	if eN.syncTrigger == nil {
+		return
+	}
+	select {
+	case eN.syncTrigger <- struct{}{}:
+	default:
+	}
+}
+
 // Sync scans from the stored checkpoints to the head. It returns nil also
 // when it stopped early for a pending redeem halt; scanPaused then says so.
 // A pass that held a final registration it could not check does not count
 // as having scanned the chain: a later pass, which the redeem checkpoint
 // makes revisit it, has to.
 func (eN *evmNetwork) Sync() error {
-	err := eN.sync()
+	through, err := eN.sync()
 	if err == nil && !eN.scanPaused.Load() && !eN.finalUnchecked.Load() {
+		eN.lastScannedThrough.Store(through)
 		eN.scanned.Store(true)
 	}
 	return err
 }
 
-func (eN *evmNetwork) sync() error {
+func (eN *evmNetwork) sync() (uint64, error) {
 	eN.logger.Info("In sync evm")
 	eN.resetCanonicalCache()
 	eN.scanPaused.Store(false)
@@ -387,14 +419,14 @@ func (eN *evmNetwork) sync() error {
 	eN.settleChecked.Store(true)
 	startHeight, redeemFrom, legacy, err := eN.eventsStore().GetScanHeights(eN.ConfirmationsToFinality())
 	if err != nil {
-		return errors.Wrapf(err, "read sync cursor for chainId %d", eN.ChainId())
+		return 0, errors.Wrapf(err, "read sync cursor for chainId %d", eN.ChainId())
 	}
 	eN.logger.Info("updateHeight: ", startHeight)
 
 	if legacy {
 		provisional, err := eN.dbManager.ZnnStorage().HasLegacyRedeemStatuses(eN.ChainId())
 		if err != nil {
-			return err
+			return 0, err
 		}
 		if provisional {
 			redeemFrom = min(redeemFrom, eN.ContractDeploymentHeight())
@@ -405,6 +437,7 @@ func (eN *evmNetwork) sync() error {
 	// Once a range defers a near-tip block, later ranges cannot move the
 	// redeem checkpoint past that gap, even if the head advances mid-pass.
 	finalizedTip := uint64(math.MaxUint64)
+	var lastThrough uint64
 	startedAt := time.Now()
 	ranges := 0
 	attempts := 0
@@ -439,20 +472,20 @@ func (eN *evmNetwork) sync() error {
 		// ranges are unavailable. Resume this range after the halt completes.
 		if eN.state.RedeemHaltGeneration() != 0 {
 			eN.scanPaused.Store(true)
-			return nil
+			return lastThrough, nil
 		}
 		latestBlock, rpcErr := eN.EvmRpc().BlockNumber()
 		eN.health.UpdateNetwork(eN.ChainId(), func(n *snapshot.Network) { n.HeadHeight = snapshot.Reading(latestBlock, rpcErr) })
 		if rpcErr != nil {
 			if err := retryRange("reading chain head", rpcErr); err != nil {
-				return err
+				return 0, err
 			}
 			continue
 		}
 
 		if startHeight > latestBlock || fromBlock > latestBlock {
 			// todo this can happen if we have a fork
-			return errors.Errorf("sync evm problem for network: %s, chainId: %d", eN.NetworkName(), eN.ChainId())
+			return 0, errors.Errorf("sync evm problem for network: %s, chainId: %d", eN.NetworkName(), eN.ChainId())
 		}
 
 		if eN.queryRange == nil {
@@ -470,7 +503,7 @@ func (eN *evmNetwork) sync() error {
 			// query would report success for blocks it has not seen, and the
 			// cursor would then pass them for good. Wait for the head.
 			if err := retryRange(fmt.Sprintf("head %d is below the range end %d", latestBlock, rangeEnd), errors.New("provider head behind range")); err != nil {
-				return err
+				return 0, err
 			}
 			continue
 		}
@@ -490,13 +523,13 @@ func (eN *evmNetwork) sync() error {
 						eN.ChainId(), blockCount, err, newSize)
 					rangeFrozen = false
 					if !eN.sleep(time.Second) {
-						return errors.New("sync interrupted by shutdown")
+						return 0, errors.New("sync interrupted by shutdown")
 					}
 					continue
 				}
 			}
 			if err := retryRange(fmt.Sprintf("eth_getLogs for blocks [%d, %d]", fromBlock, rangeEnd), err); err != nil {
-				return err
+				return 0, err
 			}
 			continue
 		}
@@ -504,7 +537,7 @@ func (eN *evmNetwork) sync() error {
 		// future block must never underflow the unsigned finality calculation.
 		if err := validateLogHeights(logs, fromBlock, rangeEnd); err != nil {
 			if err := retryRange("validating returned log heights", err); err != nil {
-				return err
+				return 0, err
 			}
 			continue
 		}
@@ -531,7 +564,7 @@ func (eN *evmNetwork) sync() error {
 						}
 						if eN.state.RedeemHaltGeneration() != 0 {
 							eN.scanPaused.Store(true)
-							return nil
+							return lastThrough, nil
 						}
 					}
 					continue
@@ -546,14 +579,14 @@ func (eN *evmNetwork) sync() error {
 				eN.logger.Errorf("Sync: failed to interpret log tx %s logIndex %d in block %d, range [%d, %d] will be retried: %v",
 					log.TxHash.String(), log.Index, log.BlockNumber, fromBlock, rangeEnd, err)
 				if err := retryRange("interpreting logs", err); err != nil {
-					return err
+					return 0, err
 				}
 				interpretFailed = true
 				break
 			}
 			if eN.state.RedeemHaltGeneration() != 0 {
 				eN.scanPaused.Store(true)
-				return nil
+				return lastThrough, nil
 			}
 		}
 		if interpretFailed {
@@ -569,9 +602,10 @@ func (eN *evmNetwork) sync() error {
 		}
 
 		through := max(startHeight, rangeEnd)
+		lastThrough = through
 		redeemFrom = max(redeemFrom, min(rangeEnd, finalizedTip))
 		if err := eN.eventsStore().SetScanHeights(through, redeemFrom); err != nil {
-			return err
+			return 0, err
 		}
 		eN.health.UpdateNetwork(eN.ChainId(), func(n *snapshot.Network) {
 			n.ScannedThrough = snapshot.Measure(through)
@@ -603,7 +637,7 @@ func (eN *evmNetwork) sync() error {
 		eN.logger.Infof("Sync complete for chainId %d: blocks %d to %d in %d ranges, %s",
 			eN.ChainId(), startHeight, rangeEnd, ranges, time.Since(startedAt).Round(time.Second))
 	}
-	return nil
+	return lastThrough, nil
 }
 
 func validateLogHeights(logs []etypes.Log, from, to uint64) error {
@@ -968,6 +1002,8 @@ func (eN *evmNetwork) subscribeToEvents() {
 				if errInterpret := eN.InterpretLog(newLog, true); errInterpret != nil {
 					eN.logger.Debug(errInterpret)
 				}
+			case <-eN.syncTrigger:
+				break consume
 			case <-refresh.C:
 				// A scan that stopped for a pending halt has nothing to do
 				// until the halt is released. Keep this subscription and

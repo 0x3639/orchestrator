@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
+	"fmt"
 	"github.com/ethereum/go-ethereum"
 	ecommon "github.com/ethereum/go-ethereum/common"
 	etypes "github.com/ethereum/go-ethereum/core/types"
@@ -82,7 +83,14 @@ type znnNetwork struct {
 	stopChan          chan os.Signal
 	setBridgeMetadata func(metadata *common.BridgeMetadata)
 	logger            *zap.SugaredLogger
+	adminMu           sync.RWMutex
 	administrator     string
+	// Tracks the earliest EVM chain head observed while holding a late
+	// sourceUnknown unwrap inside its redeem delay, so fast-block chains still
+	// prove scan coverage once Sync passes that head.
+	unknownUnwrapMu   sync.Mutex
+	unknownUnwrapKey  string
+	unknownUnwrapHead uint64
 }
 
 // CheckOrchestratorInfoInitialized this method should have the same checks as in go-zenon
@@ -1034,7 +1042,7 @@ func (rC *znnNetwork) interpretSendBlockData(ctx context.Context, sendBlock *api
 			}
 		}
 	case base64.StdEncoding.EncodeToString(definition.ABIBridge.Methods[definition.RevokeUnwrapRequestMethodName].Id()):
-		if sendBlock.Address.String() != rC.administrator {
+		if sendBlock.Address.String() != rC.getAdministrator() {
 			break
 		}
 		param := new(definition.RevokeUnwrapParam)
@@ -1075,16 +1083,18 @@ func (rC *znnNetwork) interpretSendBlockData(ctx context.Context, sendBlock *api
 	// A running listener also reconciles historical network changes against
 	// the current contract. Startup initialized its networks from that state.
 	case base64.StdEncoding.EncodeToString(definition.ABIBridge.Methods[definition.SetNetworkMethodName].Id()):
-		if mode == startupHistory || sendBlock.Address.String() != rC.administrator {
+		if mode == startupHistory || outcome == receiveRejected || sendBlock.Address.String() != rC.getAdministrator() {
 			break
 		}
 		param := new(definition.NetworkInfoParam)
 		if err := definition.ABIBridge.UnpackMethod(param, definition.SetNetworkMethodName, sendBlock.Data); err != nil {
 			return constants.ErrUnpackError
 		}
-		common.AdministratorLogger.Info("SetNetworkMethodName NetworkClass: %d, ChainId: %d, Name: %s, ContractAddress: %s, Metadata: %s",
+		common.AdministratorLogger.Infof("SetNetworkMethodName NetworkClass: %d, ChainId: %d, Name: %s, ContractAddress: %s, Metadata: %s",
 			param.NetworkClass, param.ChainId, param.Name, param.ContractAddress, param.Metadata)
-		network, err := rC.ZnnRpc().GetNetworkByClassAndId(param.NetworkClass, param.ChainId)
+		read, cancel := context.WithTimeout(rC.readContext(ctx), rpc.ZnnSettingsTimeout)
+		network, err := rC.ZnnRpc().GetNetworkByClassAndIdContext(read, param.NetworkClass, param.ChainId)
+		cancel()
 		if err != nil {
 			return err
 		} else if network == nil {
@@ -1092,13 +1102,48 @@ func (rC *znnNetwork) interpretSendBlockData(ctx context.Context, sendBlock *api
 			rC.logger.Info("network not added")
 			break
 		}
-		rC.logger.Debugf("network found in go-zeonon: %s, %d, %d", network.Name, network.NetworkClass, network.Id)
+		rC.logger.Debugf("network found in go-zenon: %s, %d, %d", network.Name, network.NetworkClass, network.Id)
 		// check locally that the network is added
 		switch param.NetworkClass {
 		case definition.EvmClass:
-			existent := rC.rpcManager.HasEvmNetwork(param.ChainId)
-			if existent {
-				rC.logger.Info("network already existent")
+			existingClient, hasClient := rC.rpcManager.LookupEvm(param.ChainId)
+			var existingNet *evmNetwork
+			if rC.networkManager != nil {
+				existingNet = rC.networkManager.LookupEvm(param.ChainId)
+			}
+			if hasClient || existingNet != nil {
+				if !ecommon.IsHexAddress(network.ContractAddress) {
+					err := errors.Errorf("EVM network %d (%s) has invalid contract address %q; halting signing and stopping for a clean restart",
+						network.Id, network.Name, network.ContractAddress)
+					rC.stopForContractChange(ctx, existingNet, existingClient, err)
+					return err
+				}
+				newAddr := ecommon.HexToAddress(network.ContractAddress)
+				var currentAddr ecommon.Address
+				mismatch := false
+				if existingNet != nil && existingNet.ContractAddress() != nil {
+					currentAddr = *existingNet.ContractAddress()
+					if currentAddr != newAddr {
+						mismatch = true
+					}
+				}
+				if hasClient {
+					if currentAddr == (ecommon.Address{}) {
+						currentAddr = existingClient.BridgeAddress()
+					}
+					if existingClient.BridgeAddress() != newAddr {
+						currentAddr = existingClient.BridgeAddress()
+						mismatch = true
+					}
+				}
+				if mismatch {
+					err := errors.Errorf("EVM network %d (%s) contract address changed from %s to %s; halting signing and stopping for a clean restart",
+						network.Id, network.Name, currentAddr.Hex(), newAddr.Hex())
+					rC.stopForContractChange(ctx, existingNet, existingClient, err)
+					return err
+				}
+				rC.logger.Info("network already existent with unchanged contract address")
+				rC.applyNetworkTokenPairs(network)
 				break
 			}
 			rC.logger.Debug("network non existent")
@@ -1116,35 +1161,41 @@ func (rC *znnNetwork) interpretSendBlockData(ctx context.Context, sendBlock *api
 				}
 				return err
 			}
+			rC.applyNetworkTokenPairs(network)
 		}
 	case base64.StdEncoding.EncodeToString(definition.ABIBridge.Methods[definition.RemoveNetworkMethodName].Id()):
-		if mode == startupHistory || sendBlock.Address.String() != rC.administrator {
+		if mode == startupHistory || outcome == receiveRejected || sendBlock.Address.String() != rC.getAdministrator() {
 			break
 		}
 		param := new(definition.NetworkInfoParam)
 		if err := definition.ABIBridge.UnpackMethod(param, definition.RemoveNetworkMethodName, sendBlock.Data); err != nil {
 			return constants.ErrUnpackError
 		}
-		common.AdministratorLogger.Info("RemoveNetworkMethodName NetworkClass: %d, ChainId: %d, Name: %s, ContractAddress: %s, Metadata: %s",
+		common.AdministratorLogger.Infof("RemoveNetworkMethodName NetworkClass: %d, ChainId: %d, Name: %s, ContractAddress: %s, Metadata: %s",
 			param.NetworkClass, param.ChainId, param.Name, param.ContractAddress, param.Metadata)
-		network, err := rC.ZnnRpc().GetNetworkByClassAndId(param.NetworkClass, param.ChainId)
+		read, cancel := context.WithTimeout(rC.readContext(ctx), rpc.ZnnSettingsTimeout)
+		network, err := rC.ZnnRpc().GetNetworkByClassAndIdContext(read, param.NetworkClass, param.ChainId)
+		cancel()
 		if err != nil {
 			return err
 		} else if network == nil {
 			switch param.NetworkClass {
 			case definition.EvmClass:
+				rC.state.ReplaceTokensMap(param.ChainId, nil)
 				existent := rC.rpcManager.HasEvmNetwork(param.ChainId)
 				if !existent {
 					rC.logger.Info("network already deleted")
 					break
 				}
 				// todo integrate these two
-				rC.networkManager.RemoveEvmNetwork(param.ChainId)
+				if rC.networkManager != nil {
+					rC.networkManager.RemoveEvmNetwork(param.ChainId)
+				}
 				rC.rpcManager.RemoveEvmClient(param.ChainId)
 			}
 		}
 	case base64.StdEncoding.EncodeToString(definition.ABIBridge.Methods[definition.SetTokenPairMethod].Id()):
-		if !live || sendBlock.Address.String() != rC.administrator {
+		if mode == startupHistory || outcome == receiveRejected || sendBlock.Address.String() != rC.getAdministrator() {
 			break
 		}
 		param := new(definition.TokenPairParam)
@@ -1155,8 +1206,13 @@ func (rC *znnNetwork) interpretSendBlockData(ctx context.Context, sendBlock *api
 			"Redeemable: %t, Owned: %t, MinAmount: %s, FeePercentage: %d, RedeemDelay: %d, Metadata: %s",
 			param.NetworkClass, param.ChainId, param.TokenStandard.String(), param.TokenAddress, param.Bridgeable, param.Redeemable, param.Owned, param.MinAmount.String(),
 			param.FeePercentage, param.RedeemDelay, param.Metadata)
+		if param.NetworkClass == definition.EvmClass {
+			if err := rC.refreshNetworkTokenPairs(ctx, param.NetworkClass, param.ChainId); err != nil {
+				return err
+			}
+		}
 	case base64.StdEncoding.EncodeToString(definition.ABIBridge.Methods[definition.RemoveTokenPairMethodName].Id()):
-		if !live || sendBlock.Address.String() != rC.administrator {
+		if mode == startupHistory || outcome == receiveRejected || sendBlock.Address.String() != rC.getAdministrator() {
 			break
 		}
 		param := new(definition.TokenPairParam)
@@ -1165,6 +1221,11 @@ func (rC *znnNetwork) interpretSendBlockData(ctx context.Context, sendBlock *api
 		}
 		common.AdministratorLogger.Infof("RemoveTokenPairMethodName NetworkClass: %d, ChainId: %d, TokenStandard: %s, TokenAddress: %s",
 			param.NetworkClass, param.ChainId, param.TokenStandard.String(), param.TokenAddress)
+		if param.NetworkClass == definition.EvmClass {
+			if err := rC.refreshNetworkTokenPairs(ctx, param.NetworkClass, param.ChainId); err != nil {
+				return err
+			}
+		}
 	case base64.StdEncoding.EncodeToString(definition.ABIBridge.Methods[definition.HaltMethodName].Id()):
 		if mode == startupHistory {
 			break
@@ -1177,7 +1238,10 @@ func (rC *znnNetwork) interpretSendBlockData(ctx context.Context, sendBlock *api
 		}
 		// if the node is in emergency, it will set the state to halted after all txs, we don't need to do it after we see one
 		if currentState != common.EmergencyState {
-			halted := rC.IsHalted()
+			halted, err := rC.halted()
+			if err != nil {
+				return err
+			}
 			if halted {
 				if err := rC.state.SetState(common.HaltedState); err != nil {
 					rC.stopBridgeListener(rC.listenerCtx, err)
@@ -1186,7 +1250,7 @@ func (rC *znnNetwork) interpretSendBlockData(ctx context.Context, sendBlock *api
 			}
 		}
 	case base64.StdEncoding.EncodeToString(definition.ABIBridge.Methods[definition.NominateGuardiansMethodName].Id()):
-		if !live || sendBlock.Address.String() != rC.administrator {
+		if !live || sendBlock.Address.String() != rC.getAdministrator() {
 			break
 		}
 		guardians := new([]types.Address)
@@ -1197,12 +1261,12 @@ func (rC *znnNetwork) interpretSendBlockData(ctx context.Context, sendBlock *api
 			common.AdministratorLogger.Infof("NominateGuardiansMethodName Idx: %d, Guardian: %s", idx, guardian.String())
 		}
 	case base64.StdEncoding.EncodeToString(definition.ABIBridge.Methods[definition.UnhaltMethodName].Id()):
-		if !live || sendBlock.Address.String() != rC.administrator {
+		if !live || sendBlock.Address.String() != rC.getAdministrator() {
 			break
 		}
 		common.AdministratorLogger.Info("UnhaltMethodName")
 	case base64.StdEncoding.EncodeToString(definition.ABIBridge.Methods[definition.ProposeAdministratorMethodName].Id()):
-		if !live {
+		if mode == startupHistory || outcome == receiveRejected {
 			break
 		}
 		address := new(types.Address)
@@ -1210,23 +1274,27 @@ func (rC *znnNetwork) interpretSendBlockData(ctx context.Context, sendBlock *api
 			return constants.ErrUnpackError
 		}
 		common.AdministratorLogger.Infof("ProposeAdministratorMethodName %s", address.String())
+		if err := rC.refreshAdministrator(ctx); err != nil {
+			return err
+		}
 	case base64.StdEncoding.EncodeToString(definition.ABIBridge.Methods[definition.EmergencyMethodName].Id()):
-		if mode == startupHistory || sendBlock.Address.String() != rC.administrator {
+		if mode == startupHistory || outcome == receiveRejected || sendBlock.Address.String() != rC.getAdministrator() {
 			break
 		}
 		common.AdministratorLogger.Info("EmergencyMethodName")
-		halted := rC.IsHalted()
+		halted, err := rC.halted()
+		if err != nil {
+			return err
+		}
 		if halted {
 			if err := rC.state.SetState(common.HaltedState); err != nil {
 				rC.stopBridgeListener(rC.listenerCtx, err)
 				return err
 			}
 		}
-		bridgeInfo, err := rC.GetBridgeInfo()
-		if err != nil {
+		if err := rC.refreshAdministrator(ctx); err != nil {
 			return err
 		}
-		rC.administrator = bridgeInfo.Administrator.String()
 	case base64.StdEncoding.EncodeToString(definition.ABIBridge.Methods[definition.ChangeTssECDSAPubKeyMethodName].Id()):
 		param := new(definition.ChangeECDSAPubKeyParam)
 		if err := definition.ABIBridge.UnpackMethod(param, definition.ChangeTssECDSAPubKeyMethodName, sendBlock.Data); err != nil {
@@ -1252,7 +1320,7 @@ func (rC *znnNetwork) interpretSendBlockData(ctx context.Context, sendBlock *api
 			}
 		}
 	case base64.StdEncoding.EncodeToString(definition.ABIBridge.Methods[definition.ChangeAdministratorMethodName].Id()):
-		if mode == startupHistory || sendBlock.Address.String() != rC.administrator {
+		if mode == startupHistory || outcome == receiveRejected || sendBlock.Address.String() != rC.getAdministrator() {
 			break
 		}
 		address := new(types.Address)
@@ -1260,11 +1328,9 @@ func (rC *znnNetwork) interpretSendBlockData(ctx context.Context, sendBlock *api
 			return constants.ErrUnpackError
 		}
 		common.AdministratorLogger.Infof("ChangeAdministratorMethodName %s", address.String())
-		bridgeInfo, err := rC.GetBridgeInfo()
-		if err != nil {
+		if err := rC.refreshAdministrator(ctx); err != nil {
 			return err
 		}
-		rC.administrator = bridgeInfo.Administrator.String()
 	case base64.StdEncoding.EncodeToString(definition.ABIBridge.Methods[definition.SetAllowKeygenMethodName].Id()):
 		if !live {
 			// What the bridge allows now decides, whoever sent this and
@@ -1274,7 +1340,7 @@ func (rC *znnNetwork) interpretSendBlockData(ctx context.Context, sendBlock *api
 			}
 			break
 		}
-		if sendBlock.Address.String() != rC.administrator {
+		if sendBlock.Address.String() != rC.getAdministrator() {
 			break
 		}
 		var value bool
@@ -1289,7 +1355,7 @@ func (rC *znnNetwork) interpretSendBlockData(ctx context.Context, sendBlock *api
 			}
 		}
 	case base64.StdEncoding.EncodeToString(definition.ABIBridge.Methods[definition.SetOrchestratorInfoMethodName].Id()):
-		if mode == startupHistory || sendBlock.Address.String() != rC.administrator {
+		if mode == startupHistory || sendBlock.Address.String() != rC.getAdministrator() {
 			break
 		}
 
@@ -1297,7 +1363,7 @@ func (rC *znnNetwork) interpretSendBlockData(ctx context.Context, sendBlock *api
 			return err
 		}
 	case base64.StdEncoding.EncodeToString(definition.ABIBridge.Methods[definition.SetBridgeMetadataMethodName].Id()):
-		if mode == startupHistory || sendBlock.Address.String() != rC.administrator {
+		if mode == startupHistory || sendBlock.Address.String() != rC.getAdministrator() {
 			break
 		}
 		var metadataJSON string
@@ -1325,7 +1391,7 @@ func (rC *znnNetwork) interpretSendBlockData(ctx context.Context, sendBlock *api
 		}
 		rC.setBridgeMetadata(&metadata)
 	case base64.StdEncoding.EncodeToString(definition.ABIBridge.Methods[definition.SetNetworkMetadataMethodName].Id()):
-		if !live || sendBlock.Address.String() != rC.administrator {
+		if !live || sendBlock.Address.String() != rC.getAdministrator() {
 			break
 		}
 		param := new(definition.SetNetworkMetadataParam)
@@ -1358,7 +1424,11 @@ const (
 // unwrapSource looks for the EVM event a registered unwrap request claims as
 // its source.
 func (rC *znnNetwork) unwrapSource(ctx context.Context, param *definition.UnwrapTokenParam, rpcZnnEvent *definition.UnwrapTokenRequest) (unwrapSource, error) {
-	evm := rC.rpcManager.Evm(rpcZnnEvent.ChainId)
+	evm, ok := rC.rpcManager.LookupEvm(rpcZnnEvent.ChainId)
+	if !ok {
+		return sourceUnknown, errors.Errorf("unwrap request %s/%d is on EVM chainId %d, which has no active EVM RPC client",
+			param.TransactionHash.String(), param.LogIndex, rpcZnnEvent.ChainId)
+	}
 	var blockHash ecommon.Hash
 	var logs []etypes.Log
 	tx, rpcEvmErr := evm.TransactionReceiptContext(ctx, ecommon.Hash(param.TransactionHash))
@@ -1655,7 +1725,8 @@ func (rC *znnNetwork) recordUnwrapRegistration(ctx context.Context, param *defin
 	// The bridge returned the request, so its network and token pair exist
 	// there. Without a client or store for the chain this node can neither
 	// check the request nor record it; looking either up would stop the node.
-	if !rC.rpcManager.HasEvmNetwork(rpcZnnEvent.ChainId) || !rC.dbManager.HasEvmStorage(rpcZnnEvent.ChainId) {
+	evm, hasClient := rC.rpcManager.LookupEvm(rpcZnnEvent.ChainId)
+	if !hasClient || !rC.dbManager.HasEvmStorage(rpcZnnEvent.ChainId) {
 		if checked {
 			return errors.Errorf("unwrap request %s/%d is on EVM chainId %d, which this node has no client or store for",
 				param.TransactionHash.String(), param.LogIndex, rpcZnnEvent.ChainId)
@@ -1674,10 +1745,19 @@ func (rC *znnNetwork) recordUnwrapRegistration(ctx context.Context, param *defin
 			return err
 		}
 		if source == sourceUnknown && !live {
-			return awaitsSourceRecord{errors.Errorf("unwrap request %s/%d on chainId %d cannot be judged: the endpoint has no receipt for its transaction and this node has no record of the event, "+
-				"and this long after the receive that does not show whether the transaction never existed or lies outside the endpoint's history",
-				param.TransactionHash.String(), param.LogIndex, rpcZnnEvent.ChainId)}
+			inside := false
+			if redeemableIn != nil {
+				inside, _ = insideRedeemDelay(rpcZnnEvent, redeemableIn)
+			}
+			if !inside || !rC.lateUnknownUnwrapCovered(evm, rpcZnnEvent) {
+				return awaitsSourceRecord{errors.Errorf("unwrap request %s/%d on chainId %d cannot be judged: the endpoint has no receipt for its transaction and this node has no record of the event, "+
+					"and this long after the receive that does not show whether the transaction never existed or lies outside the endpoint's history",
+					param.TransactionHash.String(), param.LogIndex, rpcZnnEvent.ChainId)}
+			}
+			rC.logger.Errorf("late unwrap request %s/%d inside its redeem delay on chainId %d has no receipt and no recorded source event despite completed canonical EVM scan coverage; escalating to emergency",
+				param.TransactionHash.String(), param.LogIndex, rpcZnnEvent.ChainId)
 		}
+		rC.clearUnknownUnwrapObs()
 		if source != sourceMatches {
 			rC.logger.Errorf("unwrap request %s/%d has no matching source event on chainId %d",
 				param.TransactionHash.String(), param.LogIndex, rpcZnnEvent.ChainId)
@@ -2036,7 +2116,7 @@ func (rC *znnNetwork) holdBridgeAccount(height uint64, err error, listed bool, n
 	rC.hold.attempts++
 	rC.hold.listed = rC.hold.listed || listed
 	held := snapshot.ReceiveHold{Height: height, Since: rC.hold.since.UTC(), Attempts: rC.hold.attempts}
-	rC.state.HealthStore().UpdateZenon(func(z *snapshot.Zenon) { z.ReceiveHold = &held })
+	rC.state.SetReceiveHold(&held)
 	if now.Sub(rC.hold.reported) >= bridgeAccountHoldReport {
 		rC.hold.reported = now
 		rC.logger.Errorf("bridge account listener has not passed height %d for %s (%d attempts) and reads nothing after it: %v",
@@ -2052,12 +2132,13 @@ func (rC *znnNetwork) holdBridgeAccount(height uint64, err error, listed bool, n
 }
 
 func (rC *znnNetwork) releaseBridgeAccount() {
+	rC.clearUnknownUnwrapObs()
 	if rC.hold.attempts == 0 {
 		return
 	}
 	rC.logger.Infof("bridge account listener passed height %d after %d attempts", rC.hold.height, rC.hold.attempts)
 	rC.hold = bridgeAccountHold{}
-	rC.state.HealthStore().UpdateZenon(func(z *snapshot.Zenon) { z.ReceiveHold = nil })
+	rC.state.SetReceiveHold(nil)
 }
 
 // Return the last consecutively processed height, including successful work
@@ -2263,11 +2344,18 @@ func (rC *znnNetwork) IsHalted() bool {
 	return bridgeInfo.Halted || bridgeInfo.UnhaltedAt+bridgeInfo.UnhaltDurationInMomentums >= frMom
 }
 
+// Halted reports whether the bridge on Zenon is halted or still inside the
+// wait that follows an unhalt, returning an error instead of stopping the node
+// on transient RPC failures.
+func (rC *znnNetwork) Halted() (bool, error) {
+	return rC.halted()
+}
+
 // halted reports whether the bridge on Zenon is halted or still inside the
 // wait that follows an unhalt, as IsHalted does, from a read that ends with
 // the listener or after ZnnSettingsTimeout.
 func (rC *znnNetwork) halted() (bool, error) {
-	read, cancel := context.WithTimeout(rC.listenerCtx, rpc.ZnnSettingsTimeout)
+	read, cancel := context.WithTimeout(rC.readContext(rC.listenerCtx), rpc.ZnnSettingsTimeout)
 	defer cancel()
 	bridgeInfo, err := rC.ZnnRpc().GetBridgeInfoContext(read)
 	if err != nil {
@@ -2281,6 +2369,143 @@ func (rC *znnNetwork) halted() (bool, error) {
 		return false, err
 	}
 	return bridgeInfo.Halted || bridgeInfo.UnhaltedAt+bridgeInfo.UnhaltDurationInMomentums >= frMom, nil
+}
+
+func (rC *znnNetwork) readContext(ctx context.Context) context.Context {
+	if ctx != nil {
+		return ctx
+	}
+	return context.Background()
+}
+
+func (rC *znnNetwork) getAdministrator() string {
+	rC.adminMu.RLock()
+	defer rC.adminMu.RUnlock()
+	return rC.administrator
+}
+
+func (rC *znnNetwork) setAdministrator(admin string) {
+	rC.adminMu.Lock()
+	defer rC.adminMu.Unlock()
+	rC.administrator = admin
+}
+
+func (rC *znnNetwork) refreshAdministrator(ctx context.Context) error {
+	read, cancel := context.WithTimeout(rC.readContext(ctx), rpc.ZnnSettingsTimeout)
+	defer cancel()
+	bridgeInfo, err := rC.ZnnRpc().GetBridgeInfoContext(read)
+	if err != nil {
+		return err
+	}
+	if bridgeInfo == nil {
+		return errors.New("missing Zenon bridge info")
+	}
+	rC.setAdministrator(bridgeInfo.Administrator.String())
+	return nil
+}
+
+func (rC *znnNetwork) refreshNetworkTokenPairs(ctx context.Context, networkClass, chainId uint32) error {
+	read, cancel := context.WithTimeout(rC.readContext(ctx), rpc.ZnnSettingsTimeout)
+	defer cancel()
+	network, err := rC.ZnnRpc().GetNetworkByClassAndIdContext(read, networkClass, chainId)
+	if err != nil {
+		if bridgeObjectGone(err) {
+			rC.state.ReplaceTokensMap(chainId, nil)
+			return nil
+		}
+		return err
+	}
+	if network == nil {
+		rC.state.ReplaceTokensMap(chainId, nil)
+		return nil
+	}
+	rC.applyNetworkTokenPairs(network)
+	return nil
+}
+
+func (rC *znnNetwork) applyNetworkTokenPairs(network *definition.NetworkInfo) {
+	if network == nil {
+		return
+	}
+	pairs := make(map[string]string, len(network.TokenPairs))
+	for _, pair := range network.TokenPairs {
+		if pair.TokenAddress == "" || pair.TokenStandard == types.ZeroTokenStandard {
+			continue
+		}
+		pairs[pair.TokenStandard.String()] = pair.TokenAddress
+	}
+	rC.state.ReplaceTokensMap(network.Id, pairs)
+}
+
+// stopForContractChange immediately halts signing, stops watching the stale
+// EVM contract, and requests a clean restart so startup re-syncs cleanly
+// against the new bridge contract address.
+func (rC *znnNetwork) stopForContractChange(ctx context.Context, existingNet *evmNetwork, existingClient *rpc.EvmRpc, reason error) {
+	rC.state.MarkSettingsStale()
+	if _, haltErr := rC.state.HaltSigning(); haltErr != nil {
+		rC.logger.Errorf("failed to halt signing during EVM contract address change: %v", haltErr)
+	}
+	if existingNet != nil {
+		existingNet.halt()
+		if existingNet.unconfirmedQueue != nil {
+			_ = existingNet.unconfirmedQueue.Close()
+		}
+	}
+	if existingClient != nil {
+		existingClient.Stop()
+	}
+	rC.stopBridgeListener(ctx, reason)
+}
+
+func (rC *znnNetwork) observeUnknownUnwrapHead(chainId uint32, txHash types.Hash, logIndex uint32, head uint64) uint64 {
+	key := fmt.Sprintf("%d:%s:%d", chainId, txHash.String(), logIndex)
+	rC.unknownUnwrapMu.Lock()
+	defer rC.unknownUnwrapMu.Unlock()
+	if rC.unknownUnwrapKey != key || head < rC.unknownUnwrapHead {
+		rC.unknownUnwrapKey = key
+		rC.unknownUnwrapHead = head
+	}
+	return rC.unknownUnwrapHead
+}
+
+func (rC *znnNetwork) clearUnknownUnwrapObs() {
+	rC.unknownUnwrapMu.Lock()
+	rC.unknownUnwrapKey = ""
+	rC.unknownUnwrapHead = 0
+	rC.unknownUnwrapMu.Unlock()
+}
+
+// lateUnknownUnwrapCovered reports whether the local EVM network's completed
+// canonical scan and configured endpoints already cover the finalized window
+// in which any genuine source event for rpcZnnEvent would have been mined.
+// It returns false on any RPC error, incomplete scan, non-empty unconfirmed
+// queue, or endpoint disagreement so pruned or lagging RPCs never trigger a
+// false-positive emergency halt.
+func (rC *znnNetwork) lateUnknownUnwrapCovered(evm *rpc.EvmRpc, rpcZnnEvent *definition.UnwrapTokenRequest) bool {
+	if rC.networkManager == nil || evm == nil {
+		return false
+	}
+	eN := rC.networkManager.LookupEvm(rpcZnnEvent.ChainId)
+	if eN == nil || eN.ContractAddress() == nil || *eN.ContractAddress() != evm.BridgeAddress() {
+		return false
+	}
+	head, err := evm.BlockNumber()
+	if err != nil {
+		return false
+	}
+	obsHead := rC.observeUnknownUnwrapHead(rpcZnnEvent.ChainId, rpcZnnEvent.TransactionHash, rpcZnnEvent.LogIndex, head)
+	depth := eN.ConfirmationsToFinality()
+	requiredHeight := obsHead - min(obsHead, depth)
+
+	scanned, through, queueEmpty := eN.canonicalScanCoverage()
+	if !scanned || !queueEmpty || through < requiredHeight {
+		eN.requestCatchUpSync()
+		return false
+	}
+	if _, err := evm.CanonicalHash(requiredHeight); err != nil {
+		return false
+	}
+	return true
 }
 
 /// Local storage

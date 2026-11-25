@@ -400,6 +400,17 @@ func (r *ZnnRpc) GetNetworkByClassAndId(networkClass, id uint32) (*definition.Ne
 	return network, nil
 }
 
+func (r *ZnnRpc) GetNetworkByClassAndIdContext(ctx context.Context, networkClass, id uint32) (*definition.NetworkInfo, error) {
+	var network *definition.NetworkInfo
+	if err := r.settingsClient.CallContext(ctx, &network, "embedded.bridge.getNetworkInfo", networkClass, id); err != nil {
+		return nil, err
+	}
+	if network == nil || network.NetworkClass == 0 {
+		return nil, nil
+	}
+	return network, nil
+}
+
 func (r *ZnnRpc) GetPillarPublicKeys() (map[string]string, error) {
 	orchestratorInfo, err := r.GetOrchestratorInfo()
 	if err != nil {

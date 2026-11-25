@@ -1246,30 +1246,7 @@ func (node *Node) processSignatures() {
 				node.logger.Info("the halt is not confirmed on every bridge yet; signing it again")
 			}
 		case common.HaltedState:
-			if halted, unhalted, err := node.networksManager.CountNetworksHaltState(); err != nil {
-				node.logger.Debug(err)
-			} else {
-				// the state should be given by the znn network
-				// when unhalting, start with the znn network
-				if node.networksManager.Znn().IsHalted() {
-					// if some of the networks are not halted, either some error occurred while sending halt tx or the tx is not accepted yet
-					// in any case we want to try to halt the networks again
-					if unhalted > 0 {
-						if err := node.state.SetState(common.EmergencyState); err != nil {
-							node.logger.Debug(err)
-							continue
-						}
-					}
-				} else {
-					// we wait so the administrator unhalts all the networks if znn is unhalted
-					if halted == 0 {
-						if err := node.state.SetState(common.LiveState); err != nil {
-							node.logger.Debug(err)
-							continue
-						}
-					}
-				}
-			}
+			node.reconcileHaltedState()
 		case common.ReSignState:
 			pageIndex := uint32(0)
 			pageSize := uint32(100)
@@ -1878,6 +1855,39 @@ func (node *Node) znnHaltFlag() (halted, ok bool) {
 		return false, false
 	}
 	return halted, true
+}
+
+// reconcileHaltedState checks Zenon and EVM halt status without terminating
+// the node on a transient Zenon RPC failure.
+func (node *Node) reconcileHaltedState() {
+	halted, unhalted, err := node.networksManager.CountNetworksHaltState()
+	if err != nil {
+		node.logger.Debug(err)
+		return
+	}
+	// the state should be given by the znn network
+	// when unhalting, start with the znn network
+	znnHalted, err := node.networksManager.Znn().Halted()
+	if err != nil {
+		node.logger.Warnf("cannot read Zenon halt state: %v", err)
+		return
+	}
+	if znnHalted {
+		// if some of the networks are not halted, either some error occurred while sending halt tx or the tx is not accepted yet
+		// in any case we want to try to halt the networks again
+		if unhalted > 0 {
+			if err := node.state.SetState(common.EmergencyState); err != nil {
+				node.logger.Debug(err)
+			}
+		}
+		return
+	}
+	// we wait so the administrator unhalts all the networks if znn is unhalted
+	if halted == 0 {
+		if err := node.state.SetState(common.LiveState); err != nil {
+			node.logger.Debug(err)
+		}
+	}
 }
 
 // activeKeyCanSign reports whether a key change signed with the active key

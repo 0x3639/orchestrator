@@ -233,10 +233,34 @@ func (gs *GlobalState) RedeemLogAcknowledged(ev RedeemIncident) bool {
 
 // PendingRedeemIncidents lists the evidence that still holds the bridge.
 func (gs *GlobalState) PendingRedeemIncidents() ([]RedeemIncident, error) {
-	if gs.redeemIncidents == nil {
+	gs.stateMu.Lock()
+	store := gs.redeemIncidents
+	gs.stateMu.Unlock()
+	if store == nil {
 		return nil, errors.New("missing redeem incident store")
 	}
-	return gs.redeemIncidents.PendingRedeemIncidents()
+	return store.PendingRedeemIncidents()
+}
+
+// PendingRedeemIncidentStatus returns the count of unresolved pending redeem
+// incidents in storage (zero if no store is attached) and whether a redeem halt
+// is currently active.
+func (gs *GlobalState) PendingRedeemIncidentStatus() (count int, haltPending bool, err error) {
+	if gs == nil {
+		return 0, false, nil
+	}
+	haltPending = gs.RedeemHaltGeneration() != 0
+	gs.stateMu.Lock()
+	store := gs.redeemIncidents
+	gs.stateMu.Unlock()
+	if store == nil {
+		return 0, haltPending, nil
+	}
+	incidents, err := store.PendingRedeemIncidents()
+	if err != nil {
+		return 0, haltPending, err
+	}
+	return len(incidents), haltPending, nil
 }
 
 // ArchiveSettledRedeem records an unmatched redeem that the chain shows can no

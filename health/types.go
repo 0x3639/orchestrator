@@ -36,14 +36,24 @@ type StatusNetworkInfo struct {
 	NetworkSigningStatus
 }
 
+// ReceiveHoldStatus describes an unresolved bridge account listener hold.
+type ReceiveHoldStatus struct {
+	Height   uint64    `json:"height"`
+	Since    time.Time `json:"since"`
+	Attempts uint64    `json:"attempts"`
+}
+
 // Status struct
 type Status struct {
-	State            uint8                        `json:"state"`
-	StateName        string                       `json:"stateName"`
-	FrontierMomentum uint64                       `json:"frontierMomentum"`
-	Networks         map[string]StatusNetworkInfo `json:"networks"`
-	PeersLen         uint32                       `json:"peersLen"`
-	Peers            []string                     `json:"peers"`
+	State                  uint8                        `json:"state"`
+	StateName              string                       `json:"stateName"`
+	FrontierMomentum       uint64                       `json:"frontierMomentum"`
+	Networks               map[string]StatusNetworkInfo `json:"networks"`
+	PeersLen               uint32                       `json:"peersLen"`
+	Peers                  []string                     `json:"peers"`
+	ReceiveHold            *ReceiveHoldStatus           `json:"receiveHold,omitempty"`
+	PendingRedeemIncidents int                          `json:"pendingRedeemIncidents,omitempty"`
+	RedeemHaltPending      bool                         `json:"redeemHaltPending,omitempty"`
 }
 
 type BuildInfo struct {

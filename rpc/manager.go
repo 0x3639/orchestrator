@@ -38,6 +38,9 @@ func (m *Manager) AddEvmClient(networkConfig config.BaseNetworkConfig, chainId u
 }
 
 func (m *Manager) RegisterEvmClient(chainId uint32, client *EvmRpc) {
+	if client != nil {
+		client.SetChainID(chainId)
+	}
 	m.evmMu.Lock()
 	defer m.evmMu.Unlock()
 	m.evmClients[chainId] = client
@@ -68,11 +71,21 @@ func (m *Manager) Znn() *ZnnRpc {
 	return m.znnClient
 }
 
-func (m *Manager) Evm(chainId uint32) *EvmRpc {
+// LookupEvm returns the EVM RPC client registered for chainId without
+// requesting a stop when none is present.
+func (m *Manager) LookupEvm(chainId uint32) (*EvmRpc, bool) {
 	m.evmMu.RLock()
 	client, ok := m.evmClients[chainId]
 	m.evmMu.RUnlock()
 	if !ok || client == nil {
+		return nil, false
+	}
+	return client, true
+}
+
+func (m *Manager) Evm(chainId uint32) *EvmRpc {
+	client, ok := m.LookupEvm(chainId)
+	if !ok {
 		common.GlobalLogger.Debugf("evm rpc client non existent for chainId %d", chainId)
 		common.RequestStop(m.stopChan)
 	}

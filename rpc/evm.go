@@ -1,6 +1,7 @@
 package rpc
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"github.com/ethereum/go-ethereum"
@@ -59,6 +60,27 @@ type EvmRpc struct {
 	secondaryMu      sync.Mutex
 	secondary        map[string]*secondaryClient
 	secondaryStopped bool
+
+	// txMu guards chainID and pendingTx, which track the latest unconfirmed
+	// halt or key-change transaction per (sender, contract, action) so retries
+	// reuse the same nonce with bumped fees instead of stalling behind stuck txs.
+	txMu      sync.Mutex
+	chainID   *big.Int
+	pendingTx map[evmTxKey]*pendingEvmTx
+}
+
+type evmTxKey struct {
+	sender   ecommon.Address
+	contract ecommon.Address
+	kind     string
+}
+
+type pendingEvmTx struct {
+	nonce     uint64
+	gasPrice  *big.Int
+	tipCap    *big.Int
+	feeCap    *big.Int
+	isDynamic bool
 }
 
 type secondaryClient struct {
@@ -281,8 +303,354 @@ func (r *EvmRpc) SubscribeToLogs(ctx context.Context) (ethereum.Subscription, ch
 
 /// Transactions
 
+const (
+	evmTxKindHalt   = "halt"
+	evmTxKindSetTss = "setTss"
+	// evmReplacementFeeBumpPercent exceeds the 10% mempool replacement minimum
+	// used by go-ethereum and other EVM clients so retries replace stuck txs.
+	evmReplacementFeeBumpPercent = 20
+)
+
+func (r *EvmRpc) SetChainID(chainId uint32) {
+	r.txMu.Lock()
+	defer r.txMu.Unlock()
+	r.chainID = new(big.Int).SetUint64(uint64(chainId))
+}
+
+func (r *EvmRpc) ChainID() (*big.Int, error) {
+	r.txMu.Lock()
+	if r.chainID != nil {
+		id := new(big.Int).Set(r.chainID)
+		r.txMu.Unlock()
+		return id, nil
+	}
+	r.txMu.Unlock()
+
+	ctx, cancel, err := r.callContext(evmCallTimeout)
+	if err != nil {
+		return nil, err
+	}
+	defer cancel()
+	id, err := r.rpcClient.ChainID(ctx)
+	if err != nil {
+		return nil, err
+	}
+	r.txMu.Lock()
+	r.chainID = new(big.Int).Set(id)
+	r.txMu.Unlock()
+	return id, nil
+}
+
 func (r *EvmRpc) SendTransaction(tx *etypes.Transaction) error {
-	return r.rpcClient.SendTransaction(context.Background(), tx)
+	ctx, cancel, err := r.callContext(evmCallTimeout)
+	if err != nil {
+		return err
+	}
+	defer cancel()
+	sendErr := r.rpcClient.SendTransaction(ctx, tx)
+	r.observeSentTx(tx, sendErr)
+	return sendErr
+}
+
+func cloneBigInt(v *big.Int) *big.Int {
+	if v == nil {
+		return nil
+	}
+	return new(big.Int).Set(v)
+}
+
+func maxBigInt(a, b *big.Int) *big.Int {
+	if a == nil {
+		return cloneBigInt(b)
+	}
+	if b == nil {
+		return cloneBigInt(a)
+	}
+	if a.Cmp(b) >= 0 {
+		return new(big.Int).Set(a)
+	}
+	return new(big.Int).Set(b)
+}
+
+// bumpFee increases prev by evmReplacementFeeBumpPercent using ceiling
+// division and guarantees at least +1 wei progress.
+func bumpFee(prev *big.Int) *big.Int {
+	if prev == nil || prev.Sign() <= 0 {
+		return big.NewInt(1)
+	}
+	factor := big.NewInt(100 + evmReplacementFeeBumpPercent)
+	bumped := new(big.Int).Mul(prev, factor)
+	bumped.Add(bumped, big.NewInt(99))
+	bumped.Div(bumped, big.NewInt(100))
+	if bumped.Cmp(prev) <= 0 {
+		bumped.Add(prev, big.NewInt(1))
+	}
+	return bumped
+}
+
+func evmTxKeyFromTx(tx *etypes.Transaction) (evmTxKey, bool) {
+	if tx == nil || tx.To() == nil || len(tx.Data()) < 4 {
+		return evmTxKey{}, false
+	}
+	var kind string
+	switch {
+	case bytes.Equal(tx.Data()[:4], common.EvmContractAbi.Methods["halt"].ID):
+		kind = evmTxKindHalt
+	case bytes.Equal(tx.Data()[:4], common.EvmContractAbi.Methods["setTss"].ID):
+		kind = evmTxKindSetTss
+	default:
+		return evmTxKey{}, false
+	}
+	var signer etypes.Signer
+	if cid := tx.ChainId(); cid != nil && cid.Sign() > 0 {
+		signer = etypes.LatestSignerForChainID(cid)
+	} else {
+		signer = etypes.HomesteadSigner{}
+	}
+	sender, err := etypes.Sender(signer, tx)
+	if err != nil {
+		return evmTxKey{}, false
+	}
+	return evmTxKey{sender: sender, contract: *tx.To(), kind: kind}, true
+}
+
+func shouldTrackPendingTxErr(err error) bool {
+	if err == nil {
+		return true
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "replacement transaction underpriced") ||
+		strings.Contains(msg, "already known") ||
+		strings.Contains(msg, "transaction underpriced") ||
+		strings.Contains(msg, "fee cap less than block base fee") ||
+		strings.Contains(msg, "max fee per gas less than block base fee")
+}
+
+func isNonceTooLowErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(strings.ToLower(err.Error()), "nonce too low")
+}
+
+func (r *EvmRpc) observeSentTx(tx *etypes.Transaction, sendErr error) {
+	key, ok := evmTxKeyFromTx(tx)
+	if !ok {
+		return
+	}
+	r.txMu.Lock()
+	defer r.txMu.Unlock()
+	if isNonceTooLowErr(sendErr) {
+		if prev := r.pendingTx[key]; prev != nil && prev.nonce <= tx.Nonce() {
+			delete(r.pendingTx, key)
+		}
+		return
+	}
+	if !shouldTrackPendingTxErr(sendErr) {
+		return
+	}
+	if r.pendingTx == nil {
+		r.pendingTx = make(map[evmTxKey]*pendingEvmTx)
+	}
+	entry := &pendingEvmTx{
+		nonce:     tx.Nonce(),
+		isDynamic: tx.Type() == etypes.DynamicFeeTxType,
+	}
+	if entry.isDynamic {
+		entry.tipCap = cloneBigInt(tx.GasTipCap())
+		entry.feeCap = cloneBigInt(tx.GasFeeCap())
+	} else {
+		entry.gasPrice = cloneBigInt(tx.GasPrice())
+	}
+	if prev := r.pendingTx[key]; prev != nil {
+		if prev.nonce > entry.nonce {
+			return
+		}
+		if prev.nonce == entry.nonce {
+			entry.gasPrice = maxBigInt(prev.gasPrice, entry.gasPrice)
+			entry.tipCap = maxBigInt(prev.tipCap, entry.tipCap)
+			entry.feeCap = maxBigInt(prev.feeCap, entry.feeCap)
+		}
+	}
+	r.pendingTx[key] = entry
+}
+
+func (r *EvmRpc) lookupPendingTx(key evmTxKey, confirmedNonce uint64) *pendingEvmTx {
+	r.txMu.Lock()
+	defer r.txMu.Unlock()
+	prev := r.pendingTx[key]
+	if prev == nil {
+		return nil
+	}
+	if prev.nonce < confirmedNonce {
+		delete(r.pendingTx, key)
+		return nil
+	}
+	return &pendingEvmTx{
+		nonce:     prev.nonce,
+		gasPrice:  cloneBigInt(prev.gasPrice),
+		tipCap:    cloneBigInt(prev.tipCap),
+		feeCap:    cloneBigInt(prev.feeCap),
+		isDynamic: prev.isDynamic,
+	}
+}
+
+func (r *EvmRpc) buildContractTx(sender ecommon.Address, contractAddress *ecommon.Address, kind string, encodedData []byte, label string) (*etypes.Transaction, error) {
+	if contractAddress == nil {
+		return nil, errors.Errorf("missing contract address for %s", label)
+	}
+	blockHeight, err := r.BlockNumber()
+	if err != nil {
+		return nil, err
+	}
+	balance, err := r.BalanceAt(sender, blockHeight)
+	if err != nil {
+		return nil, err
+	}
+	if balance.Sign() <= 0 {
+		return nil, errors.Errorf("Balance is 0, not enough to send %s", label)
+	}
+	r.logger.Debugf("Balance: %s", balance.String())
+
+	confirmedNonce, err := r.NonceAt(sender, blockHeight)
+	if err != nil {
+		return nil, err
+	}
+
+	key := evmTxKey{sender: sender, contract: *contractAddress, kind: kind}
+	prev := r.lookupPendingTx(key, confirmedNonce)
+	nonce := confirmedNonce
+	if prev != nil {
+		nonce = prev.nonce
+	} else if pendingNonce, err := r.PendingNonceAt(sender); err == nil && pendingNonce > nonce {
+		nonce = pendingNonce
+	}
+
+	// Prefer EIP-1559 dynamic fees when the latest block carries a baseFeePerGas
+	// and the node serves tip suggestions and chain ID; fall back to legacy
+	// gasPrice on non-1559 chains or endpoints that do not support 1559 RPCs.
+	baseFee, baseFeeErr := r.baseFeeByNumber(blockHeight)
+	if baseFeeErr != nil {
+		if r.ctx.Err() != nil {
+			return nil, r.ctx.Err()
+		}
+		r.logger.Debugf("baseFee lookup failed for %s, falling back to legacy gas price: %v", label, baseFeeErr)
+		baseFee = nil
+	}
+	if baseFee != nil && baseFee.Sign() < 0 {
+		baseFee = nil
+	}
+
+	if baseFee != nil {
+		tipCap, tipErr := r.SuggestGasTipCap()
+		chainID, chainErr := r.ChainID()
+		if tipErr == nil && chainErr == nil {
+			if tipCap == nil || tipCap.Sign() < 0 {
+				tipCap = big.NewInt(0)
+			}
+			if prev != nil {
+				if prev.tipCap != nil {
+					if minTip := bumpFee(prev.tipCap); tipCap.Cmp(minTip) < 0 {
+						tipCap = minTip
+					}
+				}
+				if prev.gasPrice != nil {
+					if minFromLegacy := bumpFee(prev.gasPrice); tipCap.Cmp(minFromLegacy) < 0 {
+						tipCap = minFromLegacy
+					}
+				}
+			}
+			feeCap := new(big.Int).Mul(baseFee, big.NewInt(2))
+			feeCap.Add(feeCap, tipCap)
+			if prev != nil {
+				if prev.feeCap != nil {
+					if minFee := bumpFee(prev.feeCap); feeCap.Cmp(minFee) < 0 {
+						feeCap = minFee
+					}
+				}
+				if prev.gasPrice != nil {
+					if minFromLegacy := bumpFee(prev.gasPrice); feeCap.Cmp(minFromLegacy) < 0 {
+						feeCap = minFromLegacy
+					}
+				}
+			}
+
+			msg := ethereum.CallMsg{
+				From:      sender,
+				To:        contractAddress,
+				Gas:       0,
+				GasTipCap: tipCap,
+				GasFeeCap: feeCap,
+				Value:     big.NewInt(0),
+				Data:      encodedData,
+			}
+			estimatedGas, err := r.EstimateGas(msg)
+			if err != nil {
+				return nil, err
+			}
+			r.logger.Debug("estimatedGas: ", estimatedGas)
+
+			fees := new(big.Int).Mul(feeCap, new(big.Int).SetUint64(estimatedGas))
+			if balance.Cmp(fees) < 0 {
+				return nil, errors.Errorf("not enough balance to send %s", label)
+			}
+			return etypes.NewTx(&etypes.DynamicFeeTx{
+				ChainID:   chainID,
+				Nonce:     nonce,
+				GasTipCap: tipCap,
+				GasFeeCap: feeCap,
+				Gas:       estimatedGas,
+				To:        contractAddress,
+				Value:     big.NewInt(0),
+				Data:      encodedData,
+			}), nil
+		}
+		if r.ctx.Err() != nil {
+			return nil, r.ctx.Err()
+		}
+		r.logger.Debugf("EIP-1559 fee suggestion unavailable for %s (tipErr=%v chainErr=%v), falling back to legacy gas price", label, tipErr, chainErr)
+	}
+
+	gasPrice, err := r.SuggestGasPrice()
+	if err != nil {
+		return nil, err
+	}
+	if prev != nil {
+		prevPrice := maxBigInt(prev.gasPrice, prev.feeCap)
+		if minPrice := bumpFee(prevPrice); gasPrice.Cmp(minPrice) < 0 {
+			gasPrice = minPrice
+		}
+	}
+
+	msg := ethereum.CallMsg{
+		From:     sender,
+		To:       contractAddress,
+		Gas:      0,
+		GasPrice: gasPrice,
+		Value:    big.NewInt(0),
+		Data:     encodedData,
+	}
+	estimatedGas, err := r.EstimateGas(msg)
+	if err != nil {
+		return nil, err
+	}
+	r.logger.Debug("estimatedGas: ", estimatedGas)
+
+	fees := new(big.Int).Mul(gasPrice, new(big.Int).SetUint64(estimatedGas))
+	if balance.Cmp(fees) < 0 {
+		return nil, errors.Errorf("not enough balance to send %s", label)
+	}
+	return etypes.NewTx(&etypes.LegacyTx{
+		Nonce:    nonce,
+		To:       contractAddress,
+		Value:    big.NewInt(0),
+		Gas:      estimatedGas,
+		GasPrice: gasPrice,
+		Data:     encodedData,
+	}), nil
 }
 
 func (r *EvmRpc) GetSetTssEcdsaPubKeyEvmMessage(newAddress ecommon.Address, networkClass, chainId uint32, contractAddress *ecommon.Address) ([]byte, error) {
@@ -312,63 +680,11 @@ func (r *EvmRpc) GetSetTssEcdsaPubKeyEvmMessage(newAddress ecommon.Address, netw
 }
 
 func (r *EvmRpc) GetSetTssEcdsaPubKeyEvmTx(newTss, sender ecommon.Address, oldFullSignature, newFullSignature []byte, contractAddress *ecommon.Address) (*etypes.Transaction, error) {
-	if blockHeight, err := r.BlockNumber(); err != nil {
+	encodedData, err := common.EvmContractAbi.Pack("setTss", newTss, oldFullSignature, newFullSignature)
+	if err != nil {
 		return nil, err
-	} else {
-		if balance, err := r.BalanceAt(sender, blockHeight); err != nil {
-			return nil, err
-		} else {
-			if balance.Cmp(big.NewInt(0)) == 0 {
-				return nil, errors.New("Balance is 0, not enough to send set ecdsa pub key tx")
-			}
-			r.logger.Debugf("Balance: %d", balance.Uint64())
-			if nonce, err := r.NonceAt(sender, blockHeight); err != nil {
-				return nil, err
-			} else {
-				gasPrice, err := r.SuggestGasPrice()
-				if err != nil {
-					return nil, err
-				}
-
-				encodedData, err := common.EvmContractAbi.Pack("setTss", newTss, oldFullSignature, newFullSignature)
-				if err != nil {
-					return nil, err
-				}
-				msg := ethereum.CallMsg{
-					From:     sender,
-					To:       contractAddress,
-					Gas:      0,
-					GasPrice: gasPrice,
-					Value:    big.NewInt(0),
-					Data:     encodedData,
-				}
-				estimatedGas, err := r.EstimateGas(msg)
-				if err != nil {
-					return nil, err
-				} else {
-					r.logger.Debug("estimatedGas: ", estimatedGas)
-				}
-
-				fees := big.NewInt(0).Mul(gasPrice, big.NewInt(0).SetUint64(estimatedGas))
-				// We subtract the fees and send the difference to the contract
-				// We subtract the fees and send the difference to the contract
-				if balance.Cmp(fees) < 0 {
-					return nil, errors.New("not enough balance to send set ecdsa pub key tx")
-				}
-				balance.Sub(balance, fees)
-				tx := etypes.NewTx(&etypes.LegacyTx{
-					Nonce:    nonce,
-					To:       contractAddress,
-					Value:    big.NewInt(0),
-					Gas:      estimatedGas,
-					GasPrice: gasPrice,
-					Data:     encodedData,
-				})
-
-				return tx, nil
-			}
-		}
 	}
+	return r.buildContractTx(sender, contractAddress, evmTxKindSetTss, encodedData, "set ecdsa pub key tx")
 }
 
 func (r *EvmRpc) GetHaltEvmMessage(networkClass, chainId uint32, contractAddress *ecommon.Address) ([]byte, error) {
@@ -393,60 +709,11 @@ func (r *EvmRpc) GetHaltEvmMessage(networkClass, chainId uint32, contractAddress
 }
 
 func (r *EvmRpc) GetHaltTxEvm(sender ecommon.Address, signature []byte, contractAddress *ecommon.Address) (*etypes.Transaction, error) {
-	if blockHeight, err := r.BlockNumber(); err != nil {
+	encodedData, err := common.EvmContractAbi.Pack("halt", signature)
+	if err != nil {
 		return nil, err
-	} else {
-		if balance, err := r.BalanceAt(sender, blockHeight); err != nil {
-			return nil, err
-		} else {
-			if balance.Cmp(big.NewInt(0)) == 0 {
-				return nil, errors.New("Balance is 0, not enough to send halt evm tx")
-			}
-			r.logger.Debugf("Balance: %d", balance.Uint64())
-			if nonce, err := r.NonceAt(sender, blockHeight); err != nil {
-				return nil, err
-			} else {
-				gasPrice, err := r.SuggestGasPrice()
-				if err != nil {
-					return nil, err
-				}
-
-				encodedData, err := common.EvmContractAbi.Pack("halt", signature)
-				if err != nil {
-					return nil, err
-				}
-				msg := ethereum.CallMsg{
-					From:     sender,
-					To:       contractAddress,
-					Gas:      0,
-					GasPrice: gasPrice,
-					Value:    big.NewInt(0),
-					Data:     encodedData,
-				}
-				estimatedGas, err := r.EstimateGas(msg)
-				if err != nil {
-					return nil, err
-				}
-
-				fees := big.NewInt(0).Mul(gasPrice, big.NewInt(0).SetUint64(estimatedGas))
-				// We subtract the fees and send the difference to the contract
-				if balance.Cmp(fees) < 0 {
-					return nil, errors.New("not enough balance to send halt evm tx")
-				}
-				balance.Sub(balance, fees)
-				tx := etypes.NewTx(&etypes.LegacyTx{
-					Nonce:    nonce,
-					To:       contractAddress,
-					Value:    big.NewInt(0),
-					Gas:      estimatedGas,
-					GasPrice: gasPrice,
-					Data:     encodedData,
-				})
-
-				return tx, nil
-			}
-		}
 	}
+	return r.buildContractTx(sender, contractAddress, evmTxKindHalt, encodedData, "halt evm tx")
 }
 
 /// Rpc Calls
@@ -561,6 +828,15 @@ func (r *EvmRpc) SuggestGasPrice() (*big.Int, error) {
 	return r.rpcClient.SuggestGasPrice(ctx)
 }
 
+func (r *EvmRpc) SuggestGasTipCap() (*big.Int, error) {
+	ctx, cancel, err := r.callContext(evmCallTimeout)
+	if err != nil {
+		return nil, err
+	}
+	defer cancel()
+	return r.rpcClient.SuggestGasTipCap(ctx)
+}
+
 func (r *EvmRpc) NonceAt(address ecommon.Address, blockNumber uint64) (uint64, error) {
 	ctx, cancel, err := r.callContext(evmCallTimeout)
 	if err != nil {
@@ -568,6 +844,36 @@ func (r *EvmRpc) NonceAt(address ecommon.Address, blockNumber uint64) (uint64, e
 	}
 	defer cancel()
 	return r.rpcClient.NonceAt(ctx, address, big.NewInt(0).SetUint64(blockNumber))
+}
+
+func (r *EvmRpc) PendingNonceAt(address ecommon.Address) (uint64, error) {
+	ctx, cancel, err := r.callContext(evmCallTimeout)
+	if err != nil {
+		return 0, err
+	}
+	defer cancel()
+	return r.rpcClient.PendingNonceAt(ctx, address)
+}
+
+// baseFeeByNumber reads only baseFeePerGas from eth_getBlockByNumber so
+// minimal or pre-London RPC responses without full header fields do not fail
+// decoding, and returns (nil, nil) on non-1559 chains.
+func (r *EvmRpc) baseFeeByNumber(blockNumber uint64) (*big.Int, error) {
+	ctx, cancel, err := r.callContext(evmCallTimeout)
+	if err != nil {
+		return nil, err
+	}
+	defer cancel()
+	var raw struct {
+		BaseFee *hexutil.Big `json:"baseFeePerGas"`
+	}
+	if err := r.rpcClient.Client().CallContext(ctx, &raw, "eth_getBlockByNumber", hexutil.EncodeUint64(blockNumber), false); err != nil {
+		return nil, err
+	}
+	if raw.BaseFee == nil {
+		return nil, nil
+	}
+	return raw.BaseFee.ToInt(), nil
 }
 
 func (r *EvmRpc) BalanceAt(address ecommon.Address, blockNumber uint64) (*big.Int, error) {
