@@ -125,3 +125,162 @@ def Laws.invalid_scan_preserves_checkpoint(previous, last):
 
 def Laws.valid_scan_commits_through_last_block(previous, last):
   {==}
+
+def Laws.emergency_blocks_live_transition(redeem_halt_pending, restart_required):
+  match redeem_halt_pending restart_required:
+    case False{} False{}: {==}
+    case False{} True{}: {==}
+    case True{} False{}: {==}
+    case True{} True{}: {==}
+
+def Laws.emergency_blocks_keygen_transition(redeem_halt_pending, restart_required):
+  match redeem_halt_pending restart_required:
+    case False{} False{}: {==}
+    case False{} True{}: {==}
+    case True{} False{}: {==}
+    case True{} True{}: {==}
+
+def Laws.emergency_blocks_resign_transition(redeem_halt_pending, restart_required):
+  match redeem_halt_pending restart_required:
+    case False{} False{}: {==}
+    case False{} True{}: {==}
+    case True{} False{}: {==}
+    case True{} True{}: {==}
+
+def Laws.redeem_halt_blocks_transfer_signing(state, restart_required):
+  match state:
+    case Bridge.StateLive{}: {==}
+    case Bridge.StateKeyGen{}: {==}
+    case Bridge.StateHalted{}: {==}
+    case Bridge.StateEmergency{}: {==}
+    case Bridge.StateReSign{}: {==}
+
+def Laws.restart_latch_blocks_transfer_signing(state, redeem_halt_pending):
+  match state redeem_halt_pending:
+    case Bridge.StateLive{} False{}: {==}
+    case Bridge.StateLive{} True{}: {==}
+    case Bridge.StateKeyGen{} False{}: {==}
+    case Bridge.StateKeyGen{} True{}: {==}
+    case Bridge.StateHalted{} False{}: {==}
+    case Bridge.StateHalted{} True{}: {==}
+    case Bridge.StateEmergency{} False{}: {==}
+    case Bridge.StateEmergency{} True{}: {==}
+    case Bridge.StateReSign{} False{}: {==}
+    case Bridge.StateReSign{} True{}: {==}
+
+def Laws.restart_latch_blocks_live_transition(current, redeem_halt_pending):
+  match current redeem_halt_pending:
+    case Bridge.StateLive{} False{}: {==}
+    case Bridge.StateLive{} True{}: {==}
+    case Bridge.StateKeyGen{} False{}: {==}
+    case Bridge.StateKeyGen{} True{}: {==}
+    case Bridge.StateHalted{} False{}: {==}
+    case Bridge.StateHalted{} True{}: {==}
+    case Bridge.StateEmergency{} False{}: {==}
+    case Bridge.StateEmergency{} True{}: {==}
+    case Bridge.StateReSign{} False{}: {==}
+    case Bridge.StateReSign{} True{}: {==}
+
+def Laws.halted_never_signs_transfers(redeem_halt_pending, restart_required):
+  match redeem_halt_pending restart_required:
+    case False{} False{}: {==}
+    case False{} True{}: {==}
+    case True{} False{}: {==}
+    case True{} True{}: {==}
+
+def Laws.halt_signing_leaves_protected_or_halts(state):
+  match state:
+    case Bridge.StateLive{}: {==}
+    case Bridge.StateKeyGen{}: {==}
+    case Bridge.StateHalted{}: {==}
+    case Bridge.StateEmergency{}: {==}
+    case Bridge.StateReSign{}: {==}
+
+def Laws.interrupted_resign_promotes_on_live_resume():
+  {==}
+
+def Laws.empty_endpoints_never_agree():
+  {==}
+
+def Laws.leading_endpoint_error_blocks_consensus(rest):
+  {==}
+
+def Laws.trailing_endpoint_error_blocks_consensus(expected, rest):
+  {==}
+
+def nat_eq_refl(+n: Nat) -> {True{} == Nat.is_eq(n, n) : Bool}:
+  match n:
+    case 0n: {==}
+    case 1n+p: nat_eq_refl(p)
+
+def nat_eq_add_succ_right(+n: Nat, delta: Nat) -> {False{} == Nat.is_eq(n, Nat.add(n, 1n+delta)) : Bool}:
+  match n:
+    case 0n: {==}
+    case 1n+p: nat_eq_add_succ_right(p, delta)
+
+def nat_eq_add_succ_left(+n: Nat, delta: Nat) -> {False{} == Nat.is_eq(Nat.add(n, 1n+delta), n) : Bool}:
+  match n:
+    case 0n: {==}
+    case 1n+p: nat_eq_add_succ_left(p, delta)
+
+def Laws.unanimous_pair_agrees(h):
+  %nat_eq_refl(h) : {Bridge.keep_consensus(_, Bridge.ConsensusAgreed{h}) == Bridge.ConsensusAgreed{h} : Bridge.Consensus}
+  {==}
+
+def Laws.byzantine_higher_hash_blocks_consensus(h, delta):
+  %nat_eq_add_succ_right(h, delta) : {Bridge.keep_consensus(_, Bridge.ConsensusAgreed{h}) == Bridge.ConsensusNone{} : Bridge.Consensus}
+  {==}
+
+def Laws.byzantine_lower_hash_blocks_consensus(h, delta):
+  %nat_eq_add_succ_left(h, delta) : {Bridge.keep_consensus(_, Bridge.ConsensusAgreed{Nat.add(h, 1n+delta)}) == Bridge.ConsensusNone{} : Bridge.Consensus}
+  {==}
+
+def Laws.zero_window_size_rejects_vote(pool_nonempty, prior, candidate):
+  {==}
+
+def Laws.empty_pool_rejects_vote(size, prior, candidate):
+  match size:
+    case 0n: {==}
+    case 1n+s: {==}
+
+def Laws.first_vote_records_candidate(size, candidate):
+  {==}
+
+def Laws.same_vote_retry_is_idempotent(size, digest):
+  %nat_eq_refl(digest) : {Bridge.vote_match(_, digest) == Bridge.VoteAccepted{digest} : Bridge.VoteOutcome}
+  {==}
+
+def Laws.higher_conflicting_vote_is_rejected(size, digest, delta):
+  %nat_eq_add_succ_right(digest, delta) : {Bridge.vote_match(_, digest) == Bridge.VoteRejected{} : Bridge.VoteOutcome}
+  {==}
+
+def Laws.lower_conflicting_vote_is_rejected(size, digest, delta):
+  %nat_eq_add_succ_left(digest, delta) : {Bridge.vote_match(_, Nat.add(digest, 1n+delta)) == Bridge.VoteRejected{} : Bridge.VoteOutcome}
+  {==}
+
+def Laws.matched_live_redeem_never_halts(acknowledged, evidence_ok, settled_latest, settled_final):
+  {==}
+
+def Laws.unmatched_redeem_without_agreed_evidence_retries(live, acknowledged, settled_latest, settled_final):
+  match live acknowledged:
+    case False{} False{}: {==}
+    case False{} True{}: {==}
+    case True{} False{}: {==}
+    case True{} True{}: {==}
+
+def Laws.acknowledged_unmatched_redeem_archives(live, settled_latest, settled_final):
+  match live:
+    case False{}: {==}
+    case True{}: {==}
+
+def Laws.live_unmatched_unsettled_redeem_halts(settled_final):
+  {==}
+
+def Laws.live_settled_redeem_waits_for_finality(settled_final):
+  {==}
+
+def Laws.historical_settled_redeem_archives_without_halt(settled_latest):
+  {==}
+
+def Laws.historical_unsettled_unmatched_redeem_halts(settled_latest):
+  {==}

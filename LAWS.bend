@@ -144,3 +144,145 @@ law valid_scan_commits_through_last_block:
   for previous: Nat
   for +last: Nat
   {Bridge.scan_checkpoint(previous, last, True{}) == last : Nat}
+
+# GlobalState safety, emergency halt ownership, and restart-required latch.
+law emergency_blocks_live_transition:
+  for redeem_halt_pending: Bool
+  for restart_required: Bool
+  {Bridge.transition_allowed(Bridge.StateEmergency{}, Bridge.StateLive{}, redeem_halt_pending, restart_required) == False{} : Bool}
+
+law emergency_blocks_keygen_transition:
+  for redeem_halt_pending: Bool
+  for restart_required: Bool
+  {Bridge.transition_allowed(Bridge.StateEmergency{}, Bridge.StateKeyGen{}, redeem_halt_pending, restart_required) == False{} : Bool}
+
+law emergency_blocks_resign_transition:
+  for redeem_halt_pending: Bool
+  for restart_required: Bool
+  {Bridge.transition_allowed(Bridge.StateEmergency{}, Bridge.StateReSign{}, redeem_halt_pending, restart_required) == False{} : Bool}
+
+law redeem_halt_blocks_transfer_signing:
+  for state: Bridge.BridgeState
+  for restart_required: Bool
+  {Bridge.can_sign_transfers(state, True{}, restart_required) == False{} : Bool}
+
+law restart_latch_blocks_transfer_signing:
+  for state: Bridge.BridgeState
+  for redeem_halt_pending: Bool
+  {Bridge.can_sign_transfers(state, redeem_halt_pending, True{}) == False{} : Bool}
+
+law restart_latch_blocks_live_transition:
+  for current: Bridge.BridgeState
+  for redeem_halt_pending: Bool
+  {Bridge.transition_allowed(current, Bridge.StateLive{}, redeem_halt_pending, True{}) == False{} : Bool}
+
+law halted_never_signs_transfers:
+  for redeem_halt_pending: Bool
+  for restart_required: Bool
+  {Bridge.can_sign_transfers(Bridge.StateHalted{}, redeem_halt_pending, restart_required) == False{} : Bool}
+
+law halt_signing_leaves_protected_or_halts:
+  for state: Bridge.BridgeState
+  {Bridge.is_protected_state(Bridge.halt_signing_target(state)) == True{} : Bool}
+
+law interrupted_resign_promotes_on_live_resume:
+  {Bridge.next_state(Bridge.StateHalted{}, Bridge.StateLive{}, False{}, False{}, True{}) == Bridge.StateReSign{} : Bridge.BridgeState}
+
+# Multi-endpoint unanimous agreement (Byzantine EVM RPC resistance).
+law empty_endpoints_never_agree:
+  {Bridge.agree_all([]) == Bridge.ConsensusNone{} : Bridge.Consensus}
+
+law leading_endpoint_error_blocks_consensus:
+  for rest: List<Bridge.EndpointAnswer>
+  {Bridge.agree_all(Bridge.AnswerError{} <> rest) == Bridge.ConsensusNone{} : Bridge.Consensus}
+
+law trailing_endpoint_error_blocks_consensus:
+  for expected: Nat
+  for rest: List<Bridge.EndpointAnswer>
+  {Bridge.agree_rest(expected, Bridge.AnswerError{} <> rest) == Bridge.ConsensusNone{} : Bridge.Consensus}
+
+law unanimous_pair_agrees:
+  for +h: Nat
+  {Bridge.agree_all([Bridge.AnswerHash{h}, Bridge.AnswerHash{h}]) == Bridge.ConsensusAgreed{h} : Bridge.Consensus}
+
+law byzantine_higher_hash_blocks_consensus:
+  for +h: Nat
+  for delta: Nat
+  {Bridge.agree_all([Bridge.AnswerHash{h}, Bridge.AnswerHash{Nat.add(h, 1n+delta)}]) == Bridge.ConsensusNone{} : Bridge.Consensus}
+
+law byzantine_lower_hash_blocks_consensus:
+  for +h: Nat
+  for delta: Nat
+  {Bridge.agree_all([Bridge.AnswerHash{Nat.add(h, 1n+delta)}, Bridge.AnswerHash{h}]) == Bridge.ConsensusNone{} : Bridge.Consensus}
+
+# Unwrap pool agreement vote non-equivocation.
+law zero_window_size_rejects_vote:
+  for pool_nonempty: Bool
+  for prior: Bridge.VoteRecord
+  for candidate: Nat
+  {Bridge.reserve_vote(0n, pool_nonempty, prior, candidate) == Bridge.VoteRejected{} : Bridge.VoteOutcome}
+
+law empty_pool_rejects_vote:
+  for size: Nat
+  for prior: Bridge.VoteRecord
+  for candidate: Nat
+  {Bridge.reserve_vote(size, False{}, prior, candidate) == Bridge.VoteRejected{} : Bridge.VoteOutcome}
+
+law first_vote_records_candidate:
+  for size: Nat
+  for +candidate: Nat
+  {Bridge.reserve_vote(1n+size, True{}, Bridge.NoVote{}, candidate) == Bridge.VoteAccepted{candidate} : Bridge.VoteOutcome}
+
+law same_vote_retry_is_idempotent:
+  for size: Nat
+  for +digest: Nat
+  {Bridge.reserve_vote(1n+size, True{}, Bridge.Voted{digest}, digest) == Bridge.VoteAccepted{digest} : Bridge.VoteOutcome}
+
+law higher_conflicting_vote_is_rejected:
+  for size: Nat
+  for +digest: Nat
+  for delta: Nat
+  {Bridge.reserve_vote(1n+size, True{}, Bridge.Voted{digest}, Nat.add(digest, 1n+delta)) == Bridge.VoteRejected{} : Bridge.VoteOutcome}
+
+law lower_conflicting_vote_is_rejected:
+  for size: Nat
+  for +digest: Nat
+  for delta: Nat
+  {Bridge.reserve_vote(1n+size, True{}, Bridge.Voted{Nat.add(digest, 1n+delta)}, digest) == Bridge.VoteRejected{} : Bridge.VoteOutcome}
+
+# Unmatched RegisteredRedeem fraud-detection decision laws.
+law matched_live_redeem_never_halts:
+  for acknowledged: Bool
+  for evidence_ok: Bool
+  for settled_latest: Bool
+  for settled_final: Bool
+  {Bridge.decide_redeem(True{}, True{}, acknowledged, evidence_ok, settled_latest, settled_final) == Bridge.RedeemRecordMatch{} : Bridge.RedeemAction}
+
+law unmatched_redeem_without_agreed_evidence_retries:
+  for live: Bool
+  for acknowledged: Bool
+  for settled_latest: Bool
+  for settled_final: Bool
+  {Bridge.decide_redeem(False{}, live, acknowledged, False{}, settled_latest, settled_final) == Bridge.RedeemRetry{} : Bridge.RedeemAction}
+
+law acknowledged_unmatched_redeem_archives:
+  for live: Bool
+  for settled_latest: Bool
+  for settled_final: Bool
+  {Bridge.decide_redeem(False{}, live, True{}, True{}, settled_latest, settled_final) == Bridge.RedeemArchive{} : Bridge.RedeemAction}
+
+law live_unmatched_unsettled_redeem_halts:
+  for settled_final: Bool
+  {Bridge.decide_redeem(False{}, True{}, False{}, True{}, False{}, settled_final) == Bridge.RedeemHalt{} : Bridge.RedeemAction}
+
+law live_settled_redeem_waits_for_finality:
+  for settled_final: Bool
+  {Bridge.decide_redeem(False{}, True{}, False{}, True{}, True{}, settled_final) == Bridge.RedeemRetry{} : Bridge.RedeemAction}
+
+law historical_settled_redeem_archives_without_halt:
+  for settled_latest: Bool
+  {Bridge.decide_redeem(False{}, False{}, False{}, True{}, settled_latest, True{}) == Bridge.RedeemArchive{} : Bridge.RedeemAction}
+
+law historical_unsettled_unmatched_redeem_halts:
+  for settled_latest: Bool
+  {Bridge.decide_redeem(False{}, False{}, False{}, True{}, settled_latest, False{}) == Bridge.RedeemHalt{} : Bridge.RedeemAction}

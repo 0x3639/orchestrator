@@ -124,3 +124,126 @@ def scan_checkpoint(previous: Nat, last: Nat, valid: Bool) -> Nat:
   match valid:
     case False{}: previous
     case True{}: last
+
+# common/global_state.go & common/redeem_incident.go:
+# Bridge state machine safety, emergency latch, and restart-required latch.
+type BridgeState is Data:
+  StateLive{}
+  StateKeyGen{}
+  StateHalted{}
+  StateEmergency{}
+  StateReSign{}
+
+def is_protected_state(s: BridgeState) -> Bool:
+  match s:
+    case StateHalted{}: True{}
+    case StateEmergency{}: True{}
+    case _: False{}
+
+def can_sign_transfers(s: BridgeState, redeem_halt_pending: Bool, restart_required: Bool) -> Bool:
+  match s redeem_halt_pending restart_required:
+    case _ True{} _: False{}
+    case _ False{} True{}: False{}
+    case StateEmergency{} False{} False{}: False{}
+    case StateHalted{} False{} False{}: False{}
+    case _ False{} False{}: True{}
+
+def transition_allowed(current: BridgeState, requested: BridgeState, redeem_halt_pending: Bool, restart_required: Bool) -> Bool:
+  match current requested redeem_halt_pending restart_required:
+    case _ StateEmergency{} True{} _: True{}
+    case _ _ True{} _: False{}
+    case _ StateEmergency{} False{} True{}: True{}
+    case _ StateHalted{} False{} True{}: True{}
+    case _ _ False{} True{}: False{}
+    case StateEmergency{} StateEmergency{} False{} False{}: True{}
+    case StateEmergency{} StateHalted{} False{} False{}: True{}
+    case StateEmergency{} _ False{} False{}: False{}
+    case _ _ False{} False{}: True{}
+
+def next_state(current: BridgeState, requested: BridgeState, redeem_halt_pending: Bool, restart_required: Bool, pending_resign: Bool) -> BridgeState:
+  match current requested redeem_halt_pending restart_required pending_resign:
+    case _ _ True{} _ _: StateEmergency{}
+    case _ StateEmergency{} False{} True{} _: StateEmergency{}
+    case _ StateHalted{} False{} True{} _: StateHalted{}
+    case cur _ False{} True{} _: cur
+    case StateEmergency{} StateEmergency{} False{} False{} _: StateEmergency{}
+    case StateEmergency{} StateHalted{} False{} False{} _: StateHalted{}
+    case StateEmergency{} _ False{} False{} _: StateEmergency{}
+    case StateKeyGen{} StateLive{} False{} False{} True{}: StateReSign{}
+    case StateHalted{} StateLive{} False{} False{} True{}: StateReSign{}
+    case _ req False{} False{} _: req
+
+def halt_signing_target(s: BridgeState) -> BridgeState:
+  match s:
+    case StateEmergency{}: StateEmergency{}
+    case StateHalted{}: StateHalted{}
+    case _: StateHalted{}
+
+# rpc/evm.go & rpc/unwrap_evidence.go:
+# Every configured EVM endpoint must answer and agree on the exact value.
+type EndpointAnswer is Data:
+  AnswerError{}
+  AnswerHash{h: Nat}
+
+type Consensus is Data:
+  ConsensusNone{}
+  ConsensusAgreed{h: Nat}
+
+def keep_consensus(eq: Bool, res: Consensus) -> Consensus:
+  match eq:
+    case False{}: ConsensusNone{}
+    case True{}: res
+
+def agree_rest(+expected: Nat, xs: List<EndpointAnswer>) -> Consensus:
+  match xs:
+    case Nil{}: ConsensusAgreed{expected}
+    case Con{AnswerError{}, _}: ConsensusNone{}
+    case Con{AnswerHash{h}, rest}: keep_consensus(Nat.is_eq(expected, h), agree_rest(expected, rest))
+
+def agree_all(xs: List<EndpointAnswer>) -> Consensus:
+  match xs:
+    case Nil{}: ConsensusNone{}
+    case Con{AnswerError{}, _}: ConsensusNone{}
+    case Con{AnswerHash{+h}, rest}: agree_rest(h, rest)
+
+# tss/unwrap_agreement.go:
+# Durable non-equivocating vote reservation per (key, windowSize, windowNumber).
+type VoteRecord is Data:
+  NoVote{}
+  Voted{digest: Nat}
+
+type VoteOutcome is Data:
+  VoteAccepted{digest: Nat}
+  VoteRejected{}
+
+def vote_match(eq: Bool, digest: Nat) -> VoteOutcome:
+  match eq:
+    case True{}: VoteAccepted{digest}
+    case False{}: VoteRejected{}
+
+def reserve_vote(window_size: Nat, pool_nonempty: Bool, prior: VoteRecord, +candidate: Nat) -> VoteOutcome:
+  match window_size pool_nonempty prior:
+    case 0n _ _: VoteRejected{}
+    case 1n+_ False{} _: VoteRejected{}
+    case 1n+_ True{} NoVote{}: VoteAccepted{candidate}
+    case 1n+_ True{} Voted{+prev}: vote_match(Nat.is_eq(prev, candidate), prev)
+
+# network/registered_redeem.go:
+# Fraud-detection decision model for EVM RegisteredRedeem events.
+type RedeemAction is Data:
+  RedeemRecordMatch{}
+  RedeemRetry{}
+  RedeemArchive{}
+  RedeemHalt{}
+
+def decide_redeem(matched: Bool, live: Bool, acknowledged: Bool, evidence_ok: Bool, settled_latest: Bool, settled_final: Bool) -> RedeemAction:
+  match matched live acknowledged evidence_ok settled_latest settled_final:
+    case True{} True{} _ _ _ _: RedeemRecordMatch{}
+    case True{} False{} _ True{} _ _: RedeemRecordMatch{}
+    case True{} False{} _ False{} _ _: RedeemRetry{}
+    case False{} _ _ False{} _ _: RedeemRetry{}
+    case False{} _ True{} True{} _ _: RedeemArchive{}
+    case False{} True{} False{} True{} True{} _: RedeemRetry{}
+    case False{} True{} False{} True{} False{} _: RedeemHalt{}
+    case False{} False{} False{} True{} _ True{}: RedeemArchive{}
+    case False{} False{} False{} True{} _ False{}: RedeemHalt{}
