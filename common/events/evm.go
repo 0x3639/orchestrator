@@ -1,6 +1,7 @@
 package events
 
 import (
+	"errors"
 	"github.com/ethereum/go-ethereum/accounts/abi"
 	ecommon "github.com/ethereum/go-ethereum/common"
 	zcommon "github.com/zenon-network/go-zenon/common"
@@ -41,6 +42,9 @@ func UnwrapRequestEvmBuilder() interface{} {
 }
 
 func (e *UnwrapRequestEvm) Hash() (string, error) {
+	if e.Amount == nil {
+		return "", errors.New("unwrap request amount is nil")
+	}
 	args := abi.Arguments{{Type: definition.Uint256Ty}, {Type: definition.Uint256Ty}, {Type: definition.AddressTy}, {Type: definition.AddressTy}, {Type: definition.Uint256Ty}}
 	values := make([]interface{}, 0)
 	values = append(values,

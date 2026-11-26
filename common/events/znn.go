@@ -1,6 +1,7 @@
 package events
 
 import (
+	"fmt"
 	ecommon "github.com/ethereum/go-ethereum/common"
 	zcommon "github.com/zenon-network/go-zenon/common"
 	"github.com/zenon-network/go-zenon/common/types"
@@ -44,8 +45,8 @@ func (e *WrapRequestZnn) Proto() *WrapRequestZnnProto {
 		Id:            e.Id.Bytes(),
 		ToAddress:     e.ToAddress,
 		TokenAddress:  e.TokenAddress,
-		Amount:        e.Amount.Bytes(),
-		Fee:           e.Fee.Bytes(),
+		Amount:        zcommon.BigIntToBytes(e.Amount),
+		Fee:           zcommon.BigIntToBytes(e.Fee),
 		Signature:     e.Signature,
 		Status:        e.RedeemStatus,
 		SentSignature: e.SentSignature,
@@ -76,5 +77,20 @@ func DeserializeWrapEventZnn(data []byte) (*WrapRequestZnn, error) {
 	if err := proto.Unmarshal(data, ev); err != nil {
 		return nil, err
 	}
-	return DeProtoWrapEventZnn(ev), nil
+	id, err := types.BytesToHash(ev.Id)
+	if err != nil {
+		return nil, fmt.Errorf("invalid wrap request id: %w", err)
+	}
+	return &WrapRequestZnn{
+		NetworkClass:  ev.NetworkClass,
+		ChainId:       ev.ChainId,
+		Id:            id,
+		ToAddress:     ev.ToAddress,
+		TokenAddress:  ev.TokenAddress,
+		Amount:        zcommon.BytesToBigInt(ev.Amount),
+		Fee:           zcommon.BytesToBigInt(ev.Fee),
+		Signature:     ev.Signature,
+		RedeemStatus:  ev.Status,
+		SentSignature: ev.SentSignature,
+	}, nil
 }
