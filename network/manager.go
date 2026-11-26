@@ -1716,10 +1716,13 @@ func (m *NetworksManager) SetUnsentUnwrapRequestAsUnsigned(event events.UnwrapRe
 	return nil
 }
 
+// SetEvmUnwrapRequestAsSent records that Zenon already holds the request by
+// moving an unredeemed record to pending. The listener may store a redeemed or
+// revoked status while the Zenon lookup runs; that status is kept.
 func (m *NetworksManager) SetEvmUnwrapRequestAsSent(event *events.UnwrapRequestEvm) error {
 	for _, network := range m.networks() {
 		if network.ChainId() == event.ChainId {
-			if err := network.SetUnwrapRequestStatus(event.TransactionHash, event.LogIndex, common.PendingRedeemStatus); err != nil {
+			if err := network.ApplyUnwrapReconciliationStatus(event.TransactionHash, event.LogIndex, common.UnredeemedStatus, common.PendingRedeemStatus); err != nil {
 				return err
 			}
 		}

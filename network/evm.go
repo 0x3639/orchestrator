@@ -1549,15 +1549,6 @@ func (eN *evmNetwork) GetUnwrapRequestByHashAndLog(txHash ecommon.Hash, logIndex
 	return eN.eventsStore().GetUnwrapRequestByHashAndLog(txHash, logIndex)
 }
 
-func (eN *evmNetwork) SetUnwrapRequestStatus(txHash ecommon.Hash, logIndex, status uint32) error {
-	eN.useMu.RLock()
-	defer eN.useMu.RUnlock()
-	if eN.detached {
-		return context.Canceled
-	}
-	return eN.eventsStore().SetUnwrapRequestStatus(txHash, logIndex, status)
-}
-
 func (eN *evmNetwork) ApplyUnwrapReconciliationStatus(txHash ecommon.Hash, logIndex, expected, status uint32) error {
 	eN.useMu.RLock()
 	defer eN.useMu.RUnlock()
