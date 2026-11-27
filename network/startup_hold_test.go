@@ -284,6 +284,10 @@ type heldEvm struct {
 	// Every transaction sent to this chain is rejected.
 	sendFails atomic.Bool
 	rejected  atomic.Int32 // transactions this chain rejected
+	// Transactions sent to this chain wait for this channel to close before
+	// they are answered; nil answers them at once.
+	sendHold     atomic.Pointer[chan struct{}]
+	sendAttempts atomic.Int32 // eth_sendRawTransaction calls this chain saw
 	// The TSS address the contract holds, when one is set.
 	tss atomic.Pointer[ecommon.Address]
 	// Runs, once, when the TSS address is read.
@@ -394,9 +398,13 @@ func (e *heldEvm) answer(method string, params []json.RawMessage) (interface{}, 
 	case "eth_estimateGas":
 		return "0x5208", nil
 	case "eth_sendRawTransaction":
+		e.sendAttempts.Add(1)
 		if e.sendFails.Load() {
 			e.rejected.Add(1)
 			return nil, &replayRPCError{-32000, "nonce too low"}
+		}
+		if hold := e.sendHold.Load(); hold != nil {
+			<-*hold
 		}
 		e.sent.Add(1)
 		return ecommon.Hash{1}.Hex(), nil

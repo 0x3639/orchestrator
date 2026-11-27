@@ -48,6 +48,8 @@ type NetworksManager struct {
 	// Tests shorten the pause before a network that failed to start in the
 	// background is started again.
 	evmStartRetry time.Duration
+	// Tests shorten the bound on one submission's publication.
+	submitTimeout time.Duration
 	// The networks Start began with, and until when the signer waits for
 	// their first scans to look at restored redeem incidents. Set by Start
 	// before the signing loop runs. See RestoredIncidentsChecked.
@@ -695,7 +697,9 @@ func (m *NetworksManager) UpdateWrapRequest(id types.Hash, signature string, key
 // publishTransfer publishes tx through while, and returns ErrNotLive when it
 // was not published.
 func (m *NetworksManager) publishTransfer(tx *nom.AccountBlock, while WhileLive) error {
-	sent, err := submit(while, func() error { return m.Znn().ZnnRpc().PublishTransaction(tx) })
+	sent, err := m.submitContext(context.Background(), while, func(pubCtx context.Context) error {
+		return m.Znn().ZnnRpc().PublishTransactionContext(pubCtx, tx)
+	})
 	if err != nil {
 		return err
 	}
@@ -736,21 +740,27 @@ type WhileEmergency func(send func() error) (bool, error)
 // before the halt was sent.
 var ErrEmergencyEnded = errors.New("the emergency ended before the halt was sent")
 
-// submitTimeout bounds how long one submission can hold off the change of
-// state it waits on: the release of a halt's emergency, or the end of
+// defaultSubmitTimeout bounds how long one submission can hold off the change
+// of state it waits on: the release of a halt's emergency, or the end of
 // LiveState for a transfer. A submission still running then may yet land.
-const submitTimeout = 30 * time.Second
+const defaultSubmitTimeout = 30 * time.Second
 
-// submit runs send through while, and waits for it at most submitTimeout. A
-// nil while always runs send.
-func submit(while func(send func() error) (bool, error), send func() error) (bool, error) {
-	return submitContext(context.Background(), while, func(context.Context) error { return send() })
+// submitBound is the longest one submission may hold off the change of state
+// it waits on. Tests shorten it per manager.
+func (m *NetworksManager) submitBound() time.Duration {
+	if m.submitTimeout != 0 {
+		return m.submitTimeout
+	}
+	return defaultSubmitTimeout
 }
 
 // submitContext runs send through while with a deadline-bound publication
-// context derived from ctx and submitTimeout so cancellation or timeout
-// aborts the underlying publish RPC directly.
-func submitContext(ctx context.Context, while func(send func() error) (bool, error), send func(context.Context) error) (bool, error) {
+// context derived from ctx and the submit bound, so cancellation or timeout
+// aborts the underlying publish RPC directly. send runs synchronously: every
+// caller passes a context-aware send, so while keeps guarding its state until
+// the publication has really returned and no goroutine outlives the state the
+// publication was submitted under.
+func (m *NetworksManager) submitContext(ctx context.Context, while func(send func() error) (bool, error), send func(context.Context) error) (bool, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -758,16 +768,9 @@ func submitContext(ctx context.Context, while func(send func() error) (bool, err
 		return false, err
 	}
 	bounded := func() error {
-		pubCtx, cancel := context.WithTimeout(ctx, submitTimeout)
+		pubCtx, cancel := context.WithTimeout(ctx, m.submitBound())
 		defer cancel()
-		done := make(chan error, 1)
-		go func() { done <- send(pubCtx) }()
-		select {
-		case err := <-done:
-			return err
-		case <-pubCtx.Done():
-			return pubCtx.Err()
-		}
+		return send(pubCtx)
 	}
 	if while == nil {
 		return true, bounded()
@@ -786,7 +789,7 @@ func (m *NetworksManager) HaltZnnContext(ctx context.Context, signature string, 
 	if err != nil {
 		return false, err
 	}
-	return submitContext(ctx, while, func(pubCtx context.Context) error {
+	return m.submitContext(ctx, while, func(pubCtx context.Context) error {
 		return m.Znn().ZnnRpc().PublishTransactionContext(pubCtx, tx)
 	})
 }
@@ -1284,7 +1287,7 @@ func (m *NetworksManager) sendHaltEvmWithExpected(ctx context.Context, batch Evm
 			m.logger.Error(err)
 			continue
 		}
-		sent, err := submitContext(ctx, while, func(pubCtx context.Context) error {
+		sent, err := m.submitContext(ctx, while, func(pubCtx context.Context) error {
 			return network.SendTransactionContext(pubCtx, tx, nil)
 		})
 		if err != nil {
@@ -1531,7 +1534,9 @@ func (m *NetworksManager) SendHaltEvmAdministrator(batch EvmBatch, idx int, ecds
 	if err != nil {
 		return false, err
 	}
-	sent, err := submit(while, func() error { return network.SendTransaction(tx) })
+	sent, err := m.submitContext(context.Background(), while, func(pubCtx context.Context) error {
+		return network.SendTransactionContext(pubCtx, tx, nil)
+	})
 	if err != nil {
 		return false, err
 	}
