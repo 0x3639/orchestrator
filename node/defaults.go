@@ -9,32 +9,29 @@ import (
 
 var DefaultNodeConfig = config.Config{
 	DataPath: common.DefaultDataDir(),
-	// RpcRequestsPerSecond/RpcBurst default to 3/5: at ~75 CU per
-	// eth_getLogs that is ~225 CU/s, about a quarter of a typical free
-	// provider's degraded floor (50,400 CU/min) and a tenth of its normal
-	// budget (120,000 CU/min). Existing config.json files without the fields
-	// stay uncapped; add the fields to opt in.
+	// BNB Chain and Ethereum default to dRPC free-tier-safe sync settings:
+	// FilterQuerySize 100 stays within dRPC's ~100-block eth_getLogs free-plan
+	// ceiling; RpcRequestsPerSecond/RpcBurst 2/3 keeps both networks running
+	// concurrently on the same IP/key at <=80 CU/s (at 20 CU/call), within the
+	// 210M CU/30-day monthly budget (~81 CU/s average) and well below the
+	// 50,400 CU/min (840 CU/s) degraded floor even at 75 CU/call. Omitted
+	// fields in config.json inherit these defaults; set RpcRequestsPerSecond
+	// explicitly to 0 to run uncapped (for example against a local full node).
 	Networks: map[string]config.BaseNetworkConfig{
 		common.ZenonNetworkName: {
 			Urls: []string{"ws://127.0.0.1:35998"},
 		},
-		"BSC": {
+		"BNB Chain": {
 			Urls:                 []string{"ws://127.0.0.1:8545"},
-			FilterQuerySize:      2000,
-			RpcRequestsPerSecond: 3,
-			RpcBurst:             5,
+			FilterQuerySize:      100,
+			RpcRequestsPerSecond: 2,
+			RpcBurst:             3,
 		},
 		"Ethereum": {
 			Urls:                 []string{"ws://127.0.0.1:8545"},
-			FilterQuerySize:      2000,
-			RpcRequestsPerSecond: 3,
-			RpcBurst:             5,
-		},
-		"Supernova": {
-			Urls:                 []string{},
-			FilterQuerySize:      2000,
-			RpcRequestsPerSecond: 3,
-			RpcBurst:             5,
+			FilterQuerySize:      100,
+			RpcRequestsPerSecond: 2,
+			RpcBurst:             3,
 		},
 	},
 	GlobalState: common.LiveState,

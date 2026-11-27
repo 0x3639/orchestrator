@@ -36,7 +36,7 @@ Set these fields in the existing `Networks.Ethereum` entry of `config.json` and 
 }
 ```
 
-`RpcBurst: 1` spaces requests even after idle time. Lowering the rate also slows retries and other reads that share the endpoint. Local waits happen before the RPC timeout starts. A missing or zero `RpcRequestsPerSecond` leaves an existing network entry uncapped.
+`RpcBurst: 1` spaces requests even after idle time. Lowering the rate also slows retries and other reads that share the endpoint. Local waits happen before the RPC timeout starts. Setting `RpcRequestsPerSecond` explicitly to `0` leaves that network entry uncapped; omitting the field in a built-in network entry (`BNB Chain`, `Ethereum`) inherits its default cap.
 
 Choose a rate that fits both throughput and total quota. For example, a continuously busy endpoint at 0.5 requests per second can use about 43,200 requests per day. If the provider bills compute units, allow for the most expensive calls the sync makes. Divide shared account allowances among all active endpoints, networks and other clients using the same key. The orchestrator does not track the provider's remaining credits.
 
@@ -55,14 +55,20 @@ The limits below are [dRPC's](https://drpc.org/docs/howitworks/ratelimiting) fre
 | Request timeout | 2 s |
 | `eth_getLogs` response cap | 10,000 entries |
 
-The cost of the cap in CU per second is `RpcRequestsPerSecond × CU per call`, so look up `eth_getLogs` and `eth_blockNumber` in the provider's [compute-unit table](https://drpc.org/docs/pricing/compute-units), which changes over time. At 20 CU per call the default cap of 3 requests per second is 60 CU/s, about 7% of the degraded floor; at 75 CU per call it is 225 CU/s, about 27%. Either leaves room for other clients on the same IP. A full first sync from contract deployment is a few thousand `eth_getLogs` calls plus as many head reads, far below the monthly quota.
+The cost of the cap in CU per second is `RpcRequestsPerSecond × CU per call`, so look up `eth_getLogs` and `eth_blockNumber` in the provider's [compute-unit table](https://drpc.org/docs/pricing/compute-units), which changes over time. At dRPC's 20 CU per call, the default cap of 2 requests per second is 40 CU/s per endpoint (80 CU/s across both `BNB Chain` and `Ethereum` combined), staying under the 210M CU/30-day continuous average (~81 CU/s) and at roughly 10% of the degraded floor. At higher per-call costs (for example 75 CU per call), 2 req/s is 150 CU/s per endpoint (300 CU/s combined), which stays well below the degraded floor but would exceed the 30-day monthly budget if sustained continuously. `FilterQuerySize: 100` keeps `eth_getLogs` inside dRPC's free-tier block-range window without repeated range-limit rejections. Note that scanning from contract deployment at 100 blocks per query makes ~20× as many `eth_getLogs` calls as at 2,000 blocks—on BNB Chain at 2 req/s that takes days and consumes a large share of the monthly quota, so use a [local checkpoint](operations/sync-checkpoints.md) or a wide-window endpoint for initial catch-up. Operators running their own local full node should raise `FilterQuerySize` (for example to `2000`) in addition to setting `RpcRequestsPerSecond` to `0`.
 
 ```json
+"BNB Chain": {
+    "Urls": ["wss://bnb-a.example/v3/KEY", "wss://bnb-b.example/KEY"],
+    "FilterQuerySize": 100,
+    "RpcRequestsPerSecond": 2,
+    "RpcBurst": 3
+},
 "Ethereum": {
     "Urls": ["wss://eth-a.example/v3/KEY", "wss://eth-b.example/KEY"],
-    "FilterQuerySize": 2000,
-    "RpcRequestsPerSecond": 3,
-    "RpcBurst": 5
+    "FilterQuerySize": 100,
+    "RpcRequestsPerSecond": 2,
+    "RpcBurst": 3
 }
 ```
 

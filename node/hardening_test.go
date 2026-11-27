@@ -1837,13 +1837,26 @@ func TestParseLocalStateParticipantKeysAndEmptyBaseDir(t *testing.T) {
 	}
 }
 
-func TestDefaultNodeConfigRequiresExplicitSupernovaEndpoint(t *testing.T) {
-	sn, ok := DefaultNodeConfig.Networks["Supernova"]
-	if !ok {
-		t.Fatal("Supernova missing from DefaultNodeConfig.Networks")
+func TestDefaultNodeConfigNetworksAndFreeTierSyncDefaults(t *testing.T) {
+	for _, removed := range []string{"BSC", "Supernova"} {
+		if _, ok := DefaultNodeConfig.Networks[removed]; ok {
+			t.Fatalf("DefaultNodeConfig.Networks must not include deprecated network %q", removed)
+		}
 	}
-	if len(sn.Urls) != 0 {
-		t.Fatalf("Supernova default Urls = %v, want empty slice requiring an explicit endpoint", sn.Urls)
+	if len(DefaultNodeConfig.Networks) != 3 {
+		t.Fatalf("DefaultNodeConfig.Networks has %d entries, want 3 (Zenon, BNB Chain, Ethereum)", len(DefaultNodeConfig.Networks))
+	}
+	if _, ok := DefaultNodeConfig.Networks[common.ZenonNetworkName]; !ok {
+		t.Fatalf("%s missing from DefaultNodeConfig.Networks", common.ZenonNetworkName)
+	}
+	for _, name := range []string{"BNB Chain", "Ethereum"} {
+		netCfg, ok := DefaultNodeConfig.Networks[name]
+		if !ok {
+			t.Fatalf("%s missing from DefaultNodeConfig.Networks", name)
+		}
+		if netCfg.FilterQuerySize != 100 || netCfg.RpcRequestsPerSecond != 2 || netCfg.RpcBurst != 3 {
+			t.Fatalf("%s default sync settings = %+v, want FilterQuerySize=100 RpcRequestsPerSecond=2 RpcBurst=3", name, netCfg)
+		}
 	}
 	for name, netCfg := range DefaultNodeConfig.Networks {
 		for _, u := range netCfg.Urls {

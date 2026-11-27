@@ -10,6 +10,7 @@ import (
 	"orchestrator/common"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -113,6 +114,65 @@ type Config struct {
 	// environment, the passphrase file, config.json or a prompt. It is
 	// unexported so it can never be serialized back into config.json.
 	resolvedPassphrase string
+}
+
+// Clone returns a copy of c with independent maps and slices so mutating the
+// copy (for example during config loading) never mutates DefaultNodeConfig.
+func (c Config) Clone() Config {
+	if c.Networks != nil {
+		networks := make(map[string]BaseNetworkConfig, len(c.Networks))
+		for name, netCfg := range c.Networks {
+			netCfg.Urls = slices.Clone(netCfg.Urls)
+			networks[name] = netCfg
+		}
+		c.Networks = networks
+	}
+	c.TssConfig.LocalPubKeys = slices.Clone(c.TssConfig.LocalPubKeys)
+	if c.TssConfig.PubKeyWhitelist != nil {
+		wl := make(map[string]bool, len(c.TssConfig.PubKeyWhitelist))
+		for k, v := range c.TssConfig.PubKeyWhitelist {
+			wl[k] = v
+		}
+		c.TssConfig.PubKeyWhitelist = wl
+	}
+	c.AcknowledgedRedeems = slices.Clone(c.AcknowledgedRedeems)
+	return c
+}
+
+// UnmarshalJSON preserves pre-populated default fields inside existing
+// Networks entries when JSON omits those fields (for example an existing
+// config.json that sets only Urls or predates RpcRequestsPerSecond/RpcBurst),
+// while honoring every field explicitly set in JSON (including explicit 0 to
+// disable rate limiting).
+func (c *Config) UnmarshalJSON(data []byte) error {
+	type configAlias Config
+	defaults := c.Networks
+	raw := struct {
+		*configAlias
+		Networks map[string]json.RawMessage
+	}{
+		configAlias: (*configAlias)(c),
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	if raw.Networks == nil {
+		return nil
+	}
+	merged := make(map[string]BaseNetworkConfig, len(defaults)+len(raw.Networks))
+	for name, netCfg := range defaults {
+		netCfg.Urls = slices.Clone(netCfg.Urls)
+		merged[name] = netCfg
+	}
+	for name, rawNet := range raw.Networks {
+		entry := merged[name]
+		if err := json.Unmarshal(rawNet, &entry); err != nil {
+			return fmt.Errorf("Networks[%q]: %w", name, err)
+		}
+		merged[name] = entry
+	}
+	c.Networks = merged
+	return nil
 }
 
 // ProducerPassphrase returns the passphrase resolved by LoadProducerPassphrase,

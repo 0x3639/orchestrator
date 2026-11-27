@@ -6,7 +6,7 @@ description: "Reference for every field in the orchestrator's config.json: data 
 
 # Configuration
 
-Everything lives in `~/.orchestrator/config.json`. On first start the orchestrator writes a default file; on every start it re-reads the file, fills in defaults, and rewrites it with mode `0600` inside a `0700` data directory. Fields you leave out take their defaults, with one exception noted under [EVM networks](#networks).
+Everything lives in `~/.orchestrator/config.json`. On first start the orchestrator writes a default file; on every start it re-reads the file, fills in defaults for omitted fields, and rewrites it with mode `0600` inside a `0700` data directory.
 
 ## Complete example
 
@@ -18,11 +18,17 @@ Everything lives in `~/.orchestrator/config.json`. On first start the orchestrat
         "Zenon": {
             "Urls": ["ws://127.0.0.1:35998"]
         },
+        "BNB Chain": {
+            "Urls": ["wss://bnb-a.example/v3/KEY", "wss://bnb-b.example/KEY"],
+            "FilterQuerySize": 100,
+            "RpcRequestsPerSecond": 2,
+            "RpcBurst": 3
+        },
         "Ethereum": {
             "Urls": ["wss://eth-a.example/v3/KEY", "wss://eth-b.example/KEY"],
-            "FilterQuerySize": 2000,
-            "RpcRequestsPerSecond": 3,
-            "RpcBurst": 5
+            "FilterQuerySize": 100,
+            "RpcRequestsPerSecond": 2,
+            "RpcBurst": 3
         }
     },
     "TssConfig": {
@@ -61,17 +67,17 @@ Everything lives in `~/.orchestrator/config.json`. On first start the orchestrat
 
 `Networks` is a map from network name to settings. `Zenon` is required. At startup the orchestrator reads the networks registered on the Zenon bridge contract and requires an entry here **for each of them**, by name; startup fails if one is missing. Entries for names the bridge does not register are ignored.
 
-The file is loaded on top of the built-in defaults, which contain `BSC` and `Ethereum` entries pointing at `ws://127.0.0.1:8545`, plus a `Supernova` entry with an empty `Urls` list (`[]`). Leaving a network out of your file therefore does not remove it; the default entry remains and is rewritten into the file. When `Supernova` is registered on the bridge, you must supply an explicit `Supernova` RPC URL in `config.json`. The example above shows only the entries you should edit.
+The file is loaded on top of the built-in defaults, which contain `Zenon` (`ws://127.0.0.1:35998`) plus `BNB Chain` and `Ethereum` entries pointing at `ws://127.0.0.1:8545` (sized for dRPC's free tier: `FilterQuerySize: 100`, `RpcRequestsPerSecond: 2`, `RpcBurst: 3`). Leaving one of those networks out of your file therefore does not remove it; the default entry remains and is rewritten into the file.
 
 | Field | Default | Meaning |
 | --- | --- | --- |
 | `Urls` | required | Endpoints, tried in order at startup. For EVM networks, list two or more independent providers; see [EVM networks](networks.md). |
-| `FilterQuerySize` | `2000` | Blocks per `eth_getLogs` query during sync. `0` falls back to `2000`. |
-| `RpcRequestsPerSecond` | `0` (uncapped) | Request cap per endpoint. A freshly generated file contains `3`. |
-| `RpcBurst` | `0` | Requests allowed at once before the cap applies. A freshly generated file contains `5`. |
+| `FilterQuerySize` | `100` (built-in `BNB Chain`, `Ethereum`); `0` for custom networks | Blocks per `eth_getLogs` query during sync. `0` falls back to `2000` at runtime. |
+| `RpcRequestsPerSecond` | `2` (built-in `BNB Chain`, `Ethereum`); `0` for custom networks | Request cap per endpoint. `0` disables rate limiting (for example against a local full node). |
+| `RpcBurst` | `3` (built-in `BNB Chain`, `Ethereum`); `0` for custom networks | Requests allowed at once before the cap applies. |
 
-:::caution An entry without the field is uncapped
-Network entries are read wholesale, so an entry that omits `RpcRequestsPerSecond` runs uncapped regardless of what a freshly generated file would contain. Put the field in every EVM network entry you write.
+:::caution Explicit `0` runs uncapped
+Omitted fields in a built-in network entry inherit their defaults, while an explicit `"RpcRequestsPerSecond": 0` in `config.json` leaves that network uncapped. If an earlier build wrote `"RpcRequestsPerSecond": 0` into your file, remove those fields or set explicit limits before restarting.
 :::
 
 ## TssConfig

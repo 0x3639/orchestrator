@@ -21,7 +21,7 @@ The rest of this guide describes the orchestrator as it behaves in the 0x3639 bu
 
 - `ORCHESTRATOR_PRODUCER_PASSPHRASE` and `ProducerKeyFilePassphraseFile` as passphrase sources; `ProducerKeyFilePassphrase` in `config.json` still works, with a warning. See [Producer key and passphrase](secrets.md).
 - `HealthConfig.Address`, `PerClientResponsesPerSecond`, `PerClientBurst`.
-- `RpcRequestsPerSecond` and `RpcBurst` per EVM network. **Existing configs are uncapped until you add the fields**; new configs default to 3 per second, burst 5.
+- `RpcRequestsPerSecond` and `RpcBurst` per EVM network. Built-in `BNB Chain` (renamed from `BSC`; `Supernova` removed) and `Ethereum` defaults are sized for dRPC's free tier (`FilterQuerySize: 100`, `RpcRequestsPerSecond: 2`, `RpcBurst: 3`). Omitted fields in built-in network entries inherit those defaults on load, while explicit values already written in `config.json` (such as `2000`/`3`/`5`, `0`, or legacy `BSC`/`Supernova` entries) are preserved across restarts; edit your `BNB Chain`/`Ethereum` entries if you want the new free-tier limits and remove unused `BSC`/`Supernova` blocks by hand.
 - `--evm.backfill-blocks N` command-line flag. See [Backfill](operations/backfill.md).
 
 ### Behaviour changes

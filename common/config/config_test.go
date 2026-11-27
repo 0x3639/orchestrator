@@ -644,3 +644,89 @@ func TestLinkOwnedFileToCleansTempOnSameInode(t *testing.T) {
 		t.Fatalf("unexpected dst entries after same-inode relink: %v", entries)
 	}
 }
+
+func TestConfigUnmarshalPreservesNetworkDefaultsForOmittedFields(t *testing.T) {
+	defaults := Config{
+		DataPath: t.TempDir(),
+		Networks: map[string]BaseNetworkConfig{
+			"Zenon": {
+				Urls: []string{"ws://127.0.0.1:35998"},
+			},
+			"BNB Chain": {
+				Urls:                 []string{"ws://127.0.0.1:8545"},
+				FilterQuerySize:      100,
+				RpcRequestsPerSecond: 2,
+				RpcBurst:             3,
+			},
+			"Ethereum": {
+				Urls:                 []string{"ws://127.0.0.1:8545"},
+				FilterQuerySize:      100,
+				RpcRequestsPerSecond: 2,
+				RpcBurst:             3,
+			},
+		},
+	}
+
+	// Simulate an existing config.json that specifies only Urls for BNB Chain,
+	// explicitly sets RpcRequestsPerSecond=0 for Ethereum (local node opt-out),
+	// and adds a custom network.
+	raw := []byte(`{
+		"Networks": {
+			"BNB Chain": {
+				"Urls": ["wss://bnb.drpc.org"]
+			},
+			"Ethereum": {
+				"Urls": ["ws://127.0.0.1:8545"],
+				"FilterQuerySize": 2000,
+				"RpcRequestsPerSecond": 0,
+				"RpcBurst": 0
+			},
+			"Custom": {
+				"Urls": ["wss://custom.example"]
+			}
+		}
+	}`)
+	if err := os.WriteFile(defaults.ConfigPath(), raw, ConfigFilePerm); err != nil {
+		t.Fatal(err)
+	}
+
+	loaded := defaults.Clone()
+	found, err := ReadConfigFile(&loaded)
+	if err != nil || !found {
+		t.Fatalf("ReadConfigFile failed: found=%v err=%v", found, err)
+	}
+
+	bnb := loaded.Networks["BNB Chain"]
+	if len(bnb.Urls) != 1 || bnb.Urls[0] != "wss://bnb.drpc.org" {
+		t.Fatalf("BNB Chain Urls = %v, want [wss://bnb.drpc.org]", bnb.Urls)
+	}
+	if bnb.FilterQuerySize != 100 || bnb.RpcRequestsPerSecond != 2 || bnb.RpcBurst != 3 {
+		t.Fatalf("BNB Chain omitted sync fields did not inherit defaults: %+v", bnb)
+	}
+
+	eth := loaded.Networks["Ethereum"]
+	if eth.FilterQuerySize != 2000 || eth.RpcRequestsPerSecond != 0 || eth.RpcBurst != 0 {
+		t.Fatalf("Ethereum explicit fields were not honored: %+v", eth)
+	}
+
+	if _, ok := loaded.Networks["Zenon"]; !ok {
+		t.Fatal("Zenon default network entry was dropped")
+	}
+	if custom := loaded.Networks["Custom"]; len(custom.Urls) != 1 || custom.Urls[0] != "wss://custom.example" || custom.FilterQuerySize != 0 || custom.RpcRequestsPerSecond != 0 {
+		t.Fatalf("unexpected Custom network entry: %+v", custom)
+	}
+
+	// Verify defaults map and slices were not mutated.
+	if orig := defaults.Networks["BNB Chain"]; len(orig.Urls) != 1 || orig.Urls[0] != "ws://127.0.0.1:8545" {
+		t.Fatalf("defaults.Networks mutated: %+v", orig)
+	}
+	if _, leaked := defaults.Networks["Custom"]; leaked {
+		t.Fatal("defaults.Networks gained Custom entry")
+	}
+
+	// Malformed network field errors must name the offending network.
+	var bad Config
+	if err := json.Unmarshal([]byte(`{"Networks":{"Ethereum":{"FilterQuerySize":"bad"}}}`), &bad); err == nil || !strings.Contains(err.Error(), `Networks["Ethereum"]`) {
+		t.Fatalf("expected error naming Networks[\"Ethereum\"], got %v", err)
+	}
+}

@@ -8,7 +8,7 @@ import (
 )
 
 func MakeConfig() (*config.Config, error) {
-	cfg := node.DefaultNodeConfig
+	cfg := node.DefaultNodeConfig.Clone()
 
 	// 1: Load config file.
 	err := readConfigFromFile(&cfg)
