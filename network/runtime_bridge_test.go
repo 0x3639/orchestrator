@@ -3376,7 +3376,7 @@ func TestLateUnknownUnwrapRevalidatesCanonicalAgreementAndHashAfterMultiBatchCor
 
 func TestSubmitContextPassesDeadlineBoundContextToSend(t *testing.T) {
 	var hasDeadline bool
-	sent, err := submitContext(context.Background(), nil, func(pubCtx context.Context) error {
+	sent, err := new(NetworksManager).submitContext(context.Background(), nil, func(pubCtx context.Context) error {
 		_, hasDeadline = pubCtx.Deadline()
 		return nil
 	})
